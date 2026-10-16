@@ -440,7 +440,7 @@ class DeviceContextChecks(unittest.TestCase):
         engine = AscendServingEngine(
             session, SimpleNamespace(first_token_id=6500), "npu:1",
         )
-        with self.assertRaisesRegex(ValueError, "prompt-row replay"):
+        with self.assertRaisesRegex(ValueError, "decode prefix"):
             engine.decode(6501, max_tokens=2)
         session.decode.assert_not_called()
 

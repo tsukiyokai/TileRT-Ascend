@@ -39,6 +39,16 @@ class RankPrefix:
     seq_len: int
 
 
+@dataclass(frozen=True)
+class FullRankPrefix:
+    """Full-P main KV, P-1 MTP KV and normalized main hidden[P-1]."""
+
+    main: list
+    mtp: dict
+    parent_hidden: object
+    seq_len: int
+
+
 class AscendReceiveBuffer:
     """Retain one contiguous registered allocation until HIXL peers drain."""
 
@@ -135,6 +145,19 @@ class AscendReceiveBuffer:
         self._last_generation = generation
         return prefix
 
+    def mtp_prefix(self, request):
+        """Consume the v3 parent and both caches without prompt replay."""
+        if PARENT_HIDDEN_REGION not in self.views:
+            raise ValueError("CANN MTP requires the v3 parent-hidden layout")
+        length, generation = self._validate_prefix(request)
+        prefix = FullRankPrefix(
+            [self._layer_prefix(layer, length) for layer in range(78)],
+            self._layer_prefix(78, length - 1),
+            self.views[PARENT_HIDDEN_REGION], length,
+        )
+        self._last_generation = generation
+        return prefix
+
     def frozen_prefix(self, request, checkpoint_hashes):
         """Consume P main rows and P-1 MTP rows without prompt replay.
 
@@ -221,7 +244,7 @@ class AscendRankEngine:
         if self._decode_mode is not None:
             raise RuntimeError("MTP must start before any decode operation")
         if type(first_token) is not int or first_token != self.first_token_id:
-            raise ValueError("First token differs from prompt-row replay")
+            raise ValueError("First token differs from the injected prefix")
         rounds = MtpRoundExecutor(
             self.target, self.draft, width, max_tokens, eos_tokens,
         )
@@ -255,3 +278,19 @@ class AscendRankEngine:
         self._clear_request()
         self.target.reset()
         self.draft.reset()
+
+
+class CannRankEngine(AscendRankEngine):
+    """Start CANN MTP at P using the transferred parent and full main KV."""
+
+    def inject(self, prefix):
+        self._clear_request()
+        self.target.inject(prefix.main)
+        self.draft.inject(prefix.mtp)
+        if (self.target.position != prefix.seq_len
+                or self.draft.position != prefix.seq_len - 1):
+            raise ValueError("CANN main/MTP prefixes require P and P-1 rows")
+        self.parent_hidden = prefix.parent_hidden.clone()
+        result = self.target.predict(self.parent_hidden)
+        self.first_token_id = int(result.token_ids[0].item())
+        self._prompt_length = prefix.seq_len

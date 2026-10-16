@@ -296,6 +296,22 @@ class CannModel:
     def step(self, token):
         return self.verify((token,), full_logits=False)
 
+    def predict(self, normalized_parent, *, full_logits=False):
+        """Project transferred hidden[P-1] without changing the KV length."""
+        import torch
+        from vllm.config import set_current_vllm_config
+
+        if (normalized_parent.shape != (1, 6144)
+                or normalized_parent.dtype != torch.bfloat16
+                or normalized_parent.device != self.device):
+            raise ValueError("Parent must be normalized device BF16 [1,6144]")
+        with torch.npu.device(self.device), torch.inference_mode(), (
+            set_current_vllm_config(self.config)
+        ):
+            logits = self.model.compute_logits(normalized_parent)
+            return CannStep(logits if full_logits else None, normalized_parent,
+                            logits.argmax(dim=-1))
+
     def truncate(self, length):
         """Retain written rows [0, length); later writes replace the tail."""
         if type(length) is not int or not 0 <= length <= self.position:

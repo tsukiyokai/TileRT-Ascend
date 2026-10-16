@@ -60,8 +60,9 @@ PD lifecycle 33 and prefix capture 8. Their reports and the 15 static/CLI
 checks are in [the host evidence directory](mtp-parent-host-checks-20261017).
 Device and numerical acceptance follow separately.
 
-The next device check is an 8K v3 capture with sixteen receipts, followed
-by CANN MTP seeding from the saved parent and HF comparison. The full-P
-[CANN M1 adapter](cann-model.md) runs independently of this optional field.
-The Native engine's existing replay path remains in use by its own entry;
-the new bundle has not yet been connected to a live CANN MTP engine.
+The [CANN MTP execution path](cann-mtp.md) now connects the v3 parent and
+P/P-1 caches to the existing TP16 rounds and HTTP service. CPU API and
+streaming lifecycle checks pass. The next device check is an 8K v3 capture
+with sixteen receipts, followed by real CANN MTP seeding and HF comparison.
+The full-P [CANN M1 adapter](cann-model.md) runs independently of this
+optional field. The Native engine retains its own replay entry.

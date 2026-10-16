@@ -40,7 +40,7 @@ class AscendDeviceContext:
 
 
 class AscendServingEngine(AscendDeviceContext):
-    """Check the replayed first token before serving the Native backend."""
+    """Check the prefill token against the injected target prefix."""
 
     def __init__(self, session, rank_engine, device):
         super().__init__(session, device)
@@ -49,7 +49,7 @@ class AscendServingEngine(AscendDeviceContext):
     def decode(self, first_token_id, **kwargs):
         if first_token_id != self.rank_engine.first_token_id:
             raise ValueError(
-                "Prefill first token differs from CANN prompt-row replay: "
+                "Prefill first token differs from the decode prefix: "
                 f"{first_token_id} != {self.rank_engine.first_token_id}"
             )
         return super().decode(first_token_id, **kwargs)
