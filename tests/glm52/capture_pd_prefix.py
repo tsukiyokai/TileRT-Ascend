@@ -25,6 +25,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--ctrl-port", type=int, default=5557)
     parser.add_argument("--http-port", type=int, default=18081)
     parser.add_argument("--capacity", type=int, default=9344)
+    parser.add_argument("--mtp-parent-hidden", action="store_true",
+                        help="Receive the final normalized target row")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -64,7 +66,8 @@ def run(args):
     transport = HixlTransport(library_path=args.hixl_library,
                               port=args.hixl_port_base + rank)
     buffer = AscendReceiveBuffer(rank, device, args.capacity, transport,
-                                args.hixl_host)
+                                args.hixl_host,
+                                parent_hidden=args.mtp_parent_hidden)
     endpoints = [None] * 16
     distributed.all_gather_object(endpoints, buffer.endpoint())
     channel = TorchControlChannel()

@@ -14,7 +14,7 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 | 不变量 | 形式与代码依据 |
 |---|---|
-| 前缀一致 | `L=P+N−1`，主干 KV 对应 prompt 和前 N−1 个输出；[末行重放](../tilert/pd_vllm/ascend_cache.py)建立初始状态。 |
+| 前缀一致 | `L=P+N−1`，主干 KV 对应 prompt 和前 N−1 个输出；[完整 P 行注入](../tilert/models/glm_5_2_ascend/cann_model.py)后，首个 pending token 在位置 P 被消费。 |
 | 接受等价于 greedy | `c[0]=pending`；若连续匹配 k 个 draft，则自然提交 `A=k+1≤M` 个 target predictions，并按输出预算／EOS 裁剪；`L'=L+A`，新 pending 为最后一个提交的 prediction。[接受状态](../tilert/models/glm_5_2_ascend/mtp_state.py) |
 | MTP parent 正确 | 有效 MTP 行 p 对应 `(normalized_target_hidden[p], token[p+1])`。chain 行先截掉，再由 target hidden 重算；seed 后每轮提交的 main/MTP 同长。[轮次实现](../tilert/models/glm_5_2_ascend/mtp_round.py) |
 | TP／PD 一致 | 16 rank 消费同一请求 generation，并按同一命令序列推进有效长度；本 generation 的全部 KV 写入完成后才能 inject。[TP 控制](../tilert/models/glm_5_2_ascend/tp_runtime.py)、[PD 接收](../tilert/pd_vllm/ascend_receiver.py) |
@@ -77,7 +77,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 3. 执行调度：先使用已有算子的预打包权重和预分配缓存，验证 ACL Graph 对固定阶段的收益。重复搬运、独立启动或同步边界进入关键路径时，优先调整 CANN 实现的 tiling、布局、双缓冲和融合范围。需要跨算子的 tile 流水时，再以 AIC/AIV/MTE 和 cross-core flag 组织生产与消费；缓冲区按 `round/layer/tile` epoch 复用。
 4. 通信：以 HCCL 给出 TP16 的正确性与时延基线，再比较适用的 AIV 路径。若归约等待主导，改造已有输出投影／expert down 与归约的衔接，并比较 residual/RMSNorm 融合收益；需要时以小型 AscendC extern 接入 device 通信。每项改造验证完成语义与关键路径净收益。HIXL 负责 P→D KV 交接。
 5. 稀疏与 MTP：先复用已有 Q/KV 投影、norm／RoPE／cache 更新、indexer 和稀疏 attention，逐项验证 8K 选 2K、4 heads/rank 与 INT8/BF16 混合 index cache；再比较现有 fused prolog 和 SwiGLU／量化接口。共享层复用 indices。MoE 按 M 个位置的专家并集复用权重；draft、verify、accept 按实际接受长度提交 KV／位置并丢弃未接受尾部，每轮向 Python 返回 token 列表。
-6. PD：复用 [Transport 接口](../tilert/pd_vllm/transport.py) 接入 HIXL 注册、批量 WRITE 与完成通知；[Ascend 专用 V1 connector／receiver](evidence/ascend-decode/pd-ascend.md) 使用 16 个 rank endpoint，独立于 GPU wire 的 8-rank 默认。开启 `indexer_kv_dtype=int8` 后，本 checkpoint 的 16 个主干 indexer 使用 INT8＋FP16 scale，0/1/2/70/74 及 MTP78 使用 BF16；MLA latent512+RoPE64 仍按 BF16。两端统一 page、逐层 dtype、scale、rotation、position 和 layout version。传主干 P 行、MTP P-1 行，全部 rank 完成同一 generation 才 ready；D 重放末个 prompt token，恢复 MTP seed 的 normalized hidden。8K 前缀约 0.78 GB/rank。生成 1024 tokens、M=4 时按 `L≥8192+1024+3` 再向 page 对齐分配；双份权重、KV 与当前阶段 workspace 合计峰值 ≤60 GiB/die，workspace 按阶段释放。
+6. PD：复用 [Transport 接口](../tilert/pd_vllm/transport.py) 接入 HIXL 注册、批量 WRITE 与完成通知；[Ascend 专用 V1 connector／receiver](evidence/ascend-decode/pd-ascend.md) 使用 16 个 rank endpoint，独立于 GPU wire 的 8-rank 默认。开启 `indexer_kv_dtype=int8` 后，本 checkpoint 的 16 个主干 indexer 使用 INT8＋FP16 scale，0/1/2/70/74 及 MTP78 使用 BF16；MLA latent512+RoPE64 仍按 BF16。两端统一 page、逐层 dtype、scale、rotation、position 和 layout version。传主干 P 行、MTP P-1 行，全部 rank 完成同一 generation 才 ready；M1 直接消费 prefill 首 token。MTP 另传 12 KiB 的主干 normalized hidden[P-1]，在 D 端只补一行 MTP seed；[可选交接与捕获](evidence/ascend-decode/mtp-parent-handoff.md)已实现，CANN MTP 执行接入与设备精度随后验证。8K 前缀约 0.78 GB/rank。生成 1024 tokens、M=4 时按 `L≥8192+1024+3` 再向 page 对齐分配；双份权重、KV 与当前阶段 workspace 合计峰值 ≤60 GiB/die，workspace 按阶段释放。
 
 已验证的起点：单 die 四层 BF16 缩小模型已执行，TileLang RMSNorm＋Torch/NPU 计算路径在 CPU、A3 上各通过 1,729 项检查；NPU 最大 NRMSE 为 0.008435，greedy token、索引、专家选择和 reset 重放通过。完整 W4A8C8／TP16／MTP 与 2 ms 性能验收按下表推进。[复现与原始结果](evidence/ascend-decode/README.md)
 

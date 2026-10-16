@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 
 from tilert.models.glm_5_2_ascend.session import AscendPDEngine
+from .ascend_layout import PARENT_HIDDEN_REGION
 from .decode_timing import atomic_json
 
 
@@ -69,11 +70,14 @@ def save_rank_prefix(buffer, request, checkpoint, directory, *,
         else:
             bundle["layer"] = {name: copy_tensor(value)
                                for name, value in bundle["layer"].items()}
+            if "parent_hidden" in bundle:
+                parent = bundle["parent_hidden"]
+                parent["tensor"] = copy_tensor(parent["tensor"])
         save_bundle(bundle, paths[role], save)
         files[role] = {"path": str(paths[role]),
                        "sha256": digest(paths[role]),
                        "bytes": paths[role].stat().st_size}
-    return {
+    receipt = {
         "status": "saved", "rank": buffer.rank,
         "request_id": request.request_id, "seq_len": request.seq_len,
         "mtp_seq_len": request.metadata["mtp_seq_len"],
@@ -81,6 +85,9 @@ def save_rank_prefix(buffer, request, checkpoint, directory, *,
         "prompt_sha256": prompt_digest(request.metadata["prompt_token_ids"]),
         "checkpoint_sha256": checkpoint, "files": files,
     }
+    if PARENT_HIDDEN_REGION in request.metadata:
+        receipt[PARENT_HIDDEN_REGION] = request.metadata[PARENT_HIDDEN_REGION]
+    return receipt
 
 
 def validate_receipts(receipts, request, checkpoint):
@@ -91,6 +98,7 @@ def validate_receipts(receipts, request, checkpoint):
         "prompt_sha256": prompt_digest(request.metadata["prompt_token_ids"]),
         "checkpoint_sha256": checkpoint,
     }
+    expected[PARENT_HIDDEN_REGION] = request.metadata.get(PARENT_HIDDEN_REGION)
     if len(receipts) != 16:
         raise RuntimeError("Prefix export requires sixteen rank receipts")
     for rank, receipt in enumerate(receipts):
@@ -190,6 +198,10 @@ class PrefixCaptureEngine:
             "scope": "Original HIXL prefix export; no decode inference",
             "numerical_execution": False, "tpot_measured": False,
         }
+        if PARENT_HIDDEN_REGION in request.metadata:
+            self.current[PARENT_HIDDEN_REGION] = dict(
+                request.metadata[PARENT_HIDDEN_REGION],
+            )
         self._save()
         try:
             with self.device_context():

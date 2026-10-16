@@ -6,9 +6,13 @@ set -u
 : "${TRT_HIXL_IP:?Set TRT_HIXL_IP to the prefill business IP}"
 decode_host=${TRT_DECODE_HOST:-$TRT_HIXL_IP}
 ctrl_port=${TRT_CTRL_PORT:-5557}
-transfer_config=$(python3 -S - "$TRT_HIXL_IP" "$decode_host" "$ctrl_port" <<'PY'
+transfer_config=$(python3 -S - "$TRT_HIXL_IP" "$decode_host" "$ctrl_port" \
+    "${TRT_MTP_PARENT_HIDDEN:-0}" <<'PY'
 import json
 import sys
+
+if sys.argv[4] not in ("0", "1"):
+    raise ValueError("TRT_MTP_PARENT_HIDDEN must be 0 or 1")
 
 print(json.dumps({
     "kv_connector": "AscendTileRTConnector",
@@ -25,6 +29,7 @@ print(json.dumps({
             "libtilert_hixl.so"
         ),
         "tilert_timeout_s": 1800,
+        "transfer_mtp_parent_hidden": sys.argv[4] == "1",
     },
 }))
 PY

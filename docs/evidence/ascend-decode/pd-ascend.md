@@ -3,8 +3,9 @@
 This path connects a TP16 vLLM-Ascend producer to rank-local CANN decode
 engines through HIXL. It serves one fresh greedy request at a time, with the
 whole prompt scheduled in one step.
-Serving supports serial M=1 and MTP verification widths 2/4 through the same
-TP16 request loop. Serial decode remains the default precision baseline.
+The current [CANN model entry](../../../tests/glm52/serve_cann_pd.py) uses
+serial M=1 with full-P injection. The existing Native engine provides the
+MTP width 2/4 request loop; its numerical acceptance remains in progress.
 
 ## Ownership and completion
 
@@ -25,11 +26,14 @@ TP16 request loop. Serial decode remains the default precision baseline.
 - Main caches transfer P rows; MTP transfers P-1 target-conditioned parent
   rows. The receiver publishes ready only after all sixteen ranks finish
   the same generation. The slot remains occupied throughout decode.
-- [Injection](../../../tilert/pd_vllm/ascend_cache.py) consumes P-1 rows in
-  each cache, then replays the final prompt token through the main model.
-  This restores main length P, normalized target hidden[P-1], and its greedy
-  first token. Serving compares that token with the prefill result before
-  emitting it. No hidden-state tensor crosses the wire.
+- [CannModel injection](../../../tilert/models/glm_5_2_ascend/cann_model.py)
+  keeps all P main rows. Its next input is the prefill first token at
+  position P. The older Native rank engine injects P-1 rows and replays the
+  final prompt token, then checks its prediction against prefill.
+- [Optional layout v3](mtp-parent-handoff.md) adds the unrotated target
+  final-norm hidden[P-1], BF16 `[1,6144]`, to the same completed WRITE.
+  The capture bundle retains it for one-row MTP seeding. Live CANN MTP
+  execution still needs this bundle connected to the draft model.
 - Cancellation retains admitted writers until their WRITE completions.
   A disconnect without completion quarantines the slot. Stop both sides
   before replacing registered allocations or restarting an endpoint.
@@ -92,23 +96,22 @@ cd /workspace/src/TileRT-Ascend
 PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   ACL_OP_INIT_MODE=1 OMP_NUM_THREADS=1 HCCL_NPU_SOCKET_PORT_RANGE=auto \
   /opt/trt-asc/venv/bin/python -m torch.distributed.run \
-  --standalone --nproc-per-node=16 --module tilert.pd_vllm.ascend_server \
+  --standalone --nproc-per-node=16 tests/glm52/serve_cann_pd.py \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
   --hixl-host "${TRT_HIXL_IP:?set the business IP}" \
   --hixl-library /workspace/experiments/hixl-build/build-sync-contract/libtilert_hixl.so \
-  --capacity 9344 --mtp-width 1 --ctrl-port 5556 --http-port 18080 \
+  --capacity 9344 --gpu-memory-utilization 0.4 \
+  --ctrl-port 5556 --http-port 18080 \
   --output /workspace/experiments/glm52/pd-serving
 ```
 
-The [launcher](../../../tilert/pd_vllm/ascend_server.py) registers one HIXL
-endpoint per rank at ports 26100–26115 and gathers their descriptors before
-starting HTTP. The default per-expert path loads expert weights on first
-use for functional validation. `--timing-dir` preloads every main/MTP
-expert before measurement; `--expert-bank` also preloads the CANN GMM
-candidate. No device timing is inferred from startup or CPU checks.
-After serial and MTP numerical acceptance, use `--mtp-width 4` for the
-speculative path in the traffic budget. The output metadata records the
-selected width and implementation hashes.
+This entry loads the pinned vLLM-Ascend model and CANN weights, registers
+one HIXL endpoint per rank at ports 26100–26115, and gathers their
+descriptors before starting HTTP. The two resident models' actual combined
+HBM use must be measured during startup. The
+[Native launcher](../../../tilert/pd_vllm/ascend_server.py) retains
+`--mtp-width 2/4`, `--timing-dir` and `--expert-bank` for its separate
+numerical and performance experiments.
 
 Set the vLLM producer to TP16, PP/DP/PCP/DCP=1, expert parallel off,
 `max_num_seqs=1`, prefix caching off, block size 128,
@@ -147,9 +150,9 @@ The V1 connector configuration is:
 ```
 
 The existing router can use the decode HTTP endpoint; requests explicitly
-use `temperature=0`. Prefill produces the first token. Decode first replays
-the prompt row during injection, then emits that token and consumes it only
-when a successor is needed. The final emitted token stays outside main KV.
+use `temperature=0`. Prefill produces the first token. CANN M1 emits that
+token and consumes it at P only when a successor is needed. The final
+emitted token stays outside main KV.
 During measured decode, the prefill service must be quiescent.
 
 ## CPU evidence and remaining device work
@@ -179,7 +182,7 @@ The scalar checks execute on the a3-gs host CPU without Torch. The
 [HIXL device checks](pd-hixl-20261017/README.md) verify a 1 KiB WRITE from
 die 0 to an independent process on die 1, with exact receiver readback.
 The same-die control fails during Connect with status 103900. Full TP16
-8K handoff, NPU prefix injection/replay, HTTP delivery timing and numerical
+8K handoff, full-P NPU continuation, HTTP delivery timing and numerical
 parity remain the next device acceptance steps. Follow the
 precision→profiling→calibration order in
 [the development record](offline-development.md).

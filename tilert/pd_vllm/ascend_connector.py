@@ -17,10 +17,12 @@ from . import wire
 from .ascend_cache import checkpoint_fingerprint
 from .ascend_layout import (
     LAYOUT_NAME,
-    LAYOUT_VERSION,
     NUM_RANKS,
     PAGE_SIZE,
+    PARENT_HIDDEN_BYTES,
+    PARENT_HIDDEN_REGION,
     cache_layout,
+    parent_hidden_metadata,
     validate_layout,
 )
 from .ascend_receiver import validate_endpoints
@@ -64,6 +66,15 @@ class AscendTileRTConnector(TileRTConnector):
         )
         self._check_config(vllm_config)
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self._transfer_parent_hidden = extra.get(
+            "transfer_mtp_parent_hidden", False,
+        )
+        if type(self._transfer_parent_hidden) is not bool:
+            raise ValueError("transfer_mtp_parent_hidden must be boolean")
+        if (self._transfer_parent_hidden
+                and not vllm_config.model_config.enforce_eager):
+            raise ValueError("Parent hidden capture requires an eager target")
+        self._parent_capture = None
         self._default_host = extra.get("tilert_host")
         self._default_port = int(extra.get("tilert_ctrl_port", 5556))
         self._max_seq = int(extra.get(
@@ -182,6 +193,23 @@ class AscendTileRTConnector(TileRTConnector):
     def bind_connector_metadata(self, metadata):
         super().bind_connector_metadata(metadata)
         self._written_layers.clear()
+        if self._parent_capture is not None:
+            self._parent_capture.clear()
+        if self._transfer_parent_hidden and metadata.requests:
+            from vllm.forward_context import get_forward_context
+
+            if self._parent_capture is None or len(metadata.requests) != 1:
+                raise RuntimeError("Parent capture needs registered batch1 KV")
+            context = get_forward_context()
+            if getattr(context, "is_draft_model", False):
+                raise ValueError("Parent hidden must come from the target")
+            self._parent_capture.bind(context.model_instance,
+                                      metadata.requests[0])
+
+    def clear_connector_metadata(self):
+        if self._parent_capture is not None:
+            self._parent_capture.clear()
+        super().clear_connector_metadata()
 
     def register_kv_caches(self, kv_caches):
         from vllm.distributed import get_tensor_model_parallel_rank
@@ -195,6 +223,11 @@ class AscendTileRTConnector(TileRTConnector):
         self._tp_rank = get_tensor_model_parallel_rank()
         if not 0 <= self._tp_rank < NUM_RANKS:
             raise ValueError("Source rank must belong to TP16")
+        if self._transfer_parent_hidden:
+            from .ascend_parent import ParentHiddenCapture
+
+            device = next(iter(self._binding.regions.values())).tensor.device
+            self._parent_capture = ParentHiddenCapture(device)
 
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
         self._written_layers.add(layer_name)
@@ -210,6 +243,9 @@ class AscendTileRTConnector(TileRTConnector):
         transport.init(self._hixl_host or wire.local_ip(remote_host))
         for pointer, size in self._binding.registration_ranges():
             transport.register(pointer, size, self._binding.device_id)
+        if self._parent_capture is not None:
+            transport.register(self._parent_capture.tensor.data_ptr(),
+                               PARENT_HIDDEN_BYTES, self._binding.device_id)
         self._transport = transport
 
     def wait_for_save(self):
@@ -227,6 +263,9 @@ class AscendTileRTConnector(TileRTConnector):
             raise RuntimeError(
                 f"Unwritten backbone/MTP cache layers: {sorted(missing)}"
             )
+        if self._parent_capture is not None:
+            for request in metadata.requests:
+                self._parent_capture.pointer_for(request)
         import torch
 
         torch.npu.synchronize(self._binding.device_id)
@@ -235,10 +274,13 @@ class AscendTileRTConnector(TileRTConnector):
             self._send_request(request)
 
     def _validate_hello(self, hello):
+        expected_layout = cache_layout(
+            parent_hidden=self._transfer_parent_hidden,
+        )
         for field, expected in (
             ("magic", wire.MAGIC), ("protocol_version", wire.PROTOCOL_VERSION),
             ("transport", "hixl"), ("profile", LAYOUT_NAME),
-            ("layout_version", LAYOUT_VERSION),
+            ("layout_version", expected_layout["version"]),
             ("num_ranks", NUM_RANKS), ("senders", NUM_RANKS),
         ):
             if hello.get(field) != expected:
@@ -247,6 +289,9 @@ class AscendTileRTConnector(TileRTConnector):
             raise ValueError("Prefill and decode checkpoint metadata differ")
         layout = hello["ascend_layout"]
         validate_layout(layout)
+        if ((PARENT_HIDDEN_REGION in layout["regions"])
+                != self._transfer_parent_hidden):
+            raise ValueError("Parent hidden transfer flags differ")
         if hello["max_seq_len"] != layout["capacity_tokens"]:
             raise ValueError("Receiver capacity differs from its layout")
         validate_endpoints(hello["rank_endpoints"], layout)
@@ -270,6 +315,10 @@ class AscendTileRTConnector(TileRTConnector):
                 request.block_ids_per_group, endpoint["base_ptr"],
                 request.num_tokens, mtp_prefix_tokens=request.num_tokens - 1,
                 destination_layout=layout,
+                parent_hidden_ptr=(
+                    self._parent_capture.pointer_for(request)
+                    if self._parent_capture is not None else None
+                ),
             )
             admission = {
                 "rid": request.rid, "rank": self._tp_rank,
@@ -280,6 +329,10 @@ class AscendTileRTConnector(TileRTConnector):
             }
             if request.prompt_token_ids:
                 admission["prompt_token_ids"] = request.prompt_token_ids
+            if self._transfer_parent_hidden:
+                admission[PARENT_HIDDEN_REGION] = parent_hidden_metadata(
+                    request.num_tokens,
+                )
             wire.send_msg(connection, admission)
             reply = wire.recv_msg(connection)
             if not reply.get("accepted"):

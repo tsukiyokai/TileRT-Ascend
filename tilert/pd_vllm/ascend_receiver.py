@@ -9,7 +9,9 @@ import time
 
 from . import wire
 from .ascend_layout import (
-    LAYOUT_NAME, NUM_RANKS, validate_layout, validate_prompt_token_ids,
+    LAYOUT_NAME, LAYOUT_VERSION, NUM_RANKS, PARENT_HIDDEN_LAYOUT_VERSION,
+    PARENT_HIDDEN_REGION, validate_layout, validate_parent_hidden_metadata,
+    validate_prompt_token_ids,
 )
 
 
@@ -26,6 +28,7 @@ class AscendReceivedRequest:
     generation: int
     first_token_id: int | None = None
     prompt_token_ids: list = field(default_factory=list)
+    parent_hidden: dict | None = None
     admitted_ranks: set = field(default_factory=set)
     active_ranks: set = field(default_factory=set)
     done_ranks: set = field(default_factory=set)
@@ -37,8 +40,13 @@ class AscendReceivedRequest:
 class AscendPDProfile:
     name = LAYOUT_NAME
     num_ranks = NUM_RANKS
-    layout_version = 2
+    layout_version = LAYOUT_VERSION
     sender_ranks = frozenset(range(NUM_RANKS))
+
+    def __init__(self, *, parent_hidden=False):
+        self.parent_hidden = parent_hidden
+        if parent_hidden:
+            self.layout_version = PARENT_HIDDEN_LAYOUT_VERSION
 
     def convert(self, buffer, base_ptr, max_seq_len, received, num_devices):
         """Publish a descriptor only after all sixteen WRITE completions."""
@@ -55,6 +63,12 @@ class AscendPDProfile:
             "mtp_seq_len": received.mtp_seq_len,
             "last_prompt_token": received.last_prompt_token,
         }
+        if self.parent_hidden:
+            validate_parent_hidden_metadata(received.parent_hidden,
+                                            received.seq_len)
+            metadata[PARENT_HIDDEN_REGION] = dict(received.parent_hidden)
+        elif received.parent_hidden is not None:
+            raise ValueError("Parent hidden was not enabled on this receiver")
         if received.prompt_token_ids:
             validate_prompt_token_ids(
                 received.prompt_token_ids, received.seq_len,
@@ -110,7 +124,9 @@ class AscendReceiveServer:
         self.checkpoint_sha256 = checkpoint_sha256
         self.max_seq_len = layout["capacity_tokens"]
         self.request_timeout = request_timeout
-        self.profile = AscendPDProfile()
+        self.profile = AscendPDProfile(
+            parent_hidden=PARENT_HIDDEN_REGION in layout["regions"],
+        )
         self.buffer = None
         self.base_ptr = [endpoint["base_ptr"] for endpoint in endpoints]
         self.completed = queue.Queue()
@@ -177,6 +193,15 @@ class AscendReceiveServer:
             return wire.reject_msg("MTP prefix must contain P-1 parent rows")
         if type(token) is not int or not 0 <= token < 154880:
             return wire.reject_msg("invalid_last_prompt_token")
+        parent_hidden = request.get(PARENT_HIDDEN_REGION)
+        if self.profile.parent_hidden:
+            try:
+                validate_parent_hidden_metadata(parent_hidden, length)
+            except ValueError:
+                return wire.reject_msg("invalid_mtp_parent_hidden")
+            parent_hidden = dict(parent_hidden)
+        elif PARENT_HIDDEN_REGION in request:
+            return wire.reject_msg("mtp_parent_hidden_not_enabled")
         sampling = request.get("sampling")
         prompt = request.get("prompt_token_ids", [])
         if "prompt_token_ids" in request:
@@ -198,7 +223,7 @@ class AscendReceiveServer:
                 self._generation += 1
                 current = AscendReceivedRequest(
                     rid, length, mtp_length, token, sampling, self._generation,
-                    prompt_token_ids=prompt,
+                    prompt_token_ids=prompt, parent_hidden=parent_hidden,
                 )
                 self._current = current
             elif current.rid != rid:
@@ -211,6 +236,7 @@ class AscendReceiveServer:
                 or current.mtp_seq_len != mtp_length
                 or current.last_prompt_token != token
                 or current.sampling != sampling
+                or current.parent_hidden != parent_hidden
                 or (prompt and current.prompt_token_ids
                     and prompt != current.prompt_token_ids)
             ):

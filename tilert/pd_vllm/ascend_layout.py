@@ -9,6 +9,29 @@ FULL_INDEX_LAYERS = (0, 1, 2, *range(6, 79, 4))
 INT8_INDEX_LAYERS = frozenset(range(6, 67, 4))
 LAYOUT_NAME = "glm5_2_ascend_w4a8c8"
 LAYOUT_VERSION = 2
+PARENT_HIDDEN_LAYOUT_VERSION = 3
+PARENT_HIDDEN_REGION = "mtp_parent_hidden"
+PARENT_HIDDEN_BYTES = 6144 * 2
+
+
+def parent_hidden_metadata(seq_len):
+    """Describe the target output consumed by MTP before its rotation."""
+    return {
+        "position": seq_len - 1, "normalized": True, "rotated": False,
+        "dtype": "bfloat16", "shape": [1, 6144],
+    }
+
+
+def validate_parent_hidden_metadata(metadata, seq_len):
+    expected = parent_hidden_metadata(seq_len)
+    if (
+        not isinstance(metadata, dict) or metadata != expected
+        or type(metadata.get("position")) is not int
+        or metadata.get("normalized") is not True
+        or metadata.get("rotated") is not False
+        or any(type(size) is not int for size in metadata.get("shape", []))
+    ):
+        raise ValueError("Invalid normalized, unrotated MTP parent hidden")
 
 
 def validate_prompt_token_ids(tokens, seq_len, last_prompt_token):
@@ -27,13 +50,15 @@ def validate_prompt_token_ids(tokens, seq_len, last_prompt_token):
         raise ValueError("Prompt IDs differ from the final prompt token")
 
 
-def cache_layout(capacity_tokens=9344):
+def cache_layout(capacity_tokens=9344, *, parent_hidden=False):
     """Describe one rank's contiguous receive buffer, including MTP layer 78.
 
     BF16 latent[512], RoPE[64], index keys, and FP16 index scales occupy
     separate regions. Shared indexer layers own no region.
     Both peers use 128-token pages and the checkpoint's mixed index recipe.
     """
+    if type(parent_hidden) is not bool:
+        raise ValueError("parent_hidden must be a boolean")
     capacity_tokens = index(capacity_tokens)
     if capacity_tokens < 1:
         raise ValueError("cache capacity must be positive")
@@ -68,8 +93,18 @@ def cache_layout(capacity_tokens=9344):
         )
         if quantized:
             add(f"index_scale.{layer}", "float16", 2, (pages, PAGE_SIZE, 1))
+    if parent_hidden:
+        regions[PARENT_HIDDEN_REGION] = {
+            "dtype": "bfloat16", "row_bytes": PARENT_HIDDEN_BYTES,
+            "shape": (1, 6144), "offset": offset,
+            "nbytes": PARENT_HIDDEN_BYTES,
+        }
+        offset += PARENT_HIDDEN_BYTES
     return {
-        "name": LAYOUT_NAME, "version": LAYOUT_VERSION, "num_ranks": NUM_RANKS,
+        "name": LAYOUT_NAME,
+        "version": (PARENT_HIDDEN_LAYOUT_VERSION
+                    if parent_hidden else LAYOUT_VERSION),
+        "num_ranks": NUM_RANKS,
         "page_size": PAGE_SIZE, "capacity_tokens": padded_capacity,
         "nbytes": offset, "regions": regions,
     }
@@ -77,7 +112,10 @@ def cache_layout(capacity_tokens=9344):
 
 def validate_layout(layout):
     """Require the complete split-region contract after JSON serialization."""
-    expected = cache_layout(layout["capacity_tokens"])
+    expected = cache_layout(
+        layout["capacity_tokens"],
+        parent_hidden=PARENT_HIDDEN_REGION in layout["regions"],
+    )
     for field in (
         "name", "version", "num_ranks", "page_size", "capacity_tokens",
         "nbytes",
@@ -85,7 +123,7 @@ def validate_layout(layout):
         if layout[field] != expected[field]:
             raise ValueError(f"Ascend KV layout mismatch: {field}")
     if set(layout["regions"]) != set(expected["regions"]):
-        raise ValueError("Ascend KV layout must contain all 196 regions")
+        raise ValueError("Ascend layout regions differ from its version")
     for name, region in expected["regions"].items():
         actual = layout["regions"][name]
         for field, value in region.items():
@@ -97,6 +135,7 @@ def validate_layout(layout):
 def page_transfer_plan(
     layout, source_ptrs, source_blocks, destination_ptr, prefix_tokens, *,
     source_page_strides=None, source_block_counts=None, mtp_prefix_tokens=None,
+    parent_hidden_ptr=None,
 ):
     """Return (sources, destinations, lengths) for one rank's HIXL WRITE.
 
@@ -122,8 +161,20 @@ def page_transfer_plan(
     )
     if mtp_prefix_tokens not in (prefix_tokens - 1, prefix_tokens):
         raise ValueError("MTP prefix must contain P-1 or P rows")
+    has_parent = PARENT_HIDDEN_REGION in layout["regions"]
+    if has_parent != (parent_hidden_ptr is not None):
+        raise ValueError("Parent hidden source and destination must agree")
+    if has_parent and (
+        type(parent_hidden_ptr) is not int or parent_hidden_ptr <= 0
+    ):
+        raise ValueError("Parent hidden needs a positive source pointer")
     sources, destinations, lengths = [], [], []
     for name, region in layout["regions"].items():
+        if name == PARENT_HIDDEN_REGION:
+            sources.append(parent_hidden_ptr)
+            destinations.append(destination_ptr + region["offset"])
+            lengths.append(PARENT_HIDDEN_BYTES)
+            continue
         valid_tokens = (
             mtp_prefix_tokens if name.endswith(".78") else prefix_tokens
         )

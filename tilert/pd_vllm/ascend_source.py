@@ -55,6 +55,7 @@ class SourceBinding:
     def transfer_plan(
         self, block_ids_per_group, destination_ptr, prefix_tokens, *,
         mtp_prefix_tokens=None, destination_layout=None,
+        parent_hidden_ptr=None,
     ):
         """Resolve each region's request-local scheduler block table."""
         blocks = {}
@@ -78,6 +79,7 @@ class SourceBinding:
                 for name, region in self.regions.items()
             },
             mtp_prefix_tokens=mtp_prefix_tokens,
+            parent_hidden_ptr=parent_hidden_ptr,
         )
 
 

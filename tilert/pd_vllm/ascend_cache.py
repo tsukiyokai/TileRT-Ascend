@@ -5,7 +5,8 @@ import hashlib
 from pathlib import Path
 
 from .ascend_layout import (
-    NUM_RANKS, cache_layout, validate_prompt_token_ids,
+    NUM_RANKS, PARENT_HIDDEN_REGION, cache_layout,
+    validate_parent_hidden_metadata, validate_prompt_token_ids,
 )
 
 
@@ -41,14 +42,15 @@ class RankPrefix:
 class AscendReceiveBuffer:
     """Retain one contiguous registered allocation until HIXL peers drain."""
 
-    def __init__(self, rank, device, capacity, transport, hostname):
+    def __init__(self, rank, device, capacity, transport, hostname, *,
+                 parent_hidden=False):
         import torch
 
         if type(rank) is not int or not 0 <= rank < NUM_RANKS:
             raise ValueError("Receive rank must be in [0,16)")
         self.rank = rank
         self.device = torch.device(device)
-        self.layout = cache_layout(capacity)
+        self.layout = cache_layout(capacity, parent_hidden=parent_hidden)
         self.transport = transport
         self.storage = torch.empty(
             self.layout["nbytes"], dtype=torch.uint8, device=self.device,
@@ -102,6 +104,12 @@ class AscendReceiveBuffer:
         token = request.metadata["last_prompt_token"]
         if type(token) is not int or not 0 <= token < 154880:
             raise ValueError("Invalid final prompt token")
+        if PARENT_HIDDEN_REGION in self.layout["regions"]:
+            validate_parent_hidden_metadata(
+                request.metadata.get(PARENT_HIDDEN_REGION), length,
+            )
+        elif PARENT_HIDDEN_REGION in request.metadata:
+            raise ValueError("Parent hidden is absent from the receive layout")
         return length, generation
 
     def prefix(self, request):
@@ -150,6 +158,12 @@ class AscendReceiveBuffer:
                 "layer": self._layer_prefix(78, length - 1),
             },
         }
+        if PARENT_HIDDEN_REGION in self.layout["regions"]:
+            frozen["mtp"]["parent_hidden"] = {
+                **request.metadata[PARENT_HIDDEN_REGION],
+                "request_id": request.request_id, "generation": generation,
+                "tensor": self.views[PARENT_HIDDEN_REGION],
+            }
         self._last_generation = generation
         return frozen
 
