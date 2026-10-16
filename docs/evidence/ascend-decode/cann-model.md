@@ -65,7 +65,7 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   python -m torch.distributed.run --standalone --nproc-per-node=16 \
   tests/glm52/run_cann_model.py \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
-  --capture-case /workspace/experiments/glm52/prefix-8k-20261017-attempt-04/case-00 \
+  --capture-case /workspace/experiments/glm52/prefix-8k-20261017-attempt-05/case-00 \
   --steps 2 --capacity 9344 --layer-trace \
   --output /workspace/experiments/glm52/cann-m1-8k-20261017-attempt-01
 ```
@@ -88,6 +88,26 @@ their BF16 tensors are compared against the independent HF trace. The
 [CPU hook checks](cann-trace-cpu-20261017.json) pass 27 cases with no NPU
 initialization. Hooks and auxiliary projections run only in this diagnostic
 mode and are excluded from TPOT measurement.
+
+## Saved-trace comparison
+
+Generate the HF oracle with the captured `consumed_tokens` and the same
+main-prefix files. Then run [the offline comparator](../../../tests/glm52/compare_saved_cann.py)
+on CPU; it reads all 16 rank reports and tensor files without loading
+model weights. It verifies file hashes, checkpoint/prompt/teacher identity,
+exact reset coverage, all 79 hidden states, 78 logits and new KV rows.
+Results are written separately from both inputs. The
+[host validator checks](check-compare-saved-cann-20261017.json) pass 24
+cases, including a changed intermediate hidden on rank 15.
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/glm52/compare_saved_cann.py \
+  --native /workspace/experiments/glm52/cann-m1-8k-20261017-attempt-01 \
+  --reference /workspace/experiments/glm52/hf-cann-m1-8k-20261017 \
+  --output /workspace/experiments/glm52/compare-cann-m1-8k-20261017.json
+```
+
+## PD serving
 
 The [M1 PD entry](../../../tests/glm52/serve_cann_pd.py) uses the same
 adapter with the existing HTTP request lifecycle and HIXL receiver.
