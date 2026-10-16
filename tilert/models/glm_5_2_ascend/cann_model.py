@@ -1,4 +1,4 @@
-"""M1 GLM-5.2 execution through the pinned vLLM-Ascend model and CANN."""
+"""GLM-5.2 execution through the pinned vLLM-Ascend model and CANN."""
 
 from dataclasses import dataclass
 import hashlib
@@ -19,7 +19,7 @@ class CannStep:
 
 
 class CannModel:
-    """One request, TP16, full-P injection and one-token decode forwards.
+    """One request, TP16, full-P injection and M=1/2/4 target forwards.
 
     ``rank`` is the logical TP rank; ``device`` selects the process's NPU.
     The caller supplies all 16 visible devices without a visibility rotation.
@@ -87,7 +87,7 @@ class CannModel:
             self.runner = self.worker.model_runner
             self.model = self.runner.model
             if self.runner.drafter is not None:
-                raise ValueError("The M1 adapter must not load a draft model")
+                raise ValueError("Target must not load a draft model")
             self._bind_cache()
         self._allocate_inputs()
 
@@ -172,12 +172,18 @@ class CannModel:
     def _allocate_inputs(self):
         import torch
 
-        self.input_ids = torch.empty(1, dtype=torch.long, device=self.device)
-        self.positions = torch.empty_like(self.input_ids)
-        self.slots = torch.empty(1, dtype=torch.int32, device=self.device)
-        self.seq_lens = torch.empty_like(self.slots)
-        self.query_cpu = torch.tensor([0, 1], dtype=torch.int32)
-        self.query = self.query_cpu.to(self.device)
+        self._input_buffers = {}
+        for width in (1, 2, 4):
+            tokens = torch.empty(width, dtype=torch.long, device=self.device)
+            positions = torch.empty_like(tokens)
+            slots = torch.empty(width, dtype=torch.int32, device=self.device)
+            query_cpu = torch.tensor([0, width], dtype=torch.int32)
+            self._input_buffers[width] = (
+                tokens, positions, slots, query_cpu, query_cpu.to(self.device),
+            )
+        (self.input_ids, self.positions, self.slots,
+         self.query_cpu, self.query) = self._input_buffers[1]
+        self.seq_lens = torch.empty(1, dtype=torch.int32, device=self.device)
         self.block_table = torch.arange(
             self.layout["capacity_tokens"] // PAGE_SIZE,
             dtype=torch.int32, device=self.device,
@@ -208,16 +214,27 @@ class CannModel:
                     destination[:length].copy_(source[name])
         self.position = length
 
-    def _metadata(self):
+    def _metadata(self, width=1):
         import torch
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
         from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
-        length_cpu = torch.tensor([self.position + 1], dtype=torch.int32)
+        (self.input_ids, self.positions, self.slots,
+         self.query_cpu, self.query) = self._input_buffers[width]
+        length_cpu = torch.tensor([self.position + width], dtype=torch.int32)
         computed_cpu = torch.tensor([self.position], dtype=torch.int32)
+        positions_cpu = torch.arange(
+            self.position, self.position + width, dtype=torch.long,
+        )
         self.seq_lens.copy_(length_cpu)
-        self.slots.fill_(self.position)
-        self.positions.fill_(self.position)
+        if width == 1:
+            self.slots.fill_(self.position)
+            self.positions.fill_(self.position)
+        else:
+            self.slots.copy_(positions_cpu)
+            self.positions.copy_(positions_cpu)
+        state = (AscendAttentionState.DecodeOnly if width == 1
+                 else AscendAttentionState.ChunkedPrefill)
         common = AscendCommonAttentionMetadata(
             query_start_loc=self.query, query_start_loc_cpu=self.query_cpu,
             seq_lens=self.seq_lens, seq_lens_cpu=length_cpu,
@@ -225,13 +242,14 @@ class CannModel:
             num_computed_tokens_cpu=computed_cpu,
             _seq_lens_cpu=length_cpu,
             _num_computed_tokens_cpu=computed_cpu,
-            num_reqs=1, num_actual_tokens=1, max_query_len=1,
-            max_seq_len=self.position + 1,
+            num_reqs=1, num_actual_tokens=width, max_query_len=width,
+            max_seq_len=self.position + width,
             block_table_tensor=self.block_table, slot_mapping=self.slots,
-            positions=self.positions, positions_cpu=computed_cpu.long(),
+            positions=self.positions, positions_cpu=positions_cpu,
+            causal=True,
             is_prefilling=torch.tensor([False]),
-            decode_token_per_req=1, actual_seq_lengths_q=[1],
-            attn_state=AscendAttentionState.DecodeOnly, num_input_tokens=1,
+            decode_token_per_req=1, actual_seq_lengths_q=[width],
+            attn_state=state, num_input_tokens=width,
         )
         result = {}
         for names, builder in self.builders:
@@ -240,37 +258,49 @@ class CannModel:
         return result
 
     def verify(self, tokens, *, full_logits=True):
-        """Consume one pending token and return its next-token logits."""
+        """Consume M causal rows and return M next-token predictions."""
         import torch
         from vllm.config import set_current_vllm_config
         from vllm_ascend.ascend_forward_context import (
             set_ascend_forward_context,
         )
 
-        if (len(tokens) != 1 or type(tokens[0]) is not int
-                or not 0 <= tokens[0] < 154880):
-            raise ValueError("This adapter accepts one vocabulary token")
-        if self.position >= self.capacity:
+        width = len(tokens)
+        if (width not in (1, 2, 4)
+                or any(type(token) is not int or not 0 <= token < 154880
+                       for token in tokens)):
+            raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
+        if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            self.input_ids.fill_(tokens[0])
-            metadata = self._metadata()
+            metadata = self._metadata(width)
+            if width == 1:
+                self.input_ids.fill_(tokens[0])
+            else:
+                self.input_ids.copy_(torch.tensor(tokens, dtype=torch.long))
             with set_ascend_forward_context(
-                metadata, self.config, num_tokens=1, num_actual_tokens=1,
+                metadata, self.config, num_tokens=width,
+                num_actual_tokens=width,
                 model_instance=self.model,
             ):
                 hidden = self.model(self.input_ids, self.positions)
                 logits = self.model.compute_logits(hidden)
                 token_ids = logits.argmax(dim=-1)
-            self.position += 1
+            self.position += width
             return CannStep(
                 logits if full_logits else None, hidden, token_ids,
             )
 
     def step(self, token):
         return self.verify((token,), full_logits=False)
+
+    def truncate(self, length):
+        """Retain written rows [0, length); later writes replace the tail."""
+        if type(length) is not int or not 0 <= length <= self.position:
+            raise ValueError("Truncation requires an already written prefix")
+        self.position = length
 
     def reset(self):
         """Exclude prior rows from attention without replaying the prompt."""

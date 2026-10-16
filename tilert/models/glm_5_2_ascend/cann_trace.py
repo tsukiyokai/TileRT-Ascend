@@ -1,4 +1,4 @@
-"""Diagnostic hidden-state snapshots for one eager CANN M1 forward."""
+"""Diagnostic hidden-state snapshots for one eager CANN forward."""
 
 from functools import partial
 
@@ -11,7 +11,9 @@ class CannTrace:
     copy those tensors; they do not reconstruct a residual or project logits.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, width=1):
+        if type(width) is not int or width not in (1, 2, 4):
+            raise ValueError("Trace width must be 1, 2 or 4")
         backbone = model.model
         if (backbone.start_layer != 0 or backbone.end_layer != 78
                 or len(backbone.layers) != 78):
@@ -19,6 +21,7 @@ class CannTrace:
         if any(layer.use_sequence_parallel_moe for layer in backbone.layers):
             raise ValueError("Tracing requires unsharded token rows")
         self.hidden_size = backbone.hidden_size
+        self.width = width
         self.norms = tuple(layer.input_layernorm for layer in backbone.layers)
         self._handles = []
         self._hidden = []
@@ -55,9 +58,9 @@ class CannTrace:
             )
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"Hidden {index} must be a Tensor")
-        if value.shape != (1, self.hidden_size):
+        if value.shape != (self.width, self.hidden_size):
             raise ValueError(
-                f"Hidden {index} must have shape [1, hidden_size]"
+                f"Hidden {index} must have shape [{self.width}, hidden_size]"
             )
         if value.dtype != torch.bfloat16:
             raise ValueError(f"Hidden {index} must be BF16")

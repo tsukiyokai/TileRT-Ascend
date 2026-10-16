@@ -1,4 +1,4 @@
-# CANN model execution for M1 decode
+# CANN model execution
 
 [CannModel](../../../tilert/models/glm_5_2_ascend/cann_model.py) reuses the
 pinned vLLM-Ascend model, weight processing and CANN operators. TileRT
@@ -15,7 +15,10 @@ require the prefill and decode arithmetic to agree at that position;
 
 The adapter binds the existing paged latent/RoPE and INT8/BF16 index
 layouts to 78 main attention layers and 21 indexers. It uses the existing
-SFA and indexer metadata builders for one decode row. Logical TP rank
+SFA and indexer metadata builders. M1 uses `DecodeOnly`; target widths 2/4
+use the production `ChunkedPrefill` continuation path without a speculative
+model. For M rows at P, Q is `[M]`, KV is `[P+M]`, slots are P through
+P+M-1, and sparse mode 3 limits row i to keys below P+i+1. Logical TP rank
 selects the weight shard; physical device selection remains independent.
 Reset invalidates cache length. The next request replaces its valid rows.
 
@@ -28,6 +31,21 @@ PD serving integration require device acceptance. MTP follows M1 numerical
 acceptance and retains its separate target-hidden and draft-cache state.
 
 ## Host verification
+
+The adapter invokes the official platform registration before constructing
+`EngineArgs`: its dictionary validation otherwise rejects C8 `int8` before
+engine-config initialization can register it. The
+[constructor check](cann-m1-init-cpu-20261017.json) passes eight cases with
+real `EngineArgs` and device/worker allocation doubles. The
+[previous constructor](cann-m1-init-negative-20261017.json) rejects the same
+configuration in a fresh process. Neither test initializes an NPU.
+
+The [width metadata checks](cann-target-m124-cpu-20261017.json) pass 15
+cases, including positions 0, 1, 8192 and the page boundary at 8319 for
+M=1/2/4. They exercise the installed SFA and C8/BF16 indexer builders,
+capture wrapper arguments, verify shared-index shape and check truncation.
+The kernel source's right-aligned causal bounds are recorded separately
+from these CPU witnesses; device arithmetic remains unexecuted.
 
 The [installed API probe](cann-adapter-cpu-api-20261017.json) constructs the
 real engine configuration, cache bindings, SFA/indexer metadata and forward
@@ -85,9 +103,32 @@ layer's first output alone is an FFN increment, not its completed hidden.
 The last hidden and logits come from the original forward. The other 77
 states receive one batched final norm/head projection on every TP rank;
 their BF16 tensors are compared against the independent HF trace. The
-[CPU hook checks](cann-trace-cpu-20261017.json) pass 27 cases with no NPU
-initialization. Hooks and auxiliary projections run only in this diagnostic
-mode and are excluded from TPOT measurement.
+[CPU hook checks](cann-trace-wide-cpu-20261017.json) pass 37 cases for
+M=1/2/4 with no NPU initialization. Hooks and auxiliary projections run
+only in this diagnostic mode and are excluded from TPOT measurement.
+
+## Target width checks
+
+After the M1 continuation check, use
+[run_cann_verify.py](../../../tests/glm52/run_cann_verify.py) with
+`--width 2` or `4` and `--layer-trace`. It runs fixed teacher candidates
+from the same complete prefix, comparing each token and layer with serial
+M1. The captured g0 is the first candidate. These calls verify the target;
+they do not run a drafter or measure speculative acceptance.
+
+The entry checks same-width exact replay, each future input's effect on
+earlier rows, and rollback while an old tail remains unwritten. The dirty
+and clean branches consume the same replacement token at M1 from identical
+retained KV. Only the clean branch clears the discarded tail, and both
+stop below the old high watermark. Prefix contents, actual input arrays,
+returned argmax IDs, logits, hidden and all new cache rows are retained.
+
+The [CPU runner checks](check-cann-verify-cpu-20261017.json) pass ten cases
+with a scalar model fixture, rejecting deliberately noncausal and stale-tail
+reads. The [static/CLI checks](cann-verify-static-20261017.json) pass five
+cases. Device cross-width agreement and matching independent HF comparison
+remain separate acceptance steps; the report retains
+`precision_verified=false` and `performance_measured=false`.
 
 ## Saved-trace comparison
 
@@ -116,3 +157,17 @@ Its default memory guard is 0.4 for two resident models; actual combined
 HBM use must be checked when starting P+D. The standalone continuation
 must pass before this serving experiment and TPOT measurement. Finish the
 request and confirm `/decode_status` is idle before stopping the service.
+
+The [allocation audit](pd-capacity-20261017.json) counts two live D cache
+allocations at capacity 9344: model cache and HIXL receive storage, each
+884,166,656 bytes, totaling 1.647 GiB/rank. The standalone test has one.
+The producer's prior successful eager startup reports 27.998 GiB for target
+and drafter weights plus a 2 GiB KV budget. Live D's `0.4` setting lowers
+its startup free-memory requirement; it does not cap weight or cache
+allocations. Measure eager P and standalone D peaks before choosing
+simultaneous residency. The frozen-prefix numerical test releases P first.
+
+If a serving experiment also loads D after stopping P, retain g0 until D
+is ready before delivering it to the client. A loading gap after g0 has
+already been delivered belongs to request TPOT. The capture-only response
+delivers g0 for input provenance and supplies no serving TPOT measurement.

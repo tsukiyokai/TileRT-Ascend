@@ -65,8 +65,9 @@ class FixtureModel(nn.Module):
         self.live = []
         self.unchanged_outputs = True
 
-    def forward(self, stop=78, fail_at=None):
-        embedding = torch.zeros(1, 4, dtype=torch.bfloat16, requires_grad=True)
+    def forward(self, stop=78, fail_at=None, width=1):
+        rows = torch.arange(width, dtype=torch.bfloat16).unsqueeze(1)
+        embedding = rows.expand(width, 4).clone().requires_grad_(True)
         self.live = [embedding]
         residual = self.model.layers[0].input_layernorm(embedding)
         self.unchanged_outputs = residual is embedding
@@ -78,7 +79,7 @@ class FixtureModel(nn.Module):
             self.unchanged_outputs &= output is norm.last_output
             residual = output[1]
             self.live.append(residual)
-        return SimpleNamespace(last_hidden=torch.full_like(residual, 78))
+        return SimpleNamespace(last_hidden=(rows + 78).expand(width, 4))
 
 
 def hook_keys(model):
@@ -171,6 +172,40 @@ def check_failures(checks):
     rejects("sequence_parallel", lambda: CannTrace(model), checks)
 
 
+def check_widths(checks):
+    for width in (2, 4):
+        model = FixtureModel()
+        before = hook_keys(model)
+        with CannTrace(model, width) as trace:
+            step = model(width=width)
+            hidden = trace.finish(step)
+            for value in model.live:
+                value.detach().fill_(-1)
+            step.last_hidden.fill_(-2)
+        rows = torch.arange(width, dtype=torch.bfloat16).unsqueeze(1)
+        checks.extend([
+            {"name": f"width_{width}.79_owned_ordered_rows",
+             "passed": len(hidden) == 79 and all(
+                 torch.equal(value, (rows + layer).expand(width, 4))
+                 for layer, value in enumerate(hidden))},
+            {"name": f"width_{width}.hooks_removed",
+             "passed": hook_keys(model) == before},
+        ])
+    for width in (0, 3, True, "4"):
+        rejects(f"invalid_width_{width}",
+                lambda: CannTrace(FixtureModel(), width), checks)
+    model = FixtureModel()
+    before = hook_keys(model)
+
+    def mismatch():
+        with CannTrace(model, 4):
+            model(width=2)
+
+    rejects("width_mismatch", mismatch, checks)
+    checks.append({"name": "width_mismatch_cleanup",
+                   "passed": hook_keys(model) == before})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -182,6 +217,7 @@ def main():
     checks = []
     check_snapshots(checks)
     check_failures(checks)
+    check_widths(checks)
     initialized_after = torch_npu.npu._initialized
     checks.append({"name": "no_npu_initialization",
                    "passed": not initialized_before and not initialized_after})
