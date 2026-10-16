@@ -10,12 +10,11 @@ import platform
 import sys
 
 
-class AscendServingEngine:
+class AscendDeviceContext:
     """Bind FastAPI worker threads to the rank-zero NPU context."""
 
-    def __init__(self, session, rank_engine, device):
+    def __init__(self, session, device):
         self.session = session
-        self.rank_engine = rank_engine
         self.device = device
 
     def __getattr__(self, name):
@@ -30,11 +29,6 @@ class AscendServingEngine:
     def decode(self, first_token_id, **kwargs):
         import torch
 
-        if first_token_id != self.rank_engine.first_token_id:
-            raise ValueError(
-                "Prefill first token differs from CANN prompt-row replay: "
-                f"{first_token_id} != {self.rank_engine.first_token_id}"
-            )
         with torch.npu.device(self.device):
             return self.session.decode(first_token_id, **kwargs)
 
@@ -43,6 +37,22 @@ class AscendServingEngine:
 
         with torch.npu.device(self.device):
             self.session.reset()
+
+
+class AscendServingEngine(AscendDeviceContext):
+    """Check the replayed first token before serving the Native backend."""
+
+    def __init__(self, session, rank_engine, device):
+        super().__init__(session, device)
+        self.rank_engine = rank_engine
+
+    def decode(self, first_token_id, **kwargs):
+        if first_token_id != self.rank_engine.first_token_id:
+            raise ValueError(
+                "Prefill first token differs from CANN prompt-row replay: "
+                f"{first_token_id} != {self.rank_engine.first_token_id}"
+            )
+        return super().decode(first_token_id, **kwargs)
 
 
 def create_session(backend, mtp_width, stop_ids):

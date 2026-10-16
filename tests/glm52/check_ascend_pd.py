@@ -31,6 +31,9 @@ from tilert.pd_vllm.ascend_layout import cache_layout  # noqa: E402
 from tilert.pd_vllm.ascend_receiver import (  # noqa: E402
     AscendReceiveServer, validate_endpoints,
 )
+from tilert.pd_vllm.ascend_server import (  # noqa: E402
+    AscendDeviceContext, AscendServingEngine,
+)
 from tilert.pd_vllm.token_queue import TokenQueue, finish_worker  # noqa: E402
 from tilert.models.glm_5_2_ascend.session import PrefixRequest  # noqa: E402
 
@@ -328,7 +331,7 @@ class FrozenPrefixChecks(unittest.TestCase):
                 self.assertEqual(buffer._last_generation, 1)
 
     def test_decode_and_freeze_share_one_generation_consumption(self):
-        for first in ("prefix", "frozen_prefix"):
+        for first in ("prefix", "main_prefix", "frozen_prefix"):
             with self.subTest(first=first):
                 buffer = self.buffer()
                 request = self.request()
@@ -336,10 +339,16 @@ class FrozenPrefixChecks(unittest.TestCase):
                     prefix = buffer.prefix(request)
                     self.assertEqual(prefix.main[0]["latent"].shape[0], 127)
                     self.assertEqual(prefix.mtp["latent"].shape[0], 127)
+                elif first == "main_prefix":
+                    prefix = buffer.main_prefix(request)
+                    self.assertEqual(len(prefix), 78)
+                    self.assertEqual(prefix[0]["latent"].shape[0], 128)
                 else:
                     buffer.frozen_prefix(request, {})
                 with self.assertRaises(ValueError):
                     buffer.prefix(request)
+                with self.assertRaises(ValueError):
+                    buffer.main_prefix(request)
                 with self.assertRaises(ValueError):
                     buffer.frozen_prefix(request, {})
                 buffer.frozen_prefix(self.request(generation=2), {})
@@ -352,7 +361,7 @@ class FrozenPrefixChecks(unittest.TestCase):
             ("mtp_seq_len", 128), ("mtp_seq_len", False),
             ("last_prompt_token", True), ("last_prompt_token", 154880),
         )
-        for consumer in ("prefix", "frozen_prefix"):
+        for consumer in ("prefix", "main_prefix", "frozen_prefix"):
             for field, value in cases:
                 with self.subTest(consumer=consumer, field=field, value=value):
                     buffer = self.buffer()
@@ -369,6 +378,21 @@ class FrozenPrefixChecks(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         getattr(buffer, consumer)(*arguments)
                     self.assertEqual(buffer._last_generation, 0)
+
+    def test_main_consumer_keeps_all_rows_and_registered_storage(self):
+        for length in (1, 128, 129, 8192):
+            with self.subTest(length=length):
+                buffer = self.buffer()
+                layers = buffer.main_prefix(self.request(length))
+                self.assertEqual(len(layers), 78)
+                for layer, entry in enumerate(layers):
+                    self.assertEqual(entry["latent"].shape, (length, 512))
+                    self.assertEqual(entry["rope"].shape, (length, 64))
+                    self.assertIs(
+                        entry["latent"].storage,
+                        buffer.views[f"mla_latent.{layer}"].storage,
+                    )
+                self.assertEqual(buffer._last_generation, 1)
 
     def test_invalid_prompt_or_failed_view_does_not_consume_generation(self):
         buffer = self.buffer()
@@ -387,6 +411,38 @@ class FrozenPrefixChecks(unittest.TestCase):
         buffer.views["mla_rope.78"] = original
         buffer.frozen_prefix(request, {})
         self.assertEqual(buffer._last_generation, 1)
+
+
+class DeviceContextChecks(unittest.TestCase):
+    def test_full_prefix_session_uses_supplied_prefill_token(self):
+        context = mock.MagicMock()
+        set_device = mock.Mock(return_value=context)
+        torch = SimpleNamespace(npu=SimpleNamespace(device=set_device))
+        session = mock.Mock()
+        session.decode.return_value = [6500, 198]
+        engine = AscendDeviceContext(session, "npu:1")
+        request = PrefixRequest("full", 8192)
+        with mock.patch.dict(sys.modules, {"torch": torch}):
+            engine.inject(request)
+            output = engine.decode(6500, max_tokens=2)
+            engine.reset()
+        self.assertEqual(output, [6500, 198])
+        self.assertEqual(session.method_calls, [
+            mock.call.inject(request),
+            mock.call.decode(6500, max_tokens=2), mock.call.reset(),
+        ])
+        self.assertEqual(set_device.call_args_list, [mock.call("npu:1")] * 3)
+        self.assertEqual(context.__enter__.call_count, 3)
+        self.assertEqual(context.__exit__.call_count, 3)
+
+    def test_native_wrapper_keeps_replay_token_check(self):
+        session = mock.Mock()
+        engine = AscendServingEngine(
+            session, SimpleNamespace(first_token_id=6500), "npu:1",
+        )
+        with self.assertRaisesRegex(ValueError, "prompt-row replay"):
+            engine.decode(6501, max_tokens=2)
+        session.decode.assert_not_called()
 
 
 class TokenQueueChecks(unittest.IsolatedAsyncioTestCase):
@@ -650,7 +706,8 @@ def main():
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
         for case in (
-            ReceiveChecks, FrozenPrefixChecks, TokenQueueChecks,
+            ReceiveChecks, FrozenPrefixChecks, DeviceContextChecks,
+            TokenQueueChecks,
             PromptReplayChecks,
             WorkerOwnershipChecks, LeaseChecks, HttpOwnershipChecks,
         )
@@ -673,8 +730,8 @@ def main():
         "command": [sys.executable, *sys.argv], "tests": result.testsRun,
         "failures": len(result.failures), "errors": len(result.errors),
         "test_output": output.getvalue(),
-        "scope": ("CPU TCP receiver, frozen-prefix view metadata, request "
-                  "ownership, replay, token wakeups"),
+        "scope": ("CPU TCP receiver, full-P/frozen-prefix view metadata, "
+                  "device context dispatch, ownership, replay, token wakeups"),
         "torch_imported": "torch" in sys.modules,
         "not_executed": ["HIXL DMA", "NPU arithmetic", "NPU-to-CPU copy",
                          "frozen tensor values", "HTTP delivery timing"],

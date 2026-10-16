@@ -32,7 +32,7 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 走读已确认两个候选主机同步点：默认 [MLA](../tilert/models/glm_5_2_ascend/ops/mla.py) 每层读取 indices 到 CPU；默认 [MoE](../tilert/models/glm_5_2_ascend/native_engine.py) 读取 routes 到 CPU 后逐专家执行。现有设备路径需先通过相同输入的数值验收，再以实际暴露耗时判断收益。
 
-当前推进第 1 步：先封闭 M1 主干数值，再以[真实 M4 轮次的输入捕获](../tests/glm52/capture_native_mtp_inputs.py)衔接已有 HF oracle 和设备数值验收。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round，并在上述阶段条件满足后转入下一步。若固定布局的必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
+当前推进第 1 步：M1 优先复用已运行的 vLLM-Ascend 模型计算层及 CANN fused prolog，由 TileRT 管理完整 P 行 KV 注入与 decode 调用循环；首个输入是 prefill 已产出的 pending token，位置为 P。[薄适配器与验收入口](evidence/ascend-decode/cann-model.md)先单独验证，设备精度通过后接入 PD 服务；已有 Native 算子实现用于同输入差分。随后以[真实 M4 轮次的输入捕获](../tests/glm52/capture_native_mtp_inputs.py)衔接 MTP 数值验收。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round，并在上述阶段条件满足后转入下一步。若固定布局的必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
 
 精度定位按 `F_N(s_N)−F_H(s_H)=[F_N(s_N)−F_H(s_N)]+[F_H(s_N)−F_H(s_H)]` 分解；s 包含 hidden、有效 KV 和共享 indices。[同输入逐层检查](../tests/glm52/check_saved_layers.py)定位局部算术误差，[独立轨迹重比](../tests/glm52/compare_saved_decode.py)保留误差传播结果。局部已通过的分支收束，整体未通过时检查共同传播机制；真实 8K 精度验收决定能否进入 profiling。生产路径修改后重跑设备检查，reference 修改先重比已有设备张量。
 

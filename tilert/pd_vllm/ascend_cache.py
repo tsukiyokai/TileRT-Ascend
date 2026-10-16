@@ -120,6 +120,13 @@ class AscendReceiveBuffer:
         self._last_generation = generation
         return prefix
 
+    def main_prefix(self, request):
+        """Consume all P main rows for serial decode from prefill's token."""
+        length, generation = self._validate_prefix(request)
+        prefix = [self._layer_prefix(layer, length) for layer in range(78)]
+        self._last_generation = generation
+        return prefix
+
     def frozen_prefix(self, request, checkpoint_hashes):
         """Consume P main rows and P-1 MTP rows without prompt replay.
 
