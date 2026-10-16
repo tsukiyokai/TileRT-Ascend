@@ -40,6 +40,14 @@ the host interfaces; they do not execute weights or NPU kernels. The
 [PD entry check](cann-model-host-checks-20261017/check_cann_pd_entry.json)
 also verifies explicit Torch-NPU registration before NPU device parsing.
 
+The [current CPU HF reference](hf-cold-current-20261017.json) completes
+teacher tokens `[154820, 198]` and exact reset replay. Its raw traces remain
+at `/workspace/experiments/glm52/hf-cold-current-20261017-attempt-01`.
+The [comparison check](cann-layer-comparison-cpu-20261017.json) accepts the
+identical trace and rejects changed or missing intermediate hidden/logits.
+For the cold device test, use `--tokens 154820 198 --steps 2 --layer-trace`
+and `--reference` with that trace directory.
+
 ## Device acceptance
 
 After a complete HIXL prefix capture, stop the producer and receiver and
@@ -58,17 +66,28 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   tests/glm52/run_cann_model.py \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
   --capture-case /workspace/experiments/glm52/prefix-8k-20261017-attempt-04/case-00 \
-  --steps 2 --capacity 9344 \
+  --steps 2 --capacity 9344 --layer-trace \
   --output /workspace/experiments/glm52/cann-m1-8k-20261017-attempt-01
 ```
 
 Every rank saves both forwards, verifies all injected rows remain exact,
 and repeats from reset. `--reference` adds a matching independent HF trace
 with the same prefix hashes and teacher tokens. Final logits, normalized
-hidden and all 78 new KV rows are covered; intermediate hidden/logits,
-routing and index choices still require the layerwise acceptance in
-[the plan](../../plan.md). The report keeps `precision_verified=false`
-until that coverage is complete.
+hidden and all 78 new KV rows are covered. `--layer-trace` adds the
+79 hidden states and 78 layer logits used by the HF trace; routing and
+index choices remain outside this adapter's coverage. The report keeps
+`precision_verified=false` until the coverage in [the plan](../../plan.md)
+is complete.
+
+[CannTrace](../../../tilert/models/glm_5_2_ascend/cann_trace.py) captures
+each preceding layer's merged residual from the next input norm. A decoder
+layer's first output alone is an FFN increment, not its completed hidden.
+The last hidden and logits come from the original forward. The other 77
+states receive one batched final norm/head projection on every TP rank;
+their BF16 tensors are compared against the independent HF trace. The
+[CPU hook checks](cann-trace-cpu-20261017.json) pass 27 cases with no NPU
+initialization. Hooks and auxiliary projections run only in this diagnostic
+mode and are excluded from TPOT measurement.
 
 The [M1 PD entry](../../../tests/glm52/serve_cann_pd.py) uses the same
 adapter with the existing HTTP request lifecycle and HIXL receiver.

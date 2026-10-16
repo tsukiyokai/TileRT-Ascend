@@ -40,6 +40,8 @@ def parse_arguments():
     parser.add_argument("--init-method", default="env://")
     parser.add_argument("--reference", type=Path,
                         help="Matching independent HF trace directory")
+    parser.add_argument("--layer-trace", action="store_true",
+                        help="Capture 79 hidden states and 78 layer logits")
     args = parser.parse_args()
     if args.steps < 1 or args.capacity < 128:
         parser.error("Positive steps and capacity >= 128 are required")
@@ -142,6 +144,35 @@ def snapshot(engine, result, token, position):
     }
 
 
+def capture_step(engine, token, position, layer_trace):
+    if not layer_trace:
+        return snapshot(engine, engine.verify((token,)), token, position)
+
+    import torch
+    from vllm.config import set_current_vllm_config
+    from tilert.models.glm_5_2_ascend.cann_trace import CannTrace
+
+    with torch.npu.device(engine.device), torch.inference_mode(), (
+        set_current_vllm_config(engine.config)
+    ):
+        with CannTrace(engine.model) as trace:
+            result = engine.verify((token,))
+            hidden = trace.finish(result)
+        normalized = engine.model.model.norm(torch.cat(hidden[1:-1]))
+        projected = engine.model.compute_logits(normalized)
+        if projected.shape != (77, result.logits.shape[-1]):
+            raise ValueError("Layer projection must retain all 77 rows")
+        logits = (*projected.split(1, dim=0), result.logits)
+        actual = snapshot(engine, result, token, position)
+        actual.update(
+            hidden_states=tuple(value.detach().cpu().clone()
+                                for value in hidden),
+            layer_logits=tuple(value.detach().cpu().clone()
+                               for value in logits),
+        )
+    return actual
+
+
 def compare_step(name, actual, expected, checks, *, exact=False):
     import torch
 
@@ -156,6 +187,19 @@ def compare_step(name, actual, expected, checks, *, exact=False):
               else expected["hidden_states"][-1])
     compare_tensor(name + ".last_hidden", actual["last_hidden"], hidden,
                    checks, exact=exact)
+    for field, count in (("hidden_states", 79), ("layer_logits", 78)):
+        if field not in actual:
+            continue
+        left, right = actual[field], expected[field]
+        checks.append({
+            "name": name + "." + field + ".count",
+            "passed": len(left) == len(right) == count,
+        })
+        for layer, (value, reference) in enumerate(zip(left, right)):
+            compare_tensor(
+                f"{name}.{field}.{layer}", value, reference, checks,
+                exact=exact, logits=field == "layer_logits",
+            )
     checks.append({"name": name + ".cache_layer_count",
                    "passed": len(actual["cache_rows"]) == 78
                    and len(expected["cache_rows"]) == 78})
@@ -224,7 +268,7 @@ def execute(args):
         if step < len(teacher):
             token = teacher[step]
         position = engine.position
-        actual = snapshot(engine, engine.verify((token,)), token, position)
+        actual = capture_step(engine, token, position, args.layer_trace)
         path = rank_dir / f"step-{position:05d}.pt"
         torch.save(actual, path)
         trace_hashes[path.name] = digest(path)
@@ -251,7 +295,7 @@ def execute(args):
         engine.inject(prefixes)
     for step, token in enumerate(consumed):
         position = engine.position
-        actual = snapshot(engine, engine.verify((token,)), token, position)
+        actual = capture_step(engine, token, position, args.layer_trace)
         expected = torch.load(
             rank_dir / f"step-{position:05d}.pt", map_location="cpu",
             weights_only=True,
@@ -263,15 +307,19 @@ def execute(args):
         "status": ("pass" if reference else "captured") if passed else "fail",
         "precision_verified": False,
         "continuation_parity": bool(reference and passed),
+        "layerwise_logits_parity": bool(
+            reference and args.layer_trace and passed
+        ),
         "repeatability_passed": all(check["passed"] for check in checks
                                     if check["name"].startswith("reset.")),
-        "scope": "M1 final logits/normalized hidden/new KV and frozen prefix",
+        "scope": "M1 logits/hidden/new KV and frozen prefix",
         "coverage": {
             "independent_reference": reference is not None,
             "final_logits": True, "final_normalized_hidden": True,
             "all_layers_new_kv": True, "frozen_prefix_exact": bool(prefixes),
-            "reset_exact": True, "intermediate_hidden_states": False,
-            "intermediate_layer_logits": False,
+            "reset_exact": True,
+            "intermediate_hidden_states": args.layer_trace,
+            "intermediate_layer_logits": args.layer_trace,
             "routing_choices": False, "index_choices": False,
             "mtp": False,
         },
@@ -291,12 +339,19 @@ def execute(args):
         },
         "trace_sha256": trace_hashes, "checks": checks,
     }
+    if args.layer_trace:
+        path = (Path(__file__).resolve().parents[2]
+                / "tilert/models/glm_5_2_ascend/cann_trace.py")
+        report["source_sha256"][str(path)] = digest(path)
     report_path = args.output / f"rank-{rank}.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     summaries = [None] * 16
     distributed.all_gather_object(
         summaries, {"rank": rank, "passed": passed,
                     "continuation_parity": report["continuation_parity"],
+                    "layerwise_logits_parity": (
+                        report["layerwise_logits_parity"]
+                    ),
                     "consumed_tokens": consumed, "predicted_tokens": predicted,
                     "report_sha256": digest(report_path)},
         group=get_world_group().cpu_group,
@@ -311,6 +366,9 @@ def execute(args):
             "all_ranks_agree": same_tokens,
             "precision_verified": False,
             "continuation_parity": success and bool(reference),
+            "layerwise_logits_parity": bool(
+                success and reference and args.layer_trace
+            ),
             "performance_measured": False, "ranks": summaries,
         }
         (args.output / "summary.json").write_text(
