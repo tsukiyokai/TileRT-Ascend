@@ -57,8 +57,10 @@ and rejects a partial chunk. These checks use no NPU execution or HIXL WRITE.
 | TileLang packed W4 GEMV | [Compilation](tilelang-w4a8-xor/compile-result.json) | N256/K6144 and N6144/K128 compile; corrected XOR aliasing awaits device verification |
 | Ascend receive layout v2 | [CPU source-binding checks](ascend-layout-v2-source-binding.json) | 196 regions/rank; 79 split latent/RoPE pairs, 22 index keys and 16 scales; 8K transfer 775,159,808 B/rank |
 
-The [CANN backbone](cann-operators.md) now has a TP16 M=1 execution entry
-and a teacher-forced layer/logit/cache checker. An independent HF trace
+The [CANN adapter](cann-model.md) has TP16 M=1/2/4 execution entries and
+teacher-forced hidden/logit/cache checks. Diagnostic traces capture actual
+index and expert selections; saved wide rows are compared directly with HF.
+An independent HF trace
 generator retains the installed model/decoder/attention/cache and supplies
 CPU quantization adapters. [Metadata checks](hf-reference-metadata.json)
 pass 34/34; [raw-byte checks](hf-reference-weights-metadata.json) cover 24

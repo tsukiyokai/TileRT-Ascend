@@ -26,7 +26,7 @@ CACHE_FIELDS = {
     "index": "index_keys", "index_scale": "index_scales",
 }
 TENSOR_FIELDS = ("token_ids", "logits", "last_hidden")
-TRACE_FIELDS = ("hidden_states", "layer_logits")
+TRACE_FIELDS = ("hidden_states", "layer_logits", "indices", "routes")
 VOCAB_SIZE = 154880
 
 
@@ -118,6 +118,7 @@ def snapshot(engine, result, tokens, position):
 def capture(engine, tokens, layer_trace):
     import torch
     from vllm.config import set_current_vllm_config
+    from tilert.models.glm_5_2_ascend.cann_choices import CannChoices
     from tilert.models.glm_5_2_ascend.cann_trace import CannTrace
 
     position, width = engine.position, len(tokens)
@@ -126,9 +127,13 @@ def capture(engine, tokens, layer_trace):
     with torch.npu.device(engine.device), torch.inference_mode(), (
         set_current_vllm_config(engine.config)
     ):
-        with CannTrace(engine.model, width) as trace:
+        with (
+            CannTrace(engine.model, width) as trace,
+            CannChoices(engine.model, width) as choices,
+        ):
             result = engine.verify(tokens)
             hidden = trace.finish(result)
+            indices, routes = choices.finish()
         normalized = engine.model.model.norm(torch.cat(hidden[1:-1]))
         projected = engine.model.compute_logits(normalized)
         if projected.shape != (77 * width, result.logits.shape[-1]):
@@ -136,7 +141,11 @@ def capture(engine, tokens, layer_trace):
         layers = (*projected.split(width, dim=0), result.logits)
         saved = snapshot(engine, result, tokens, position)
         saved.update(hidden_states=tuple(map(cpu_copy, hidden)),
-                     layer_logits=tuple(map(cpu_copy, layers)))
+                     layer_logits=tuple(map(cpu_copy, layers)),
+                     indices=tuple(map(cpu_copy, indices)),
+                     routes=tuple(None if value is None else cpu_copy(value)
+                                  for value in routes),
+                     choice_source_sha256=choices.source_metadata())
         return saved
 
 
@@ -243,7 +252,7 @@ def run_checks(engine, prefixes, tokens, directory, layer_trace, checked):
     checked("output.prepare", lambda: directory.mkdir(
         parents=True, exist_ok=True,
     ))
-    checks, hashes = [], {}
+    checks, hashes, choice_sources = [], {}, {}
 
     def prepare(label, prefix):
         def initialize():
@@ -262,6 +271,10 @@ def run_checks(engine, prefixes, tokens, directory, layer_trace, checked):
         def operation():
             result = capture(engine, ids, layer_trace)
             check_record(label, result, ids, checks)
+            for name, sha in result.get("choice_source_sha256", {}).items():
+                if name in choice_sources and choice_sources[name] != sha:
+                    raise ValueError("Choice capture source changed")
+                choice_sources[name] = sha
             return result
         return checked(label + ".forward", operation)
 
@@ -358,7 +371,7 @@ def run_checks(engine, prefixes, tokens, directory, layer_trace, checked):
         compare(label + ".earlier_rows", first_rows(actual, row),
                 first_rows(wide, row))
         prefix_check(label + ".prefix.after", prefixes)
-    return checks, hashes, plan, wide["token_ids"].tolist()
+    return checks, hashes, plan, wide["token_ids"].tolist(), choice_sources
 
 
 def execute(args):
@@ -412,7 +425,7 @@ def execute(args):
                          "capture": inputs.get("capture_manifest_sha256")})
     if any(value != identities[0] for value in identities):
         raise ValueError("Sixteen ranks need the same capture and teachers")
-    checks, traces, plan, predicted = run_checks(
+    checks, traces, plan, predicted, choice_sources = run_checks(
         engine, prefixes, tokens, args.output / f"rank-{rank}",
         args.layer_trace, checked,
     )
@@ -452,14 +465,15 @@ def execute(args):
             "future_rows": list(range(1, len(tokens))),
             "intermediate_hidden_states": args.layer_trace,
             "intermediate_layer_logits": args.layer_trace,
-            "routing_choices": False, "index_choices": False, "mtp": False,
+            "routing_choices": args.layer_trace,
+            "index_choices": args.layer_trace, "mtp": False,
         },
         "interpretation": "Cross-width and future-input differences may "
         "include shape-dependent rounding; failures do not identify a mask "
         "error without the corresponding operator boundary.",
         "packages": {name: version(name) for name in
                      ("torch", "torch-npu", "vllm", "vllm-ascend")},
-        "source_sha256": {**engine.source_metadata(),
+        "source_sha256": {**engine.source_metadata(), **choice_sources,
                           **{str(path.resolve()): digest(path)
                              for path in source_paths}},
         "trace_sha256": traces, "checks": checks,

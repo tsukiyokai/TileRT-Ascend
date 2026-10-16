@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
+from precision_gate import is_digest
 from run_cann_model import compare_step, digest, validate_reference_manifest
 
 
@@ -15,6 +16,11 @@ CHECKPOINT_FILES = {
     "config.json", "quant_model_description.json",
     "quant_model_weights.safetensors.index.json",
 }
+CHOICE_SOURCE_SUFFIXES = (
+    "tilert/models/glm_5_2_ascend/cann_choices.py",
+    "vllm_ascend/attention/sfa_v1.py",
+    "vllm_ascend/ops/fused_moe/routed_experts.py",
+)
 
 
 def require(condition, name, checks):
@@ -26,6 +32,19 @@ def require(condition, name, checks):
 def read_report(path, artifacts):
     artifacts[str(path)] = digest(path)
     return json.loads(path.read_text())
+
+
+def validate_choice_sources(trace, report, checks, label):
+    sources = trace.get("choice_source_sha256", {})
+    for suffix in CHOICE_SOURCE_SUFFIXES:
+        matches = [name for name in sources
+                   if Path(name).as_posix() == suffix
+                   or Path(name).as_posix().endswith("/" + suffix)]
+        require(len(matches) == 1,
+                label + ".choice_source." + suffix, checks)
+    require(all(is_digest(sha) and report["source_sha256"].get(path) == sha
+                for path, sha in sources.items()),
+            label + ".choice_sources", checks)
 
 
 def valid_tokens(tokens):
@@ -61,6 +80,14 @@ def validate_reset(report, checks, label):
             "position_and_input", "hidden_states.count",
             "layer_logits.count", "cache_layer_count",
         )}
+        if any(report["coverage"].get(field) for field in (
+            "routing_choices", "index_choices",
+        )):
+            tensors.update(f"reset.{step}.{field}.{layer}"
+                           for field in ("indices", "routes")
+                           for layer in range(78))
+            counts.update(f"reset.{step}.{field}.count"
+                          for field in ("indices", "routes"))
         require(tensors | counts <= names.keys(),
                 f"{label}.reset.{step}.complete", checks)
         require(all(names[name].get("exact") is True for name in tensors),
@@ -112,7 +139,8 @@ def validate_inputs(report, reference, checks, label):
                 label + ".cold_inputs", checks)
 
 
-def validate_trace(trace, position, token, checks, label, *, native):
+def validate_trace(trace, position, token, checks, label, *, native,
+                   choices=False):
     import torch
 
     require(all(type(trace[field]) is int for field in (
@@ -138,6 +166,23 @@ def validate_trace(trace, position, token, checks, label, *, native):
                 and torch.equal(trace["token_ids"],
                                 trace["logits"].argmax(-1)),
                 label + ".final_hidden_and_prediction", checks)
+    if choices:
+        for field in ("indices", "routes"):
+            values = trace.get(field, ())
+            require(isinstance(values, (tuple, list)) and len(values) == 78,
+                    label + ".complete_" + field, checks)
+            for layer, value in enumerate(values):
+                if field == "routes" and layer < 3:
+                    require(value is None,
+                            f"{label}.{field}.{layer}.dense", checks)
+                    continue
+                width = 8 if field == "routes" else (
+                    2048 if native else min(position + 1, 2048)
+                )
+                require(isinstance(value, torch.Tensor)
+                        and value.dtype in (torch.int32, torch.int64)
+                        and value.shape == (width,),
+                        f"{label}.{field}.{layer}.layout", checks)
     rows = trace["cache_rows"]
     require(len(rows) == 78, label + ".cache_count", checks)
     for layer, row in enumerate(rows):
@@ -177,7 +222,7 @@ def compare_saved(native, reference_dir):
         "source_sha256": {
             name: digest(Path(__file__).with_name(name)) for name in (
                 Path(__file__).name, "run_cann_model.py",
-                "run_native_decode.py",
+                "run_native_decode.py", "precision_gate.py",
             )
         },
     }
@@ -210,6 +255,11 @@ def compare_saved(native, reference_dir):
                 "intermediate_hidden_states", "intermediate_layer_logits",
                 "all_layers_new_kv", "reset_exact",
             )), label + ".layer_trace_enabled", checks)
+            selection = [report["coverage"].get(field, False)
+                         for field in ("routing_choices", "index_choices")]
+            require(all(type(value) is bool for value in selection)
+                    and selection[0] == selection[1],
+                    label + ".choice_coverage", checks)
             require(receipt["consumed_tokens"] == report["consumed_tokens"]
                     and receipt["predicted_tokens"]
                     == report["predicted_tokens"]
@@ -257,13 +307,20 @@ def compare_saved(native, reference_dir):
             position = initial + offset
             token = first["consumed_tokens"][offset]
             validate_trace(expected, position, token, checks, f"hf.{position}",
-                           native=False)
+                           native=False, choices=any(
+                               r["coverage"].get("routing_choices", False)
+                               for r in reports
+                           ))
             for rank, report in enumerate(reports):
                 label = f"rank.{rank}.step.{position}"
                 actual = torch.load(native / f"rank-{rank}" / name,
                                     map_location="cpu", weights_only=True)
                 validate_trace(actual, position, token, checks, label,
-                               native=True)
+                               native=True, choices=report["coverage"].get(
+                                   "routing_choices", False,
+                               ))
+                if report["coverage"].get("routing_choices"):
+                    validate_choice_sources(actual, report, checks, label)
                 require(actual["token_ids"].item()
                         == report["predicted_tokens"][offset],
                         label + ".reported_prediction", checks)
@@ -280,6 +337,10 @@ def compare_saved(native, reference_dir):
             tp_ranks=16, steps=steps, hidden_states_per_step=79,
             layer_logits_per_step=78, all_layers_new_kv=True, reset_exact=True,
             prompt_tokens=initial, frozen_prefix_exact=initial > 0,
+            routing_choices=all(r["coverage"].get("routing_choices") is True
+                                for r in reports),
+            index_choices=all(r["coverage"].get("index_choices") is True
+                              for r in reports),
         )
     except Exception as exc:
         checks.append({"name": "validation_error", "passed": False,

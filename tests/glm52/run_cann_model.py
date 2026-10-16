@@ -150,14 +150,16 @@ def capture_step(engine, token, position, layer_trace):
 
     import torch
     from vllm.config import set_current_vllm_config
+    from tilert.models.glm_5_2_ascend.cann_choices import CannChoices
     from tilert.models.glm_5_2_ascend.cann_trace import CannTrace
 
     with torch.npu.device(engine.device), torch.inference_mode(), (
         set_current_vllm_config(engine.config)
     ):
-        with CannTrace(engine.model) as trace:
+        with CannTrace(engine.model) as trace, CannChoices(engine.model) as c:
             result = engine.verify((token,))
             hidden = trace.finish(result)
+            indices, routes = c.finish()
         normalized = engine.model.model.norm(torch.cat(hidden[1:-1]))
         projected = engine.model.compute_logits(normalized)
         if projected.shape != (77, result.logits.shape[-1]):
@@ -169,8 +171,65 @@ def capture_step(engine, token, position, layer_trace):
                                 for value in hidden),
             layer_logits=tuple(value.detach().cpu().clone()
                                for value in logits),
+            indices=tuple(value[0].detach().cpu().clone()
+                          for value in indices),
+            routes=tuple(None if value is None else
+                         value[0].detach().cpu().clone() for value in routes),
+            choice_source_sha256=c.source_metadata(),
         )
     return actual
+
+
+def compare_choices(name, actual, expected, checks, *, exact=False):
+    import torch
+
+    for field in ("indices", "routes"):
+        left, right = actual.get(field, ()), expected.get(field, ())
+        checks.append({"name": name + "." + field + ".count",
+                       "passed": len(left) == len(right) == 78})
+        for layer, (value, reference) in enumerate(zip(left, right)):
+            label = f"{name}.{field}.{layer}"
+            if value is None or reference is None:
+                compare_tensor(label, value, reference, checks, exact=True)
+                continue
+            integer = (value.dtype in (torch.int32, torch.int64)
+                       and reference.dtype in (torch.int32, torch.int64))
+            single_row = all(t.ndim == 1 or (t.ndim == 2 and t.shape[0] == 1)
+                             for t in (value, reference))
+            checks.append({"name": label + ".integer_row",
+                           "passed": integer and single_row})
+            if not integer or not single_row:
+                continue
+            raw_value, raw_reference = value, reference
+            value, reference = value.flatten(), reference.flatten()
+            if field == "indices":
+                valid = all(bool(torch.all((row == -1) | (
+                    (row >= 0) & (row <= actual["position"])
+                ))) for row in (value, reference))
+                checks.append({"name": label + ".causal_range",
+                               "passed": valid})
+                value, reference = value[value >= 0], reference[reference >= 0]
+                count = min(actual["position"] + 1, 2048)
+            else:
+                count = 8
+                checks.append({"name": label + ".expert_range",
+                               "passed": all(bool(torch.all(
+                                   (row >= 0) & (row < 256)
+                               )) for row in (value, reference))})
+            checks.append({"name": label + ".valid_selection",
+                           "passed": all(row.numel() == count
+                                         and row.unique().numel() == count
+                                         for row in (value, reference))})
+            if exact:
+                compare_tensor(label, raw_value, raw_reference, checks,
+                               exact=True)
+                continue
+            value = value.to(torch.int64).sort().values
+            reference = reference.to(torch.int64).sort().values
+            if value.numel() == 0 or reference.numel() == 0:
+                checks.append({"name": label + ".nonempty", "passed": False})
+                continue
+            compare_tensor(label, value, reference, checks, exact=True)
 
 
 def compare_step(name, actual, expected, checks, *, exact=False):
@@ -187,6 +246,8 @@ def compare_step(name, actual, expected, checks, *, exact=False):
               else expected["hidden_states"][-1])
     compare_tensor(name + ".last_hidden", actual["last_hidden"], hidden,
                    checks, exact=exact)
+    if "indices" in actual or "routes" in actual:
+        compare_choices(name, actual, expected, checks, exact=exact)
     for field, count in (("hidden_states", 79), ("layer_logits", 78)):
         if field not in actual:
             continue
@@ -312,7 +373,7 @@ def execute(args):
         ),
         "repeatability_passed": all(check["passed"] for check in checks
                                     if check["name"].startswith("reset.")),
-        "scope": "M1 logits/hidden/new KV and frozen prefix",
+        "scope": "M1 logits/hidden/choices/new KV and frozen prefix",
         "coverage": {
             "independent_reference": reference is not None,
             "final_logits": True, "final_normalized_hidden": True,
@@ -320,7 +381,8 @@ def execute(args):
             "reset_exact": True,
             "intermediate_hidden_states": args.layer_trace,
             "intermediate_layer_logits": args.layer_trace,
-            "routing_choices": False, "index_choices": False,
+            "routing_choices": args.layer_trace,
+            "index_choices": args.layer_trace,
             "mtp": False,
         },
         "performance_measured": False, "draft_model_loaded": False,
@@ -335,6 +397,7 @@ def execute(args):
                      ("torch", "torch-npu", "vllm", "vllm-ascend")},
         "source_sha256": {
             **engine.source_metadata(),
+            **actual.get("choice_source_sha256", {}),
             str(Path(__file__).resolve()): digest(Path(__file__)),
         },
         "trace_sha256": trace_hashes, "checks": checks,

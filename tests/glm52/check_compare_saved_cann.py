@@ -12,9 +12,9 @@ import tempfile
 
 import torch
 
-from compare_saved_cann import compare_saved, digest
+from compare_saved_cann import CHOICE_SOURCE_SUFFIXES, compare_saved, digest
 from prefix_io import prompt_identity
-from run_cann_model import compare_step
+from run_cann_model import compare_choices, compare_step
 from tilert.models.glm_5_2_ascend.ops.indexer import (
     cann_arch22_scoring_contract,
 )
@@ -32,7 +32,7 @@ def fingerprint(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def trace_fixture(position):
+def trace_fixture(position, choices=False):
     hidden = torch.ones(1, 6144, dtype=torch.bfloat16)
     logits = torch.zeros(1, 154880, dtype=torch.bfloat16)
     logits[0, 5] = 1
@@ -49,20 +49,28 @@ def trace_fixture(position):
             "index_scale": torch.ones(1, dtype=torch.float16)
             if quantized else None,
         })
-    return {
+    trace = {
         "token": 42, "position": position,
         "committed_position": position + 1,
         "token_ids": torch.tensor([5]), "logits": logits,
         "last_hidden": hidden, "hidden_states": (hidden,) * 79,
         "layer_logits": (logits,) * 78, "cache_rows": rows,
     }
+    if choices:
+        trace.update(
+            indices=(torch.arange(2048, dtype=torch.int32),) * 78,
+            routes=(None,) * 3 + (torch.arange(8, dtype=torch.int32),) * 75,
+            choice_source_sha256={name: fingerprint(name)
+                                  for name in CHOICE_SOURCE_SUFFIXES},
+        )
+    return trace
 
 
-def make_fixture(root):
+def make_fixture(root, choices=False):
     native, reference = root / "native", root / "reference"
     native.mkdir(parents=True)
     reference.mkdir()
-    trace = trace_fixture(8192)
+    trace = trace_fixture(8192, choices)
     filename = "step-08192.pt"
     metadata = {name: fingerprint(name) for name in (
         "config.json", "quant_model_description.json",
@@ -97,7 +105,8 @@ def make_fixture(root):
             "initial_position": 8192, "final_position": 8193, "steps": 1,
             "consumed_tokens": [42], "predicted_tokens": [5],
             "checkpoint_sha256": metadata,
-            "source_sha256": {"synthetic_fixture": fingerprint("fixture")},
+            "source_sha256": {"synthetic_fixture": fingerprint("fixture"),
+                              **trace.get("choice_source_sha256", {})},
             "repeatability_passed": True, "checks": reset_checks,
             "trace_sha256": {filename: digest(directory / filename)},
             "coverage": {name: True for name in (
@@ -111,6 +120,8 @@ def make_fixture(root):
                 "request_id": "host-validator", "generation": 1,
             },
         }
+        report["coverage"].update(routing_choices=choices,
+                                  index_choices=choices)
         path = native / f"rank-{rank}.json"
         write_json(path, report)
         receipts.append({"rank": rank, "report_sha256": digest(path),
@@ -192,6 +203,88 @@ def corrupt_hidden(trace):
 def tree_hashes(root):
     return {str(path.relative_to(root)): digest(path)
             for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def check_choices(root, checks):
+    base = root / "choices"
+    make_fixture(base, choices=True)
+    result = compare_saved(base / "native", base / "reference")
+    checks.append({"name": "actual_choices_complete_tp16",
+                   "passed": result["status"] == "pass"
+                   and result["coverage"]["routing_choices"]
+                   and result["coverage"]["index_choices"]})
+
+    def wrong_selection(trace):
+        values = list(trace["routes"])
+        values[3] = values[3].clone()
+        values[3][0] = 255
+        trace["routes"] = tuple(values)
+
+    cases = (
+        ("missing_indices", lambda t: t.pop("indices")),
+        ("missing_dense_route", lambda t: t.update(routes=t["routes"][3:])),
+        ("float_indices", lambda t: t.update(
+            indices=tuple(x.float() for x in t["indices"])
+        )),
+        ("wrong_actual_route", wrong_selection),
+        ("missing_choice_sources", lambda t: t.pop("choice_source_sha256")),
+        ("partial_choice_sources", lambda t: t.update(
+            choice_source_sha256={CHOICE_SOURCE_SUFFIXES[0]:
+                                  fingerprint(CHOICE_SOURCE_SUFFIXES[0])}
+        )),
+        ("duplicate_choice_source_suffix", lambda t:
+         t["choice_source_sha256"].update({
+             "/another/" + CHOICE_SOURCE_SUFFIXES[0]:
+                 fingerprint(CHOICE_SOURCE_SUFFIXES[0]),
+         })),
+    )
+    for name, mutate in cases:
+        current = root / name
+        shutil.copytree(base, current)
+        change_trace(current, mutate, rank=15)
+        result = compare_saved(current / "native", current / "reference")
+        checks.append({"name": "choices.reject." + name,
+                       "passed": result["status"] == "fail"})
+        shutil.rmtree(current)
+
+    padded = torch.full((2048,), -1, dtype=torch.int32)
+    padded[:3] = torch.tensor([2, 0, 1], dtype=torch.int32)
+    actual = {"position": 2, "indices": (padded,) * 78,
+              "routes": (None,) * 3
+              + (torch.arange(8, dtype=torch.int32),) * 75}
+    expected = {"indices": (torch.arange(3),) * 78,
+                "routes": (None,) * 3 + (torch.arange(8),) * 75}
+    numeric = []
+    compare_choices("padded", actual, expected, numeric)
+    checks.append({"name": "choices.padding_and_set_order",
+                   "passed": all(item["passed"] for item in numeric)})
+    padded[0] = 3
+    numeric = []
+    compare_choices("future", actual, expected, numeric)
+    checks.append({"name": "choices.future_index_rejected",
+                   "passed": any(not item["passed"] for item in numeric
+                                 if item["name"].endswith("causal_range"))})
+    reordered = {"indices": tuple(x.flip(0) for x in actual["indices"]),
+                 "routes": actual["routes"]}
+    numeric = []
+    compare_choices("reset", actual, reordered, numeric, exact=True)
+    checks.append({"name": "choices.reset_preserves_raw_order",
+                   "passed": any(not item["passed"] for item in numeric)})
+    for field, invalid in (
+        ("indices", torch.tensor([0, 0, 1])),
+        ("indices", torch.tensor([0, 1])),
+        ("routes", torch.tensor([0, 0, 2, 3, 4, 5, 6, 7])),
+        ("routes", torch.arange(256, 264)),
+    ):
+        malformed = {**expected, "position": 2,
+                     field: (invalid,) * 78 if field == "indices" else
+                     (None,) * 3 + (invalid,) * 75}
+        numeric = []
+        compare_choices("invalid", malformed, malformed, numeric)
+        checks.append({"name": "choices.same_invalid_selection_rejected."
+                       + field + "." + str(invalid.tolist()),
+                       "passed": any(not item["passed"]
+                                     for item in numeric)})
 
 
 def main():
@@ -292,6 +385,7 @@ def main():
                        and result["completed_rank_steps"] == 16})
         checks.append({"name": "original_files_unchanged",
                        "passed": tree_hashes(base) == original})
+        check_choices(root, checks)
     after_npu = torch_npu.npu._initialized
     checks.append({"name": "no_npu_initialization",
                    "passed": not before_npu and not after_npu})

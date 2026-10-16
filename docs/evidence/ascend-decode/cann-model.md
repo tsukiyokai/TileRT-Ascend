@@ -85,15 +85,15 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
   --capture-case /workspace/experiments/glm52/prefix-8k-20261017-attempt-05/case-00 \
   --steps 2 --capacity 9344 --layer-trace \
-  --output /workspace/experiments/glm52/cann-m1-8k-20261017-attempt-01
+  --output /workspace/experiments/glm52/cann-m1-8k-choices-20261017
 ```
 
 Every rank saves both forwards, verifies all injected rows remain exact,
 and repeats from reset. `--reference` adds a matching independent HF trace
 with the same prefix hashes and teacher tokens. Final logits, normalized
 hidden and all 78 new KV rows are covered. `--layer-trace` adds the
-79 hidden states and 78 layer logits used by the HF trace; routing and
-index choices remain outside this adapter's coverage. The report keeps
+79 hidden states, 78 layer logits, 78 sparse-index selections and 75 MoE
+route selections used by the HF comparison. The report keeps
 `precision_verified=false` until the coverage in [the plan](../../plan.md)
 is complete.
 
@@ -106,6 +106,17 @@ their BF16 tensors are compared against the independent HF trace. The
 [CPU hook checks](cann-trace-wide-cpu-20261017.json) pass 37 cases for
 M=1/2/4 with no NPU initialization. Hooks and auxiliary projections run
 only in this diagnostic mode and are excluded from TPOT measurement.
+
+[CannChoices](../../../tilert/models/glm_5_2_ascend/cann_choices.py) copies
+the actual SFA input indices and final routed-expert IDs. Each layer's
+shared buffer is cloned before reuse. The first three dense layers retain
+route `None`. HF comparison requires the same unique, causal top-2048
+indices and eight valid expert IDs; short prefixes use their available key
+count and ignore `-1` padding. Exact reset also preserves original dtype,
+shape and ordering. Saved hashes bind the collector, SFA implementation
+and final expert selector. The
+[CPU capture checks](cann-choices-cpu-20261017.json) pass 22 cases with
+synthetic call targets and real CPU tensors, including cleanup on errors.
 
 ## Target width checks
 
@@ -123,9 +134,10 @@ retained KV. Only the clean branch clears the discarded tail, and both
 stop below the old high watermark. Prefix contents, actual input arrays,
 returned argmax IDs, logits, hidden and all new cache rows are retained.
 
-The [CPU runner checks](check-cann-verify-cpu-20261017.json) pass ten cases
+The [CPU runner checks](cann-choices-runner-cpu-20261017.json) pass 11 cases
 with a scalar model fixture, rejecting deliberately noncausal and stale-tail
-reads. The [static/CLI checks](cann-verify-static-20261017.json) pass five
+reads and checking choice ownership across merge, slice and reset. The
+[static/CLI checks](cann-verify-static-20261017.json) pass five
 cases. Device cross-width agreement and matching independent HF comparison
 remain separate acceptance steps; the report retains
 `precision_verified=false` and `performance_measured=false`.
@@ -137,15 +149,35 @@ main-prefix files. Then run [the offline comparator](../../../tests/glm52/compar
 on CPU; it reads all 16 rank reports and tensor files without loading
 model weights. It verifies file hashes, checkpoint/prompt/teacher identity,
 exact reset coverage, all 79 hidden states, 78 logits and new KV rows.
+Choice-enabled traces also require all routing/index selections and their
+three source files; older partial traces retain choice coverage `false`.
 Results are written separately from both inputs. The
-[host validator checks](check-compare-saved-cann-20261017.json) pass 24
-cases, including a changed intermediate hidden on rank 15.
+[host validator checks](check-compare-saved-cann-choices-20261017.json)
+pass 39 cases, including changed hidden states on rank 15, missing sources
+and identical but invalid selections in both compared traces.
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/glm52/compare_saved_cann.py \
-  --native /workspace/experiments/glm52/cann-m1-8k-20261017-attempt-01 \
-  --reference /workspace/experiments/glm52/hf-cann-m1-8k-20261017 \
-  --output /workspace/experiments/glm52/compare-cann-m1-8k-20261017.json
+  --native /workspace/experiments/glm52/cann-m1-8k-choices-20261017 \
+  --reference /workspace/experiments/glm52/hf-cann-m1-8k-choices-20261017 \
+  --output /workspace/experiments/glm52/compare-cann-m1-8k-choices-20261017.json
+```
+
+For widths 2/4, [the wide comparator](../../../tests/glm52/compare_saved_cann_verify.py)
+compares every row directly against its matching HF trace. It checks all
+16 ranks, absolute positions, actual model inputs, captured prefix and
+teacher identity, numerical tensors and enabled choices. Serial/wide
+agreement is a separate result. The
+[CPU validator checks](check-compare-saved-cann-verify-20261017.json)
+pass 22 cases, including a BF16 counterexample where each comparison passes
+1% NRMSE but wide/HF reaches 1.5625% and fails. These fixture checks verify
+the validator; real target/MTP numerical acceptance remains pending.
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/glm52/compare_saved_cann_verify.py \
+  --native /workspace/experiments/glm52/cann-verify-m4-8k-20261017 \
+  --reference /workspace/experiments/glm52/hf-cann-verify-m4-8k-20261017 \
+  --output /workspace/experiments/glm52/compare-cann-verify-m4-8k-20261017.json
 ```
 
 ## PD serving

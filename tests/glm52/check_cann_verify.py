@@ -113,6 +113,17 @@ def capture_cpu(engine, tokens, layer_trace):
         saved["layer_logits"] = tuple(
             saved["logits"].clone() for _ in range(78)
         )
+        indices = torch.full((len(tokens), 2048), -1, dtype=torch.int32)
+        for row in range(len(tokens)):
+            count = min(position + row + 1, 2048)
+            indices[row, :count] = torch.arange(count, dtype=torch.int32)
+        saved["indices"] = tuple(indices.clone() for _ in range(78))
+        saved["routes"] = (None,) * 3 + tuple(
+            torch.stack([(torch.arange(8, dtype=torch.int32)
+                          + position + row + layer) % 256
+                         for row in range(len(tokens))])
+            for layer in range(3, 78)
+        )
     return saved
 
 
@@ -172,7 +183,7 @@ class VerifyRunnerChecks(unittest.TestCase):
         for width in (2, 4):
             for prefix_length in (0, 3):
                 with self.subTest(width=width, prefix=prefix_length):
-                    (checks, hashes, plan, _), artifacts = fixture_run(
+                    (checks, hashes, plan, _, _), artifacts = fixture_run(
                         width, prefix_length,
                     )
                     self.assertTrue(all(item["passed"] for item in checks),
@@ -190,14 +201,14 @@ class VerifyRunnerChecks(unittest.TestCase):
 
     def test_stale_high_watermark_fixture_is_rejected(self):
         for width in (2, 4):
-            (checks, _, _, _), _ = fixture_run(width, 3, "stale")
+            (checks, _, _, _, _), _ = fixture_run(width, 3, "stale")
             failures = [item["name"] for item in checks
                         if not item["passed"]]
             self.assertTrue(any(name.startswith("rollback.same_m1")
                                 for name in failures), failures)
 
     def test_future_read_fixture_is_rejected(self):
-        (checks, _, _, _), _ = fixture_run(4, 3, "future")
+        (checks, _, _, _, _), _ = fixture_run(4, 3, "future")
         failures = [item["name"] for item in checks if not item["passed"]]
         self.assertTrue(any(name.startswith("future-") for name in failures))
 
@@ -214,6 +225,29 @@ class VerifyRunnerChecks(unittest.TestCase):
         self.assertTrue(torch.equal(
             saved["cache_rows"][0]["latent"], expected,
         ))
+
+    def test_choices_survive_merge_slice_and_exact_reset(self):
+        (checks, _, _, _, _), artifacts = fixture_run(4, 3)
+        self.assertTrue(all(item["passed"] for item in checks),
+                        [item for item in checks if not item["passed"]][:3])
+        wide, serial = artifacts["wide"], artifacts["serial"]
+        for field in ("indices", "routes"):
+            for actual, expected in zip(wide[field], serial[field]):
+                if expected is None:
+                    self.assertIsNone(actual)
+                else:
+                    self.assertTrue(torch.equal(actual, expected))
+        row = runner.snapshot_rows(wide, 2, 3)
+        self.assertTrue(torch.equal(row["indices"][0][0, :6],
+                                    torch.arange(6, dtype=torch.int32)))
+        self.assertTrue(torch.equal(row["routes"][3][0],
+                                    torch.arange(8, 16, dtype=torch.int32)))
+        row["indices"][0].zero_()
+        row["routes"][3].zero_()
+        self.assertTrue(torch.equal(wide["indices"][0],
+                                    serial["indices"][0]))
+        self.assertTrue(torch.equal(wide["routes"][3],
+                                    serial["routes"][3]))
 
     def test_metadata_and_wrong_returned_token_are_rejected(self):
         saved = capture_cpu(ScalarEngine(), (3, 7), False)
@@ -251,7 +285,9 @@ def main():
     result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
     import torch_npu
 
-    paths = (Path(__file__), Path(runner.__file__))
+    paths = (Path(__file__), Path(runner.__file__),
+             Path(__file__).with_name("run_cann_model.py"),
+             Path(__file__).with_name("run_native_decode.py"))
     initialized = bool(torch_npu.npu._initialized)
     report = {
         "status": "pass" if result.wasSuccessful() and not initialized
