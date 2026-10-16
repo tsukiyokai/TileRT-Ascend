@@ -209,7 +209,7 @@ def run(args, report):
     markers = StageMarkers(rank)
     report["markers"] = markers.events
     engine = instrument_engine(target, draft, markers)
-    channel = TorchControlChannel(device)
+    channel = TorchControlChannel()
     phase_args = (engine, rank, channel, lambda request, rank: prefix,
                   request, args.mtp_width, args.max_tokens, markers)
     with torch.inference_mode():

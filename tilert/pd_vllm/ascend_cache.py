@@ -15,6 +15,11 @@ CHECKPOINT_FILES = (
 )
 
 
+def receive_device_id(rank):
+    """Move each PD destination off its source die on the single A3 host."""
+    return (rank + 1) % NUM_RANKS
+
+
 def checkpoint_fingerprint(directory):
     directory = Path(directory)
     return {

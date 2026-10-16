@@ -1,6 +1,7 @@
 """Ordered request commands for sixteen rank-local CANN engines."""
 
 from dataclasses import asdict
+from datetime import timedelta
 
 from .session import PrefixRequest
 
@@ -9,17 +10,23 @@ TP_SIZE = 16
 
 
 class TorchControlChannel:
-    """Broadcast small host descriptors through the existing HCCL group."""
+    """Wait for host commands on Gloo without an outstanding NPU task."""
 
-    def __init__(self, device, group=None):
+    def __init__(self, group=None):
         import torch
         import torch.distributed as distributed
 
         if distributed.get_world_size(group) != TP_SIZE:
             raise ValueError("Ascend request control requires TP16")
+        if group is None:
+            group = distributed.new_group(
+                backend="gloo", timeout=timedelta(hours=24),
+            )
+        if distributed.get_backend(group) != "gloo":
+            raise ValueError("Host request control requires a Gloo group")
         self.distributed = distributed
         self.group = group
-        self.device = torch.device(device)
+        self.device = torch.device("cpu")
         self.rank = distributed.get_rank(group)
 
     def send(self, command):

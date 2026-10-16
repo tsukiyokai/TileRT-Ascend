@@ -4,7 +4,7 @@
 
 vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，TPOT p50=16.39 ms、p95=18.29 ms，均值 16.51 ms，即 60.55 tok/s。2 ms 需要将 p50 缩短 8.20 倍；后续用 vLLM prefill、HIXL 与 TileRT M4 重跑相同输入，先验精度，再根据 profiling 压缩关键路径。[原始结果与口径](evidence/ascend-decode/vllm-baseline-20261017/README.md)、[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
 
-当前 P+D 基线使用空闲的 `a3-gs:trt-asc`，复用已有镜像与统一 Python 环境。此前 TP16 短序列验证使用 `a3-187:trt-asc`。[环境快照](evidence/ascend-decode/a3-187-environment-20261016.json)、[运行时检查](evidence/ascend-decode/a3-187-runtime-20261016.json)
+本次 P+D 基线在 `a3-gs:trt-asc` 空闲时复用已有镜像与统一 Python 环境。此前 TP16 短序列验证使用 `a3-187:trt-asc`。[环境快照](evidence/ascend-decode/a3-187-environment-20261016.json)、[运行时检查](evidence/ascend-decode/a3-187-runtime-20261016.json)
 
 实施顺序：直接复用 CANN 9.2.0 已有算子，先跑通真实 W4A8C8、batch=1、TP16 decode，并通过逐层精度、路由、索引和缓存检查；随后采集 profiling，建立正确执行路径的算子、搬运、启动与同步基线；再按采集结果调整 tiling、布局、流水与融合范围。只有能力缺失或已有实现难以达到预算时，才用 TileLang Ascend／AscendC 重写。每次替换保留同输入、同精度、同计时范围的 CANN 对照。[已有算子与精度入口](evidence/ascend-decode/cann-operators.md)
 
@@ -38,7 +38,7 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 精度基线提前注册并初始化 vLLM SFA vendor，保留 RMSNorm 的 `BF16(normalized) × gamma` 舍入边界，并将各 rank 的 BF16 partial 转为 FP32 做 HCCL、最后转回 BF16。M=1／4 的基线消息为 24／96 KiB；通信优化以 BF16 传输、FP32 累加恢复 12／48 KiB 消息，融合保持上述数值合同。
 
-[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；同输入检查仍有 38/1,572 项失败。下一设备窗口只补 step0／layer5 的真实 post-attention RMS 输入与 router corrected scores，分清 attention 传播与 router 本地算术，再推进真实 8K 验收。
+[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；同输入检查仍有 38/1,572 项失败。下一设备窗口先完成真实 8K HIXL 交接和末行重放；按同输入逐层差分定位续算中的数值差异。[通信修复与设备证据](evidence/ascend-decode/pd-hixl-20261017/README.md)
 
 ## 1. 先算速度边界
 

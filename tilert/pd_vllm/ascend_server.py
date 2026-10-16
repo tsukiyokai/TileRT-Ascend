@@ -106,6 +106,7 @@ def run(args):
     from tilert.pd_vllm import decode_server
     from tilert.pd_vllm.ascend_cache import (
         AscendRankEngine, AscendReceiveBuffer, checkpoint_fingerprint,
+        receive_device_id,
     )
     from tilert.pd_vllm.ascend_layout import NUM_RANKS, cache_layout
     from tilert.pd_vllm.ascend_receiver import AscendReceiveServer
@@ -119,18 +120,21 @@ def run(args):
     if isinstance(stop_ids, int):
         stop_ids = [stop_ids]
     torch.set_num_threads(1)
-    device = torch.device(f"npu:{int(os.environ['LOCAL_RANK'])}")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"npu:{receive_device_id(local_rank)}")
     torch.npu.set_device(device)
     distributed.init_process_group("hccl")
     rank = distributed.get_rank()
-    if distributed.get_world_size() != NUM_RANKS:
+    if distributed.get_world_size() != NUM_RANKS or rank != local_rank:
         raise ValueError("Ascend PD serving requires sixteen local ranks")
     target = NativeDecodeEngine(
         args.checkpoint, device, capacity, use_expert_bank=args.expert_bank,
     )
     draft = NativeMtp(target)
-    target.prepare_experts()
-    draft.prepare_experts()
+    preload_experts = args.expert_bank or args.timing_dir is not None
+    if preload_experts:
+        target.prepare_experts()
+        draft.prepare_experts()
     transport = HixlTransport(
         library_path=args.hixl_library, port=args.hixl_port_base + rank,
     )
@@ -144,7 +148,7 @@ def run(args):
         rank_engine, rank, lambda request, _local_rank:
         receive_buffer.prefix(request),
     )
-    channel = TorchControlChannel(device)
+    channel = TorchControlChannel()
     root = Path(__file__).resolve().parents[2]
     sources = [
         *(root / "tilert/models/glm_5_2_ascend").rglob("*.py"),
@@ -167,6 +171,7 @@ def run(args):
         else f"CANN greedy, MTP width {args.mtp_width}",
         "mtp_width": args.mtp_width,
         "expert_backend": "bank" if args.expert_bank else "per_expert",
+        "expert_loading": "preloaded" if preload_experts else "on first use",
         "status": "initialized",
     }
     args.output.mkdir(parents=True, exist_ok=True)

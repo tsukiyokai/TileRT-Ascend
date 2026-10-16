@@ -1,7 +1,8 @@
 # Ascend prefill/decode handoff
 
 This path connects a TP16 vLLM-Ascend producer to rank-local CANN decode
-engines through HIXL. It serves one fresh, unchunked greedy request at a time.
+engines through HIXL. It serves one fresh greedy request at a time, with the
+whole prompt scheduled in one step.
 Serving supports serial M=1 and MTP verification widths 2/4 through the same
 TP16 request loop. Serial decode remains the default precision baseline.
 
@@ -12,7 +13,9 @@ TP16 request loop. Serial decode remains the default precision baseline.
   including 79 MLA latent/RoPE pairs, 22 index keys and 16 FP16 scales.
 - A [central receiver](../../../tilert/pd_vllm/ascend_receiver.py) publishes
   sixteen rank-specific HIXL endpoints. Source rank r writes destination r;
-  equal virtual addresses in different processes are separate allocations.
+  on this single host, destination rank r uses die `(r+1)%16` to avoid
+  HIXL self-device connections. TP shard ownership remains logical rank r.
+  Equal virtual addresses in different processes are separate allocations.
 - The [V1 connector](../../../tilert/pd_vllm/ascend_connector.py) binds the
   actual cache views and scheduler block tables. Its `wait_for_save` returns
   after producer synchronization, synchronous WRITE and the matching
@@ -33,11 +36,18 @@ TP16 request loop. Serial decode remains the default precision baseline.
   A cancelled prefill also retires its slot when no HTTP decode was started;
   a later HTTP announcement cannot revive that generation.
 
-The pinned runner calls connector finalization after MTP proposal:
-vLLM-Ascend `f558b58c`, `model_runner_v1.py:2981–2999`; the vLLM MTP first
-pass shifts input IDs but retains parent positions (`c4df37df`,
-`llm_base_proposer.py:1803–1836`). The connector requires all 79 MLA save
-callbacks. This excludes a skipped MTP pass, prefix hits and partial prompts.
+With vLLM `c4df37df` and vLLM-Ascend `f558b58c`, `max_tokens=1` still runs
+the first MTP forward. The scheduler passes the fixed draft count without
+capping it to the request's output budget (`scheduler.py:1446–1451`). The
+Ascend runner proposes after sampling, provided prompt length plus the draft
+count fits the drafter (`model_runner_v1.py:2779–2791,2981–2999`). Its
+`llm_base_proposer.py:1491` calls the draft model before the one-draft early
+return at line 1634. The first pass shifts input IDs while retaining parent
+positions (`llm_base_proposer.py:1793–1806`). Connector finalization then
+calls `wait_for_save` (`kv_connector_model_runner_mixin.py:53–61`); the
+scheduler checks the output limit only after receiving model output
+(`scheduler.py:2443–2448`). The connector requires all 79 MLA save callbacks.
+This excludes a skipped MTP pass, prefix hits and partial prompts.
 
 ## MTP delivery and cache retention
 
@@ -62,7 +72,10 @@ records its delivered count. The final emitted token stays pending outside
 main KV unless it was consumed to discover EOS.
 
 The TP commands are inject, start, advance, finish and reset, ordered by
-serial, request ID and main position. A command failure after broadcast can
+serial, request ID and main position. All ranks create a separate CPU Gloo
+group before HTTP starts; its command receive timeout is 24 hours.
+Workers wait there while rank zero handles HTTP. Model computation and
+cache receipts use the original HCCL group. A command failure after broadcast can
 leave ranks at different serials. The backend then rejects further commands
 locally; HTTP cleanup retains the slot and lock. Restart all sixteen ranks
 instead of broadcasting a recovery reset.
@@ -89,19 +102,29 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
 
 The [launcher](../../../tilert/pd_vllm/ascend_server.py) registers one HIXL
 endpoint per rank at ports 26100–26115 and gathers their descriptors before
-starting HTTP. It preloads main/MTP experts. `--expert-bank` selects the
-separately validated CANN GMM candidate; the default keeps the per-expert
-baseline. No device timing is inferred from startup or CPU checks.
+starting HTTP. The default per-expert path loads expert weights on first
+use for functional validation. `--timing-dir` preloads every main/MTP
+expert before measurement; `--expert-bank` also preloads the CANN GMM
+candidate. No device timing is inferred from startup or CPU checks.
 After serial and MTP numerical acceptance, use `--mtp-width 4` for the
 speculative path in the traffic budget. The output metadata records the
 selected width and implementation hashes.
 
 Set the vLLM producer to TP16, PP/DP/PCP/DCP=1, expert parallel off,
-`max_num_seqs=1`, chunked prefill and prefix caching off, block size 128,
+`max_num_seqs=1`, prefix caching off, block size 128,
 and a fixed positive MTP draft count with `parallel_drafting=false`.
 Prompt length plus that count must fit
 the draft model length; the scheduler token budget must fit the whole
-prompt. Use the same local ModelSlim checkpoint and mixed C8 index recipe.
+prompt. Chunking may be enabled, but the connector requires the actual
+scheduled token count to equal the complete fresh prompt and rejects a
+partial prefill. Use the same local ModelSlim checkpoint and mixed C8 index
+recipe. The [a3-gs producer launcher](../../../tests/glm52/serve_vllm_prefill.sh)
+uses an 8192-token budget, MTP1, eager execution and synchronous scheduling;
+its default destination is the capture receiver on control port 5557.
+Set `TRT_HIXL_IP` to the prefill host's business IP. `TRT_DECODE_HOST`
+defaults to that address; set `TRT_CTRL_PORT=5556` for the decode service.
+The [launcher argument checks](pd-hixl-20261017/prefill-launcher.json)
+exercise both destinations and a changed host without starting vLLM.
 The [prefix capture receiver](measurement.md#capture-original-vllm-prefixes)
 uses the same producer configuration for frozen numerical inputs, before
 the decode service is started.
@@ -152,15 +175,18 @@ the response on every token instead of the former 200-ms poll. A decoder
 thread still alive after a cancellation join timeout retains its request
 slot and HTTP lock until it terminates; a failed reset retains ownership.
 
-These checks execute on the a3-gs host CPU without Torch. Actual HIXL
-Initialize/registration/DMA, NPU prefix injection/replay, V1 callbacks,
-HTTP delivery timing and full numerical parity remain device acceptance
-work. Follow the precision→profiling→calibration order in
+The scalar checks execute on the a3-gs host CPU without Torch. The
+[HIXL device checks](pd-hixl-20261017/README.md) verify a 1 KiB WRITE from
+die 0 to an independent process on die 1, with exact receiver readback.
+The same-die control fails during Connect with status 103900. Full TP16
+8K handoff, NPU prefix injection/replay, HTTP delivery timing and numerical
+parity remain the next device acceptance steps. Follow the
+precision→profiling→calibration order in
 [the development record](offline-development.md).
 
 After main and MTP HF parity, run
 [run_native_mtp_session.py](../../../tests/glm52/run_native_mtp_session.py)
-on sixteen ranks. It uses the production serving factory, HCCL command
+on sixteen ranks. It uses the production serving factory, CPU command
 channel and rank engine; compares normal/cancelled/repeated requests with
 serial CANN AR plus all valid target-conditioned MTP cache rows; and checks
 every rank before reset. Frozen prefix rows compare exactly; replay/new rows

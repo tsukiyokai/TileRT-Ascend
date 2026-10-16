@@ -224,7 +224,7 @@ def run(args, report):
             return prefix
 
         executor = RankExecutor(rank_engine, rank, prefix_loader)
-        channel = TorchControlChannel(device)
+        channel = TorchControlChannel()
         if rank == 0:
             backend = CoordinatedBackend(executor, channel)
             session = create_session(backend, args.width, stops)

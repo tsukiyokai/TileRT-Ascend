@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from tilert.pd_vllm import wire  # noqa: E402
 from tilert.pd_vllm.ascend_cache import (  # noqa: E402
-    AscendRankEngine, AscendReceiveBuffer, RankPrefix,
+    AscendRankEngine, AscendReceiveBuffer, RankPrefix, receive_device_id,
 )
 from tilert.pd_vllm.ascend_layout import cache_layout  # noqa: E402
 from tilert.pd_vllm.ascend_receiver import (  # noqa: E402
@@ -38,7 +38,8 @@ from tilert.models.glm_5_2_ascend.session import PrefixRequest  # noqa: E402
 def endpoints(layout):
     return [{
         "rank": rank, "base_ptr": 1048576, "transport": "hixl",
-        "hixl_engine": f"127.0.0.1:{26100 + rank}", "hixl_device": rank,
+        "hixl_engine": f"127.0.0.1:{26100 + rank}",
+        "hixl_device": receive_device_id(rank),
         "hixl_regions": [{"base": 1048576, "bytes": layout["nbytes"]}],
     } for rank in range(16)]
 
@@ -52,6 +53,10 @@ def wait_for(predicate, timeout=2):
 
 
 class ReceiveChecks(unittest.TestCase):
+    def test_receive_devices_form_a_shifted_tp16_permutation(self):
+        self.assertEqual([receive_device_id(rank) for rank in range(16)],
+                         [*range(1, 16), 0])
+
     def setUp(self):
         self.layout = cache_layout(128)
         self.server = AscendReceiveServer(

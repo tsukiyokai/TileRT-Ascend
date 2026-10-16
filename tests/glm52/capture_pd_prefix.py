@@ -44,7 +44,7 @@ def run(args):
     )
     from tilert.pd_vllm import decode_server
     from tilert.pd_vllm.ascend_cache import (
-        AscendReceiveBuffer, checkpoint_fingerprint,
+        AscendReceiveBuffer, checkpoint_fingerprint, receive_device_id,
     )
     from tilert.pd_vllm.ascend_receiver import AscendReceiveServer
     from tilert.pd_vllm.hixl_transport import HixlTransport
@@ -53,11 +53,12 @@ def run(args):
     )
 
     torch.set_num_threads(1)
-    device = torch.device(f"npu:{int(os.environ['LOCAL_RANK'])}")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"npu:{receive_device_id(local_rank)}")
     torch.npu.set_device(device)
     distributed.init_process_group("hccl")
     rank = distributed.get_rank()
-    if distributed.get_world_size() != 16 or rank != device.index:
+    if distributed.get_world_size() != 16 or rank != local_rank:
         raise ValueError("Prefix capture requires one local TP16 group")
     checkpoint = checkpoint_fingerprint(args.checkpoint)
     transport = HixlTransport(library_path=args.hixl_library,
@@ -66,7 +67,7 @@ def run(args):
                                 args.hixl_host)
     endpoints = [None] * 16
     distributed.all_gather_object(endpoints, buffer.endpoint())
-    channel = TorchControlChannel(device)
+    channel = TorchControlChannel()
 
     def gather(receipt):
         values = [None] * 16

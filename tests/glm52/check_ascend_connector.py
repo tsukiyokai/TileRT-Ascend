@@ -152,7 +152,7 @@ def run(root):
     from tilert.pd_vllm import ascend_connector as connector
     from tilert.pd_vllm import ascend_layout
     from tilert.pd_vllm.ascend_cache import (
-        CHECKPOINT_FILES, checkpoint_fingerprint,
+        CHECKPOINT_FILES, checkpoint_fingerprint, receive_device_id,
     )
     from tilert.pd_vllm.ascend_receiver import AscendReceiveServer
 
@@ -180,7 +180,7 @@ def run(root):
     endpoints = [{
         "rank": rank, "base_ptr": 2 ** 44 + rank * 2 ** 32,
         "transport": "hixl", "hixl_engine": f"127.0.0.1:{26100 + rank}",
-        "hixl_device": rank,
+        "hixl_device": receive_device_id(rank),
         "hixl_regions": [{"base": 2 ** 44 + rank * 2 ** 32,
                           "bytes": layout["nbytes"]}],
     } for rank in range(16)]

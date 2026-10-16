@@ -67,7 +67,7 @@ def run(args, report):
                 for item in bundle["layers"]]
 
     executor = RankExecutor(engine, rank, prefix_loader)
-    channel = TorchControlChannel(device)
+    channel = TorchControlChannel()
     if rank == 0:
         backend = CoordinatedBackend(executor, channel)
         session = AscendPDEngine(backend, stop_ids=stop_ids)
