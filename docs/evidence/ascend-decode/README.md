@@ -36,6 +36,11 @@ MTP, 8K-context parity, and TPOT remain separate acceptance stages.
 
 ## Quantized operators and PD
 
+The full [GLM-5.2 vLLM P+D baseline](vllm-baseline-20261017/README.md)
+completes 32 serial 8K-to-1K requests after three warmups on a3-gs.
+With TP16, MTP3 and four-row decode graph replay, client TPOT is
+16.390 ms p50 and 18.295 ms p95, averaging 60.555 tok/s.
+
 The [2026-10-17 CPU contract suite](cpu-contracts-20261017/summary.json)
 passes all eight checks in the unified `a3-gs:trt-asc` environment: MTP state,
 round and session transitions; token-delivery timing; causal verify layout;

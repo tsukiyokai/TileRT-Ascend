@@ -2,7 +2,7 @@
 
 目标：`a3-gs:trt-asc`，单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms，即 ≥500 tok/s。vLLM-Ascend 执行 prefill，HIXL 交接 KV，TileRT-Ascend 执行 decode；单机两阶段依次占用设备，decode 计时期间 prefill 静默。
 
-先用 vLLM-Ascend 完成 P+D 基线，再接入 TileRT decode。基线使用同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，记录 token IDs、流式到达时刻及 TPOT p50／p95。随后用 vLLM prefill、HIXL 与 TileRT M4 重跑相同输入，先验精度，再量时延。[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
+vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，TPOT p50=16.39 ms、p95=18.29 ms，均值 16.51 ms，即 60.55 tok/s。2 ms 需要将 p50 缩短 8.20 倍；后续用 vLLM prefill、HIXL 与 TileRT M4 重跑相同输入，先验精度，再根据 profiling 压缩关键路径。[原始结果与口径](evidence/ascend-decode/vllm-baseline-20261017/README.md)、[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
 
 当前 P+D 基线使用空闲的 `a3-gs:trt-asc`，复用已有镜像与统一 Python 环境。此前 TP16 短序列验证使用 `a3-187:trt-asc`。[环境快照](evidence/ascend-decode/a3-187-environment-20261016.json)、[运行时检查](evidence/ascend-decode/a3-187-runtime-20261016.json)
 
