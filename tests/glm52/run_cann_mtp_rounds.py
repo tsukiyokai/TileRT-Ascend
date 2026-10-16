@@ -1,0 +1,448 @@
+"""Compare CANN MTP rounds with serial continuation of a v3 capture.
+
+Launch with torchrun --nproc-per-node=16. Main KV contains P rows, MTP KV
+contains P-1 rows, and the captured normalized, unrotated parent is at P-1.
+The prefill first token is pending: no prompt row is replayed. Logical
+outputs include EOS; the final output has not been consumed by the target.
+Serial and first speculative runs clear shared KV storage before injection;
+the reset run retains speculative tail bytes for the exact repeat check.
+This checks serial/speculative consistency and exact reset, not HF parity
+or performance. Only one target and one official CANN MTP model are loaded.
+"""
+
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import version
+import inspect
+import json
+import os
+from pathlib import Path
+import platform
+import sys
+from types import SimpleNamespace
+import traceback
+
+from prefix_io import mtp_prefix_layer
+from run_cann_model import check_prefix, load_capture
+from run_native_decode import compare_tensor
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from tilert.models.glm_5_2_ascend.mtp_round import (  # noqa: E402
+    MtpRoundExecutor, token_ids,
+)
+from tilert.pd_vllm.ascend_layout import (  # noqa: E402
+    PARENT_HIDDEN_REGION, validate_layout, validate_parent_hidden_metadata,
+)
+from tilert.pd_vllm.decode_timing import atomic_json  # noqa: E402
+from tilert.pd_vllm.prefix_capture import (  # noqa: E402
+    copy_to_cpu, digest, save_bundle,
+)
+
+
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--capture-case", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--width", type=int, choices=(2, 4), default=4)
+    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--capacity", type=int, default=9344)
+    parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--device-offset", type=int, choices=range(16),
+                        default=0)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--init-method", default="env://")
+    args = parser.parse_args(argv)
+    if args.max_tokens < 1 or args.capacity < 128:
+        parser.error("Positive output budget and capacity >= 128 required")
+    if not 0 < args.gpu_memory_utilization <= 1:
+        parser.error("Memory utilization must be in (0, 1]")
+    return args
+
+
+def validate_v3(manifest, checkpoint):
+    if (type(manifest.get("seq_len")) is not int
+            or manifest["seq_len"] < 1
+            or type(manifest.get("generation")) is not int
+            or manifest["generation"] < 1
+            or not isinstance(manifest.get("request_id"), str)
+            or not manifest["request_id"]):
+        raise ValueError("Capture needs a valid request, generation and P")
+    runtime = manifest["runtime"]
+    layout = runtime["layout"]
+    validate_layout(layout)
+    if (layout["version"] != 3 or runtime["world_size"] != 16
+            or runtime["checkpoint_sha256"] != checkpoint):
+        raise ValueError("MTP requires a checkpoint-bound TP16 v3 capture")
+    contract = manifest.get(PARENT_HIDDEN_REGION)
+    validate_parent_hidden_metadata(contract, manifest["seq_len"])
+    if any(type(receipt.get("rank")) is not int
+           or receipt.get(PARENT_HIDDEN_REGION) != contract
+           for receipt in manifest["ranks"]):
+        raise ValueError("Rank receipts disagree on the parent contract")
+    sources = runtime.get("source_sha256")
+    if not isinstance(sources, dict) or not sources or any(
+        not isinstance(name, str) or not name
+        or not isinstance(value, str) or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for name, value in sources.items()
+    ):
+        raise ValueError("Capture source SHA256 records are required")
+    return contract
+
+
+def load_inputs(args, rank, checkpoint):
+    import torch
+
+    case = args.capture_case
+    manifest = json.loads((case / "manifest.json").read_text())
+    contract = validate_v3(manifest, checkpoint)
+    main, teacher, inputs = load_capture(case, rank, checkpoint)
+    receipt = next(item for item in manifest["ranks"]
+                   if item["rank"] == rank)
+    path = case / "mtp-prefix" / f"rank-{rank}.pt"
+    file_hash = digest(path)
+    if file_hash != receipt["files"]["mtp"]["sha256"]:
+        raise ValueError("MTP prefix differs from its rank receipt")
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    draft = mtp_prefix_layer(saved, checkpoint)
+    length = inputs["initial_position"]
+    if (length + args.max_tokens - 1 > args.capacity
+            or length >= args.capacity):
+        raise ValueError("Prefix and output budget exceed cache capacity")
+    for name, width in (("latent", 512), ("rope", 64), ("index_keys", 128)):
+        value = draft[name]
+        if (value.shape != (length - 1, width)
+                or value.dtype != torch.bfloat16):
+            raise ValueError(f"MTP {name} must contain BF16 P-1 rows")
+    parent = saved.get("parent_hidden", {})
+    identity = {**contract, "request_id": inputs["request_id"],
+                "generation": inputs["generation"]}
+    if ({key: value for key, value in parent.items() if key != "tensor"}
+            != identity):
+        raise ValueError("MTP parent identity differs from the capture")
+    tensor = parent.get("tensor")
+    if (not isinstance(tensor, torch.Tensor)
+            or tensor.shape != (1, 6144) or tensor.dtype != torch.bfloat16
+            or not torch.isfinite(tensor).all()):
+        raise ValueError("MTP parent must be finite BF16 [1,6144]")
+    parent_hash = hashlib.sha256(
+        tensor.contiguous().view(torch.uint8).numpy().tobytes(),
+    ).hexdigest()
+    inputs.update(
+        rank=rank, mtp_prefix_file=str(path), mtp_prefix_sha256=file_hash,
+        parent_hidden=identity, parent_hidden_sha256=parent_hash,
+        capture_source_sha256=manifest["runtime"]["source_sha256"],
+    )
+    return main, draft, tensor, teacher[0], inputs
+
+
+def final_positions(initial, output_count):
+    """Counts include EOS; the last output remains pending in the target."""
+    if output_count < 1:
+        raise ValueError("The prefill token is the first logical output")
+    main = initial + output_count - 1
+    return (main, initial - 1 if output_count == 1 else main)
+
+
+def finish_reason(tokens, position, capacity, budget, stops):
+    if tokens[-1] in stops:
+        return "eos"
+    if len(tokens) >= budget:
+        return "length"
+    if position == capacity:
+        return "capacity"
+    return None
+
+
+def serial_run(target, draft, first, parent, budget, stops, observe=None):
+    """Teacher-force every MTP row with a serial target parent/prediction."""
+    output = [first]
+    reason = finish_reason(output, target.position, target.capacity,
+                           budget, stops)
+    if reason is None:
+        draft.forward((first,), parent, full_logits=False)
+    while reason is None:
+        result = target.verify((output[-1],), full_logits=False)
+        prediction = token_ids(result)[0]
+        draft.forward((prediction,), result.last_hidden, full_logits=False)
+        output.append(prediction)
+        reason = finish_reason(output, target.position, target.capacity,
+                               budget, stops)
+        if observe is not None:
+            observe((output, target.position, draft.position, reason))
+    return {"tokens": output, "positions": [target.position, draft.position],
+            "finish_reason": reason}
+
+
+def speculative_run(target, draft, first, parent, width, budget, stops,
+                    observe=None):
+    executor = MtpRoundExecutor(target, draft, width, budget, stops)
+    executor.start(first, parent)
+    output, rounds = [first], []
+    while executor.state.finish_reason is None:
+        executed = executor.advance()
+        output.extend(executed.commit.accepted_tokens)
+        rounds.append(asdict(executed))
+        if observe is not None:
+            observe((output, target.position, draft.position,
+                     executor.state.finish_reason))
+    return {
+        "tokens": output, "positions": [target.position, draft.position],
+        "finish_reason": executor.state.finish_reason, "rounds": rounds,
+        "statistics": executor.state.statistics(),
+    }
+
+
+def new_cache(target, draft, initial):
+    def rows(layers, begin, end):
+        return [{name: copy_to_cpu(value[begin:end])
+                 for name, value in layer.items()} for layer in layers]
+
+    return {"main": rows(target.cache, initial, target.position),
+            "mtp": rows([draft.cache], initial - 1, draft.position)}
+
+
+def prepare_phase(target, draft, main_prefix, mtp_prefix, label):
+    target.reset()
+    draft.reset()
+    if target.position != 0 or draft.position != 0:
+        raise ValueError("Reset must clear both logical cache lengths")
+    cleared = label in ("serial", "speculative")
+    if cleared:
+        # Layer 78 shares this allocation with the main-model caches.
+        target.storage.zero_()
+    target.inject(main_prefix)
+    draft.inject(mtp_prefix)
+    return cleared
+
+
+def compare_cache(label, actual, expected, checks, *, exact=False):
+    for model, count in (("main", 78), ("mtp", 1)):
+        left, right = actual[model], expected[model]
+        checks.append({"name": f"{label}.{model}.layers",
+                       "passed": len(left) == len(right) == count})
+        for layer, (values, references) in enumerate(zip(left, right)):
+            key = f"{label}.{model}.{layer}"
+            checks.append({"name": key + ".fields",
+                           "passed": values.keys() == references.keys()
+                           and {"latent", "rope"} <= values.keys()})
+            for name in values.keys() & references.keys():
+                value, reference = values[name], references[name]
+                same_layout = (value.shape == reference.shape
+                               and value.dtype == reference.dtype)
+                checks.append({"name": key + "." + name + ".layout",
+                               "passed": same_layout})
+                if not same_layout:
+                    continue
+                for row in range(value.shape[0]):
+                    compare_tensor(
+                        f"{key}.{name}.row.{row}", value[row], reference[row],
+                        checks,
+                        exact=exact or not value.is_floating_point()
+                        or name == "index_scales",
+                    )
+
+
+def source_hashes(target, draft):
+    from vllm.model_executor.model_loader.default_loader import (
+        DefaultModelLoader,
+    )
+    from vllm.model_executor.model_loader.utils import (
+        process_weights_after_loading,
+    )
+
+    paths = {Path(__file__).resolve(),
+             *[Path(__file__).with_name(name) for name in
+               ("run_cann_model.py", "run_native_decode.py", "prefix_io.py")]}
+    for value in (type(draft), type(draft.model), type(draft.model.model),
+                  type(draft.model.model.layers["78"]), DefaultModelLoader,
+                  process_weights_after_loading, MtpRoundExecutor):
+        paths.add(Path(inspect.getfile(inspect.unwrap(value))).resolve())
+    paths.add(ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py")
+    paths.update(ROOT / f"tilert/pd_vllm/{name}.py" for name in
+                 ("ascend_layout", "ascend_cache", "prefix_capture"))
+    return {**target.source_metadata(),
+            **{str(path): digest(path) for path in sorted(paths)}}
+
+
+def execute(args):
+    import torch
+    import torch.distributed as distributed
+    from vllm.distributed import get_world_group
+    from tilert.models.glm_5_2_ascend.cann_model import CannModel
+    from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
+    from tilert.pd_vllm.ascend_cache import checkpoint_fingerprint
+
+    rank = int(os.environ["RANK"])
+    if int(os.environ["WORLD_SIZE"]) != 16:
+        raise ValueError("Launch exactly 16 ranks")
+    physical = (rank + args.device_offset) % 16
+    checkpoint = checkpoint_fingerprint(args.checkpoint)
+    main_prefix, mtp_prefix, saved_parent, first, inputs = load_inputs(
+        args, rank, checkpoint,
+    )
+    config = json.loads((args.checkpoint / "config.json").read_text())
+    stops = config["eos_token_id"]
+    stops = (stops,) if type(stops) is int else tuple(stops)
+    stops = () if args.ignore_eos else stops
+    torch.set_num_threads(1)
+    target = CannModel(
+        args.checkpoint, f"npu:{physical}", rank, args.init_method,
+        args.capacity, args.gpu_memory_utilization,
+    )
+    draft = CannMtp(target)
+    source = source_hashes(target, draft)
+    group = get_world_group().cpu_group
+
+    def gather(value):
+        values = [None] * 16
+        distributed.all_gather_object(values, value, group=group)
+        return values
+
+    def agree(value):
+        if any(other != value for other in gather(value)):
+            raise ValueError("Sixteen ranks disagree on inputs or decode")
+
+    agree({"capture": inputs["capture_manifest_sha256"],
+           "prompt": inputs["prompt_sha256"], "first": first,
+           "parent": inputs["parent_hidden_sha256"], "source": source,
+           "checkpoint": checkpoint, "width": args.width,
+           "budget": args.max_tokens, "stops": stops})
+    initial = inputs["initial_position"]
+    checks, runs, paths = [], {}, {}
+    directory = args.output / f"rank-{rank}"
+    directory.mkdir(parents=True, exist_ok=False)
+    expected_cache = None
+    with torch.inference_mode():
+        for label in ("serial", "speculative", "reset"):
+            cleared = prepare_phase(
+                target, draft, main_prefix, mtp_prefix, label,
+            )
+            parent = saved_parent.to(target.device)
+            predicted = token_ids(target.predict(parent))[0]
+            agree((predicted, target.position, draft.position))
+            if predicted != first:
+                raise ValueError("Captured parent head differs from g0")
+            if (target.position, draft.position) != (initial, initial - 1):
+                raise ValueError("Injection must retain main P / MTP P-1")
+            if label == "serial":
+                result = serial_run(
+                    target, draft, first, parent, args.max_tokens, stops,
+                    observe=agree,
+                )
+            else:
+                result = speculative_run(
+                    target, draft, first, parent, args.width,
+                    args.max_tokens, stops, observe=agree,
+                )
+            result["cache_zeroed_before_inject"] = cleared
+            runs[label] = result
+            checks.append({
+                "name": label + ".pending_lengths",
+                "passed": tuple(result["positions"]) == final_positions(
+                    initial, len(result["tokens"]),
+                ),
+            })
+            check_prefix(target, main_prefix, checks, label + ".main")
+            check_prefix(SimpleNamespace(cache=[draft.cache]), [mtp_prefix],
+                         checks, label + ".mtp")
+            compare_tensor(label + ".parent_unchanged", copy_to_cpu(parent),
+                           saved_parent, checks, exact=True)
+            cache = new_cache(target, draft, initial)
+            path = directory / f"{label}.pt"
+            save_bundle({**result, "new_cache": cache}, path)
+            paths[label] = {"path": str(path), "sha256": digest(path)}
+            if label == "serial":
+                expected_cache = cache
+            else:
+                reference = runs["serial" if label == "speculative"
+                                 else "speculative"]
+                checks.append({
+                    "name": label + ".tokens_and_state",
+                    "passed": all(result[key] == reference[key] for key in
+                                  ("tokens", "positions", "finish_reason")),
+                })
+                compare_cache(label, cache, expected_cache, checks,
+                              exact=label == "reset")
+                if label == "speculative":
+                    expected_cache = cache
+                else:
+                    checks.append({
+                        "name": "reset.rounds_exact",
+                        "passed": result["rounds"] == reference["rounds"],
+                    })
+    checks.append({"name": "source_stable",
+                   "passed": source_hashes(target, draft) == source})
+    passed = all(item["passed"] for item in checks)
+    report = {
+        "status": "pass" if passed else "fail", "rank": rank,
+        "world_size": 16, "physical_device": physical,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hostname": platform.node(), "command": [sys.executable, *sys.argv],
+        "source_commit": args.source_commit, "source_sha256": source,
+        "checkpoint_sha256": checkpoint, "inputs": inputs,
+        "width": args.width, "max_tokens": args.max_tokens,
+        "capacity": args.capacity, "eos_tokens": stops,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "packages": {name: version(name) for name in
+                     ("torch", "torch-npu", "vllm", "vllm-ascend")},
+        "scope": "CANN serial/speculative consistency and exact reset",
+        "logical_outputs_include_eos": True,
+        "final_output_is_pending": True, "prompt_replayed": False,
+        "serial_speculative_consistency": passed,
+        "reset_exact": all(item["passed"] for item in checks
+                           if item["name"].startswith("reset.")),
+        "precision_verified": False, "hf_parity": False,
+        "performance_measured": False, "numerical_execution": True,
+        "coverage": {
+            "greedy_tokens": True, "valid_new_main_mtp_kv": True,
+            "frozen_prefix_exact": True, "reset_exact": True,
+            "intermediate_hidden_logits": False, "routes_indices": False,
+        },
+        "runs": runs, "trace_files": paths, "checks": checks,
+    }
+    path = args.output / f"rank-{rank}.json"
+    atomic_json(path, report)
+    receipts = gather({"rank": rank, "passed": passed,
+                       "report_sha256": digest(path),
+                       "tokens": runs["speculative"]["tokens"],
+                       "positions": runs["speculative"]["positions"]})
+    same = all(item["tokens"] == receipts[0]["tokens"]
+               and item["positions"] == receipts[0]["positions"]
+               for item in receipts)
+    success = same and all(item["passed"] for item in receipts)
+    if rank == 0:
+        summary = {
+            "status": "pass" if success else "fail", "ranks": receipts,
+            "all_ranks_agree": same,
+            "serial_speculative_consistency": success,
+            "precision_verified": False, "hf_parity": False,
+            "performance_measured": False,
+        }
+        atomic_json(args.output / "summary.json", summary)
+        print(json.dumps(summary))
+    target.worker.shutdown()
+    return 0 if success else 1
+
+
+def main():
+    args = parse_arguments()
+    try:
+        return execute(args)
+    except Exception:
+        args.output.mkdir(parents=True, exist_ok=True)
+        rank = os.environ.get("RANK", "unknown")
+        path = args.output / f"rank-{rank}-error.txt"
+        path.write_text(traceback.format_exc())
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

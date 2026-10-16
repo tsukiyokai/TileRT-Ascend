@@ -62,3 +62,20 @@ Device acceptance requires real weight loading, an 8K v3 HIXL capture,
 serial-versus-MTP token/cache comparison, and independent HF numerical
 comparison. P/D coexistence memory remains unmeasured; the current staged
 accuracy route is described in the [capacity audit](pd-capacity-20261017.json).
+
+The [device consistency entry](../../../tests/glm52/run_cann_mtp_rounds.py)
+loads one target/drafter pair and compares serial continuation, speculative
+rounds and an exact reset run. Use a v3 `--capture-case`; its defaults are
+`--width 4 --max-tokens 16`. Every rank saves new main/MTP KV, actual round
+commits, input identities and source hashes. Logical outputs include EOS:
+for T=1, main/draft lengths are P/P-1; for T>=2 both are P+T-1, with the
+last output still pending. Frozen prompt rows must remain exact.
+KV comparison checks each token row. Serial and the first speculative run
+start with cleared storage; the reset run retains the speculative tail
+and must reproduce the fresh speculative result exactly.
+
+The [163 host checks](cann-mtp-rounds-cpu-20261017.json) exercise synthetic
+v3 file validation and scalar schedules across acceptance modes, EOS,
+page boundaries and capacity tails. They run no official model arithmetic
+or TP collective and do not import Torch NPU. Real device consistency and
+HF parity remain separate acceptance steps.
