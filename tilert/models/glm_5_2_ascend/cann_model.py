@@ -43,6 +43,7 @@ class CannModel:
         import torch_npu  # noqa: F401
         from vllm.config import set_current_vllm_config
         from vllm.engine.arg_utils import EngineArgs
+        from vllm.platforms import current_platform
         from vllm_ascend.worker.worker import NPUWorker
 
         self.device = torch.device(device)
@@ -53,6 +54,7 @@ class CannModel:
         self.position = 0
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
+        current_platform.pre_register_and_update()
         self.config = EngineArgs(
             model=self.checkpoint, trust_remote_code=True,
             dtype="bfloat16", quantization="ascend",
