@@ -1,0 +1,231 @@
+"""Rank-local HIXL receive memory and CANN prefix injection."""
+
+from dataclasses import dataclass
+import hashlib
+from pathlib import Path
+
+from .ascend_layout import (
+    NUM_RANKS, cache_layout, validate_prompt_token_ids,
+)
+
+
+CHECKPOINT_FILES = (
+    "config.json", "quant_model_description.json",
+    "quant_model_weights.safetensors.index.json",
+)
+
+
+def checkpoint_fingerprint(directory):
+    directory = Path(directory)
+    return {
+        name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        for name in CHECKPOINT_FILES
+    }
+
+
+@dataclass(frozen=True)
+class RankPrefix:
+    """P-1 main/MTP rows plus the final prompt token replayed at injection."""
+
+    main: list
+    mtp: dict
+    last_prompt_token: int
+    seq_len: int
+
+
+class AscendReceiveBuffer:
+    """Retain one contiguous registered allocation until HIXL peers drain."""
+
+    def __init__(self, rank, device, capacity, transport, hostname):
+        import torch
+
+        if type(rank) is not int or not 0 <= rank < NUM_RANKS:
+            raise ValueError("Receive rank must be in [0,16)")
+        self.rank = rank
+        self.device = torch.device(device)
+        self.layout = cache_layout(capacity)
+        self.transport = transport
+        self.storage = torch.empty(
+            self.layout["nbytes"], dtype=torch.uint8, device=self.device,
+        )
+        self.views = {}
+        for name, region in self.layout["regions"].items():
+            raw = self.storage.narrow(0, region["offset"], region["nbytes"])
+            self.views[name] = raw.view(getattr(torch, region["dtype"])).view(
+                region["shape"]
+            )
+        transport.init(hostname)
+        transport.register(
+            self.storage.data_ptr(), self.storage.numel(), self.device.index,
+        )
+        self._last_generation = 0
+
+    def endpoint(self):
+        return {
+            "rank": self.rank, "base_ptr": self.storage.data_ptr(),
+            "transport": self.transport.name, **self.transport.local_meta(),
+        }
+
+    def _layer_prefix(self, layer, length):
+        regions = self.layout["regions"]
+
+        def rows(name):
+            width = regions[name]["row_bytes"] // (
+                1 if regions[name]["dtype"] == "int8" else 2
+            )
+            return self.views[name].view(-1, width)[:length]
+
+        result = {"latent": rows(f"mla_latent.{layer}"),
+                  "rope": rows(f"mla_rope.{layer}")}
+        if f"index.{layer}" in regions:
+            result["index_keys"] = rows(f"index.{layer}")
+        if f"index_scale.{layer}" in regions:
+            result["index_scales"] = rows(f"index_scale.{layer}").view(-1)
+        return result
+
+    def _validate_prefix(self, request):
+        length = request.seq_len
+        generation = request.metadata["generation"]
+        if type(generation) is not int or generation <= self._last_generation:
+            raise ValueError("Receive generation is stale or out of order")
+        if (type(length) is not int
+                or not 1 <= length <= self.layout["capacity_tokens"]):
+            raise ValueError("Receive prefix exceeds cache capacity")
+        mtp_length = request.metadata["mtp_seq_len"]
+        if type(mtp_length) is not int or mtp_length != length - 1:
+            raise ValueError("MTP prefix must contain P-1 parent rows")
+        token = request.metadata["last_prompt_token"]
+        if type(token) is not int or not 0 <= token < 154880:
+            raise ValueError("Invalid final prompt token")
+        return length, generation
+
+    def prefix(self, request):
+        """Consume only the generation released by the central receiver.
+
+        Replaying the last prompt row recovers normalized target hidden
+        for the MTP seed. It also avoids transferring that hidden tensor.
+        Main row P-1 in the receive buffer is valid but deliberately replayed.
+        """
+        length, generation = self._validate_prefix(request)
+        prefix = RankPrefix(
+            [self._layer_prefix(layer, length - 1) for layer in range(78)],
+            self._layer_prefix(78, length - 1),
+            request.metadata["last_prompt_token"], length,
+        )
+        self._last_generation = generation
+        return prefix
+
+    def frozen_prefix(self, request, checkpoint_hashes):
+        """Consume P main rows and P-1 MTP rows without prompt replay.
+
+        The returned tensors alias registered receive memory. The caller
+        must finish copying them before releasing the receiver slot.
+        """
+        length, generation = self._validate_prefix(request)
+        tokens = request.metadata.get("prompt_token_ids")
+        validate_prompt_token_ids(
+            tokens, length, request.metadata["last_prompt_token"],
+        )
+        frozen = {
+            "main": {
+                "metadata_sha256": dict(checkpoint_hashes),
+                "prompt_token_ids": list(tokens),
+                "layers": [self._layer_prefix(layer, length)
+                           for layer in range(78)],
+            },
+            "mtp": {
+                "metadata_sha256": dict(checkpoint_hashes),
+                "layer": self._layer_prefix(78, length - 1),
+            },
+        }
+        self._last_generation = generation
+        return frozen
+
+
+class AscendRankEngine:
+    """Bind the receive prefix to the main/MTP caches on one TP rank."""
+
+    def __init__(self, target, draft):
+        self.target = target
+        self.draft = draft
+        self._clear_request()
+
+    def _clear_request(self):
+        self.parent_hidden = None
+        self.first_token_id = None
+        self._prompt_length = None
+        self._decode_mode = None
+        self._mtp = None
+
+    @property
+    def position(self):
+        return self.target.position
+
+    @property
+    def capacity(self):
+        return self.target.capacity
+
+    def inject(self, prefix):
+        self._clear_request()
+        self.target.inject(prefix.main)
+        self.draft.inject(prefix.mtp)
+        if (
+            self.target.position != prefix.seq_len - 1
+            or self.draft.position != prefix.seq_len - 1
+        ):
+            raise ValueError("Main/MTP replay prefixes have different lengths")
+        result = self.target.verify(
+            (prefix.last_prompt_token,), full_logits=False,
+        )
+        self.parent_hidden = result.last_hidden
+        self.first_token_id = int(result.token_ids[0].item())
+        self._prompt_length = prefix.seq_len
+
+    def step(self, token):
+        if self._decode_mode == "mtp":
+            raise RuntimeError("MTP and single-step decode cannot be mixed")
+        self._decode_mode = "step"
+        return self.target.verify((token,), full_logits=False)
+
+    def start_mtp(self, first_token, max_tokens, width, eos_tokens):
+        from tilert.models.glm_5_2_ascend.mtp_round import MtpRoundExecutor
+
+        if self._prompt_length is None or self.parent_hidden is None:
+            raise RuntimeError("Inject a prefix before starting MTP")
+        if self._decode_mode is not None:
+            raise RuntimeError("MTP must start before any decode operation")
+        if type(first_token) is not int or first_token != self.first_token_id:
+            raise ValueError("First token differs from prompt-row replay")
+        rounds = MtpRoundExecutor(
+            self.target, self.draft, width, max_tokens, eos_tokens,
+        )
+        rounds.start(first_token, self.parent_hidden)
+        if rounds.state.finish_reason is not None:
+            raise ValueError("MTP start requires another output token")
+        self._mtp = rounds
+        self._decode_mode = "mtp"
+
+    def advance_mtp(self):
+        if self._mtp is None:
+            raise RuntimeError("Start MTP before advancing a round")
+        return self._mtp.advance()
+
+    def finish_mtp(self, retained_position):
+        """Retain delivered-token state after a complete distributed round."""
+        if self._mtp is None:
+            raise RuntimeError("No MTP request is active")
+        if (type(retained_position) is not int
+                or not self._prompt_length <= retained_position
+                <= self.target.position):
+            raise ValueError("Retained position is outside the request")
+        if retained_position != self.target.position:
+            self.target.truncate(retained_position)
+        draft_position = min(retained_position, self.draft.position)
+        if draft_position != self.draft.position:
+            self.draft.truncate(draft_position)
+        self._mtp = None
+
+    def reset(self):
+        self._clear_request()
+        self.target.reset()
+        self.draft.reset()
