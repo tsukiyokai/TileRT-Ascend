@@ -216,8 +216,10 @@ class CannModel:
 
         self._input_buffers = {}
         for width in (1, 2, 4):
-            tokens = torch.empty(width, dtype=torch.long, device=self.device)
-            positions = torch.empty_like(tokens)
+            tokens = torch.empty(width, dtype=torch.int32, device=self.device)
+            positions = torch.empty(
+                width, dtype=torch.long, device=self.device,
+            )
             slots = torch.empty(width, dtype=torch.int32, device=self.device)
             query_cpu = torch.tensor([0, width], dtype=torch.int32)
             self._input_buffers[width] = (
@@ -321,7 +323,7 @@ class CannModel:
             if width == 1:
                 self.input_ids.fill_(tokens[0])
             else:
-                self.input_ids.copy_(torch.tensor(tokens, dtype=torch.long))
+                self.input_ids.copy_(torch.tensor(tokens, dtype=torch.int32))
             with set_ascend_forward_context(
                 metadata, self.config, num_tokens=width,
                 num_actual_tokens=width,

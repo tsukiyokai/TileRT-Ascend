@@ -66,10 +66,21 @@ registration/unregistration for two logical regions, and rejection of an
 unregistered source before native WRITE. Set
 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` before Torch initialization.
 
-The [completed 8K capture](prefix-8k-20261017.json) contains all sixteen
-rank receipts for request `ba210bea41854af3`. File sizes and SHA256 values
-match all 32 payloads. The normalized, unrotated BF16 parent hidden at
-position 8191 is bitwise equal across ranks. The frozen case is at
+The subsequent [completed 8K capture](prefix-8k-20261017.json) contains all
+sixteen rank receipts for request `ba210bea41854af3`. The
+[live capture provenance](capture-provenance.json) binds it to the actual
+producer: on 2026-10-17 at 14:20:20 Asia/Shanghai, its service log records
+all sixteen `sent` acknowledgements, each covering 775,170,688 bytes,
+8192 main rows and 8191 MTP rows. The frozen connector logs `sent` only
+after synchronous HIXL WRITE and the matching receiver acknowledgement.
+The same request's live vLLM response reports 8192 prompt tokens and first
+token 6500; the capture response and manifest agree.
+
+File sizes and SHA256 values match all 32 payloads. The normalized,
+unrotated BF16 parent hidden at position 8191 is bitwise equal across ranks.
+The frozen case is at
 `/workspace/offline/prefix8k-allocation-20261017/capture/case-00`;
-the producer and receiver have exited. Decode numerical acceptance and
-TPOT use this input in separate runs.
+the producer and receiver have exited. The capture receiver loads no decode
+weights and executes zero decode steps. Separate numerical and internal
+timing runs consume these files. Live handoff followed immediately by
+online TileRT decode and HTTP delivery remains unverified.

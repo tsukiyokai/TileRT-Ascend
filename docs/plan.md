@@ -2,7 +2,7 @@
 
 目标：`a3-gs:trt-asc`，单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms，即 ≥500 tok/s。vLLM-Ascend 执行 prefill，HIXL 交接 KV，TileRT-Ascend 执行 decode；单机两阶段依次占用设备，decode 计时期间 prefill 静默。
 
-vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，TPOT p50=16.39 ms、p95=18.29 ms，均值 16.51 ms，即 60.55 tok/s。16.39／2=8.20 是目标压缩比，TileRT 的时延差距尚待实测。同一服务在 temperature=0、seed=0 下仍产生 32 条不同轨迹，使用冻结 teacher-32 作为确定的输入与后继标签，不能把重新请求服务后的分叉归因于 TileRT。[原始结果与口径](evidence/ascend-decode/vllm-baseline-20261017/README.md)、[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
+vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，TPOT p50=16.39 ms、p95=18.29 ms，均值 16.51 ms，即 60.55 tok/s。16.39／2=8.20 是该基线到目标的压缩比，不能当作 TileRT 实测收益。同一服务在 temperature=0、seed=0 下仍产生 32 条不同轨迹，使用冻结 teacher-32 作为确定的输入与后继标签，不能把重新请求服务后的分叉归因于 TileRT。[原始结果与口径](evidence/ascend-decode/vllm-baseline-20261017/README.md)、[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
 
 本次 P+D 基线在 `a3-gs:trt-asc` 空闲时复用已有镜像与统一 Python 环境。此前 TP16 短序列验证使用 `a3-187:trt-asc`。[环境快照](evidence/ascend-decode/a3-187-environment-20261016.json)、[运行时检查](evidence/ascend-decode/a3-187-runtime-20261016.json)
 
@@ -13,6 +13,8 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 [逐层换入验证](evidence/ascend-decode/streamed-decode.md)已在共享 A3 上执行真实 8K、TP16 的连续 layer 0–4，3,568/3,568 项执行与重建重放检查通过。原 RoPE 表前缀逐位一致地裁至 8,320 行，配合小消息 HCCL 缓冲，两轮结束后 Torch 分配量均为 245.5 MiB/die。此前 HF 的 70／80 采用有误的 CPU matmul 参考，不能用于验收。
 
 [关闭 oneDNN 后的五层重比与 78 层三曲线](evidence/ascend-decode/hf-corrected-20261017/README.md)已完成，HF 执行与重放分别通过 59／59、1,587／1,587 项检查；五层与完整执行的前五层逐位一致。两步的 hidden NRMSE 峰值为 17.09%（L31）／20.66%（L38），末层为 9.04%／7.43%，仍有待定位的离散突跃，不能作为舍入底板。最终 logits 幅值为 23.75／23.125，BF16 间隔为 0.125，撤销固定 0.1 界，改报最大差／logits 极差与 top-1 余量。两步最终 top-1 均相同；这不等于八输入／32 步验收通过。参考修正与完整曲线已满足第 1→2 步条件，进入 profiling 和实际时延测量。
+
+[M1 同配置执行与实测](evidence/ascend-decode/cann-profile-20261017/README.md)已完成：原生 vLLM 与 TileRT 的 TP16、32 步张量和 reset 逐位一致。关闭 profiler 后，3 个 32 步请求的内部 TPOT 为 230.71／260.73／289.68 ms，中位数距 2 ms 预算约 130.4 倍；不含加载、KV 注入、reset、HTTP／HIXL。两步 trace 的 rank 0 设备跨度约 265 ms，其中归约区间约 215 ms，但 rank 14 的归约仅约 20–23 ms、区间内空隙约 184–185 ms，并在多数归约上最后提交。先验证主机提交与 rank 到达偏斜假设，复用线程绑定和 ACL Graph 做单变量对照；不把等待包络当作裸网络延迟，也不将该 M1 短测与 MTP3／graph4 的 1024-token 基线直接比较。
 
 ## 开发主线与停止条件
 
@@ -114,4 +116,4 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比与 78 层三曲线已交付；当前进入完整 decode profiling 和无 profiler 的短时延测量。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 短 profiling 与无 profiler 短测已交付；当前固定 M1 配置压缩主机提交和 rank 等待，再验证 M4 的实际轮耗时与接受数。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)

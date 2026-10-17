@@ -194,9 +194,12 @@ slot and HTTP lock until it terminates; a failed reset retains ownership.
 The scalar checks execute on the a3-gs host CPU without Torch. The
 [HIXL device checks](pd-hixl-20261017/README.md) verify a 1 KiB WRITE from
 die 0 to an independent process on die 1, with exact receiver readback.
-The same-die control fails during Connect with status 103900. Full TP16
-8K handoff, full-P NPU continuation, HTTP delivery timing and numerical
-parity remain the next device acceptance steps. Follow the
+The same-die control fails during Connect with status 103900. A subsequent
+[live TP16 8K HIXL capture](pd-hixl-20261017/README.md) completes all sixteen
+rank transfers and freezes 32 main/MTP files. Separate CANN M1 runs use
+those files for NPU continuation and internal timing. Live HIXL handoff
+followed immediately by online decode, HTTP delivery timing and final
+numerical acceptance remain to be verified. Follow the
 precision→profiling→calibration order in
 [the development record](offline-development.md).
 
