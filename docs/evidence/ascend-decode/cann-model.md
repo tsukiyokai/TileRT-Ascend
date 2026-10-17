@@ -22,6 +22,16 @@ P+M-1, and sparse mode 3 limits row i to keys below P+i+1. Logical TP rank
 selects the weight shard; physical device selection remains independent.
 Reset invalidates cache length. The next request replaces its valid rows.
 
+BF16 TP partials accumulate in FP32 and cast back once to BF16. The
+[TP16 comparison](cann-tp-sum-20261017.json) keeps identical local partials:
+direct BF16 reduction differs across ranks in 6,015 of 6,144 coordinates
+at the first output projection; the FP32 path produces identical BF16
+outputs. With this default, all 79 hidden states match across sixteen
+ranks in four cold forwards. Reset still differs, first at layer 6 for
+step 0 and layer 5 for step 1. Call `shutdown()` to restore the TP group's
+original reduction and stop the worker. Other input dtypes retain the
+original reduction behavior.
+
 The [device entry](../../../tests/glm52/run_cann_model.py) saves logits,
 normalized hidden state, new cache rows and source hashes. Acceptance is
 complete-prefix identity, one-row position advance, exact reset replay,
@@ -121,7 +131,7 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   python -m torch.distributed.run --standalone --nproc-per-node=16 \
   tests/glm52/run_cann_model.py \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
-  --capture-case /workspace/experiments/glm52/prefix-8k-20261017-attempt-05/case-00 \
+  --capture-case /workspace/offline/prefix8k-allocation-20261017/capture/case-00 \
   --steps 2 --capacity 9344 --layer-trace \
   --output /workspace/experiments/glm52/cann-m1-8k-choices-20261017
 ```

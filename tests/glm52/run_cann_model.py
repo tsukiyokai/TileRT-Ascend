@@ -7,6 +7,7 @@ exact reset alone is reported as repeatability, not independent precision.
 """
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import version
@@ -14,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import traceback
+from unittest.mock import patch
 
 from prefix_io import prefix_prompt_identity, prompt_identity
 from run_native_decode import compare_tensor, validate_reference_manifest
@@ -42,6 +44,11 @@ def parse_arguments():
                         help="Matching independent HF trace directory")
     parser.add_argument("--layer-trace", action="store_true",
                         help="Capture 79 hidden states and 78 layer logits")
+    parser.add_argument("--tp-reduction", default="default",
+                        choices=("default", "bfloat16", "float32"),
+                        help="Copy BF16 TP inputs and select sum dtype")
+    parser.add_argument("--trace-mlp-layer", type=int, choices=range(3, 78),
+                        help="Capture one MoE layer's routed/shared stages")
     args = parser.parse_args()
     if args.steps < 1 or args.capacity < 128:
         parser.error("Positive steps and capacity >= 128 are required")
@@ -52,6 +59,8 @@ def parse_arguments():
         parser.error("Cold teacher tokens must fit steps and vocabulary")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("gpu-memory-utilization must be in (0, 1]")
+    if args.trace_mlp_layer is not None and not args.layer_trace:
+        parser.error("trace-mlp-layer requires layer-trace")
     return args
 
 
@@ -144,7 +153,79 @@ def snapshot(engine, result, token, position):
     }
 
 
-def capture_step(engine, token, position, layer_trace):
+def capture_step(engine, token, position, layer_trace, tp_reduction="default",
+                 mlp_layer=None):
+    if tp_reduction == "default":
+        return capture_forward(engine, token, position, layer_trace, mlp_layer)
+
+    import torch
+    from cann_reduction_probe import TpReductionProbe
+
+    captures = 3 if mlp_layer is None else 2 * (mlp_layer + 1) + 1
+    with TpReductionProbe(getattr(torch, tp_reduction),
+                          capture_first=captures) as r:
+        actual = capture_forward(
+            engine, token, position, layer_trace, mlp_layer,
+        )
+    actual["tp_reductions"] = r.metadata()
+    actual["tp_reduction_samples"] = [
+        {name: value.detach().cpu().clone() for name, value in sample.items()}
+        for sample in r.captures
+    ]
+    return actual
+
+
+@contextmanager
+def capture_mlp(engine, layer):
+    stages = {}
+    if layer is None:
+        yield stages
+        return
+
+    def before(module, inputs):
+        stages["input"] = inputs[0].detach().clone()
+
+    def after(module, inputs, output):
+        stages["output"] = output.detach().clone()
+
+    mlp = engine.model.model.layers[layer].mlp
+    runner = mlp.experts
+    scheme = runner.routed_experts.quant_method.quant_method
+    original_apply = scheme.apply
+    original_gmm1 = scheme.apply_gmm1_act_quant
+    original_forward = runner._forward_impl
+
+    def apply(*args, **kwargs):
+        stages["probs_fp32"] = kwargs["topk_weights"].detach().clone()
+        return original_apply(*args, **kwargs)
+
+    def gmm1(value):
+        stages["dispatch_a8"] = value.hidden_states.detach().clone()
+        stages["dispatch_scale"] = value.dynamic_scale.detach().clone()
+        return original_gmm1(value)
+
+    def forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        shared, routed = result
+        stages["combine"] = routed.detach().clone()
+        stages["shared"] = shared.detach().clone()
+        return result
+
+    handles = [mlp.register_forward_pre_hook(before),
+               mlp.register_forward_hook(after)]
+    try:
+        with (
+            patch.object(scheme, "apply", apply),
+            patch.object(scheme, "apply_gmm1_act_quant", gmm1),
+            patch.object(runner, "_forward_impl", forward),
+        ):
+            yield stages
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def capture_forward(engine, token, position, layer_trace, mlp_layer=None):
     if not layer_trace:
         return snapshot(engine, engine.verify((token,)), token, position)
 
@@ -156,7 +237,8 @@ def capture_step(engine, token, position, layer_trace):
     with torch.npu.device(engine.device), torch.inference_mode(), (
         set_current_vllm_config(engine.config)
     ):
-        with CannTrace(engine.model) as trace, CannChoices(engine.model) as c:
+        with (CannTrace(engine.model) as trace, CannChoices(engine.model) as c,
+              capture_mlp(engine, mlp_layer) as mlp):
             result = engine.verify((token,))
             hidden = trace.finish(result)
             indices, routes = c.finish()
@@ -177,6 +259,12 @@ def capture_step(engine, token, position, layer_trace):
                          value[0].detach().cpu().clone() for value in routes),
             choice_source_sha256=c.source_metadata(),
         )
+        if mlp_layer is not None:
+            actual["mlp_layer"] = mlp_layer
+            actual["mlp_stages"] = {
+                name: value.detach().cpu().clone()
+                for name, value in mlp.items()
+            }
     return actual
 
 
@@ -318,18 +406,22 @@ def execute(args):
         args.checkpoint, f"npu:{device}", rank, args.init_method,
         args.capacity, args.gpu_memory_utilization,
     )
+    if args.tp_reduction != "default":
+        engine._restore_tp_sum()
     if prefixes:
         engine.inject(prefixes)
     initial = engine.position
     rank_dir = args.output / f"rank-{rank}"
     rank_dir.mkdir(parents=True, exist_ok=True)
     checks, trace_hashes, consumed, predicted = [], {}, [], []
+    reset_hashes = {}
     token = teacher[0]
     for step in range(args.steps):
         if step < len(teacher):
             token = teacher[step]
         position = engine.position
-        actual = capture_step(engine, token, position, args.layer_trace)
+        actual = capture_step(engine, token, position, args.layer_trace,
+                              args.tp_reduction, args.trace_mlp_layer)
         path = rank_dir / f"step-{position:05d}.pt"
         torch.save(actual, path)
         trace_hashes[path.name] = digest(path)
@@ -356,7 +448,11 @@ def execute(args):
         engine.inject(prefixes)
     for step, token in enumerate(consumed):
         position = engine.position
-        actual = capture_step(engine, token, position, args.layer_trace)
+        actual = capture_step(engine, token, position, args.layer_trace,
+                              args.tp_reduction, args.trace_mlp_layer)
+        reset_path = rank_dir / f"reset-step-{position:05d}.pt"
+        torch.save(actual, reset_path)
+        reset_hashes[reset_path.name] = digest(reset_path)
         expected = torch.load(
             rank_dir / f"step-{position:05d}.pt", map_location="cpu",
             weights_only=True,
@@ -393,6 +489,25 @@ def execute(args):
         "predicted_tokens": predicted, "inputs": inputs,
         "checkpoint_sha256": metadata,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tp_reduction": args.tp_reduction,
+        "model_tp_reduction": engine.tp_reduction,
+        "trace_mlp_layer": args.trace_mlp_layer,
+        "collective_env": {key: os.environ.get(key) for key in (
+            "HCCL_DETERMINISTIC", "HCCL_OP_EXPANSION_MODE", "HCCL_BUFFSIZE",
+        )},
+        "first_dense_projections": {
+            name: {
+                "class": type(module).__name__,
+                "tp_size": module.tp_size,
+                "reduce_results": module.reduce_results,
+                "custom_op": (None if module.custom_op is None
+                              else type(module.custom_op).__name__),
+            }
+            for name, module in (
+                ("o_proj", engine.model.model.layers[0].self_attn.o_proj),
+                ("down_proj", engine.model.model.layers[0].mlp.down_proj),
+            )
+        },
         "packages": {name: version(name) for name in
                      ("torch", "torch-npu", "vllm", "vllm-ascend")},
         "source_sha256": {
@@ -400,8 +515,14 @@ def execute(args):
             **actual.get("choice_source_sha256", {}),
             str(Path(__file__).resolve()): digest(Path(__file__)),
         },
-        "trace_sha256": trace_hashes, "checks": checks,
+        "trace_sha256": trace_hashes, "reset_trace_sha256": reset_hashes,
+        "checks": checks,
     }
+    if args.tp_reduction != "default":
+        import cann_reduction_probe
+
+        path = Path(cann_reduction_probe.__file__).resolve()
+        report["source_sha256"][str(path)] = digest(path)
     if args.layer_trace:
         path = (Path(__file__).resolve().parents[2]
                 / "tilert/models/glm_5_2_ascend/cann_trace.py")
@@ -438,7 +559,7 @@ def execute(args):
             json.dumps(summary, indent=2) + "\n",
         )
         print(json.dumps(summary))
-    engine.worker.shutdown()
+    engine.shutdown()
     return 0 if success else 1
 
 

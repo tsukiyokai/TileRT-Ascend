@@ -90,6 +90,40 @@ class CannModel:
                 raise ValueError("Target must not load a draft model")
             self._bind_cache()
         self._allocate_inputs()
+        self._install_tp_sum()
+
+    def _install_tp_sum(self):
+        from vllm.distributed import get_tp_group
+
+        self._tp_sum_group = get_tp_group()
+        self._tp_sum_original = self._tp_sum_group._all_reduce_out_place
+        self._tp_sum_had_override = (
+            "_all_reduce_out_place" in vars(self._tp_sum_group)
+        )
+        self._tp_sum_group._all_reduce_out_place = self._tp_reduce
+        self.tp_reduction = "float32"
+
+    def _tp_reduce(self, value):
+        import torch
+
+        if value.dtype == torch.bfloat16:
+            return self._tp_sum_original(value.float()).bfloat16()
+        return self._tp_sum_original(value)
+
+    def _restore_tp_sum(self):
+        if self._tp_sum_group is None:
+            return
+        if self._tp_sum_had_override:
+            self._tp_sum_group._all_reduce_out_place = self._tp_sum_original
+        else:
+            del self._tp_sum_group._all_reduce_out_place
+        self._tp_sum_group = None
+        self.tp_reduction = "original"
+
+    def shutdown(self):
+        """Restore the TP group's original reduction and stop the worker."""
+        self._restore_tp_sum()
+        self.worker.shutdown()
 
     def _bind_cache(self):
         import torch

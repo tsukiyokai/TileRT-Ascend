@@ -428,7 +428,7 @@ def execute(args):
         }
         atomic_json(args.output / "summary.json", summary)
         print(json.dumps(summary))
-    target.worker.shutdown()
+    target.shutdown()
     return 0 if success else 1
 
 

@@ -127,7 +127,7 @@ def run(args):
     metadata.update(status="stopped", command_serial=executor.serial,
                     final_position=model.position)
     atomic_json(report, metadata)
-    model.worker.shutdown()
+    model.shutdown()
 
 
 def parse_arguments(argv=None):

@@ -495,7 +495,7 @@ def execute(args):
         atomic_json(args.output / "summary.json", summary)
         print(json.dumps(summary))
     checked("summary", save_summary)
-    engine.worker.shutdown()
+    engine.shutdown()
     return 0 if success else 1
 
 

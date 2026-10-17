@@ -53,6 +53,7 @@ def run(args):
         patch.object(worker_module, "NPUWorker", WorkerDouble),
         patch.object(candidate.CannModel, "_bind_cache") as bind,
         patch.object(candidate.CannModel, "_allocate_inputs") as allocate,
+        patch.object(candidate.CannModel, "_install_tp_sum") as tp_sum,
     ):
         engine = candidate.CannModel(args.checkpoint, "npu:12", rank=7)
 
@@ -77,7 +78,7 @@ def run(args):
          and engine.position == 0},
         {"name": "device_binding_cache_allocation_boundaries",
          "passed": set_device.call_count == bind.call_count
-         == allocate.call_count == 1},
+         == tp_sum.call_count == allocate.call_count == 1},
         {"name": "no_npu_initialization",
          "passed": not torch_npu.npu._initialized},
     ]
@@ -85,7 +86,7 @@ def run(args):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "scope": "Real CannModel constructor and installed EngineArgs config",
         "stubbed": ["NPU set_device", "NPUWorker lifecycle and weights",
-                    "cache binding", "input allocation"],
+                    "cache binding", "input allocation", "TP sum install"],
         "registration_was_needed": registration_was_needed,
         "npu_initialized": bool(torch_npu.npu._initialized),
         "torch": torch.__version__, "torch_npu": torch_npu.__version__,
