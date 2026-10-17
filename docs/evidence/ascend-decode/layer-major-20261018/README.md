@@ -39,6 +39,39 @@ Complete 78-layer/32-step agreement remains a separate end-to-end check;
 the controls above establish the reorder, not full teacher acceptance.
 There is no latency or TPOT measurement in this execution order.
 
+## Complete 78-layer teacher execution
+
+The [full execution audit](full-teacher-audit.json) checks 1,264 artifacts,
+2,464 exact hidden/residual handoffs covering 484,442,112 elements, and
+81,788,928 unique causal index entries. All sixteen final logit tensors
+are bit identical. Peak allocation is 940,374,016 bytes/die. Execution
+takes 1,171.65 seconds in this residency order; it supplies no decode timing.
+
+Every rank matches 31/32 frozen successors. The only mismatch is zero-based
+step 19, position 8211, input 323: prediction 279 versus label 64019.
+Both BF16 logits equal 16.75, with zero top-1 margin.
+
+The [exact production-weight diagnostic](head-production-ties-exact-audit.json)
+first converts checkpoint FP32 head rows to the deployed BF16 dtype, then
+forms exact rational dot products with the frozen BF16 normalized hidden.
+Scores for 279 and 64019 are 16.6934759437 and 16.7554145380: both correctly
+round to 16.75. All three tied-maximum rows, seven candidates in total,
+select the frozen labels at this higher output resolution. This is a
+CPU diagnostic, not a deployed FP32-head result. Earlier raw-FP32-weight
+dot products in the server artifacts are superseded by this dtype-correct
+calculation. Verify existing CANN BF16-input/FP32-output matmul next.
+
+The [reference configuration audit](reference-config-audit.json) binds
+the baseline's original vendor, MTP3/graph4/async settings, and the
+separate MTP1/eager prefill request that supplied this KV. Prompt IDs and
+first token agree; the baseline request's KV was not saved. The prior
+same-configuration native/TileRT/reset paths also choose 279 at position
+8211. These observations distinguish the wrapper comparison, configuration
+changes and prefix provenance; they do not identify a specific cause for
+the original service's nondeterminism. HF remains the independent
+diagnostic. Release acceptance remains eight prompts with 32/32 successors
+each, plus the long trajectory check.
+
 ```bash
 torchrun --standalone --nproc-per-node=16 \
   tests/glm52/run_cann_layer_major.py \

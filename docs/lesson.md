@@ -80,3 +80,15 @@
   resident layer then validates actual M1 numerics under a small memory
   quota while other jobs retain the machine.
   [Reorder and device control](evidence/ascend-decode/layer-major-20261018/README.md)
+- Convert reference weights to the executing dtype before exact arithmetic.
+  This checkpoint stores FP32 LM-head rows, but deployment loads BF16.
+  BF16 output also merges distinct winning scores: 16.69348 and 16.75541
+  both become 16.75. Diagnose output resolution before adjusting global
+  layer-error criteria or introducing token-specific tie rules.
+  [Exact head diagnostic](evidence/ascend-decode/layer-major-20261018/head-production-ties-exact-audit.json)
+- Compare complete collective contracts. TP16 one-shot push includes
+  publication and overwrite protection; its single-kernel p50 is 38.06 µs
+  versus 59.18 µs for the consecutive BF16/FP32/HCCL/BF16 graph control.
+  Keep shared-device screening, idle calibration and decoder timing
+  distinct. Replace synchronization only with an explicit causal argument.
+  [Complete protocol](evidence/ascend-decode/execution-gap-20261018/README.md#complete-one-shot-push)

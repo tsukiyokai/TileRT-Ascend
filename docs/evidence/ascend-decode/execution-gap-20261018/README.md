@@ -138,19 +138,49 @@ formula, not the caller's allocation size: FP32 count 6144 exports 50,308
 bytes. Increasing the count to 131072 under a new tag exports a formula
 extent of 1,049,732 bytes inside a 1,114,112-byte owned allocation.
 All sixteen ranks read both endpoint regions correctly: 4096 independently
-encoded words. This proves those reads; remote writes and epoch reuse have
-not yet run. All groups close and subsequent snapshots preserve the same
+encoded words. All groups close and subsequent snapshots preserve the same
 external PIDs and sixteen healthy dies; the burst timing run has no
 immediate postflight snapshot.
 
-Continue once with complete one-shot push: 768 KiB of sender-indexed
-mailboxes/rank, ordered local FP32 sum, ready/ACK publication and retirement
-before reuse. Measure changing inputs and a dependent graph chain with all
-protocol work included. Shared-device screening needs a same-load HCCL
-control; the 8 µs stopping criterion applies to idle-device calibration.
-Stop standalone replicated-reduction tuning if that p50 exceeds 8 µs.
-Producer fusion needs its own measured overlap
-mechanism; a constant-input read time cannot justify that benefit.
+## Complete one-shot push
+
+The [full-protocol audit](full-protocol-audit.json) checks actual TP16 peer
+writes, sender-indexed mailboxes, READY, ordered local FP32 sum, one BF16
+rounding, ACK and retirement before reuse. Both implementations pass
+changing inputs, delayed consumption, dirty mailboxes and repeat replay;
+each has 1,572,864 raw output elements matching an independent integer
+RNE oracle. Initial epoch 37 reaches 441 after four functional and 400
+zero-chain calls. The single-kernel variant uses the installed public
+`aclrtLaunchKernelWithHostArgs`, batch schedule mode one and sixteen AIV
+blocks; binary load, graph capture, replay and unload complete successfully.
+
+| Shared TP16, ten dependent sums/graph | Rank-MAX p50 (µs/call) | p95 |
+|---|---|---|
+| Full push, separate producer/consumer kernels | 43.618 | 51.955 |
+| Full push, one batch-scheduled kernel | 38.059 | 47.747 |
+| HCCL, BF16→FP32→SUM→BF16 | 59.183 | 74.837 |
+| Bare FP32 HCCL, 96 KiB | 56.826 | 64.903 |
+| Native BF16 HCCL, 48 KiB | 48.429 | 59.512 |
+
+Thirty batches supply 480 rank timings per case. Push includes payload,
+flags, arithmetic and reuse; the matched HCCL contract includes both dtype
+conversions. Timing uses an in-place zero dependency chain without rescale;
+functional checks use nonzero changing inputs. Runs are consecutive under
+the same sixteen external PIDs, with healthy postflight on all dies.
+These are shared-device batch averages, not 156-call-chain or decoder
+measurements. The earlier 14.334 µs read-only number is not the complete
+protocol's latency.
+
+The complete primitive is faster than this matched HCCL screen, but still
+far above the 8 µs idle budget. Retain only a new mechanism that removes
+protocol work or fuses the producer. For strictly ordered per-tile P→C
+epochs, double payload/READY slots can replace ACK: every `P_i(e+2)`
+follows `C_i(e+1)`, which waits for all `P_j(e+1)`, each following
+`C_j(e)`. Thus every consumer has retired slot `e mod 2` before its reuse.
+Errors must stop later publication, and epoch counters must not wrap.
+This supports a bounded mechanism experiment, not a latency prediction.
+The 8 µs stopping criterion remains an idle-device calibration; model
+acceptance additionally needs measured fusion/overlap and lower read cost.
 
 ## Raw artifacts
 
@@ -166,4 +196,4 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
 - `shmem-oneshot-20261017-01/`: both source variants, binaries, per-rank
   logs, CSV samples and ELF audit. The failed prototype stays here.
 - `hccl-peer-probe-20261018-01/`: installed-header query shim, sources,
-  bounded runs and host phase markers.
+  bounded runs, complete push variants, matched HCCL samples and audits.
