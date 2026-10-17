@@ -268,8 +268,11 @@ The original local projection's separate hot graph measures p50/p95
 excludes dynamic quantization and TP reduction; the roughly 6 MB weights
 remain hot. Next compare complete O plus sum: original O with HCCL,
 original O with the complete peer protocol, and O with fused publication
-plus its consumer. Preserve the BF16 production point and require net
-latency improvement before integrating it into decode.
+plus its consumer. The strongest existing O plus single-kernel push and
+fused publication plus consumer each use two kernels. Fusion therefore
+needs a gain from local traffic or overlap; a three-kernel unfused
+diagnostic is insufficient as its performance baseline. Preserve the BF16
+production point and require net latency improvement before integration.
 
 ## Raw artifacts
 

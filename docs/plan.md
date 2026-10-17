@@ -43,7 +43,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [单层短 trace](evidence/ascend-decode/execution-gap-20261018/resident-profile-audit.json)已采 eager／compiled 各三轮、rank 0／14。图含 embedding，因此实际有三次归约。eager 第 1 轮 rank 0 的 4.445 ms 中，计算任务并集 0.377 ms，O 归约 Wait 3.657 ms、Transit 7.62 µs；compiled 同轮又出现 1.50／2.55 ms 的 Prolog 长尾与较短 O 等待。三个 replay 均在首轮设备完成前提交；现有证据不能把共享 4 ms 归为 Python 下发或纯算力成本。[实际 O 生产端](evidence/ascend-decode/execution-gap-20261018/README.md#actual-o-producer)已绑定 key24／CV 1:1：24 核各产出完整 BF16 `[4,256]`，只有一个 N 波次。独立整数参考核对全部 16 份 partial；原实现的隔离重编译在单 die 两次逐位复现。下一步测原 O＋HCCL、原 O＋完整 peer 协议、融合发布 O＋consumer 三者，按完整投影归约净收益取舍。三组并行发送的配对中位收益为 −0.196 µs，14/30 胜，停止该分支。
 
-[逐层驻留的 teacher 验证](evidence/ascend-decode/layer-major-20261018/README.md)保持 M1 与 hidden／residual 分离，逐 token 恢复共享索引。完整 78 层×32 步已执行，16 rank 的 logits 逐位一致，峰值约 897 MiB/die；BF16 head 为 31/32，位置 8211 的 279／64019 同为 16.75。生产 BF16 权重的精确分数为 16.69348／16.75541。现有 CANN BF16 输入／FP32 输出 head 按真实 `[9680,6144]` 分片重建后，M1／M4 均为 32/32；官方 TP16 M1／M4 processor／gather／裁剪也与同形状参考逐位一致，权重保持 BF16。`--fp32-head` 已接入主干及独立 MTP head，默认 BF16；head Graph 及完整 MTP 轨迹继续验证，不改第 4 节门槛。teacher 与 KV 来自不同配置、不同请求；驻留顺序不量 TPOT。
+[逐层驻留的 teacher 验证](evidence/ascend-decode/layer-major-20261018/README.md)保持 M1 与 hidden／residual 分离，逐 token 恢复共享索引。完整 78 层×32 步已执行，16 rank 的 logits 逐位一致，峰值约 897 MiB/die；BF16 head 为 31/32，位置 8211 的 279／64019 同为 16.75。生产 BF16 权重的精确分数为 16.69348／16.75541。现有 CANN BF16 输入／FP32 输出 head 按真实 `[9680,6144]` 分片重建后，M1／M4 均为 32/32；官方 TP16 M1／M4 processor／gather／裁剪也与同形状参考逐位一致，权重保持 BF16。`--fp32-head` 已接入主干及独立 MTP head，默认 BF16；本地 head Graph 的 640 次变输入重放与 eager 的 9,912,320 个 FP32 logits 逐位一致。继续验证 TP16 gathered-head Graph、独立 MTP head 和完整轨迹，不改第 4 节门槛。teacher 与 KV 来自不同配置、不同请求；驻留顺序不量 TPOT。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|

@@ -77,9 +77,15 @@ precision/timing runners, retaining BF16 weights and the original gather
 and vocabulary crop. The default remains BF16. The [actual TP16 M1/M4
 processor, gather and crop](head-tp-audit.json) match the same-shape frozen
 FP32 reference on all ranks, including all 32 teacher successors. Each width
-checks 79,298,560 logits against the reference and between ranks. Head
-Graph, the MTP own-head execution and live PD remain separate checks. No
-TPOT is measured by these head-only executions.
+checks 79,298,560 logits against the reference and between ranks.
+
+The [local head Graph audit](head-graph-audit.json) replays all sixteen
+shards sequentially on one die at M1/M4. Thirty-two graphs consume the
+32 changing normalized hidden rows through 640 replays. All 9,912,320
+FP32 logits match their eager artifacts bit for bit; both widths preserve
+32/32 successors. Peak allocation is 141,264,896 bytes. TP16 gathered-head
+Graph, the independent MTP head and the complete new-head trajectory remain
+separate checks. These head-only executions supply no TPOT measurement.
 
 The [reference configuration audit](reference-config-audit.json) binds
 the baseline's original vendor, MTP3/graph4/async settings, and the
