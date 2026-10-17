@@ -82,5 +82,8 @@ The frozen case is at
 `/workspace/offline/prefix8k-allocation-20261017/capture/case-00`;
 the producer and receiver have exited. The capture receiver loads no decode
 weights and executes zero decode steps. Separate numerical and internal
-timing runs consume these files. Live handoff followed immediately by
-online TileRT decode and HTTP delivery remains unverified.
+timing runs consume these files. A subsequent
+[live PD check](../pd-live-20261017/README.md) completes a fresh 8K prefill,
+sixteen HIXL WRITEs, seven CANN decode steps and an eight-token HTTP
+response. It keeps device KV alive while releasing P and loading D;
+the original capture remains the input to separate numerical runs.

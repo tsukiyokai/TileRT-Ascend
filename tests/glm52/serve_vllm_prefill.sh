@@ -55,7 +55,7 @@ export OMP_NUM_THREADS=1
 export TASK_QUEUE_ENABLE=1
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
-export ASCEND_CUSTOM_OPP_PATH=/workspace/src/vllm-ascend-unified/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+export ASCEND_CUSTOM_OPP_PATH=/workspace/offline/cann-workspace-owner-20261017/kernel-overlay/vendors/custom_transformer:/workspace/src/vllm-ascend-unified/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
 
 command=(
     vllm serve /workspace/models/GLM-5.2-w4a8c8
@@ -65,7 +65,7 @@ command=(
     --attention-config '{"indexer_kv_dtype":"int8"}'
     --kv-cache-dtype auto --block-size 128
     --max-num-seqs 1 --max-num-batched-tokens 8192 --max-model-len 9344
-    --gpu-memory-utilization 0.85 --kv-cache-memory-bytes 2147483648
+    --gpu-memory-utilization 0.4 --kv-cache-memory-bytes 1073741824
     --no-enable-prefix-caching --enable-chunked-prefill
     --enforce-eager --no-async-scheduling --return-tokens-as-token-ids
     --additional-config '{"enable_flashcomm1":false,"enable_dsa_cp":false,"enable_shared_expert_dp":false,"enable_fused_mc2":0}'

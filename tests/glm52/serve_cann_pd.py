@@ -7,10 +7,60 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+
+class DeferredModel:
+    """Keep the live prefix on device until the model-loading gate exists."""
+
+    def __init__(self, args, device, rank):
+        self.args = args
+        self.device = device
+        self.rank = rank
+        self.capacity = args.capacity
+        self.model = None
+        self.on_load = None
+
+    @property
+    def position(self):
+        return 0 if self.model is None else self.model.position
+
+    def inject(self, prefix):
+        if self.model is None:
+            from tilert.models.glm_5_2_ascend.cann_model import CannModel
+
+            while not self.args.load_model_after.exists():
+                time.sleep(0.1)
+            self.model = CannModel(
+                self.args.checkpoint, self.device, self.rank,
+                capacity=self.capacity,
+                gpu_memory_utilization=self.args.gpu_memory_utilization,
+            )
+            if self.on_load is not None:
+                self.on_load(self.model)
+        return self.model.inject(prefix)
+
+    def step(self, token):
+        return self.model.step(token)
+
+    def reset(self):
+        if self.model is not None:
+            self.model.reset()
+
+    def source_metadata(self):
+        return {} if self.model is None else self.model.source_metadata()
+
+    def shutdown(self):
+        if self.model is not None:
+            self.model.shutdown()
+        else:
+            import torch.distributed as distributed
+
+            distributed.destroy_process_group()
 
 
 def run(args):
@@ -44,10 +94,17 @@ def run(args):
         raise ValueError("CANN PD serving requires one local TP16 group")
     device = torch.device(f"npu:{receive_device_id(local_rank)}")
     torch.set_num_threads(1)
-    model = CannModel(
-        args.checkpoint, device, rank, capacity=args.capacity,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-    )
+    if args.load_model_after is not None:
+        torch.npu.set_device(device)
+        distributed.init_process_group("hccl")
+        if distributed.get_world_size() != 16:
+            raise ValueError("Deferred CANN serving requires TP16")
+        model = DeferredModel(args, device, rank)
+    else:
+        model = CannModel(
+            args.checkpoint, device, rank, capacity=args.capacity,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
     rank_engine = model
     draft = None
     if args.mtp_width != 1:
@@ -89,9 +146,17 @@ def run(args):
         "world_size": distributed.get_world_size(),
         "capacity": model.capacity,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "load_model_after": (str(args.load_model_after)
+                             if args.load_model_after is not None else None),
         "command": [sys.executable, *sys.argv], "status": "initialized",
     }
     report = args.output / f"rank-{rank}.json"
+    if isinstance(model, DeferredModel):
+        def record_model_sources(loaded):
+            metadata["source_sha256"].update(loaded.source_metadata())
+            atomic_json(report, metadata)
+
+        model.on_load = record_model_sources
     atomic_json(report, metadata)
     if rank == 0:
         config = json.loads((args.checkpoint / "config.json").read_text())
@@ -143,8 +208,13 @@ def parse_arguments(argv=None):
     parser.add_argument("--ctrl-port", type=int, default=5556)
     parser.add_argument("--http-port", type=int, default=18080)
     parser.add_argument("--timing-dir", type=Path)
+    parser.add_argument("--load-model-after", type=Path,
+                        help="Load M1 weights after this gate file exists")
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.load_model_after is not None and args.mtp_width != 1:
+        parser.error("--load-model-after requires --mtp-width 1")
+    return args
 
 
 def main():

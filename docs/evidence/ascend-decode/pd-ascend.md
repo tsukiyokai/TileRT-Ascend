@@ -3,9 +3,11 @@
 This path connects a TP16 vLLM-Ascend producer to rank-local CANN decode
 engines through HIXL. It serves one fresh greedy request at a time, with the
 whole prompt scheduled in one step.
-The current [CANN model entry](../../../tests/glm52/serve_cann_pd.py) uses
-serial M=1 with full-P injection. The existing Native engine provides the
-MTP width 2/4 request loop; its numerical acceptance remains in progress.
+The [CANN model entry](../../../tests/glm52/serve_cann_pd.py) supports
+serial M=1 and MTP width 2/4 with full-P injection. A
+[live M1 check](pd-live-20261017/README.md) completes an 8K prompt and eight
+HTTP output tokens. M4 target graph and eager draft have separate
+[offline device comparisons](cann-graph-20261017/README.md).
 
 ## Ownership and completion
 
@@ -34,8 +36,8 @@ MTP width 2/4 request loop; its numerical acceptance remains in progress.
   final prompt token, then checks its prediction against prefill.
 - [Optional layout v3](mtp-parent-handoff.md) adds the unrotated target
   final-norm hidden[P-1], BF16 `[1,6144]`, to the same completed WRITE.
-  The capture bundle retains it for one-row MTP seeding. Live CANN MTP
-  execution still needs this bundle connected to the draft model.
+  CANN MTP consumes it for one-row seeding. Online MTP continuation still
+  needs its own live check.
 - Cancellation retains admitted writers until their WRITE completions.
   A disconnect without completion quarantines the slot. Stop both sides
   before replacing registered allocations or restarting an endpoint.
@@ -97,6 +99,7 @@ source /workspace/environment/activate.sh
 cd /workspace/src/TileRT-Ascend
 PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   PYTORCH_NPU_ALLOC_CONF=expandable_segments:False \
+  HCCL_OP_EXPANSION_MODE=AI_CPU HCCL_BUFFSIZE=200 \
   ACL_OP_INIT_MODE=1 OMP_NUM_THREADS=1 HCCL_NPU_SOCKET_PORT_RANGE=auto \
   /opt/trt-asc/venv/bin/python -m torch.distributed.run \
   --standalone --nproc-per-node=16 tests/glm52/serve_cann_pd.py \
@@ -110,8 +113,13 @@ PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
 
 This entry loads the pinned vLLM-Ascend model and CANN weights, registers
 one HIXL endpoint per rank at ports 26100–26115, and gathers their
-descriptors before starting HTTP. The two resident models' actual combined
-HBM use must be measured during startup. The
+descriptors before starting HTTP. For single-machine sequential execution,
+add `--load-model-after PATH` with an absent file. This M1 mode registers
+the receive allocation first and loads weights inside the pending inject
+after the file exists. Complete all sixteen WRITEs, stop P and verify its
+exit, then create the file; received KV stays on device. The measured
+co-resident startup fails during P warmup, so the
+[live check](pd-live-20261017/README.md) uses this sequence. The
 [Native launcher](../../../tilert/pd_vllm/ascend_server.py) retains
 `--mtp-width 2/4`, `--timing-dir` and `--expert-bank` for its separate
 numerical and performance experiments.
