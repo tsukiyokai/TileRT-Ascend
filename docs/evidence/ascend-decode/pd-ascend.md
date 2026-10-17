@@ -96,6 +96,7 @@ host is free:
 source /workspace/environment/activate.sh
 cd /workspace/src/TileRT-Ascend
 PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+  PYTORCH_NPU_ALLOC_CONF=expandable_segments:False \
   ACL_OP_INIT_MODE=1 OMP_NUM_THREADS=1 HCCL_NPU_SOCKET_PORT_RANGE=auto \
   /opt/trt-asc/venv/bin/python -m torch.distributed.run \
   --standalone --nproc-per-node=16 tests/glm52/serve_cann_pd.py \
@@ -132,6 +133,12 @@ Build the current HIXL bridge and set `TRT_HIXL_LIBRARY` to its output;
 pass the same library to the receiver's `--hixl-library`. The
 [co-resident transport check](pd-hixl-20261017/hixl-listen-port-20261017.json)
 verifies the listener isolation required by shifted P/D placement.
+Use `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` on both sides.
+The transport resolves each Torch storage to its allocator block for IPC
+registration and retains the original logical ranges for metadata and
+WRITE validation. Bound tensors stay alive until transport close. The
+[suballocation check](pd-hixl-20261017/hixl-allocation-20261017.json)
+verifies block registration, deduplication and logical bounds.
 The [launcher argument checks](pd-hixl-20261017/prefill-launcher.json)
 exercise both destinations and a changed host without starting vLLM.
 The [prefix capture receiver](measurement.md#capture-original-vllm-prefixes)

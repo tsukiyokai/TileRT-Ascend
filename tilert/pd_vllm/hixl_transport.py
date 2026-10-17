@@ -1,4 +1,4 @@
-"""Device-memory HIXL transport with synchronous writes on one NPU rank."""
+"""HIXL writes from Torch-NPU allocations on one rank."""
 
 import ctypes
 import ipaddress
@@ -15,6 +15,7 @@ class HixlTransport(Transport):
     TILERT_HIXL_PORT must identify this rank's unique listening endpoint.
     Import and init do not load HIXL; the first register binds its device.
     The caller owns ACL initialization and the lifetime of registered memory.
+    Use non-expandable Torch-NPU allocations; IPC registers their full blocks.
     """
 
     name = "hixl"
@@ -33,6 +34,7 @@ class HixlTransport(Transport):
         self._library = None
         self._handle = ctypes.c_void_p()
         self._regions = []
+        self._allocations = []
         self._sealed = False
         self._lock = threading.RLock()
 
@@ -95,10 +97,41 @@ class HixlTransport(Transport):
                 raise RuntimeError(
                     "Register all regions before publishing metadata"
                 )
+            for current in self._regions:
+                if (current != region
+                        and ptr < current["base"] + current["bytes"]
+                        and current["base"] < ptr + nbytes):
+                    raise ValueError("Overlapping HIXL memory regions")
             self._open(dev_id)
-            self._call("register", self._handle, ptr, nbytes)
+            allocation = self._allocation(ptr, nbytes)
+            if allocation is None:
+                import torch
+
+                self._allocations = [
+                    (item["address"], item["total_size"],
+                     item["is_expandable"])
+                    for item in torch.npu.memory_snapshot()
+                    if item["device"] == dev_id
+                ]
+                allocation = self._allocation(ptr, nbytes)
+            if allocation is None:
+                raise ValueError(
+                    "HIXL memory is outside Torch-NPU allocations"
+                )
+            base, size, expandable = allocation
+            if expandable:
+                raise ValueError(
+                    "HIXL requires PYTORCH_NPU_ALLOC_CONF="
+                    "expandable_segments:False"
+                )
+            self._call("register", self._handle, base, size)
             if region not in self._regions:
                 self._regions.append(region)
+
+    def _allocation(self, address, length):
+        return next((item for item in self._allocations
+                     if item[0] <= address
+                     and address + length <= item[0] + item[1]), None)
 
     def local_meta(self) -> dict:
         with self._lock:
@@ -125,6 +158,12 @@ class HixlTransport(Transport):
         for source, destination, length in zip(srcs, dsts, lens):
             self._validate_interval(source, length)
             self._validate_interval(destination, length)
+            if not any(
+                region["base"] <= source
+                and source + length <= region["base"] + region["bytes"]
+                for region in self._regions
+            ):
+                raise ValueError("Source exceeds registered local memory")
             if not any(
                 int(region["base"]) <= destination
                 and destination + length <= (

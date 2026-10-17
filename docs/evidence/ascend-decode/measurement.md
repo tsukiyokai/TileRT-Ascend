@@ -18,6 +18,7 @@ without loading decode weights:
 source /workspace/environment/activate.sh
 cd /workspace/src/TileRT-Ascend
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 ACL_OP_INIT_MODE=1 OMP_NUM_THREADS=1 \
+  PYTORCH_NPU_ALLOC_CONF=expandable_segments:False \
   python -m torch.distributed.run --standalone --nproc-per-node=16 \
   tests/glm52/capture_pd_prefix.py \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \

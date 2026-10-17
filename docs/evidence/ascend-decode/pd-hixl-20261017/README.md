@@ -52,3 +52,15 @@ alive. All four processes exit. The rebuilt bridge is byte-identical to the
 tested library, SHA256
 `9d1421f2033d1ee0e9d11325e7d5bdd34aa5bbc78d50c42a80079af305c3ea5d`.
 This check covers co-resident transport; the TP16 8K capture is separate.
+
+The subsequent TP16 attempt initializes its communicators, then fails
+exporting a non-page-aligned Torch storage through IPC. The
+[allocation checks](hixl-allocation-20261017.json) reproduce this with a
+7,897,088-byte suballocation under both allocator modes. Registering its
+actual 20 MiB allocator block succeeds. The production transport now
+resolves non-expandable blocks through `torch.npu.memory_snapshot()`;
+the driver returns 207000 for `aclrtMemGetAddressRange`.
+Four device checks pass: exact payload, logical metadata, one physical
+registration/unregistration for two logical regions, and rejection of an
+unregistered source before native WRITE. Set
+`PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` before Torch initialization.
