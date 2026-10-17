@@ -7,11 +7,12 @@ uses HF's unabsorbed 192-channel space; CANN absorbs it into 512 channels.
 
 import torch
 
-from .reference_weights import quantize_a8
+from .reference_weights import quantize_dynamic_a8
 
 
 CONTRACT = {
     "implementation": "CPU W8 MLA Prolog V3; unabsorbed HF query",
+    "input_quant": "BF16 DynamicQuant with calibrated A3 FP32 vdiv",
     "projection": "INT32 dot; FP32 token scale then channel scale",
     "rms": "FP32 64-lane fold; Div by sqrt(mean+1e-5); FP32 gamma",
     "query_quant": "FP32 Div(amax,127) and Div(127,amax); RINT to INT8",
@@ -116,7 +117,7 @@ def preprocess(weights, prefix, hidden, cos, sin):
     if (hidden.device.type != "cpu" or hidden.dtype != torch.bfloat16
             or hidden.ndim != 2 or hidden.shape[1] != HIDDEN):
         raise ValueError("Prolog input must be CPU BF16 [tokens,6144]")
-    codes, scale = quantize_a8(hidden)
+    codes, scale = quantize_dynamic_a8(hidden)
     query = project_codes(weights, prefix + ".q_a_proj", codes, scale,
                           scale_order="token_first")
     kv = project_codes(weights, prefix + ".kv_a_proj_with_mqa", codes,

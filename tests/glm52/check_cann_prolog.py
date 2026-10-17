@@ -173,7 +173,7 @@ def rms_fp32(value, gamma):
 
 
 def quantize_input(value):
-    """Ordinary DynamicQuant: scale Muls(amax,1/127), factor Div(127,amax)."""
+    """IEEE FP32 input-quantization formula for the counterfactual."""
     import torch
 
     maximum = value.float().abs().amax(dim=-1, keepdim=True)

@@ -17,7 +17,7 @@ import torch  # noqa: E402
 
 from tilert.models.glm_5_2_ascend import reference_prolog as prolog  # noqa
 from tilert.models.glm_5_2_ascend.reference_weights import (  # noqa: E402
-    ReferenceWeights, quantize_a8,
+    ReferenceWeights, quantize_dynamic_a8,
 )
 
 
@@ -197,7 +197,7 @@ def main():
                     prolog_input_norm(norm, saved["hidden"]),
                     actual["input_norm"])
         hidden = actual["input_norm"]
-        codes, scale = quantize_a8(hidden)
+        codes, scale = quantize_dynamic_a8(hidden)
         check_equal(checks, "input.codes", codes, actual["input_codes"])
         check_equal(checks, "input.scale", scale, actual["input_scale"])
         cos, sin = observation_angles(saved)

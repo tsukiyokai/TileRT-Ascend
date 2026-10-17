@@ -30,7 +30,7 @@ from tilert.models.glm_5_2_ascend.reference_prolog import (  # noqa: E402
     project_codes,
 )
 from tilert.models.glm_5_2_ascend.reference_weights import (  # noqa: E402
-    ReferenceWeights, quantize_a8,
+    ReferenceWeights, quantize_dynamic_a8,
 )
 
 
@@ -124,7 +124,7 @@ def prepare(args):
            .bfloat16()}
     norm = SimpleNamespace(weight=raw["input_gamma"], variance_epsilon=1e-5)
     normalized = prolog_input_norm(norm, hidden)
-    codes, scale = quantize_a8(normalized)
+    codes, scale = quantize_dynamic_a8(normalized)
     prolog = prolog_reference(codes, scale, raw, cosine, sine)
     query = project_codes(
         weights, INDEXER + ".wq_b", prolog["query_norm"],

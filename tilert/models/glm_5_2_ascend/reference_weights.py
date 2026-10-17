@@ -19,6 +19,9 @@ import torch.nn.functional as functional
 
 
 TP_SIZE = 16
+DYNAMIC_DIV_BIASED_MANTISSAS = (
+    3, 7, 10, 12, 19, 22, 23, 28, 29, 35, 43, 48, 55, 73, 113,
+)
 STORAGE_DTYPES = {
     "BF16": (torch.bfloat16, 2),
     "F16": (torch.float16, 2),
@@ -30,7 +33,7 @@ STORAGE_DTYPES = {
 
 
 def quantize_a8(x):
-    """Return CANN INT8 codes with Div(127,amax) and FP32 row scales.
+    """Retain the CPU Div(127,amax) formula for the C8 reference.
 
     Rounding is nearest-even. Zero rows produce zero codes and zero scales.
     The 128-channel C8 NPU quantization order is not yet calibrated; this
@@ -45,6 +48,33 @@ def quantize_a8(x):
     # Tensor division avoids Torch scalar rdiv's reciprocal/multiply lowering.
     factor = torch.div(torch.full_like(denominator, 127), denominator)
     codes = torch.round(torch.mul(values, factor.unsqueeze(-1)))
+    return codes.clamp(-127, 127).to(torch.int8), scale
+
+
+def quantize_dynamic_a8(x):
+    """Quantize BF16 rows with the calibrated A3 FP32 Div factor.
+
+    Positive amax has exponent [-120,127]; zero rows remain zero. Scale
+    uses FP32 Muls(amax,1/127). Codes use the corrected factor, FP32 Mul
+    and nearest-even RINT.
+    """
+    if x.device.type != "cpu" or x.dtype != torch.bfloat16:
+        raise ValueError("Dynamic A8 reference requires CPU BF16 input")
+    values = x.float()
+    maximum = values.abs().amax(dim=-1)
+    below_domain = (maximum > 0) & (maximum < 2.0**-120)
+    if not bool(torch.isfinite(maximum).all()) or bool(below_domain.any()):
+        raise ValueError("Dynamic A8 amax must be zero or finite and >=2^-120")
+    scale = maximum * (1 / 127)
+    denominator = torch.where(maximum > 0, maximum, 1.0)
+    factor = torch.div(torch.full_like(maximum, 127), denominator)
+    mantissa = (maximum.contiguous().view(torch.int32) >> 16) & 127
+    corrected = torch.isin(mantissa, torch.tensor(
+        DYNAMIC_DIV_BIASED_MANTISSAS, dtype=torch.int32,
+    ))
+    factor_bits = factor.contiguous().view(torch.int32) - corrected.int()
+    factor = factor_bits.view(torch.float32)
+    codes = torch.round(values * factor.unsqueeze(-1))
     return codes.clamp(-127, 127).to(torch.int8), scale
 
 
@@ -137,7 +167,8 @@ class ReferenceWeights:
         self.contract = {
             "tp_size": TP_SIZE,
             "activation_quantization": (
-                "RINT(x * FP32 Div(127,amax)); scale=amax*FP32(1/127)"),
+                "BF16: calibrated A3 Div(127,amax), FP32 Mul, RINT; "
+                "scale=amax*FP32(1/127)"),
             "a8_source_sha256": (
                 "fd0fb30d924b48ed4455cb505d2d530e822fa48d78b526db663d0bee69ffaefc"
             ),
@@ -349,7 +380,7 @@ class ReferenceWeights:
         ``ranks`` selects the returned partials in logical TP order.
         """
         self._check_input(x)
-        codes, input_scale = quantize_a8(x)
+        codes, input_scale = quantize_dynamic_a8(x)
         gate = self._integer_weight(prefix + ".gate_proj")
         up = self._integer_weight(prefix + ".up_proj")
         down = self._integer_weight(prefix + ".down_proj")
@@ -401,7 +432,7 @@ class ReferenceWeights:
             else:
                 if weight.shape[1] != x.shape[-1]:
                     raise ValueError("Input width differs from checkpoint")
-                codes, scale = quantize_a8(local)
+                codes, scale = quantize_dynamic_a8(local)
                 output = self._integer_product(
                     weight, codes, scale, (0, weight.shape[0]), columns
                 )
@@ -437,7 +468,7 @@ class ReferenceWeights:
         if not floating:
             if x.shape[-1] != weight.shape[1]:
                 raise ValueError("Input width differs from checkpoint")
-            codes, scale = quantize_a8(x)
+            codes, scale = quantize_dynamic_a8(x)
         outputs = []
         for rank in range(shards):
             rows = rank * width, (rank + 1) * width

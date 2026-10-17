@@ -17,6 +17,11 @@ required in the CPU formula: Torch scalar `127 / maximum` may lower to a
 reciprocal followed by multiplication. `reciprocal(scale)` introduces a
 different rounding boundary.
 
+For ordinary BF16 DynamicQuant, the [A3 Div calibration](dynamic-quant-div.md)
+adds the measured native-factor correction to this CPU formula. It covers
+all 128 mantissas over exponents −120 through 127 and closes the first 8K
+indexer difference. The C8 CPU formula remains separate.
+
 The [real layer-1 counterexample](a8-operation-order-20261016.json) has
 `maximum=0.0032196044921875` and `x=±0.00160980224609375`. CANN returns
 `±64`; the old reciprocal-scale expression produces `±63.4999961853` and

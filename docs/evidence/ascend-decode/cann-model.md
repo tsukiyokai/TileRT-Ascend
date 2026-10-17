@@ -149,8 +149,12 @@ the first HF choice difference on one die. Fixed HF q/k/weights give exact
 2,048-choice parity through the same CANN selector. The actual path first
 differs at input DynamicQuant: ten half-amax values round to magnitude 63
 instead of 64. With those actual A8 inputs, CPU Prolog reproduces all query
-codes and its scale differs by one FP32 ULP. This is the next numerical
-boundary to resolve before the complete continuation.
+codes and its scale differs by one FP32 ULP. The
+[native Div calibration](dynamic-quant-div.md) closes this local boundary:
+the updated CPU reference reproduces all 6,144 input codes, 2,048 query
+codes, final BF16 query and the complete 2,048-choice set. Complete TP16
+continuation with the barrier overlay and updated HF reference remains
+the full-model acceptance.
 
 ## Device acceptance
 

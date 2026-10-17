@@ -29,16 +29,21 @@ With HF inputs the cutoff score is 19.32767; the scores of 3782 and 5950
 are 19.59767 and 19.18323. With actual CANN query values their scores become
 19.40633 and 19.76605, reversing selection with a 0.35973 gap.
 
-The next precision check is the DynamicQuant FP32 divide/multiply/RINT
-boundary on these actual values, followed by the same indexer replay and
-complete TP16 continuation. Full-model HF parity and profiling remain
-after that acceptance.
+The [native Div calibration](dynamic-quant-div.md) resolves this local
+difference: 31,744 BF16 maxima establish an exponent-independent factor
+correction. The updated CPU reference reproduces all input/query codes,
+the BF16 query and all 2,048 selected indices. Complete TP16 continuation
+with the SwiGLU barrier and updated HF reference is the next acceptance.
+Full-model parity still precedes profiling.
+
+The historical replay below uses the original source snapshot with the
+IEEE CPU formula, preserving the reported 2,047-choice comparison.
 
 ```bash
 source /workspace/environment/activate.sh
-cd /workspace/src/TileRT-Ascend
-PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-  python tests/glm52/replay_cann_indexer.py \
+cd /workspace/offline/cann-routed-stage-20261017/source
+PYTHONPATH="$PWD:$PWD/tests/glm52:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+  python /workspace/offline/cann-indexer-20261017/replay_cann_indexer.py \
     --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
     --trace /workspace/offline/cann-routed-stage-20261017/continuation8k/rank-0/step-08192.pt \
     --reference /workspace/offline/cann-layer4-default-20261017/hf-8k/step-08192.pt \
