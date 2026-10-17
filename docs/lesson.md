@@ -94,7 +94,8 @@
   Keep shared-device screening, idle calibration and decoder timing
   distinct. Double payload/READY slots remove ACK with an explicit causal
   retirement proof and pass at 35.72 µs. This still exceeds the 8 µs budget;
-  stop standalone flag tuning and move to producer fusion.
+  stop standalone flag tuning. A producer-fusion comparison must retain
+  the installed unfused operator as its baseline.
   [Complete protocol](evidence/ascend-decode/execution-gap-20261018/README.md#complete-one-shot-push)
 - More send workers do not establish lower collective latency. Three
   disjoint peer groups preserve the full protocol but win only 14/30
@@ -118,3 +119,9 @@
   were already submitted before the first completed. The 4 ms graph span
   is not evidence of Python submission cost or an intrinsic compute floor.
   [Resident-layer profile](evidence/ascend-decode/execution-gap-20261018/resident-profile-audit.json)
+- A numerically exact rebuild is not a performance-equivalent baseline.
+  O publication fusion wins 9.025 µs against rebuilt O plus push, but its
+  paired gain is −0.328 µs against the installed O plus push. The same-run
+  rebuild costs 10.609 µs more. Retain installed controls before attributing
+  a fusion gain; stop this branch without identifying a speculative cause.
+  [Installed control](evidence/ascend-decode/execution-gap-20261018/README.md#o-publication-and-complete-reduction)

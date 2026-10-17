@@ -133,8 +133,9 @@ and model bandwidth remain unmeasured; the trajectory grows toward 9K.
 
 ## Communication decision
 
-Continue with device peer reads, ordered reduction and producer/consumer
-fusion. The [open A3 deterministic executor](https://gitcode.com/cann/hcomm/blob/2b4f2a4ed628cbeb48d76eead015ef220ea5400b/src/legacy/ascend910/algorithm/base/alg_aiv_template/all_reduce/aiv_all_reduce_91093_deter.h)
+Keep the verified complete peer protocol for idle and model comparisons;
+the publication-fusion screen below supplies no net gain. The
+[open A3 deterministic executor](https://gitcode.com/cann/hcomm/blob/2b4f2a4ed628cbeb48d76eead015ef220ea5400b/src/legacy/ascend910/algorithm/base/alg_aiv_template/all_reduce/aiv_all_reduce_91093_deter.h)
 already performs peer pull and reduction within one AIV kernel. This is
 the source model; the installed trace proves AIV execution, without binding
 it to that exact algorithm. Full
@@ -266,13 +267,46 @@ source/artifact bindings. No global operator installation changes.
 The original local projection's separate hot graph measures p50/p95
 19.229/108.962 µs over 30 samples of ten calls, under external load. This
 excludes dynamic quantization and TP reduction; the roughly 6 MB weights
-remain hot. Next compare complete O plus sum: original O with HCCL,
-original O with the complete peer protocol, and O with fused publication
-plus its consumer. The strongest existing O plus single-kernel push and
-fused publication plus consumer each use two kernels. Fusion therefore
-needs a gain from local traffic or overlap; a three-kernel unfused
-diagnostic is insufficient as its performance baseline. Preserve the BF16
-production point and require net latency improvement before integration.
+remain hot. These single-die values are not the TP16 pipeline timings below.
+
+## O publication and complete reduction
+
+The [complete-pipeline audit](o-publication-audit.json) preserves the CANN
+BF16 production point, original output writeback and existing TPipe. Each
+of 24 producer tiles publishes payload/READY; a separate AIV consumer waits
+for all ranks and sums in ascending rank order in FP32, rounding once to
+BF16. Push writes every peer's mailbox; pull publishes locally and lets
+consumers read remote payloads. Both use double slots with causal retirement.
+The strongest unfused path uses the installed CANN projection followed by
+the existing 16-tile single-kernel push. It and fused publication plus
+consumer each use two kernels; fusion saves no launch here.
+
+Changing-input, delayed-consumer and dirty-buffer checks pass. The
+installation-control run checks 320 actual partials against an independent
+INT32 dot/FP32-scale reference. Five separate graph pools then execute ten
+complete pipelines per graph, with ten warmups and thirty cyclic blocks.
+Every timed last-output snapshot agrees with its own warm reference;
+ordered paths also agree with the fixed-order CPU sum. Resets and Gloo
+barriers occur outside timing. The native stream handle is read after the
+installed Torch matmul, draining its host submission queue before native
+publication without disabling TaskQueue.
+
+| Complete O + sum, TP16 | Rank-MAX p50/p95 (µs) | Paired installed-minus-case median (µs) | Wins/30 |
+|---|---|---|---|
+| Installed CANN + push16 | 162.141 / 167.688 | — | — |
+| Rebuilt CANN + push16 | 171.980 / 180.745 | −10.609 | 1 |
+| Fused push24 + consumer | 162.781 / 169.121 | −0.328 | 13 |
+| Fused pull24 + consumer | 164.485 / 168.010 | −2.129 | 9 |
+| Installed CANN + FP32 HCCL | 183.439 / 188.582 | −21.994 | 1 |
+
+The earlier rebuilt-only comparison reported a 9.025 µs paired median gain
+for fused push. The installed control removes that gain: the same-round
+rebuilt-minus-installed median is 10.609 µs. The rebuild's additional cost
+is not localized to a specific instruction or compiler change. Stop this
+publication-fusion branch and retain the unfused protocol for idle
+calibration and model comparison. Shared hot-graph gains over HCCL are not
+decoder TPOT gains. Next measure existing static kernels and SuperKernel
+on the actual resident layer before developing another fusion mechanism.
 
 ## Raw artifacts
 
@@ -295,3 +329,5 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
   and the existing projection's hot-graph baseline.
 - `cann-o-key24-20261018-01/`: isolated build, exact tiling, generated ABI,
   two device outputs and independent CPU audit.
+- `cann-o-publish-20261018-01/`: publication sources, finite protocol
+  checks, both complete-pipeline timing runs and independent raw audits.
