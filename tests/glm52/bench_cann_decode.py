@@ -55,6 +55,8 @@ def parse_arguments():
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
+    parser.add_argument("--cpu-affinity", action="store_true",
+                        help="Bind this rank's threads; leave IRQs unchanged")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup < 0 or args.requests < 1:
         parser.error("Require positive steps/requests and nonnegative warmup")
@@ -63,6 +65,36 @@ def parse_arguments():
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("gpu-memory-utilization must be in (0,1]")
     return args
+
+
+def bind_cpu_threads(rank, device, report):
+    from vllm.platforms import current_platform
+    from vllm_ascend.cpu_binding import CpuAlloc
+    import vllm_ascend.cpu_binding as cpu_binding
+
+    physical = current_platform.device_id_to_physical_device_id(device.index)
+    binder = CpuAlloc(rank, npu_id=physical)
+    before = sorted(os.sched_getaffinity(0))
+    if not binder.build_cpu_pools():
+        raise RuntimeError("The CPU allocator did not build a binding plan")
+    binder.allocate()
+    binder.bind_threads()
+    threads = []
+    for task in sorted(Path("/proc/self/task").iterdir()):
+        threads.append({
+            "tid": int(task.name), "name": (task / "comm").read_text().strip(),
+            "cpus": sorted(os.sched_getaffinity(int(task.name))),
+        })
+    report["cpu_affinity"] = {
+        "physical_device": physical, "before": before,
+        "main": binder.assign_main[physical],
+        "acl": binder.assign_acl[physical],
+        "release": binder.assign_rel[physical], "threads": threads,
+        "method": "CpuAlloc.build_cpu_pools/allocate/bind_threads",
+        "irq_modified": False, "numa_pages_migrated": False,
+    }
+    source = Path(cpu_binding.__file__)
+    report["source_sha256"][str(source)] = digest(source)
 
 
 def drive_requests(backend, first_token, args):
@@ -174,6 +206,8 @@ def run(args, report):
                 "ASCEND_RT_VISIBLE_DEVICES",
             )},
         )
+        if args.cpu_affinity:
+            bind_cpu_threads(rank, device, report)
         with torch.inference_mode():
             if rank == 0:
                 backend = CoordinatedBackend(executor, channel)
@@ -238,6 +272,7 @@ def main():
         "scope": "M1 internal TP16 session delivery; HTTP/HIXL excluded",
         "precision_verified": False, "formal_1024_token_run": False,
         "profiled": False, "forward_hooks": False, "mtp_width": 1,
+        "cpu_affinity_enabled": args.cpu_affinity,
         "steps": args.steps, "warmup": args.warmup,
         "measured_requests": args.requests, "ignore_eos": True,
         "clock": "time.perf_counter_ns at token callback completion",

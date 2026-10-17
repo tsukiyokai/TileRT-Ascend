@@ -14,7 +14,11 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [关闭 oneDNN 后的五层重比与 78 层三曲线](evidence/ascend-decode/hf-corrected-20261017/README.md)已完成，HF 执行与重放分别通过 59／59、1,587／1,587 项检查；五层与完整执行的前五层逐位一致。两步的 hidden NRMSE 峰值为 17.09%（L31）／20.66%（L38），末层为 9.04%／7.43%，仍有待定位的离散突跃，不能作为舍入底板。最终 logits 幅值为 23.75／23.125，BF16 间隔为 0.125，撤销固定 0.1 界，改报最大差／logits 极差与 top-1 余量。两步最终 top-1 均相同；这不等于八输入／32 步验收通过。参考修正与完整曲线已满足第 1→2 步条件，进入 profiling 和实际时延测量。
 
-[M1 同配置执行与实测](evidence/ascend-decode/cann-profile-20261017/README.md)已完成：原生 vLLM 与 TileRT 的 TP16、32 步张量和 reset 逐位一致。关闭 profiler 后，3 个 32 步请求的内部 TPOT 为 230.71／260.73／289.68 ms，中位数距 2 ms 预算约 130.4 倍；不含加载、KV 注入、reset、HTTP／HIXL。两步 trace 的 rank 0 设备跨度约 265 ms，其中归约区间约 215 ms，但 rank 14 的归约仅约 20–23 ms、区间内空隙约 184–185 ms，并在多数归约上最后提交。先验证主机提交与 rank 到达偏斜假设，复用线程绑定和 ACL Graph 做单变量对照；不把等待包络当作裸网络延迟，也不将该 M1 短测与 MTP3／graph4 的 1024-token 基线直接比较。
+[最初的 M1 同配置执行与实测](evidence/ascend-decode/cann-profile-20261017/README.md)：原生 vLLM 与 TileRT 的 TP16、32 步张量和 reset 逐位一致。关闭 profiler 后，3 个 32 步请求的内部 TPOT 为 230.71／260.73／289.68 ms，中位数距 2 ms 预算约 130.4 倍；不含加载、KV 注入、reset、HTTP／HIXL。两步 trace 的 rank 0 设备跨度约 265 ms，其中归约区间约 215 ms，但 rank 14 的归约仅约 20–23 ms、区间内空隙约 184–185 ms，并在多数归约上最后提交。归约等待须与裸网络传输分开计量；该 M1 短测与 MTP3／graph4 的 1024-token 基线口径不同。
+
+[M1 ACL Graph](evidence/ascend-decode/cann-graph-20261017/README.md)已完成实际执行与计时：16 rank 的 32 步 graph／eager、reset／eager、reset／graph 三组对照各有 100,352 个张量逐位一致；位置、长度、RoPE、int64 slot 与图内共享 indices 均随执行更新。无 profiler 短测中位 TPOT 为 44.68 ms，距 2 ms 仍约 22.34 倍。同版本 eager 对照为 256.84 ms；单独绑核为 246.65 ms，仅约 4% 差异且范围重叠。主机逐算子提交已被图替代，下一步验证 M4 图执行、实际轮耗时和接受数，随后按该路径的 trace 优化 CANN 算子与归约。
+
+[M4 真实权重短验证](evidence/ascend-decode/cann-graph-20261017/README.md#m4-serial-and-speculative-execution)已通过：同一 8K 输入、16 rank、16 个输出，串行／投机／reset 的 token 与有效新 KV 逐位一致。8 轮自然接受均值为 2.0，最后一轮预算裁尾后实际提交 15 行、均值 1.875；主干／MTP 最终长度均为 8207。该运行未计时。若长期 A=2，稳态预算仅 4 ms/round；A=3.2 保留为场景假设，须用长轨迹校准。
 
 ## 开发主线与停止条件
 
@@ -40,13 +44,13 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 走读已确认两个候选主机同步点：默认 [MLA](../tilert/models/glm_5_2_ascend/ops/mla.py) 每层读取 indices 到 CPU；默认 [MoE](../tilert/models/glm_5_2_ascend/native_engine.py) 读取 routes 到 CPU 后逐专家执行。现有设备路径需先通过相同输入的数值验收，再以实际暴露耗时判断收益。
 
-当前推进第 2 步：M1 复用 vLLM-Ascend 模型计算层及 CANN fused prolog，由 TileRT 管理完整 P 行 KV 注入与 decode 循环；首个输入是 prefill 已产出的 pending token，位置为 P。[薄适配器](evidence/ascend-decode/cann-model.md)的同配置原生执行与 reset 用于接线诊断，HF 保留独立数值定位。M1／M2／M4 已接入逐层 hidden、logits 和实际路由／索引捕获；[宽验证比较器](../tests/glm52/compare_saved_cann_verify.py)同样将跨配置 HF 差异保存为诊断，不再以旧逐层阈值放行。CANN MTP 的 seed、chain、target-conditioned 重算与完整 session 仍须端到端验证。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round；若必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
+当前推进第 2 步：M1 复用 vLLM-Ascend 模型计算层及 CANN fused prolog，由 TileRT 管理完整 P 行 KV 注入与 decode 循环；首个输入是 prefill 已产出的 pending token，位置为 P。[薄适配器](evidence/ascend-decode/cann-model.md)的同配置原生执行与 reset 用于接线诊断，HF 保留独立数值定位。M1／M2／M4 已接入逐层 hidden、logits 和实际路由／索引捕获；[宽验证比较器](../tests/glm52/compare_saved_cann_verify.py)同样将跨配置 HF 差异保存为诊断，不再以旧逐层阈值放行。CANN MTP 的 seed、chain 和 target-conditioned 重算已通过上述 16-token 设备对照，完整 session 与长轨迹继续验证。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round；若必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
 
 精度定位按 `F_N(s_N)−F_H(s_H)=[F_N(s_N)−F_H(s_N)]+[F_H(s_N)−F_H(s_H)]` 分解；s 包含 hidden、有效 KV 和共享 indices。同输入逐层检查定位局部算术误差，独立轨迹保留传播结果。reference 修改先重比已有设备张量，生产路径修改后重跑设备检查。逐层指标指路，冻结轨迹决定端到端验收；完成参考修正和完整曲线后进入 profiling。
 
 精度基线提前注册并初始化 vLLM SFA vendor。M1 AddRmsNorm 保留 `BF16(normalized) × gamma` 边界；CANN 普通 input norm 与 fused MLA prolog 按各自的 FP32 中间精度建立独立参考，[单 die 同输入证据](evidence/ascend-decode/mla-prolog.md)已封闭首个前处理分歧。各 rank 的 BF16 partial 转为 FP32 做 HCCL、最后转回 BF16；M=1／4 的基线消息为 24／96 KiB。通信优化以 BF16 传输、FP32 累加恢复 12／48 KiB 消息，融合保持上述数值合同。
 
-[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；此前同输入检查仍有 38/1,572 项失败。继续用冻结输入和单 die 差分封闭 CANN 前处理、MLA 与专家链，再以真实 8K HIXL 交接和完整 P 行注入验证续算。[通信修复与设备证据](evidence/ascend-decode/pd-hixl-20261017/README.md)
+[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；此前同输入检查仍有 38/1,572 项失败。继续用冻结输入和单 die 差分封闭 CANN 前处理、MLA 与专家链；在线 HIXL 交接后的 decode 续算另作端到端验收。[通信修复与设备证据](evidence/ascend-decode/pd-hixl-20261017/README.md)
 
 ## 1. 先算速度边界
 
@@ -85,7 +89,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 3. 执行调度：先使用已有算子的预打包权重和预分配缓存，验证 ACL Graph 对固定阶段的收益。重复搬运、独立启动或同步边界进入关键路径时，优先调整 CANN 实现的 tiling、布局、双缓冲和融合范围。需要跨算子的 tile 流水时，再以 AIC/AIV/MTE 和 cross-core flag 组织生产与消费；缓冲区按 `round/layer/tile` epoch 复用。
 4. 通信：以 HCCL 给出 TP16 的正确性与时延基线，再比较适用的 AIV 路径。若归约等待主导，改造已有输出投影／expert down 与归约的衔接，并比较 residual/RMSNorm 融合收益；需要时以小型 AscendC extern 接入 device 通信。每项改造验证完成语义与关键路径净收益。HIXL 负责 P→D KV 交接。
 5. 稀疏与 MTP：先复用已有 Q/KV 投影、norm／RoPE／cache 更新、indexer 和稀疏 attention，逐项验证 8K 选 2K、4 heads/rank 与 INT8/BF16 混合 index cache；再比较现有 fused prolog 和 SwiGLU／量化接口。共享层复用 indices。MoE 按 M 个位置的专家并集复用权重；draft、verify、accept 按实际接受长度提交 KV／位置并丢弃未接受尾部，每轮向 Python 返回 token 列表。
-6. PD：复用 [Transport 接口](../tilert/pd_vllm/transport.py) 接入 HIXL 注册、批量 WRITE 与完成通知；[Ascend 专用 V1 connector／receiver](evidence/ascend-decode/pd-ascend.md) 使用 16 个 rank endpoint，独立于 GPU wire 的 8-rank 默认。开启 `indexer_kv_dtype=int8` 后，本 checkpoint 的 16 个主干 indexer 使用 INT8＋FP16 scale，0/1/2/70/74 及 MTP78 使用 BF16；MLA latent512+RoPE64 仍按 BF16。两端统一 page、逐层 dtype、scale、rotation、position 和 layout version。传主干 P 行、MTP P-1 行，全部 rank 完成同一 generation 才 ready；M1 直接消费 prefill 首 token。MTP 另传 12 KiB 的主干 normalized hidden[P-1]，在 D 端只补一行 MTP seed；[可选交接与捕获](evidence/ascend-decode/mtp-parent-handoff.md)及 [CANN MTP 请求接线](evidence/ascend-decode/cann-mtp.md)已实现，CPU API／HTTP 生命周期检查通过，真实权重执行与设备精度待验证。8K 前缀约 0.78 GB/rank。生成 1024 tokens、M=4 时按 `L≥8192+1024+3` 再向 page 对齐分配；双份权重、KV 与当前阶段 workspace 合计峰值 ≤60 GiB/die，workspace 按阶段释放。
+6. PD：复用 [Transport 接口](../tilert/pd_vllm/transport.py) 接入 HIXL 注册、批量 WRITE 与完成通知；[Ascend 专用 V1 connector／receiver](evidence/ascend-decode/pd-ascend.md) 使用 16 个 rank endpoint，独立于 GPU wire 的 8-rank 默认。开启 `indexer_kv_dtype=int8` 后，本 checkpoint 的 16 个主干 indexer 使用 INT8＋FP16 scale，0/1/2/70/74 及 MTP78 使用 BF16；MLA latent512+RoPE64 仍按 BF16。两端统一 page、逐层 dtype、scale、rotation、position 和 layout version。传主干 P 行、MTP P-1 行，全部 rank 完成同一 generation 才 ready；M1 直接消费 prefill 首 token。MTP 另传 12 KiB 的主干 normalized hidden[P-1]，在 D 端只补一行 MTP seed；[可选交接与捕获](evidence/ascend-decode/mtp-parent-handoff.md)及 [CANN MTP 请求接线](evidence/ascend-decode/cann-mtp.md)已实现。真实 8K HIXL 捕获、冻结前缀 M1 续算与 M4 短验证已通过；在线交接后立即 decode 并经 HTTP 返回仍待验收。8K 前缀约 0.78 GB/rank。生成 1024 tokens、M=4 时按 `L≥8192+1024+3` 再向 page 对齐分配；双份权重、KV 与当前阶段 workspace 合计峰值 ≤60 GiB/die，workspace 按阶段释放。
 
 已验证的起点：单 die 四层 BF16 缩小模型已执行，TileLang RMSNorm＋Torch/NPU 计算路径在 CPU、A3 上各通过 1,729 项检查；NPU 最大 NRMSE 为 0.008435，greedy token、索引、专家选择和 reset 重放通过。完整 W4A8C8／TP16／MTP 与 2 ms 性能验收按下表推进。[复现与原始结果](evidence/ascend-decode/README.md)
 
@@ -116,4 +120,4 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比、78 层三曲线、M1 短 profiling 与无 profiler 短测已交付；当前固定 M1 配置压缩主机提交和 rank 等待，再验证 M4 的实际轮耗时与接受数。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 profiling、ACL Graph 精度与无 profiler 短测，以及 M4 短轨迹执行已交付；当前推进 M4 图执行、实际轮耗时与长轨迹接受数。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)

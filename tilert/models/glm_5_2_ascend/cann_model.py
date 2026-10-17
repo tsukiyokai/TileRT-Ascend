@@ -130,6 +130,8 @@ class CannModel:
 
     def shutdown(self):
         """Restore the TP group's original reduction and stop the worker."""
+        if self.graph is not None:
+            self.graph.close()
         self._restore_tp_sum()
         self.worker.shutdown()
 
@@ -214,6 +216,7 @@ class CannModel:
     def _allocate_inputs(self):
         import torch
 
+        self.graph = None
         self._input_buffers = {}
         for width in (1, 2, 4):
             tokens = torch.empty(width, dtype=torch.int32, device=self.device)
@@ -301,6 +304,13 @@ class CannModel:
             result.update((name, metadata) for name in names)
         return result
 
+    def enable_graph(self):
+        """Enable M1 capture after all ranks complete eager warmup."""
+        from .cann_graph import CannGraph
+
+        if self.graph is None:
+            self.graph = CannGraph(self)
+
     def verify(self, tokens, *, full_logits=True):
         """Consume M causal rows and return M next-token predictions."""
         import torch
@@ -316,6 +326,8 @@ class CannModel:
             raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
+        if self.graph is not None and width != 1:
+            raise ValueError("The captured CANN graph currently requires M1")
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
@@ -329,7 +341,9 @@ class CannModel:
                 num_actual_tokens=width,
                 model_instance=self.model,
             ):
-                hidden = self.model(self.input_ids, self.positions)
+                hidden = (self.model(self.input_ids, self.positions)
+                          if self.graph is None
+                          else self.graph.forward(metadata))
                 logits = self.model.compute_logits(hidden)
                 token_ids = logits.argmax(dim=-1)
             self.position += width
@@ -376,6 +390,8 @@ class CannModel:
                    type(self.model), type(self.model.model),
                    set_ascend_forward_context]
         objects.extend(type(builder) for _, builder in self.builders)
+        if self.graph is not None:
+            objects.append(type(self.graph))
         paths = {Path(inspect.getfile(inspect.unwrap(value))).resolve()
                  for value in objects}
         return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
