@@ -9,6 +9,7 @@ initial transport bridge SHA256 is
 | Independent processes, die 0 → die 0 | [Connect status 103900](same-die.json); receive allocation remains unchanged. |
 | Independent processes, die 0 → die 1 | [1 KiB WRITE passes](cross-die.json); all receiver bytes equal the source pattern. |
 | Two processes per die, 0 → 1 held while 1 → 0 runs | [Both 1 KiB WRITEs pass](hixl-listen-port-20261017.json); four explicit internal listener ports are observed. |
+| TP16, original 8192-token prompt | [All 32 prefix files verified](prefix-8k-20261017.json): main 8192 rows, MTP 8191 rows, matching parent hidden and first token 6500. |
 | Production host command channel | [16 real Gloo processes](gloo-idle.json) receive all four commands in order after 141 seconds of idle time; none imports Torch-NPU. |
 | TP16 metadata and admission | [30 PD checks](check-shifted-pd.json), [29 connector checks](check-shifted-connector.json), and [20 session checks](check-session.json) pass on CPU. |
 
@@ -64,3 +65,11 @@ Four device checks pass: exact payload, logical metadata, one physical
 registration/unregistration for two logical regions, and rejection of an
 unregistered source before native WRITE. Set
 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` before Torch initialization.
+
+The [completed 8K capture](prefix-8k-20261017.json) contains all sixteen
+rank receipts for request `ba210bea41854af3`. File sizes and SHA256 values
+match all 32 payloads. The normalized, unrotated BF16 parent hidden at
+position 8191 is bitwise equal across ranks. The frozen case is at
+`/workspace/offline/prefix8k-allocation-20261017/capture/case-00`;
+the producer and receiver have exited. Decode numerical acceptance and
+TPOT use this input in separate runs.

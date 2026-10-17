@@ -4,8 +4,9 @@ These entries use the CANN TP16 decoder and production request/command loop.
 [Eighteen server CPU suites](prefix-capture/offline-regression.json) exercise
 their control and report handling; [source checks](prefix-capture/source-checks.json)
 cover 102 Python files and imports without Torch.
-NPU precision, raw device capture and live HTTP/HIXL timing await execution
-in the existing `a3-gs:trt-asc` environment.
+The [TP16 8K HIXL capture](pd-hixl-20261017/prefix-8k-20261017.json)
+is complete in `a3-gs:trt-asc`. Decode numerical acceptance and request
+TPOT remain pending.
 
 ## Capture original vLLM prefixes
 
