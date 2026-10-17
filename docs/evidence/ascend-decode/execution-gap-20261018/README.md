@@ -33,9 +33,11 @@ HTTP/HIXL and do not satisfy teacher or formal performance acceptance.
 
 The precision runner and session benchmark accept
 `--compile-target --target-graph`; the precision runner requires width four.
-The target uses the installed AscendCompiler, with static/super kernels
-disabled. MTP keeps both model configs eager and separate registration
-state. An uncaptured forward compiles before manual M4 ACL capture.
+The target uses the installed AscendCompiler. Add `--super-kernel` to enable
+static kernels and SuperKernel; both are disabled by default. MTP keeps
+both model configs eager and separate registration state. Static binary
+selection is process-wide, including matching draft operator shapes.
+An uncaptured forward compiles before manual M4 ACL capture.
 Benchmark reports retain compiler counters and cache-artifact hashes.
 
 [Configuration precheck](compiled-config-audit.json) uses the actual
@@ -96,6 +98,49 @@ IDs are bound to this graph through trace model/stream/task identifiers.
 No PMU or cross-rank device-clock alignment was captured. The shared
 4 ms graph span is not a layer compute floor; the slowest of all sixteen
 ranks and the source of individual task stalls remain unmeasured here.
+
+## Static kernels and SuperKernel
+
+The [activation audit](static-super-activation-audit.json) exercises the
+installed AscendCompiler → npugraph_ex path on the same resident layer0,
+M4 and 8K prefix. Both static and super options are enabled. The scheduler
+limit is four so the official shape filter retains bucket `[4]`; actual
+metadata still describes one request with four verification rows.
+
+Rank 0 compiles 34 operators and installs the generated package into a
+private directory. Sixteen distinct worker PIDs select that same directory
+through the path-specific API. The guard records 146 installed-file hashes
+before the SDK removes its directory; source, package and receipts remain
+on the server. No global operator installation changes.
+
+Independent CPU comparison passes 2,959 checks. Every rank's graph and
+reset tensors agree with its active configuration bit for bit. Static
+compiled/graph outputs also match the frozen plain compiled/graph outputs:
+569,584 elements per comparison, including indices, new KV and metadata.
+Compiled/eager hidden NRMSE remains 0.00540412, with all 2048 indices per
+row shared; that comparison is diagnostic. Peak Torch allocation is
+939,961,344 bytes/die.
+
+The [short trace](static-super-profile-audit.json) independently passes
+1,315 checks. On ranks 0/14, each of three replays executes six SuperKernel
+tasks: four groups have different first/last operators, while LightningIndexer
+and final AddRmsNormBias are single-operator wrappers. There are also 28
+standalone compute tasks and three separate AllReduce AICPU tasks. This
+graph includes embedding. Using the same model/stream/task counting rule,
+compute tasks fall from the plain compiled trace's 44 to 34; MIX AIC/AIV
+is counted once. Ten observed endpoint names bind to package
+metadata and binary hashes; Level0 does not enumerate all interior members.
+Host launches link to complete MODEL_EXECUTE/WAIT spans and final sync.
+These profiled shared-device spans do not establish a latency gain.
+
+Both precision and timing runners expose
+`--target-graph --compile-target --super-kernel`. The
+[product audit](static-super-product-audit.json) uses the actual
+`create_config(super_kernel=True)` and reuses the approved static package.
+On sixteen ranks, all five saved phases match the frozen static and plain
+controls bit for bit. CPU checks cover the three configuration modes, six
+CLI cases and eager MTP isolation. The device scope is one resident dense
+layer; MoE, complete teachers and long timing follow separately.
 
 ## Symmetric-buffer reduction
 
@@ -331,3 +376,7 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
   two device outputs and independent CPU audit.
 - `cann-o-publish-20261018-01/`: publication sources, finite protocol
   checks, both complete-pipeline timing runs and independent raw audits.
+- `cann-resident-static-super-20261018-01/`: private static package,
+  sixteen selection receipts, saved phase tensors and activation audit.
+- `cann-super-product-20261018-01/`: actual product-source snapshot,
+  configuration checks, resident-layer execution and raw comparisons.

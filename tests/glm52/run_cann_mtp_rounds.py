@@ -58,6 +58,8 @@ def parse_arguments(argv=None):
                         help="Compare graph after uncaptured execution")
     parser.add_argument("--compile-target", action="store_true",
                         help="Compile the target; keep MTP eager")
+    parser.add_argument("--super-kernel", action="store_true",
+                        help="Use static kernels and SuperKernel for target")
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
@@ -74,6 +76,8 @@ def parse_arguments(argv=None):
         parser.error("Graph comparison requires a decode round")
     if args.compile_target and (not args.target_graph or args.width != 4):
         parser.error("--compile-target requires --target-graph --width 4")
+    if args.super_kernel and not args.compile_target:
+        parser.error("--super-kernel requires --compile-target")
     if args.profile_output and args.width != 4:
         parser.error("The bounded MTP capture requires width four")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -327,6 +331,7 @@ def execute(args):
         args.checkpoint, f"npu:{physical}", rank, args.init_method,
         args.capacity, args.gpu_memory_utilization,
         compile_target=args.compile_target,
+        super_kernel=args.super_kernel,
         attention_kernel=args.attention_kernel,
         fp32_head=args.fp32_head,
     )
@@ -456,6 +461,7 @@ def execute(args):
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
         "compile_target": args.compile_target,
+        "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
         "fp32_head": args.fp32_head,
         "graph": None if target.graph is None else {

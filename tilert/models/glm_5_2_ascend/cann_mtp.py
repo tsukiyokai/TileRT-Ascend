@@ -76,6 +76,13 @@ def draft_config(target_config):
     config.compilation_config.compile_sizes = []
     config.compilation_config.static_forward_context = {}
     config.compilation_config.static_all_moe_layers = []
+    config.additional_config = copy.deepcopy(target_config.additional_config)
+    compilation = config.additional_config.setdefault(
+        "ascend_compilation_config", {},
+    )
+    compilation.update(
+        enable_static_kernel=False, enable_super_kernel=False,
+    )
     config.quant_config = copy.copy(target_config.quant_config)
     config.load_config = copy.copy(target_config.load_config)
     config.load_config.load_format = "safetensors"

@@ -100,6 +100,8 @@ def arguments():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--target-graph", action="store_true")
     parser.add_argument("--compile-target", action="store_true")
+    parser.add_argument("--super-kernel", action="store_true",
+                        help="Use static kernels and SuperKernel for target")
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
@@ -111,6 +113,8 @@ def arguments():
         parser.error("Graph capture requires an unmeasured warmup request")
     if args.compile_target and not args.target_graph:
         parser.error("--compile-target requires --target-graph")
+    if args.super_kernel and not args.compile_target:
+        parser.error("--super-kernel requires --compile-target")
     if args.capacity < PREFIX_LENGTH + args.max_tokens + WIDTH - 2:
         parser.error("Capacity must permit full M4 verification at the end")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -296,6 +300,7 @@ def run(args, report):
                        capacity=args.capacity,
                        gpu_memory_utilization=args.gpu_memory_utilization,
                        compile_target=args.compile_target,
+                       super_kernel=args.super_kernel,
                        attention_kernel=args.attention_kernel,
                        fp32_head=args.fp32_head)
     try:
@@ -453,6 +458,7 @@ def run(args, report):
                 "output_tokens_per_request": args.max_tokens,
                 "target_graph": args.target_graph,
                 "compile_target": args.compile_target,
+                "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
                 "fp32_head": args.fp32_head,
                 "ranks": [{key: item[key] for key in
@@ -477,6 +483,7 @@ def main():
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
         "compile_target": args.compile_target,
+        "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
         "fp32_head": args.fp32_head,
         "scope": "M4 internal TP16 session delivery; HTTP/HIXL excluded",

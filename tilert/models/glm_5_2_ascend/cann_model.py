@@ -19,8 +19,11 @@ class CannStep:
 
 
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
-                  *, compile_target=False):
+                  *, compile_target=False, super_kernel=False):
     """Construct TP16 config, optionally compiling the M4 target backbone."""
+    if super_kernel and not compile_target:
+        raise ValueError("SuperKernel requires the compiled M4 target")
+
     from vllm.config import CompilationMode, CUDAGraphMode
     from vllm.engine.arg_utils import EngineArgs
     from vllm.platforms import current_platform
@@ -34,7 +37,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         distributed_executor_backend="external_launcher",
         attention_config={"indexer_kv_dtype": "int8"},
         kv_cache_dtype="auto", block_size=PAGE_SIZE,
-        max_num_seqs=1, max_num_batched_tokens=16,
+        # AscendCompiler filters static token buckets by this sequence limit.
+        max_num_seqs=4 if super_kernel else 1, max_num_batched_tokens=16,
         max_model_len=capacity,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=False, enable_chunked_prefill=True,
@@ -51,7 +55,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
             "enable_flashcomm1": False, "enable_dsa_cp": False,
             "enable_shared_expert_dp": False, "enable_fused_mc2": 0,
             "ascend_compilation_config": {
-                "enable_static_kernel": False, "enable_super_kernel": False,
+                "enable_static_kernel": super_kernel,
+                "enable_super_kernel": super_kernel,
             },
         },
     ).create_engine_config()
@@ -69,7 +74,7 @@ class CannModel:
     def __init__(
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
-        attention_kernel="sfa", fp32_head=False,
+        super_kernel=False, attention_kernel="sfa", fp32_head=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -98,7 +103,7 @@ class CannModel:
         torch.npu.set_device(self.device)
         self.config = create_config(
             self.checkpoint, capacity, gpu_memory_utilization,
-            compile_target=compile_target,
+            compile_target=compile_target, super_kernel=super_kernel,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(

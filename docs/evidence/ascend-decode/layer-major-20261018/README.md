@@ -83,9 +83,24 @@ The [local head Graph audit](head-graph-audit.json) replays all sixteen
 shards sequentially on one die at M1/M4. Thirty-two graphs consume the
 32 changing normalized hidden rows through 640 replays. All 9,912,320
 FP32 logits match their eager artifacts bit for bit; both widths preserve
-32/32 successors. Peak allocation is 141,264,896 bytes. TP16 gathered-head
-Graph, the independent MTP head and the complete new-head trajectory remain
-separate checks. These head-only executions supply no TPOT measurement.
+32/32 successors. Peak allocation is 141,264,896 bytes.
+
+The [TP16 head Graph audit](head-tp-graph-audit.json) executes the official
+processor, HCCL gather and vocabulary crop with one actual weight shard per
+die. M1/M4 eager, changing-input Graph and recaptured reverse-order Graph
+produce 96 saved matrices: all 475,791,360 FP32 values match the canonical
+concatenated reference bit for bit. Within-rank, cross-rank and M1/M4
+comparisons also agree; each variant retains 32/32 successors. Sixty-four
+captures supply 1,280 replays, with output poisoned to NaN before each
+replay and every graph reset before shutdown. Peak allocation is
+143,805,952 bytes/die. The independent MTP head and complete new-head
+trajectory remain separate checks. These head-only runs supply no TPOT.
+
+The process exits normally and postflight shows sixteen healthy dies with
+only the existing external jobs. One CPU `resource_tracker` shared-memory
+warning remains in the log; explicit process-group destruction was not
+observed. Raw head-Graph artifacts and audit stay in
+`/home/shanshan/trt-asc/offline/cann-fp32-head-tp-graph-20261018-01/`.
 
 The [reference configuration audit](reference-config-audit.json) binds
 the baseline's original vendor, MTP3/graph4/async settings, and the
