@@ -92,6 +92,10 @@ The [initial resource queries](hccl-query-audit.json) both hit the 60 s
 timeout. In the phased second run, all sixteen ranks first pass the
 6144-element FP32 control, then enter the native shim without returning.
 The individual API wait is not yet localized; no peer read ran.
+Source inspection identifies a graph-workspace registration prerequisite.
+A variant registers 64 KiB under the same tag and marks individual native
+calls; it is CPU-built. Its launch preflight finds another job on all
+sixteen dies, so this variant has no device result yet.
 
 ## Raw artifacts
 
