@@ -181,6 +181,9 @@ def capture_mlp(engine, layer):
     if layer is None:
         yield stages
         return
+    from vllm_ascend.ops.fused_moe.moe_comm_method import (
+        MoECommType, get_moe_comm_method,
+    )
 
     def before(module, inputs):
         stages["input"] = inputs[0].detach().clone()
@@ -191,18 +194,54 @@ def capture_mlp(engine, layer):
     mlp = engine.model.model.layers[layer].mlp
     runner = mlp.experts
     scheme = runner.routed_experts.quant_method.quant_method
+    dispatcher = get_moe_comm_method(
+        MoECommType.ALLGATHER, runner.moe_config,
+    ).token_dispatcher
     original_apply = scheme.apply
     original_gmm1 = scheme.apply_gmm1_act_quant
+    original_gmm2 = scheme.apply_gmm2
+    original_combine = dispatcher.token_combine
     original_forward = runner._forward_impl
+
+    def combine(hidden_states, combine_metadata, bias=None):
+        if (tuple(combine_metadata.restore_shape)
+                != tuple(stages["input"].shape)):
+            raise ValueError("Expected M1 AllGather restore shape")
+        stages["expanded_row_idx"] = (
+            combine_metadata.expanded_row_idx.detach().clone()
+        )
+        stages["finalize_probs_fp32"] = (
+            combine_metadata.topk_weights.detach().clone()
+        )
+        result = original_combine(hidden_states, combine_metadata, bias)
+        stages["finalize"] = result.detach().clone()
+        return result
 
     def apply(*args, **kwargs):
         stages["probs_fp32"] = kwargs["topk_weights"].detach().clone()
-        return original_apply(*args, **kwargs)
+        stages["topk_ids"] = kwargs["topk_ids"].detach().clone()
+        # The dispatcher is shared; patch only this layer's apply.
+        with patch.object(dispatcher, "token_combine", combine):
+            return original_apply(*args, **kwargs)
 
     def gmm1(value):
+        if value.group_list_type != 1:
+            raise ValueError("Expected AllGather expert-count groups")
         stages["dispatch_a8"] = value.hidden_states.detach().clone()
         stages["dispatch_scale"] = value.dynamic_scale.detach().clone()
-        return original_gmm1(value)
+        stages["group_counts"] = value.group_list.detach().clone()
+        result = original_gmm1(value)
+        stages["fused_a8"] = result[0].detach().clone()
+        stages["fused_scale"] = result[1].detach().clone()
+        return result
+
+    def gmm2(value, hidden_states, act_out_scale):
+        if value.group_list_type != 1:
+            raise ValueError("Expected AllGather expert-count groups")
+        stages["gmm2_group_counts"] = value.group_list.detach().clone()
+        result = original_gmm2(value, hidden_states, act_out_scale)
+        stages["down"] = result.detach().clone()
+        return result
 
     def forward(*args, **kwargs):
         result = original_forward(*args, **kwargs)
@@ -217,6 +256,7 @@ def capture_mlp(engine, layer):
         with (
             patch.object(scheme, "apply", apply),
             patch.object(scheme, "apply_gmm1_act_quant", gmm1),
+            patch.object(scheme, "apply_gmm2", gmm2),
             patch.object(runner, "_forward_impl", forward),
         ):
             yield stages

@@ -27,7 +27,7 @@ BF16 TP partials accumulate in FP32 and cast back once to BF16. The
 direct BF16 reduction differs across ranks in 6,015 of 6,144 coordinates
 at the first output projection; the FP32 path produces identical BF16
 outputs. With this default, all 79 hidden states match across sixteen
-ranks in four cold forwards. Reset still differs, first at layer 6 for
+ranks in four cold forwards. Cold reset still differs, first at layer 6 for
 step 0 and layer 5 for step 1. Call `shutdown()` to restore the TP group's
 original reduction and stop the worker. Other input dtypes retain the
 original reduction behavior.
@@ -109,6 +109,34 @@ capture, independent raw-weight reader and inspected kernel sources.
 The full cold comparison still fails: step 0 final-logits NRMSE increases
 from 0.1483 to 0.2686, and step 1 first exceeds the threshold in a dense
 layer before MoE. Frozen local parity does not close full-model acceptance.
+
+## Frozen 8K continuation
+
+The [TP16 capture](cann-routed-8k-20261017.json) injects the complete HIXL
+prefix at position 8192 and consumes teacher tokens `[6500, 382]`.
+All ranks predict `[382, 262]`, matching HF. Numerical parity and exact
+reset replay fail. Layer-4 capture retains the actual dispatch, both GMM
+outputs, inverse row map and combine probabilities.
+
+At position 8192, ranks 0, 12 and 15 first differ between initial execution
+and reset at the fused GMM1/SwiGLU/A8 outputs. Their inputs, dispatch A8
+codes/scales and expert counts are bitwise equal. All sixteen ranks retain
+identical local stages at position 8193. Independent CPU reconstruction
+using raw W4 weights identifies these incorrect expert rows:
+
+| Rank | Initial execution | Reset |
+|---|---|---|
+| 0 | 174 | 174, 221 |
+| 12 | 132, 144 | None |
+| 15 | 144 | 77, 132, 144, 174, 221 |
+
+Of 48 expert-phase rows, 37 have exact fused A8 codes and scales; the other
+11 scales are 10.03–36.80 times the reference. Repeated output can therefore
+remain incorrect. All 48 GMM2 outputs match the independent reconstruction
+from their actual fused inputs. All 64 captured calls reconstruct finalize
+and post-TP output exactly; routing metadata passes 1,088 checks. The open
+numerical boundary is inside fused GMM1: gate/up, SwiGLU or quantization.
+These traces do not retain its internal device intermediates.
 
 ## Device acceptance
 

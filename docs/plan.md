@@ -83,7 +83,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 
 已验证的起点：单 die 四层 BF16 缩小模型已执行，TileLang RMSNorm＋Torch/NPU 计算路径在 CPU、A3 上各通过 1,729 项检查；NPU 最大 NRMSE 为 0.008435，greedy token、索引、专家选择和 reset 重放通过。完整 W4A8C8／TP16／MTP 与 2 ms 性能验收按下表推进。[复现与原始结果](evidence/ascend-decode/README.md)
 
-当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。[TP16 短序列](evidence/ascend-decode/native-full-short-vendor-20261016.json)完成两步并逐位通过 reset，输出 `[198,59]`；修订量化与 RoPE 合同后的 [HF reference](evidence/ascend-decode/hf-full-short-rope-20261016.json)自检 1,273/1,273 通过、输出 `[198,17351]`，两者[重比](evidence/ascend-decode/recompare-short-rope-20261016.json)仍有 437/2,934 项失败。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。先完成真实 8K 精度验收，再采集 profiling。[当前差距、证据与验证入口](evidence/ascend-decode/offline-development.md)
+当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。[真实 8K 两步续算](evidence/ascend-decode/cann-model.md#frozen-8k-continuation)在全部 rank 上输出 `[382,262]`，与 HF 一致；数值与 reset 验收仍失败。冻结输入已将首个重放分歧定位到 layer 4 的融合 GMM1／SwiGLU／A8，后续 GMM2 的 48 条同输入结果逐位通过，继续修复该融合边界。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。先完成真实 8K 精度验收，再采集 profiling。[验证入口](evidence/ascend-decode/offline-development.md)
 
 [测量入口](evidence/ascend-decode/measurement.md) 将精度报告与原始 8K prompt、权重、源码和版本绑定；各 rank 在执行线程中采集短 profiling，独立关闭 profiler 的 PD 请求同时记录生产端 callback 与客户端 token 到达时间。2 ms 判定要求实测覆盖八个不同的已验收输入。
 
@@ -102,4 +102,4 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | 数值 parity | HF eager reference 逐层加载并反量化同一 checkpoint，显式模拟 TP16 局部 A8、INT8 index cache、scale/offset/bias、旋转与融合舍入边界；qA/kvA RMS epsilon 显式对齐 Ascend prefill 的 `1e-5`，indexer 使用其交错坐标及 raw head weights。固定 8 个 8K 输入，各 teacher-force 32 步；78 层及 MTP 层逐层比较 hidden states，并以同一 final norm＋LM head 得到逐层 logits：`NRMSE=‖x−ref‖₂/max(‖ref‖₂,1e−12)≤1e−2`、cosine≥0.999；logits 的 max-abs≤0.1、greedy token 100% 一致。路由 top-8、index top-2048、位置／cache 提交亦逐项核对；tie 规则固定。 |
 | 2 ms 目标 | 预热后串行运行 32 个请求，各输入 8K、输出 1024 tokens；每请求 `(t_last−t_first)/(N−1)` 的 p50/p95 均≤2 ms，同时报告逐 token 间隔、真实 A 和轮耗时，包含接受、采样和输出交付。另做 10,000 轮 reset、短接受／全拒绝交替：主干有效 KV 对齐非 MTP reference，额外 MTP 层 KV 对齐 MTP teacher-forced reference，使用上述数值容差；提交位置和有效长度完全一致。 |
 
-交付顺序：真实 W4A8C8／TP16 主干已执行短前缀；接下来完成同输入逐层检查、真实 8K 的 32 步及 MTP 数值验收，再采集完整 decode profiling，按热点实测 HBM、小消息通信与相关算子，校准预算并推进修改、融合，完成 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+交付顺序：真实 W4A8C8／TP16 主干已执行 8K 两步续算；先修复融合 GMM1 的同输入数值异常，再完成 32 步及 MTP 精度验收，采集完整 decode profiling，按热点实测 HBM、通信与相关算子，推进修改、融合并完成 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
