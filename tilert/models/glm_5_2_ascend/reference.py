@@ -114,6 +114,7 @@ class ReferenceMoe(nn.Module):
         self.weights = weights
         self.prefix = prefix
         self.gate = gate
+        self.output_scale = 1.0
 
     def forward(self, hidden):
         with StableTopk():
@@ -134,6 +135,8 @@ class ReferenceMoe(nn.Module):
                 for values, probability in zip(expert_partials, probabilities)
             ]
             combined = torch.stack(products).sum(dim=0).to(torch.bfloat16)
+            if self.output_scale != 1.0:
+                combined = combined * self.output_scale
             rank_outputs.append(combined + shared[rank])
         return tp_sum(rank_outputs).reshape_as(hidden)
 
@@ -433,9 +436,16 @@ class HfReference:
             **CONTRACT,
             "input_norm": "Layer0 FP32 norm and gamma; one BF16 output",
         }
+        self.weights.contract["expert_combine"] = (
+            "Unscaled BF16 probabilities; FP32 weighted sum; BF16 output; "
+            "BF16 routed scale; BF16 shared add; FP32 TP sum; BF16 output"
+        )
         norm = self.model.model.layers[0].input_layernorm
         norm.forward = MethodType(prolog_input_norm, norm)
         for number, layer in enumerate(self.model.model.layers):
+            if isinstance(layer.mlp, ReferenceMoe):
+                layer.mlp.output_scale = layer.mlp.gate.routed_scaling_factor
+                layer.mlp.gate.routed_scaling_factor = 1.0
             attention = layer.self_attn
             prefix = f"model.layers.{number}.self_attn"
             attention._reference_weights = self.weights

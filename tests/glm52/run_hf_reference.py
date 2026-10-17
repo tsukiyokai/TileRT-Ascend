@@ -148,6 +148,8 @@ def run(args, report):
     }
     engine = HfReference(args.checkpoint, args.mla_preprocess)
     report["weight_arithmetic"] = engine.weights.contract
+    if args.mla_preprocess == "prolog_v3":
+        report["expert_combine"] = engine.weights.contract["expert_combine"]
     prefixes = load_prefix(args, report)
     if prefixes is not None:
         engine.inject(prefixes)

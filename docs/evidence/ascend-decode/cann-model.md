@@ -70,14 +70,23 @@ The [single-die Prolog check](mla-prolog.md) isolates the first difference
 against that reference. `--mla-preprocess prolog_v3` keeps fused MLA
 intermediates in FP32 before the HF attention core. Select the arithmetic
 contract matching the executed path when generating its oracle.
-The [CANN-arithmetic HF run](hf-prolog-cold-20261017.json) passes all
-1,273 two-step/reset checks with those teacher tokens. Its raw traces are
-at `/workspace/offline/hf-prolog-integration-20261017/two-step-v2`; use
+The [updated HF run](cann-router-20261017.json) passes all 1,273
+two-step/reset checks with those teacher tokens. Its raw traces are at
+`/workspace/offline/hf-cann-arithmetic-20261017/two-step`; use
 that directory for the CANN cold test's `--reference`. This is CPU
 reference execution; full CANN numerical acceptance remains pending.
 The [rank-local MLA check](cann-mla.md) passes 57 device checks using the
 two frozen Prolog rows, including HF expanded-KV comparison and exact
 cache preservation. It uses one die and no model loading or collectives.
+
+The [router check](../../../tests/glm52/check_cann_router.py) passes 17
+single-die checks at each of positions 0 and 1 using frozen layer-3 inputs.
+It executes the production gate and top-k with unscaled probabilities.
+The pinned ALLGATHER path casts those probabilities to BF16, combines
+experts, multiplies the BF16 routed output by 2.5, adds shared output,
+then performs TP reduction. `prolog_v3` now retains that scaling order;
+the default Native reference retains scaling before combination. The
+[report](cann-router-20261017.json) binds both runs and source hashes.
 
 ## Device acceptance
 
