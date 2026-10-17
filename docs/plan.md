@@ -52,13 +52,13 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 | 权重容量 | 实际主权重 404.69 GB，另有 MTP 使用的 75.5 MB `rot.weight`；均分约 23.56 GiB/die。加复制权重、KV、workspace 后按每 die ≤48 GiB 设计。[header 审计](evidence/a3-model-bytes.json) |
 | 运行时权重读取 | 每 rank、单 token 约 3.844 GB。按当前代码计入复制的 FP32 router、W4 的 INT64 scale 与 FP32 MSD 补偿；W8 丢弃已检查为零的 offset，LM head 预转换为 BF16。[可重现计算](../tests/glm52/estimate_traffic.py) |
 | 单 rank 读取 | 权重 3.844 GB；MLA `78×2048×576×2=184 MB`；index KV `8192×(16×130+5×256)=27.5 MB`；合计约 4.056 GB。INT8 index 层携带 FP16 scale，其余 5 个主干 indexer 保持 BF16。[精度契约](evidence/ascend-decode/weight-contract.md) |
-| AllReduce | 主干每层 attention、FFN 各一次，共 156 次，目标单 token 为 `6144×2=12 KiB` BF16；当前 FP32 精度基线为 24 KiB。A3 已有 16-rank、3 KiB INT64 的 AIV AllReduce 记录为 12 µs；此处用作预算参数，TP16 实际形状待本机定标。[测量来源与口径](evidence/a3-roofline.md) |
+| AllReduce | 主干每层 attention、FFN 各一次，共 156 次，目标单 token 为 `6144×2=12 KiB` BF16；当前 FP32 精度基线为 24 KiB。TP16 同缓冲区依赖链的图重放 event p50：24 KiB FP32 为 5.028 ms，96 KiB FP32 为 5.074 ms；Python 提交的 24 KiB 链为 26.756 ms。[实测与复现](evidence/ascend-decode/tp-sum.md) |
 
-流式读取模型给出 `T_HBM=4.056 GB/(1.6 TB/s×η)`：峰值带宽下为 2.53 ms，约 394 tok/s；取 70% 带宽为 3.62 ms，约 276 tok/s。若 156 次归约各暴露 12 µs，串行预算分别为 4.41／5.49 ms，即约 227／182 tok/s。通算完全重叠时取 `max(T_HBM,156α)`；实际驻留、预取和重复加载由计数器修正。以上是布局对应的预算，当前没有 A3 后端的实测速度。
+流式读取模型给出 `T_HBM=4.056 GB/(1.6 TB/s×η)`：峰值带宽下为 2.53 ms，约 394 tok/s；取 70% 带宽为 3.62 ms，约 276 tok/s。加上当前 HCCL 图路径实测的 5.03 ms 归约链，串行预算为 7.56／8.65 ms，即约 132／116 tok/s；理想通算重叠预算为 `max(T_HBM,5.03 ms)`，约 199 tok/s。图链包含重放提交、rank 偏差和依赖调度，不能将总时长除以 156 当作裸 HCCL α；HBM 有效带宽与完整 decode 速度仍待实测。
 
-因此，保留当前读取量和逐层同步时，按上述 α=12 µs 预算约 182–227 tok/s。关键是复制的低秩投影、router、indexer、156 次归约，以及小 M 下的解包和计算效率。2 ms 路线从 MTP 共享权重读取、减少复制读取、tile 流水和设备侧归约展开。
+因此，只消除 Python 提交开销仍不足以达到 2 ms。关键是复制的低秩投影、router、indexer、156 次归约，以及小 M 下的解包和计算效率。2 ms 路线从 MTP 共享权重读取、减少复制读取、tile 流水和生产端融合归约展开。
 
-MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳态预算为 `ΣT_round/ΣA`；A 为实际提交数，包含 target 修正／bonus token，M=4 时 `1≤A≤4`。稳态 M=4 包含两次链式 draft 和一次 target-conditioned MTP4 重算；若每层专家并集为 32，当前复制布局每轮约读 7.54–8.19 GB，70% 带宽、A=3.2 时，仅 HBM 已需 2.10–2.29 ms/token。另有 166 次归约、4 次选词 all-gather。MTP 仍须结合读取优化和通算重叠；平均 A=3.2 时，每轮 6.4 ms 是稳态预算上限，初次 seed、采样和交付仍需余量。最终 TPOT 使用每请求首末 token 间耗时／(交付数−1)，计入首 token 后的初次 seed、采样和交付。[场景预算](evidence/ascend-decode/runtime-traffic.json)
+MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳态预算为 `ΣT_round/ΣA`；A 为实际提交数，包含 target 修正／bonus token，M=4 时 `1≤A≤4`。稳态 M=4 包含两次链式 draft 和一次 target-conditioned MTP4 重算；若每层专家并集为 32，当前复制布局每轮约读 7.54–8.19 GB，70% 带宽、A=3.2 时，仅 HBM 已需 2.10–2.29 ms/token，主干 96 KiB 归约图链再占 1.59 ms/token。两项串行预算为 3.69–3.87 ms/token，尚未加入 MTP 额外归约、4 次选词 all-gather 和计算。MTP 必须结合读取优化和通算重叠；平均 A=3.2 时，每轮 6.4 ms 是稳态预算上限，初次 seed、采样和交付仍需余量。最终 TPOT 使用每请求首末 token 间耗时／(交付数−1)，计入首 token 后的初次 seed、采样和交付。[场景预算](evidence/ascend-decode/runtime-traffic.json)
 
 ## 2. 从真实接口确定工作量
 
