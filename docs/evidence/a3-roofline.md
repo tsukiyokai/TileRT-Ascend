@@ -23,7 +23,7 @@ ssh a3-gs python3 - /data/shanshan/trt-asc/models/GLM-5.2-w4a8c8 \
 | 其他 norm、一个 embedding row | 0.003870720 |
 | 合计 | 31.531318272 |
 
-以上为按 checkpoint 分类的逻辑权重。当前 CANN 实现复制 FP32 router，将 W4 scale 放入 INT64 carrier，并只保留当前 rank 的 FP32 MSD 补偿；W8 offset 检查为零后丢弃。直接按代码表示计算，M=1 单 rank 权重为 3844336128 B，其中 attention 2060318208 B、indexer 217814016 B、router 471936000 B、选中专家 753868800 B、其余 dense/shared/head/norm/embedding 340399104 B。分项以 [可重现估算器](../../tests/glm52/estimate_traffic.py) 和 [结果](ascend-decode/runtime-traffic.json) 为准。旧的 `Wrep=1.755 GB`、总读取 3.828 GB 仅按文件精度分摊，未完整计入这些运行时转换，已退出性能预算。`rot.weight` 为 75.5 MB，仅在 MTP 的 hnorm 前执行；其与 `optional/quarot.safetensors:global_rotation` 的用途见 [权重契约](ascend-decode/weight-contract.md)。
+以上为按 checkpoint 分类的逻辑权重。当前 CANN router 权重为 BF16、输出为 FP32；W4 scale 使用 INT64 carrier，并保留当前 rank 的 FP32 MSD 补偿；普通 W8 scale 为 BF16，Prolog scale 为 FP32。按这些实际表示，M=1 单 rank 权重为 3,606,269,952 B，加 MLA/index KV 后逻辑读取为 3,817,820,160 B。[表示审计](ascend-decode/cann-traffic-source-audit-20261017.json)、[估算器](../../tests/glm52/estimate_traffic.py)和[分项结果](ascend-decode/runtime-traffic.json)绑定执行源码与测量标尺；专家并集及模型 HBM 流量尚未实测。`rot.weight` 为 75.5 MB，仅在 MTP 的 hnorm 前执行；其与 `optional/quarot.safetensors:global_rotation` 的用途见[权重契约](ascend-decode/weight-contract.md)。
 
 8K 下所有主干层均执行 top-2048 attention；`first_k_dense_replace=3` 只区分 FFN。[golden_attention](../../tilert/models/glm_5_2_rocm/ops/flash_sparse_mla.py) 的 `kv_len>topk` 分支要求 indices。按每 rank 的四个 heads 共享一次读取，MLA KV 为 `78×2048×(512+64)×2=184025088 B`。开启 `indexer_kv_dtype=int8` 后，配方指定的 16 层 index cache 每位置为 128 B＋2 B FP16 scale，0/1/2/70/74 五层保持 256 B BF16；一次完整扫描为 `8192×(16×130+5×256)=27525120 B`。[层列表与分配源码](ascend-decode/weight-contract.md)。合计每 rank 4.055886336 GB；此模型假设权重流式读取，不计 L2 收益、MSD scratch 及 activation 流量。
 

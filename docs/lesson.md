@@ -24,6 +24,11 @@
   for 1024 outputs. With unchanged code, median TPOT changes from 38.70
   to 20.44 ms; round means remain near 69 ms. Use the long workload to
   budget the 2 ms target, and retain short captures for diagnosis.
+- Bind byte estimates to the executing model. The current CANN router has
+  BF16 weights and FP32 output; it does not read FP32 router weights.
+  `full_logits=False` still gathers the full vocabulary before discarding
+  logits. Expert-union scenarios estimate logical reads, not measured HBM
+  traffic. [Representation audit](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
 - Compare matched execution paths before rewriting a shared kernel.
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large

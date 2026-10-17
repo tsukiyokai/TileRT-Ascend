@@ -14,6 +14,7 @@ Experiments run on `a3-gs:trt-asc`; raw artifacts stay on that server.
 | 2026-10-17 | [AIV control](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control) | Only HCCL mode changes; all sixteen ranks' tokens, proposals, acceptance and state match. Median TPOT 21.47 ms versus AI_CPU 20.44 ms; no gain. | Retain AI_CPU and compare compiled target execution next. |
 | 2026-10-17 | [Matched HCCL modes](evidence/ascend-decode/tp-mode-20261017/README.md) | FP32 96 KiB, 156 dependent graph sums: rank-MAX event p50 AI_CPU 10.931 ms, AIV 5.044 ms. Separate traces confirm actual AICPU/AIV kernels. | Locate why this communication gain does not reach decode TPOT. |
 | 2026-10-17 | [AIV M4 capture](evidence/ascend-decode/cann-mtp-profile-20261017/README.md#aiv-decode-comparison) | Same source/trajectory; ranks 0/14 really use AIV. Target span ≈46 ms versus AI_CPU ≈45 ms. One reduction has 4.21 ms pairwise arrival skew; contention is unproven. | Compare compiled target execution; retain the arrival trace for scheduling work. |
+| 2026-10-18 | [CANN traffic audit](evidence/ascend-decode/cann-traffic-source-audit-20261017.json) | Correct BF16 router/W8 scales and MTP reads: M1 3.818 GB; M4 union32 scenario 7.30–7.94 GB/round. With measured A and stream rate, HBM alone takes 1.87–2.04 ms/token. | Capture actual expert unions; reduce replicated reads alongside execution gaps. |
 
 The live check loads D after P exits while keeping device KV alive. Its
 117.59 s request includes weight loading and first-use initialization;
