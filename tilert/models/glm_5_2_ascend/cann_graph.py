@@ -1,11 +1,11 @@
-"""M1 ACL graph for the existing eager CANN model and fixed cache storage."""
+"""Fixed-width ACL graph for the eager CANN model and fixed cache storage."""
 
 
 class CannGraph:
     """Capture model forward; prepare metadata and sample outside the graph.
 
     All TP ranks must finish eager warmup before the first call. The caller
-    updates CannModel's M1 inputs and metadata before every forward, retaining
+    updates CannModel's inputs and metadata before every forward, retaining
     their storage through close(). Returned hidden storage is reused on replay.
     """
 
@@ -14,7 +14,7 @@ class CannGraph:
         "cos", "sin",
     )
 
-    def __init__(self, engine):
+    def __init__(self, engine, width=1):
         import torch
         from vllm.config import CUDAGraphMode, set_current_vllm_config
         from vllm.forward_context import BatchDescriptor
@@ -26,9 +26,12 @@ class CannGraph:
         self.device = engine.device
         self.config = engine.config
         self.model = engine.model
-        self.tokens, self.positions, self.slots = engine._input_buffers[1][:3]
+        self.width = width
+        self.tokens, self.positions, self.slots = (
+            engine._input_buffers[width][:3]
+        )
         self.mode = CUDAGraphMode.FULL
-        self.descriptor = BatchDescriptor(1, 1, uniform=True)
+        self.descriptor = BatchDescriptor(width, 1, uniform=True)
         self.capture_count = 0
         self.replay_count = 0
         self.capture_stream = None
@@ -38,17 +41,17 @@ class CannGraph:
         if not self.config.model_config.enforce_eager:
             raise ValueError("CannGraph requires the eager CANN model")
         if self.config.speculative_config is not None:
-            raise ValueError("CannGraph captures only the M1 target")
+            raise ValueError("CannGraph captures only the target model")
         with torch.npu.device(self.device), (
             set_current_vllm_config(self.config)
         ):
             params = get_graph_params()
             if params is None:
-                set_graph_params([1])
-            elif 1 not in params.workspaces:
-                raise ValueError("Existing graph parameters omit M1")
+                set_graph_params([width])
+            elif width not in params.workspaces:
+                raise ValueError("Existing graph parameters omit this width")
             self.slots_i64 = torch.empty(
-                1, dtype=torch.int64, device=self.device,
+                width, dtype=torch.int64, device=self.device,
             )
             self.wrapper = ACLGraphWrapper(
                 self.model, self.config, runtime_mode=self.mode,
@@ -71,14 +74,14 @@ class CannGraph:
         from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
 
         if not metadata:
-            raise ValueError("M1 capture requires SFA/indexer metadata")
+            raise ValueError("Capture requires SFA/indexer metadata")
         unique = {id(value): value for value in metadata.values()}
         sfa_count = 0
         for value in unique.values():
-            if value.num_actual_tokens != 1:
-                raise ValueError("CannGraph requires one query row")
+            if value.num_actual_tokens != self.width:
+                raise ValueError("Metadata differs from the captured width")
             if value.slot_mapping.data_ptr() != self.slots.data_ptr():
-                raise ValueError("Metadata must use the persistent M1 slots")
+                raise ValueError("Metadata must use the persistent slots")
             if isinstance(value, AscendSFAMetadata):
                 # _int64_kv_slots otherwise reuses a warmup-only cast result.
                 value.kv_slots_i64 = (value.slot_mapping, self.slots_i64)
@@ -113,7 +116,7 @@ class CannGraph:
             monitor.set_cudagraph_capturing_enabled(enabled)
         entry = self.wrapper.concrete_aclgraph_entries[self.descriptor]
         if entry.aclgraph is None:
-            raise RuntimeError("The M1 wrapper did not create an ACL graph")
+            raise RuntimeError("The wrapper did not create an ACL graph")
         # Ascend capture records tasks; its output is not a completed forward.
         get_forward_context().capturing = False
         hidden = self.wrapper(self.tokens, self.positions)
@@ -122,7 +125,7 @@ class CannGraph:
         return hidden
 
     def forward(self, metadata):
-        """Use freshly prepared M1 metadata; consume exactly one model row."""
+        """Consume the fixed query width using freshly prepared metadata."""
         import torch
         from vllm.config import set_current_vllm_config
         from vllm_ascend.ascend_forward_context import (
@@ -138,7 +141,8 @@ class CannGraph:
             if not self.capture_count:
                 self._bind_capture_metadata(metadata)
             with set_ascend_forward_context(
-                metadata, self.config, num_tokens=1, num_actual_tokens=1,
+                metadata, self.config, num_tokens=self.width,
+                num_actual_tokens=self.width,
                 aclgraph_runtime_mode=self.mode,
                 batch_descriptor=self.descriptor, model_instance=self.model,
             ):

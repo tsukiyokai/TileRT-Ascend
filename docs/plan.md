@@ -16,9 +16,9 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [最初的 M1 同配置执行与实测](evidence/ascend-decode/cann-profile-20261017/README.md)：原生 vLLM 与 TileRT 的 TP16、32 步张量和 reset 逐位一致。关闭 profiler 后，3 个 32 步请求的内部 TPOT 为 230.71／260.73／289.68 ms，中位数距 2 ms 预算约 130.4 倍；不含加载、KV 注入、reset、HTTP／HIXL。两步 trace 的 rank 0 设备跨度约 265 ms，其中归约区间约 215 ms，但 rank 14 的归约仅约 20–23 ms、区间内空隙约 184–185 ms，并在多数归约上最后提交。归约等待须与裸网络传输分开计量；该 M1 短测与 MTP3／graph4 的 1024-token 基线口径不同。
 
-[M1 ACL Graph](evidence/ascend-decode/cann-graph-20261017/README.md)已完成实际执行与计时：16 rank 的 32 步 graph／eager、reset／eager、reset／graph 三组对照各有 100,352 个张量逐位一致；位置、长度、RoPE、int64 slot 与图内共享 indices 均随执行更新。无 profiler 短测中位 TPOT 为 44.68 ms，距 2 ms 仍约 22.34 倍。同版本 eager 对照为 256.84 ms；单独绑核为 246.65 ms，仅约 4% 差异且范围重叠。主机逐算子提交已被图替代，下一步验证 M4 图执行、实际轮耗时和接受数，随后按该路径的 trace 优化 CANN 算子与归约。
+[M1 ACL Graph](evidence/ascend-decode/cann-graph-20261017/README.md)已完成实际执行与计时：16 rank 的 32 步 graph／eager、reset／eager、reset／graph 三组对照各有 100,352 个张量逐位一致；位置、长度、RoPE、int64 slot 与图内共享 indices 均随执行更新。无 profiler 短测中位 TPOT 为 44.68 ms，距 2 ms 仍约 22.34 倍。同版本 eager 对照为 256.84 ms；单独绑核为 246.65 ms，仅约 4% 差异且范围重叠。主机逐算子提交已被图替代，后续按 M4 路径的 trace 优化 CANN 算子与归约。
 
-[M4 真实权重短验证](evidence/ascend-decode/cann-graph-20261017/README.md#m4-serial-and-speculative-execution)已通过：同一 8K 输入、16 rank、16 个输出，串行／投机／reset 的 token 与有效新 KV 逐位一致。8 轮自然接受均值为 2.0，最后一轮预算裁尾后实际提交 15 行、均值 1.875；主干／MTP 最终长度均为 8207。该运行未计时。若长期 A=2，稳态预算仅 4 ms/round；A=3.2 保留为场景假设，须用长轨迹校准。
+[M4 target graph](evidence/ascend-decode/cann-graph-20261017/README.md#m4-target-graph-and-session-timing)已通过 16-token 串行／投机／图／dirty reset 对照，三组各 47,088 行新 KV 逐位一致。真实 session 的 32-token 短测中，eager 三次请求中位 TPOT 为 152.46 ms；target graph 三十次为 p50=38.70、p95=39.02 ms，距 2 ms 约 19.35 倍，draft 仍为 eager。每请求 17 轮，实际 A=31/17=1.824，自然 A=33/17=1.941；图路径轮耗时中位数 69.86 ms。该内部 callback 口径包含 seed、draft、verify、接受与交付，不含注入、reset、HTTP／HIXL。下一步采集该路径的分阶段 trace；长轨迹接受数与正式 1024-token 验收另测。
 
 ## 开发主线与停止条件
 
@@ -120,4 +120,4 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比、78 层三曲线、M1 profiling、ACL Graph 精度与无 profiler 短测，以及 M4 短轨迹执行已交付；当前推进 M4 图执行、实际轮耗时与长轨迹接受数。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部短测已交付；当前推进在线 HIXL→decode→HTTP 闭环与 M4 分阶段 profiling。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)

@@ -304,12 +304,14 @@ class CannModel:
             result.update((name, metadata) for name in names)
         return result
 
-    def enable_graph(self):
-        """Enable M1 capture after all ranks complete eager warmup."""
+    def enable_graph(self, width=1):
+        """Capture one query width; other widths retain eager execution."""
         from .cann_graph import CannGraph
 
         if self.graph is None:
-            self.graph = CannGraph(self)
+            self.graph = CannGraph(self, width)
+        elif self.graph.width != width:
+            raise ValueError("The model already captures another width")
 
     def verify(self, tokens, *, full_logits=True):
         """Consume M causal rows and return M next-token predictions."""
@@ -326,8 +328,7 @@ class CannModel:
             raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
-        if self.graph is not None and width != 1:
-            raise ValueError("The captured CANN graph currently requires M1")
+        use_graph = self.graph is not None and self.graph.width == width
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
@@ -342,7 +343,7 @@ class CannModel:
                 model_instance=self.model,
             ):
                 hidden = (self.model(self.input_ids, self.positions)
-                          if self.graph is None
+                          if not use_graph
                           else self.graph.forward(metadata))
                 logits = self.model.compute_logits(hidden)
                 token_ids = logits.argmax(dim=-1)

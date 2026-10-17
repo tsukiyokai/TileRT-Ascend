@@ -1,8 +1,8 @@
 # CANN decode execution
 
 Environment: `a3-gs:trt-asc`, GLM-5.2-W4A8C8, TP16, batch one,
-8192 captured prefix rows, capacity 9344, memory utilization 0.85, eager
-CANN kernels and FP32 TP sums. Requests use the production rank command
+8192 captured prefix rows, capacity 9344, memory utilization 0.85, CANN
+kernels and FP32 TP sums. Requests use the production rank command
 loop; prefix readiness, reset, HTTP and HIXL are outside internal TPOT.
 
 ## CPU thread affinity
@@ -34,7 +34,7 @@ The source is `12ae8e2` plus the hashed benchmark override in the receipt.
 
 ## ACL Graph input updates
 
-The optional `CannModel.enable_graph()` captures only the M1 model
+The optional `CannModel.enable_graph()` captures M1 or M4 target model
 forward with the installed `ACLGraphWrapper`; head and argmax remain
 outside. Eager warmup precedes capture. Before each replay, the original
 metadata builders update token, position, sequence length, slot mapping
@@ -91,10 +91,9 @@ source snapshot remain on a3-gs at
 Its `audit.py` regenerates `graph-audit.json` on CPU. The prior failed
 capture and zero-output snapshots remain in sibling `cann-graph-20261017-01`.
 
-The adapter currently captures M1. M4 target verification and the MTP
-draft layer still need their own graph execution and timing. HF remains
-the independent numerical diagnostic; the eight-input frozen teacher and
-1024-token release checks are separate.
+The M4 target graph results follow below. The MTP draft layer remains
+eager. HF remains the independent numerical diagnostic; the eight-input
+frozen teacher and 1024-token release checks are separate.
 
 ## M4 serial and speculative execution
 
@@ -114,8 +113,7 @@ first token, sixteen tokens are emitted; main and MTP lengths finish at
 the acceptance distribution for 1024 outputs.
 
 This run uses eager M4, without timing. At a sustained acceptance of two,
-the 2 ms/token goal permits only 4 ms per round. M4 graph execution and
-actual round timing must precede further performance attribution.
+the 2 ms/token goal permits only 4 ms per round.
 
 Run [run_cann_mtp_rounds.py](../../../../tests/glm52/run_cann_mtp_rounds.py)
 with sixteen ranks, the checkpoint and capture-case paths, `--width 4`,
@@ -123,3 +121,55 @@ with sixteen ranks, the checkpoint and capture-case paths, `--width 4`,
 and a fresh output directory. Launch, frozen source, rank reports,
 snapshots and `audit.py` remain on a3-gs under
 `/home/shanshan/trt-asc/offline/cann-mtp-rounds-20261017-01/`.
+
+## M4 target graph and session timing
+
+The [target graph audit](mtp-target-graph-audit.json) covers sixteen
+outputs on all sixteen ranks. Serial, eager speculative, target graph
+and graph dirty-reset runs produce identical tokens. Across 64 snapshots
+(94,436,800 bytes), each adjacent comparison checks 3136 new-KV tensors
+and 47,088 rows; every bit agrees. Device checks also preserve the full
+prefix and parent hidden. Each rank records one M4 graph capture and
+sixteen replays. These snapshots cover new KV and request state;
+intermediate layer activations are outside this comparison.
+
+The [session benchmark audit](mtp-bench-audit.json) checks the real
+rank command loop, seed, chained drafts, target verification,
+target-conditioned MTP recomputation, acceptance and token delivery.
+Only the target uses an ACL graph; draft execution stays eager. Each run
+has one warmup request, followed by the measured requests below.
+
+| Target execution | Requests | Median TPOT (ms) | P95 TPOT (ms) |
+|---|---|---|---|
+| Eager | 3 | 152.461543 | 155.3382743 |
+| M4 graph | 30 | 38.7026239 | 39.0243213 |
+
+Each request emits 32 tokens including prefill's first token. Its 17
+rounds naturally accept 33 tokens; the output budget commits 31, giving
+actual acceptance `31/17 = 1.8235` versus natural `33/17 = 1.9412`.
+Main and MTP caches end at 8223, with the last output pending. All requests
+have the same output sequence. Graph round wall time has median
+69.86422 ms across 510 measured rounds, including Gloo dispatch; the first
+round also includes the seed. Target/draft kernel time is not separated.
+
+Internal TPOT is `(last_callback - first_callback) / 31`, counting token
+IDs within bursts. Loading, prefix readiness, HTTP, HIXL, reset and finish
+after the last callback are excluded. The sequential 3-request/30-request
+runs give a median ratio of 3.9393; this is a short-session measurement,
+not the 1024-token acceptance workload.
+
+Run [bench_cann_mtp.py](../../../../tests/glm52/bench_cann_mtp.py) with
+`--max-tokens 32 --warmup 1`, and `--target-graph --requests 30` for the
+graph case. Raw runs, launch commands and frozen source remain on a3-gs
+under `/home/shanshan/trt-asc/offline/`:
+
+- `cann-mtp-target-graph-20261017-01/`: numerical snapshots and audit.
+- `cann-mtp-eager-bench-20261017-01/`: three measured eager requests.
+- `cann-mtp-target-graph-bench-20261017-01/`: thirty graph requests and audit.
+
+Both benchmark runs use source `d11505bf6769990aa1b0a870bc5ca3bbea72e2c7`
+with the recorded overrides: graph `a1b6ab356c20`, model `c3c8294b275d`,
+and benchmark `d38609fbd685`. The receipt preserves their full hashes,
+checkpoint metadata, input identities and all 32 rank-report hashes.
+The copied benchmark audit SHA256 is
+`384313a9e37b4187d0b7d2e5eb3b0510e6c88f7dd9206a315a82313c91e4cd55`.

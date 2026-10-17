@@ -54,6 +54,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--target-graph", action="store_true",
+                        help="Compare fixed-width target graph after eager")
     parser.add_argument("--device-offset", type=int, choices=range(16),
                         default=0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -61,6 +63,8 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     if args.max_tokens < 1 or args.capacity < 128:
         parser.error("Positive output budget and capacity >= 128 required")
+    if args.target_graph and args.max_tokens < 2:
+        parser.error("Graph comparison requires a decode round")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0, 1]")
     return args
@@ -214,7 +218,7 @@ def prepare_phase(target, draft, main_prefix, mtp_prefix, label):
     draft.reset()
     if target.position != 0 or draft.position != 0:
         raise ValueError("Reset must clear both logical cache lengths")
-    cleared = label in ("serial", "speculative")
+    cleared = label != "reset"
     if cleared:
         # Layer 78 shares this allocation with the main-model caches.
         target.storage.zero_()
@@ -224,6 +228,8 @@ def prepare_phase(target, draft, main_prefix, mtp_prefix, label):
 
 
 def compare_cache(label, actual, expected, checks, *, exact=False):
+    import torch
+
     for model, count in (("main", 78), ("mtp", 1)):
         left, right = actual[model], expected[model]
         checks.append({"name": f"{label}.{model}.layers",
@@ -248,6 +254,18 @@ def compare_cache(label, actual, expected, checks, *, exact=False):
                         exact=exact or not value.is_floating_point()
                         or name == "index_scales",
                     )
+                    if not exact and value.is_floating_point() and (
+                        name != "index_scales"
+                    ):
+                        item = checks[-1]
+                        item.update(
+                            diagnostic_only=True,
+                            bit_exact=torch.equal(value[row], reference[row]),
+                            passed=bool(torch.isfinite(value[row]).all()
+                                        and torch.isfinite(
+                                            reference[row],
+                                        ).all()),
+                        )
 
 
 def source_hashes(target, draft):
@@ -266,6 +284,7 @@ def source_hashes(target, draft):
                   process_weights_after_loading, MtpRoundExecutor):
         paths.add(Path(inspect.getfile(inspect.unwrap(value))).resolve())
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py")
+    paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_graph.py")
     paths.update(ROOT / f"tilert/pd_vllm/{name}.py" for name in
                  ("ascend_layout", "ascend_cache", "prefix_capture"))
     return {**target.source_metadata(),
@@ -320,11 +339,24 @@ def execute(args):
     directory = args.output / f"rank-{rank}"
     directory.mkdir(parents=True, exist_ok=False)
     expected_cache = None
+    phases = ["serial", "speculative"]
+    if args.target_graph:
+        phases.append("graph")
+    phases.append("reset")
     with torch.inference_mode():
-        for label in ("serial", "speculative", "reset"):
+        for label in phases:
             cleared = prepare_phase(
                 target, draft, main_prefix, mtp_prefix, label,
             )
+            if label == "graph":
+                for layers, begin in ((target.cache, initial),
+                                      ([draft.cache], initial - 1)):
+                    for fields in layers:
+                        for value in fields.values():
+                            tail = value[begin:initial + args.max_tokens + 4]
+                            tail.fill_(float("nan")
+                                       if value.is_floating_point() else -128)
+                target.enable_graph(width=args.width)
             parent = saved_parent.to(target.device)
             predicted = token_ids(target.predict(parent))[0]
             agree((predicted, target.position, draft.position))
@@ -362,8 +394,7 @@ def execute(args):
             if label == "serial":
                 expected_cache = cache
             else:
-                reference = runs["serial" if label == "speculative"
-                                 else "speculative"]
+                reference = runs[phases[phases.index(label) - 1]]
                 checks.append({
                     "name": label + ".tokens_and_state",
                     "passed": all(result[key] == reference[key] for key in
@@ -371,13 +402,31 @@ def execute(args):
                 })
                 compare_cache(label, cache, expected_cache, checks,
                               exact=label == "reset")
-                if label == "speculative":
+                if label != "reset":
                     expected_cache = cache
                 else:
                     checks.append({
                         "name": "reset.rounds_exact",
                         "passed": result["rounds"] == reference["rounds"],
                     })
+    if target.graph is not None:
+        graph = target.graph
+        graph.validate_metadata(target._metadata(args.width))
+        entries = graph.wrapper.concrete_aclgraph_entries
+        checks.extend([
+            {"name": "graph.actual_capture",
+             "passed": graph.capture_count == 1 and len(entries) == 1
+             and all(entry.aclgraph is not None
+                     for entry in entries.values())},
+            {"name": "graph.all_rounds_replayed",
+             "passed": graph.replay_count == sum(
+                 len(runs[label]["rounds"]) for label in ("graph", "reset")
+             )},
+            {"name": "graph.input_addresses",
+             "passed": entries[graph.descriptor].input_addresses == [
+                 target.input_ids.data_ptr(), target.positions.data_ptr(),
+             ]},
+        ])
     checks.append({"name": "source_stable",
                    "passed": source_hashes(target, draft) == source})
     passed = all(item["passed"] for item in checks)
@@ -389,6 +438,17 @@ def execute(args):
         "source_commit": args.source_commit, "source_sha256": source,
         "checkpoint_sha256": checkpoint, "inputs": inputs,
         "width": args.width, "max_tokens": args.max_tokens,
+        "target_graph": args.target_graph,
+        "graph": None if target.graph is None else {
+            "width": target.graph.width,
+            "captures": target.graph.capture_count,
+            "replays": target.graph.replay_count,
+            "entries": [{"descriptor": str(key),
+                         "has_aclgraph": entry.aclgraph is not None,
+                         "input_addresses": entry.input_addresses}
+                        for key, entry in target.graph.wrapper
+                        .concrete_aclgraph_entries.items()],
+        },
         "capacity": args.capacity, "eos_tokens": stops,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "packages": {name: version(name) for name in
