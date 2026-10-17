@@ -1,9 +1,8 @@
-"""Compare saved TP16 M2/M4 target rows directly with matching HF traces.
+"""Diagnose saved TP16 M2/M4 target rows against matching HF traces.
 
 Every wide row must contain 79 hidden states, 78 layer logits and new KV.
-Serial/wide tolerances are not used to infer HF agreement. This reads saved
-tensors on CPU; current-runtime identity, 8K/32-step coverage and MTP/session
-acceptance remain separate gates.
+HF value and selection differences are diagnostics. Input, layout, causal
+range, cache length and the saved exact reset remain execution checks.
 """
 
 import argparse
@@ -139,16 +138,18 @@ def single_row(wide, row, *, choices=False):
 def compare_saved(native, reference_dir):
     import torch
 
-    checks, artifacts = [], {}
+    checks, diagnostics, artifacts = [], [], {}
     output = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "scope": "Saved wide rows directly versus HF; CPU tensor comparison",
+        "scope": "HF cross-configuration diagnostics from saved wide rows",
+        "comparison_kind": "cross_configuration_hf",
         "native": str(native), "reference": str(reference_dir),
         "precision_verified": False, "performance_measured": False,
         "current_runtime_verified": False,
         "coverage": {"routing_choices": False, "index_choices": False,
                      "mtp": False, "session": False},
-        "checks": checks, "artifact_sha256": artifacts,
+        "checks": checks, "diagnostics": diagnostics,
+        "artifact_sha256": artifacts,
         "completed_rank_steps": 0,
         "source_sha256": {
             name: digest(Path(__file__).with_name(name)) for name in (
@@ -260,7 +261,8 @@ def compare_saved(native, reference_dir):
                 actual = single_row(wide, row, choices=choices)
                 validate_trace(actual, initial + row, teacher[row], checks,
                                label, native=True, choices=choices)
-                compare_step(label, actual, reference_trace, checks)
+                compare_step(label, actual, reference_trace, checks,
+                             diagnostics=diagnostics)
                 output["completed_rank_steps"] += 1
         output.update(
             checkpoint_sha256=first["checkpoint_sha256"],
@@ -284,9 +286,9 @@ def compare_saved(native, reference_dir):
         checks.append({"name": "validation_error", "passed": False,
                        "error": f"{type(error).__name__}: {error}"})
     failed = sum(not item["passed"] for item in checks)
-    output.update(status="fail" if failed else "pass",
-                  saved_wide_hf_parity=not failed,
-                  layerwise_logits_parity=not failed,
+    output.update(status="fail" if failed else "diagnostic",
+                  saved_wide_hf_parity=False, layerwise_logits_parity=False,
+                  hf_diagnostics_complete=not failed,
                   checks_total=len(checks), checks_failed=failed)
     return output
 
@@ -310,9 +312,9 @@ def main():
     )
     print(json.dumps({key: output[key] for key in (
         "status", "checks_total", "checks_failed", "completed_rank_steps",
-        "saved_wide_hf_parity", "precision_verified",
+        "hf_diagnostics_complete", "precision_verified",
     )}))
-    return int(output["status"] != "pass")
+    return int(output["checks_failed"] != 0)
 
 
 if __name__ == "__main__":

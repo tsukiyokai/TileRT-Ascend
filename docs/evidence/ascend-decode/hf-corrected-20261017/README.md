@@ -6,6 +6,50 @@ and retains the calibrated A3 Div arithmetic. The frozen CANN execution
 uses the SwiGLU barrier overlay and FP32 TP reduction. Both paths use the
 same W4A8C8 checkpoint, 8192-token prefix and consumed token 6500.
 
+## Full 78-layer curves
+
+![Hidden NRMSE, cosine and logits maximum difference](layer-curves.png)
+
+Both teacher-forced positions, 8192/6500 and 8193/382, complete all 78
+layers. HF passes 1,587/1,587 execution and exact reset checks. The first
+five raw hidden states, selections and attention probabilities match the
+five-layer run exactly; all five diagnostic logits also match exactly.
+
+| Position / input | Peak hidden NRMSE | Minimum cosine | Final hidden NRMSE / cosine | Peak logits max-abs | Final logits max-abs / relative difference |
+|---|---:|---:|---:|---:|---:|
+| 8192 / 6500 | 0.170898, L31 | 0.985360 | 0.090432 / 0.995911 | 2.921875, L52 | 1.062500 / 0.031716 |
+| 8193 / 382 | 0.206640, L38 | 0.978990 | 0.074282 / 0.997241 | 2.703125, L54 | 0.760742 / 0.025571 |
+
+Relative logits difference is max-abs divided by the HF logits range.
+Both final top-1 tokens agree, 382 and 262; intermediate head probes can
+disagree. Layers 0–76 compare merged residuals; layer 77 includes final
+RMSNorm on both sides. Its unnormalized CANN output was not captured.
+
+The final HF logits have maximum magnitudes 23.75 and 23.125. Their BF16
+spacing is 0.125, so a fixed 0.1 bound rejects even a single ULP at those
+magnitudes. The diagnostics report relative differences and both top-1
+margins instead of applying that bound. Hidden errors exhibit discrete
+jumps, particularly L16–17 in the first position and L27/L34 in the
+second. These peaks are not a measured rounding floor; no larger hidden
+threshold is fitted to make the two trajectories pass. Complete curves
+replace five-point extrapolation, and performance profiling proceeds
+while these differences remain available for localization.
+
+Minimum index overlap is 1966/2048 and 1971/2048. The largest mean HF
+unmatched attention masses are 0.006678 at L33 and 0.005354 at L73;
+their maximum head masses are 0.022761 and 0.019499. These are diagnostics,
+not a claim that all changed selections carry negligible weight.
+
+The [independent artifact audit](audit.json) recomputes all 156 curve
+points using Python FP64 sums, verifies the frozen sources and HF traces,
+and checks the five/full agreement. The updated all-rank comparator reads
+16 ranks × two positions: 50,116 structural/execution checks pass;
+16,160 numerical/selection observations have no pass/fail field. This
+does not establish the eight-input, 32-step end-to-end acceptance gate.
+
+Artifacts: [CSV](layer-curves.csv), [SVG](layer-curves.svg),
+[values, reference configuration and input hashes](layer-curves.json).
+
 ## Five layers
 
 The corrected HF forward and exact reset replay pass 59/59 execution and

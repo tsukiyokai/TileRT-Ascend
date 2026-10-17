@@ -25,8 +25,7 @@ from check_compare_saved_cann import (  # noqa: E402
 from compare_saved_cann_verify import (  # noqa: E402
     compare_saved, digest, single_row,
 )
-from run_cann_model import compare_step  # noqa: E402
-from run_native_decode import compare_tensor  # noqa: E402
+from run_cann_model import compare_step, diagnose_tensor  # noqa: E402
 
 
 def make_wide_fixture(root, width, *, choices=False):
@@ -130,11 +129,11 @@ def check_nontransitivity():
     expected = torch.ones((1, 6144), dtype=torch.bfloat16)
     serial = torch.full_like(expected, 1.0078125)
     wide = torch.full_like(expected, 1.015625)
-    checks = []
-    compare_tensor("serial_to_hf", serial, expected, checks)
-    compare_tensor("wide_to_serial", wide, serial, checks)
-    compare_tensor("wide_to_hf", wide, expected, checks)
-    return checks
+    checks, diagnostics = [], []
+    diagnose_tensor("serial_to_hf", serial, expected, checks, diagnostics)
+    diagnose_tensor("wide_to_serial", wide, serial, checks, diagnostics)
+    diagnose_tensor("wide_to_hf", wide, expected, checks, diagnostics)
+    return checks, diagnostics
 
 
 def break_reset(report):
@@ -166,12 +165,16 @@ def main():
         valid = read_json(root / "valid.json")
         checks.append({
             "name": "actual_cli_m4_all_16_ranks",
-            "passed": completed.returncode == 0 and valid["status"] == "pass"
+            "passed": completed.returncode == 0
+            and valid["status"] == "diagnostic"
             and valid["completed_rank_steps"] == 64
             and valid["coverage"]["hidden_states_per_step"] == 79
             and valid["coverage"]["layer_logits_per_step"] == 78
             and valid["coverage"]["routing_choices"] is True
             and valid["coverage"]["index_choices"] is True
+            and valid["hf_diagnostics_complete"] is True
+            and valid["saved_wide_hf_parity"] is False
+            and valid["layerwise_logits_parity"] is False
             and valid["precision_verified"] is False
             and valid["current_runtime_verified"] is False,
             "checks_total": valid["checks_total"],
@@ -181,16 +184,18 @@ def main():
         make_wide_fixture(two, 2)
         result = compare_saved(two / "native", two / "reference")
         checks.append({"name": "m2_all_16_ranks",
-                       "passed": result["status"] == "pass"
+                       "passed": result["status"] == "diagnostic"
                        and result["completed_rank_steps"] == 32
                        and result["coverage"]["routing_choices"] is False
                        and result["coverage"]["index_choices"] is False})
-        pairs = check_nontransitivity()
-        checks.append({"name": "nontransitive_tolerance_counterexample",
-                       "passed": [item["passed"] for item in pairs]
-                       == [True, True, False], "comparisons": pairs})
+        pair_checks, pairs = check_nontransitivity()
+        checks.append({"name": "nontransitive_differences_recorded",
+                       "passed": all(item["passed"] for item in pair_checks)
+                       and [item["max_abs"] for item in pairs]
+                       == [0.0078125, 0.0078125, 0.015625],
+                       "comparisons": pairs})
         cases = [
-            ("direct_rejects_false_transitivity", lambda path: change_wide(
+            ("direct_records_numeric_difference", lambda path: change_wide(
                 path, nontransitive_hidden)),
             ("rank_report_hash", lambda path: (
                 path / "native/rank-15.json").write_text("{}\n")),
@@ -234,15 +239,21 @@ def main():
             result = compare_saved(current / "native", current / "reference")
             failures = [item for item in result["checks"]
                         if not item["passed"]]
-            if name == "direct_rejects_false_transitivity":
+            if name == "direct_records_numeric_difference":
                 expected = [f"rank.15.row.{row}.hidden_states.3"
                             for row in range(4)]
-                accepted = ([item["name"] for item in failures] == expected
+                differences = [item for item in result["diagnostics"]
+                               if item["name"] in expected]
+                accepted = (result["status"] == "diagnostic" and not failures
+                            and [item["name"] for item in differences]
+                            == expected
+                            and all(item["max_abs"] == 0.015625
+                                    for item in differences)
                             and result["completed_rank_steps"] == 64)
             else:
-                accepted = bool(failures)
+                accepted = result["status"] == "fail" and bool(failures)
             checks.append({"name": name,
-                           "passed": result["status"] == "fail" and accepted,
+                           "passed": accepted,
                            "failures": failures})
             shutil.rmtree(current)
         checks.append({"name": "original_files_unchanged",

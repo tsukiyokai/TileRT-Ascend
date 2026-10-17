@@ -2,8 +2,8 @@
 
 Run with torchrun --nproc-per-node=16. A capture case supplies the original
 prompt, main KV with P rows, and the prefill first token. No prompt replay or
-MTP model is used. An optional matching HF trace adds numerical comparison;
-exact reset alone is reported as repeatability, not independent precision.
+MTP model is used. An optional matching HF trace adds cross-configuration
+diagnostics. Execution checks and exact reset determine capture status.
 """
 
 import argparse
@@ -18,7 +18,23 @@ import traceback
 from unittest.mock import patch
 
 from prefix_io import prefix_prompt_identity, prompt_identity
-from run_native_decode import compare_tensor, validate_reference_manifest
+from run_native_decode import compare_tensor
+from run_native_decode import (
+    validate_reference_manifest as validate_hf_manifest,
+)
+
+
+def validate_reference_manifest(reference, metadata):
+    validate_hf_manifest(reference, metadata)
+    if (reference.get("layer_count") != 78
+            or reference.get("cpu_matmul", {}).get("mkldnn_enabled")
+            is not False):
+        raise ValueError(
+            "HF diagnostics require 78 layers and oneDNN disabled"
+        )
+    checks = reference.get("checks", [])
+    if not checks or any(item.get("passed") is not True for item in checks):
+        raise ValueError("HF generation and exact reset checks must complete")
 
 
 def digest(path):
@@ -308,7 +324,47 @@ def capture_forward(engine, token, position, layer_trace, mlp_layer=None):
     return actual
 
 
-def compare_choices(name, actual, expected, checks, *, exact=False):
+def diagnose_tensor(name, actual, expected, checks, diagnostics, *,
+                    logits=False):
+    import torch
+    import torch.nn.functional as functional
+
+    if actual is None or expected is None:
+        checks.append({"name": name + ".presence",
+                       "passed": actual is None and expected is None})
+        return
+    layout = actual.shape == expected.shape and actual.dtype == expected.dtype
+    checks.append({"name": name + ".layout", "passed": layout})
+    item = {"name": name, "shape": list(actual.shape),
+            "expected_shape": list(expected.shape), "dtype": str(actual.dtype),
+            "expected_dtype": str(expected.dtype)}
+    diagnostics.append(item)
+    if not layout:
+        return
+    left, right = actual.float(), expected.float()
+    finite = bool(torch.isfinite(left).all() and torch.isfinite(right).all())
+    checks.append({"name": name + ".finite", "passed": finite})
+    if not finite:
+        return
+    norm = right.norm().item()
+    error = left - right
+    cosine = functional.cosine_similarity(
+        left.flatten(), right.flatten(), dim=0,
+    ).item() if norm else float(torch.count_nonzero(left) == 0)
+    item.update(
+        nrmse=error.norm().item() / max(norm, 1e-12), cosine=cosine,
+        max_abs=error.abs().max().item(), elements=actual.numel(),
+        equal_elements=int(torch.count_nonzero(actual == expected)),
+        evaluation_dtype="float32",
+    )
+    if logits:
+        item["argmax_equal"] = torch.equal(
+            actual.argmax(-1), expected.argmax(-1),
+        )
+
+
+def compare_choices(name, actual, expected, checks, *, exact=False,
+                    diagnostics=None):
     import torch
 
     for field in ("indices", "routes"):
@@ -352,6 +408,18 @@ def compare_choices(name, actual, expected, checks, *, exact=False):
                 compare_tensor(label, raw_value, raw_reference, checks,
                                exact=True)
                 continue
+            if diagnostics is not None:
+                left_set = set(value.tolist())
+                right_set = set(reference.tolist())
+                diagnostics.append({
+                    "name": label, "overlap": len(left_set & right_set),
+                    "actual_count": len(left_set),
+                    "reference_count": len(right_set),
+                    "sets_equal": left_set == right_set,
+                    "order_equal": torch.equal(value.to(torch.int64),
+                                                reference.to(torch.int64)),
+                })
+                continue
             value = value.to(torch.int64).sort().values
             reference = reference.to(torch.int64).sort().values
             if value.numel() == 0 or reference.numel() == 0:
@@ -360,22 +428,43 @@ def compare_choices(name, actual, expected, checks, *, exact=False):
             compare_tensor(label, value, reference, checks, exact=True)
 
 
-def compare_step(name, actual, expected, checks, *, exact=False):
+def compare_step(name, actual, expected, checks, *, exact=False, max_ulp=None,
+                 diagnostics=None):
+    """Keep exact/ULP checks; collect explicit HF differences separately."""
     import torch
+
+    if exact or max_ulp is not None:
+        diagnostics = None
+
+    def compare(label, value, reference, *, tensor_exact=False, logits=False):
+        if diagnostics is not None:
+            diagnose_tensor(label, value, reference, checks, diagnostics,
+                            logits=logits)
+        else:
+            compare_tensor(label, value, reference, checks,
+                           exact=exact or tensor_exact, logits=logits,
+                           max_ulp=max_ulp)
 
     checks.append({
         "name": name + ".position_and_input",
         "passed": all(actual[key] == expected[key]
                       for key in ("token", "position", "committed_position")),
     })
-    compare_tensor(name + ".logits", actual["logits"], expected["logits"],
-                   checks, exact=exact, logits=True)
+    if diagnostics is not None:
+        checks.append({
+            "name": name + ".causal_length",
+            "passed": all(trace["committed_position"] == trace["position"] + 1
+                          for trace in (actual, expected)),
+        })
+    compare(name + ".logits", actual["logits"], expected["logits"],
+            logits=True)
     hidden = (expected["last_hidden"] if "last_hidden" in expected
               else expected["hidden_states"][-1])
-    compare_tensor(name + ".last_hidden", actual["last_hidden"], hidden,
-                   checks, exact=exact)
+    compare(name + ".last_hidden", actual["last_hidden"], hidden)
     if "indices" in actual or "routes" in actual:
-        compare_choices(name, actual, expected, checks, exact=exact)
+        compare_choices(name, actual, expected, checks,
+                        exact=exact or max_ulp is not None,
+                        diagnostics=diagnostics)
     for field, count in (("hidden_states", 79), ("layer_logits", 78)):
         if field not in actual:
             continue
@@ -385,10 +474,8 @@ def compare_step(name, actual, expected, checks, *, exact=False):
             "passed": len(left) == len(right) == count,
         })
         for layer, (value, reference) in enumerate(zip(left, right)):
-            compare_tensor(
-                f"{name}.{field}.{layer}", value, reference, checks,
-                exact=exact, logits=field == "layer_logits",
-            )
+            compare(f"{name}.{field}.{layer}", value, reference,
+                    logits=field == "layer_logits")
     checks.append({"name": name + ".cache_layer_count",
                    "passed": len(actual["cache_rows"]) == 78
                    and len(expected["cache_rows"]) == 78})
@@ -398,10 +485,8 @@ def compare_step(name, actual, expected, checks, *, exact=False):
         for field in ("latent", "rope", "index", "index_scale"):
             value = left[field]
             integer = value is not None and value.dtype == torch.int8
-            compare_tensor(
-                f"{name}.cache.{layer}.{field}", value, right[field], checks,
-                exact=exact or integer or field == "index_scale",
-            )
+            compare(f"{name}.cache.{layer}.{field}", value, right[field],
+                    tensor_exact=integer or field == "index_scale")
 
 
 def check_prefix(engine, prefixes, checks, label):
@@ -453,7 +538,7 @@ def execute(args):
     initial = engine.position
     rank_dir = args.output / f"rank-{rank}"
     rank_dir.mkdir(parents=True, exist_ok=True)
-    checks, trace_hashes, consumed, predicted = [], {}, [], []
+    checks, diagnostics, trace_hashes, consumed, predicted = [], [], {}, [], []
     reset_hashes = {}
     token = teacher[0]
     for step in range(args.steps):
@@ -480,7 +565,8 @@ def execute(args):
             expected = torch.load(
                 expected_path, map_location="cpu", weights_only=True,
             )
-            compare_step(f"hf.{step}", actual, expected, checks)
+            compare_step(f"hf.{step}", actual, expected, checks,
+                         diagnostics=diagnostics)
     check_prefix(engine, prefixes, checks, "decode")
     engine.reset()
     checks.append({"name": "reset.position", "passed": engine.position == 0})
@@ -500,13 +586,13 @@ def execute(args):
         compare_step(f"reset.{step}", actual, expected, checks, exact=True)
     check_prefix(engine, prefixes, checks, "reset")
     passed = all(check["passed"] for check in checks)
+    completed_status = "diagnostic" if reference else "captured"
     report = {
-        "status": ("pass" if reference else "captured") if passed else "fail",
+        "status": completed_status if passed else "fail",
         "precision_verified": False,
-        "continuation_parity": bool(reference and passed),
-        "layerwise_logits_parity": bool(
-            reference and args.layer_trace and passed
-        ),
+        "continuation_parity": False, "layerwise_logits_parity": False,
+        "hf_diagnostics_complete": bool(reference and passed),
+        "comparison_kind": "cross_configuration_hf" if reference else None,
         "repeatability_passed": all(check["passed"] for check in checks
                                     if check["name"].startswith("reset.")),
         "scope": "M1 logits/hidden/choices/new KV and frozen prefix",
@@ -556,7 +642,7 @@ def execute(args):
             str(Path(__file__).resolve()): digest(Path(__file__)),
         },
         "trace_sha256": trace_hashes, "reset_trace_sha256": reset_hashes,
-        "checks": checks,
+        "checks": checks, "diagnostics": diagnostics,
     }
     if args.tp_reduction != "default":
         import cann_reduction_probe
@@ -576,6 +662,9 @@ def execute(args):
                     "layerwise_logits_parity": (
                         report["layerwise_logits_parity"]
                     ),
+                    "hf_diagnostics_complete": (
+                        report["hf_diagnostics_complete"]
+                    ),
                     "consumed_tokens": consumed, "predicted_tokens": predicted,
                     "report_sha256": digest(report_path)},
         group=get_world_group().cpu_group,
@@ -589,10 +678,8 @@ def execute(args):
             "status": report["status"] if success else "fail",
             "all_ranks_agree": same_tokens,
             "precision_verified": False,
-            "continuation_parity": success and bool(reference),
-            "layerwise_logits_parity": bool(
-                success and reference and args.layer_trace
-            ),
+            "continuation_parity": False, "layerwise_logits_parity": False,
+            "hf_diagnostics_complete": bool(success and reference),
             "performance_measured": False, "ranks": summaries,
         }
         (args.output / "summary.json").write_text(

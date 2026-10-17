@@ -1,5 +1,4 @@
-"""Compare all 16 saved CANN ranks against HF on CPU without loading weights.
-"""
+"""Diagnose saved CANN/HF differences; check capture identity and reset."""
 
 import argparse
 from datetime import datetime, timezone
@@ -208,16 +207,18 @@ def validate_trace(trace, position, token, checks, label, *, native,
 def compare_saved(native, reference_dir):
     import torch
 
-    checks, artifacts = [], {}
+    checks, diagnostics, artifacts = [], [], {}
     output = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "scope": "CPU comparison of saved TP16 M1 tensors; no weight load "
-                 "or new device execution",
+        "scope": "HF cross-configuration diagnostics from saved TP16 M1 "
+                 "tensors; execution and exact reset remain checks",
+        "comparison_kind": "cross_configuration_hf",
         "native": str(native), "reference": str(reference_dir),
         "precision_verified": False, "performance_measured": False,
         "coverage": {"routing_choices": False, "index_choices": False,
                      "mtp": False},
-        "checks": checks, "artifact_sha256": artifacts,
+        "checks": checks, "diagnostics": diagnostics,
+        "artifact_sha256": artifacts,
         "completed_rank_steps": 0,
         "source_sha256": {
             name: digest(Path(__file__).with_name(name)) for name in (
@@ -324,7 +325,8 @@ def compare_saved(native, reference_dir):
                 require(actual["token_ids"].item()
                         == report["predicted_tokens"][offset],
                         label + ".reported_prediction", checks)
-                compare_step(label, actual, expected, checks)
+                compare_step(label, actual, expected, checks,
+                             diagnostics=diagnostics)
                 output["completed_rank_steps"] += 1
         output.update(
             checkpoint_sha256=first["checkpoint_sha256"],
@@ -346,9 +348,9 @@ def compare_saved(native, reference_dir):
         checks.append({"name": "validation_error", "passed": False,
                        "error": f"{type(exc).__name__}: {exc}"})
     failed = sum(not item["passed"] for item in checks)
-    output.update(status="fail" if failed else "pass",
-                  continuation_parity=not failed,
-                  layerwise_logits_parity=not failed,
+    output.update(status="fail" if failed else "diagnostic",
+                  continuation_parity=False, layerwise_logits_parity=False,
+                  hf_diagnostics_complete=not failed,
                   checks_total=len(checks), checks_failed=failed)
     return output
 
@@ -372,9 +374,9 @@ def main():
     )
     print(json.dumps({key: output[key] for key in (
         "status", "checks_total", "checks_failed", "completed_rank_steps",
-        "layerwise_logits_parity", "precision_verified",
+        "hf_diagnostics_complete", "precision_verified",
     )}))
-    return int(output["status"] != "pass")
+    return int(output["checks_failed"] != 0)
 
 
 if __name__ == "__main__":

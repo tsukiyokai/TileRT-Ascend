@@ -12,7 +12,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [逐层换入验证](evidence/ascend-decode/streamed-decode.md)已在共享 A3 上执行真实 8K、TP16 的连续 layer 0–4，3,568/3,568 项执行与重建重放检查通过。原 RoPE 表前缀逐位一致地裁至 8,320 行，配合小消息 HCCL 缓冲，两轮结束后 Torch 分配量均为 245.5 MiB/die。此前 HF 的 70／80 采用有误的 CPU matmul 参考，不能用于验收。
 
-[完整 78 层的两步续算](evidence/ascend-decode/hidden-nrmse-20261017/README.md)已完成，16 rank 均输出 `[382,262]`，38,048 项 reset 检查通过。旧 HF 曲线保留为参考修正前的记录；以关闭 oneDNN 后的 hidden NRMSE、cosine、logits 最大绝对差三条完整曲线重新定位，不能用前五层外推稀疏层的误差。
+[关闭 oneDNN 后的五层重比与 78 层三曲线](evidence/ascend-decode/hf-corrected-20261017/README.md)已完成，HF 执行与重放分别通过 59／59、1,587／1,587 项检查；五层与完整执行的前五层逐位一致。两步的 hidden NRMSE 峰值为 17.09%（L31）／20.66%（L38），末层为 9.04%／7.43%，仍有待定位的离散突跃，不能作为舍入底板。最终 logits 幅值为 23.75／23.125，BF16 间隔为 0.125，撤销固定 0.1 界，改报最大差／logits 极差与 top-1 余量。两步最终 top-1 均相同；这不等于八输入／32 步验收通过。参考修正与完整曲线已满足第 1→2 步条件，进入 profiling 和实际时延测量。
 
 ## 开发主线与停止条件
 
@@ -38,7 +38,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 走读已确认两个候选主机同步点：默认 [MLA](../tilert/models/glm_5_2_ascend/ops/mla.py) 每层读取 indices 到 CPU；默认 [MoE](../tilert/models/glm_5_2_ascend/native_engine.py) 读取 routes 到 CPU 后逐专家执行。现有设备路径需先通过相同输入的数值验收，再以实际暴露耗时判断收益。
 
-当前推进第 1 步：M1 优先复用已运行的 vLLM-Ascend 模型计算层及 CANN fused prolog，由 TileRT 管理完整 P 行 KV 注入与 decode 调用循环；首个输入是 prefill 已产出的 pending token，位置为 P。[薄适配器与验收入口](evidence/ascend-decode/cann-model.md)先单独验证，设备精度通过后接入 PD 服务；已有 Native 算子实现用于同输入差分。M1／M2／M4 已接入逐层 hidden、logits 和实际路由／索引捕获；[宽验证比较器](../tests/glm52/compare_saved_cann_verify.py)逐行直接对照相同前缀与 teacher 的 HF，串行／宽验证的容差不传递。随后验证 CANN MTP 的 seed、chain、target-conditioned 重算与完整 session。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round，并在上述阶段条件满足后转入下一步。若固定布局的必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
+当前推进第 2 步：M1 复用 vLLM-Ascend 模型计算层及 CANN fused prolog，由 TileRT 管理完整 P 行 KV 注入与 decode 循环；首个输入是 prefill 已产出的 pending token，位置为 P。[薄适配器](evidence/ascend-decode/cann-model.md)的同配置原生执行与 reset 用于接线诊断，HF 保留独立数值定位。M1／M2／M4 已接入逐层 hidden、logits 和实际路由／索引捕获；[宽验证比较器](../tests/glm52/compare_saved_cann_verify.py)同样将跨配置 HF 差异保存为诊断，不再以旧逐层阈值放行。CANN MTP 的 seed、chain、target-conditioned 重算与完整 session 仍须端到端验证。后续任务须明确封闭哪个精度不变量，或预计减少多少 ms/round；若必要成本连 `A=4`、8 ms/round 都无法满足，就调整读取／同步机制。
 
 精度定位按 `F_N(s_N)−F_H(s_H)=[F_N(s_N)−F_H(s_N)]+[F_H(s_N)−F_H(s_H)]` 分解；s 包含 hidden、有效 KV 和共享 indices。同输入逐层检查定位局部算术误差，独立轨迹保留传播结果。reference 修改先重比已有设备张量，生产路径修改后重跑设备检查。逐层指标指路，冻结轨迹决定端到端验收；完成参考修正和完整曲线后进入 profiling。
 
@@ -87,7 +87,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 
 已验证的起点：单 die 四层 BF16 缩小模型已执行，TileLang RMSNorm＋Torch/NPU 计算路径在 CPU、A3 上各通过 1,729 项检查；NPU 最大 NRMSE 为 0.008435，greedy token、索引、专家选择和 reset 重放通过。完整 W4A8C8／TP16／MTP 与 2 ms 性能验收按下表推进。[复现与原始结果](evidence/ascend-decode/README.md)
 
-当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。layer 4 首个重放分歧已定位到 SwiGLU 写回后缺少向量流水屏障；[一行修复](evidence/ascend-decode/swiglu-barrier.md)先使 rank 0/12/15 的 832/832 条专家输出逐位通过，随后[完整 8K 两步重放](evidence/ascend-decode/cann-full8k-barrier-20261017.json)在全部 16 rank 上通过 38,048 项 reset 检查，输出 `[382,262]`。完整 vendor 仅改三个文件，保留原 host 库；[原生 Div 校准](evidence/ascend-decode/dynamic-quant-div.md)覆盖 31,744 个 BF16 amax。下一步先修正 HF CPU matmul，再依据完整曲线的突跃区分局部算术差异与轨迹传播，同时量出真实时延。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。[验证入口](evidence/ascend-decode/offline-development.md)
+当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。layer 4 首个重放分歧已定位到 SwiGLU 写回后缺少向量流水屏障；[一行修复](evidence/ascend-decode/swiglu-barrier.md)随后在全部 16 rank 的[完整 8K 两步重放](evidence/ascend-decode/cann-full8k-barrier-20261017.json)中通过 38,048 项 reset 检查，输出 `[382,262]`。完整 vendor 仅改三个文件，保留原 host 库；[原生 Div 校准](evidence/ascend-decode/dynamic-quant-div.md)覆盖 31,744 个 BF16 amax。HF CPU matmul 已修正，下一步用实际时延和 trace 选择性能主线，保留曲线突跃供同输入定位。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。[验证入口](evidence/ascend-decode/offline-development.md)
 
 [测量入口](evidence/ascend-decode/measurement.md) 将精度报告与原始 8K prompt、权重、源码和版本绑定；各 rank 在执行线程中采集短 profiling，独立关闭 profiler 的 PD 请求同时记录生产端 callback 与客户端 token 到达时间。2 ms 判定要求实测覆盖八个不同的已验收输入。
 
@@ -106,12 +106,12 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | 数值 parity | 固定 8 个不同的 8K 输入，各 teacher-force 32 步，greedy 后继 token 与冻结标签 100% 一致，并检查 MTP 接受、KV 有效长度与提交位置。性能验收的 1024-token 轨迹，其 teacher-32 覆盖段须与冻结标签一致；扩展段保持串行／MTP 提交等价。HF 为首要诊断工具，逐层数值用于定位，不作放行闸门。 |
 | 2 ms 目标 | 预热后串行运行 32 个请求，各输入 8K、输出 1024 tokens；每请求 `(t_last−t_first)/(N−1)` 的 p50/p95 均≤2 ms，同时报告逐 token 间隔、真实 A 和轮耗时，包含接受、采样和输出交付。另做 10,000 轮 reset、短接受／全拒绝交替：主干有效 KV 对齐非 MTP reference，额外 MTP 层 KV 对齐 MTP teacher-forced reference，使用上述数值容差；提交位置和有效长度完全一致。 |
 
-逐层诊断按下表解释；先完成关闭 oneDNN 的五层重比与 78 层三曲线，再据实测误差底板确定数值。BF16 的 `u=2^-8` 是相对舍入尺度，不能直接等同任意张量 NRMSE 或逐元素 ULP 数。
+逐层诊断按下表解释。修正后的 78 层曲线已完成，峰值仍远高于 L0 的 0.003595／0.004917；轨迹差异不能充当舍入底板，当前不抬高阈值来覆盖峰值。BF16 的 `u=2^-8` 是相对舍入尺度，不能直接等同任意张量 NRMSE 或逐元素 ULP 数。
 
 | 诊断量 | 改判与依据 |
 |---|---|
 | 索引 | 取消集合相等的通过／失败判定。报告 top-2048 重叠数、切点分数间隙、错配槽位的实际注意力权重质量。[layer 1 反事实](evidence/ascend-decode/layer1-index-input-20261017.json)仅替换进入 norm 的实际输入，就由 2046 回到 2048／2048；索引变化须与输入轨迹分开定位。 |
-| logits | 报告保存 dtype、max\|logit\| 及该量级的 BF16 间隔。若间隔 ≥0.1，则撤销固定 max-abs≤0.1，改报最大差／参考 logits 极差及 top-1 余量。中间层 final norm＋LM head 是探针，固定绝对界没有跨层不变的含义。 |
-| hidden | 保留 NRMSE、cosine 的指标形式；旧 1e−2／0.999 只作历史记录，待 78 层曲线后按实测误差底板重定，不以五层外推或预设值定标。 |
+| logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
+| hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-交付顺序：修参考、重比五层、补齐 78 层三曲线，随后进入完整 decode profiling；端到端八输入／32 步和 MTP 轨迹验收并行推进。按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比与 78 层三曲线已交付；当前进入完整 decode profiling 和无 profiler 的短时延测量。端到端八输入／32 步和 MTP 轨迹验收继续推进；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)

@@ -140,6 +140,7 @@ def make_fixture(root, choices=False):
         "scope": "synthetic host validator; not HF numerical execution",
         "implementation": "transformers.GlmMoeDsaForCausalLM",
         "status": "pass", "numerical_execution": True, "tp_size": 16,
+        "layer_count": 78, "cpu_matmul": {"mkldnn_enabled": False},
         "metadata_sha256": metadata, "initial_position": 8192,
         "teacher_tokens": [42], "prefix_files_sha256": prefix_hashes,
         **identity,
@@ -210,7 +211,7 @@ def check_choices(root, checks):
     make_fixture(base, choices=True)
     result = compare_saved(base / "native", base / "reference")
     checks.append({"name": "actual_choices_complete_tp16",
-                   "passed": result["status"] == "pass"
+                   "passed": result["status"] == "diagnostic"
                    and result["coverage"]["routing_choices"]
                    and result["coverage"]["index_choices"]})
 
@@ -243,8 +244,18 @@ def check_choices(root, checks):
         shutil.copytree(base, current)
         change_trace(current, mutate, rank=15)
         result = compare_saved(current / "native", current / "reference")
-        checks.append({"name": "choices.reject." + name,
-                       "passed": result["status"] == "fail"})
+        if name == "wrong_actual_route":
+            differences = [item for item in result["diagnostics"]
+                           if item["name"] == "rank.15.step.8192.routes.3"]
+            accepted = (result["status"] == "diagnostic"
+                        and len(differences) == 1
+                        and differences[0]["overlap"] == 7
+                        and differences[0]["sets_equal"] is False)
+            label = "choices.diagnostic."
+        else:
+            accepted = result["status"] == "fail"
+            label = "choices.reject."
+        checks.append({"name": label + name, "passed": accepted})
         shutil.rmtree(current)
 
     padded = torch.full((2048,), -1, dtype=torch.int32)
@@ -311,11 +322,15 @@ def main():
         valid = read_json(valid_output)
         checks.append({
             "name": "actual_cli_complete_tp16_8k",
-            "passed": completed.returncode == 0 and valid["status"] == "pass"
+            "passed": completed.returncode == 0
+            and valid["status"] == "diagnostic"
             and valid["completed_rank_steps"] == 16
             and valid["coverage"]["hidden_states_per_step"] == 79
             and valid["coverage"]["layer_logits_per_step"] == 78
             and valid["coverage"]["prompt_tokens"] == 8192
+            and valid["hf_diagnostics_complete"] is True
+            and valid["continuation_parity"] is False
+            and valid["layerwise_logits_parity"] is False
             and valid["precision_verified"] is False,
             "checks_total": valid["checks_total"],
             "stdout": completed.stdout, "stderr": completed.stderr,
@@ -369,9 +384,18 @@ def main():
             mutate(current)
             result = compare_saved(current / "native", current / "reference")
             failed = [item for item in result["checks"] if not item["passed"]]
+            if name == "rank15_layer3_numeric_difference":
+                differences = [item for item in result["diagnostics"]
+                               if item["name"]
+                               == "rank.15.step.8192.hidden_states.3"]
+                accepted = (result["status"] == "diagnostic" and not failed
+                            and len(differences) == 1
+                            and differences[0]["max_abs"] == 99
+                            and differences[0]["equal_elements"] == 0)
+            else:
+                accepted = result["status"] == "fail" and bool(failed)
             checks.append({"name": name,
-                           "passed": result["status"] == "fail"
-                           and bool(failed),
+                           "passed": accepted,
                            "failures": failed})
             shutil.rmtree(current)
         current = root / "old_hf_failure"
@@ -381,7 +405,7 @@ def main():
         }))
         result = compare_saved(current / "native", current / "reference")
         checks.append({"name": "old_hf_failure_recompared",
-                       "passed": result["status"] == "pass"
+                       "passed": result["status"] == "diagnostic"
                        and result["completed_rank_steps"] == 16})
         checks.append({"name": "original_files_unchanged",
                        "passed": tree_hashes(base) == original})

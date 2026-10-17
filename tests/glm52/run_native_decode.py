@@ -108,7 +108,7 @@ def snapshot(engine, result, token, position, layer_logits):
 
 
 def compare_tensor(
-    name, actual, expected, checks, *, exact=False, logits=False,
+    name, actual, expected, checks, *, exact=False, logits=False, max_ulp=None,
 ):
     import torch
     import torch.nn.functional as functional
@@ -133,7 +133,23 @@ def compare_tensor(
     ).item() if norm else float(torch.count_nonzero(left) == 0)
     max_abs = error.abs().max().item()
     item.update(nrmse=nrmse, cosine=cosine, max_abs=max_abs)
-    if exact:
+    if max_ulp is not None and actual.is_floating_point():
+        integer_dtype = {torch.bfloat16: torch.int16,
+                         torch.float16: torch.int16,
+                         torch.float32: torch.int32}[actual.dtype]
+        sign = 1 << (actual.element_size() * 8 - 1)
+
+        def ordered(value):
+            bits = value.contiguous().view(integer_dtype).to(torch.int64)
+            return torch.where(bits < 0, -sign - bits, bits)
+
+        distance = (ordered(actual) - ordered(expected)).abs()
+        observed = int(distance.max().item())
+        item.update(max_ulp=observed, allowed_ulp=max_ulp,
+                    bit_exact=torch.equal(actual.view(integer_dtype),
+                                          expected.view(integer_dtype)))
+        item["passed"] = observed <= max_ulp
+    elif exact:
         item["passed"] = torch.equal(actual, expected)
     else:
         item["passed"] = nrmse <= 0.01 and cosine >= 0.999
