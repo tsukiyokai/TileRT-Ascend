@@ -15,6 +15,7 @@ import struct
 import sys
 
 import torch
+import torch.nn.functional as functional
 
 
 TP_SIZE = 16
@@ -63,7 +64,8 @@ def unpack_w4(packed):
     return output
 
 
-def w4_msd_product(codes, integer, scales, correction, activation_scale):
+def w4_msd_product(codes, integer, scales, correction, activation_scale,
+                   output_dtype=torch.bfloat16):
     """Emulate CANN 9.2.0 API-dequant MSD with separate FP32 additions."""
     high = torch.div(codes, 16, rounding_mode="floor")
     low = torch.bitwise_and(codes, 15) - 8
@@ -74,7 +76,7 @@ def w4_msd_product(codes, integer, scales, correction, activation_scale):
     result = high_scaled * 16
     result = result + low_scaled
     result = result + correction
-    return (result * activation_scale).to(torch.bfloat16)
+    return (result * activation_scale).to(output_dtype)
 
 
 def tp_sum(partials):
@@ -304,7 +306,8 @@ class ReferenceWeights:
         return dimensions[prefix.rsplit(".", 1)[1]]
 
     @staticmethod
-    def _integer_product(weight, codes, activation_scale, rows, columns):
+    def _integer_product(weight, codes, activation_scale, rows, columns,
+                         output_dtype=torch.bfloat16):
         start, stop = rows
         left, right = columns
         packing = 8 // weight.bits
@@ -330,13 +333,49 @@ class ReferenceWeights:
         if weight.bits == 4:
             result = w4_msd_product(
                 flat_codes, integer, scales, actual.sum(dim=1),
-                activation_scale.reshape(-1, 1),
+                activation_scale.reshape(-1, 1), output_dtype,
             )
             return result.reshape(*codes.shape[:-1], stop - start)
         accumulator = flat_codes @ integer.T
         accumulator = accumulator.reshape(*codes.shape[:-1], stop - start)
         result = accumulator.float() * scales
-        return (result * activation_scale[..., None]).to(torch.bfloat16)
+        return (result * activation_scale[..., None]).to(output_dtype)
+
+    def fused_expert_partials(self, prefix, x, ranks=range(TP_SIZE)):
+        """CANN W4 GMM1/SwiGLU/A8 fusion, followed by BF16 GMM2.
+
+        GMM1 and SwiGLU retain FP32. The fused quantizer uses amax/127,
+        its reciprocal, then FP16 and INT8 nearest-even conversions.
+        ``ranks`` selects the returned partials in logical TP order.
+        """
+        self._check_input(x)
+        codes, input_scale = quantize_a8(x)
+        gate = self._integer_weight(prefix + ".gate_proj")
+        up = self._integer_weight(prefix + ".up_proj")
+        down = self._integer_weight(prefix + ".down_proj")
+        width = gate.shape[0] // TP_SIZE
+        partials = []
+        for rank in ranks:
+            channels = rank * width, (rank + 1) * width
+            gate_output = self._integer_product(
+                gate, codes, input_scale, channels, (0, gate.shape[1]),
+                torch.float32,
+            )
+            up_output = self._integer_product(
+                up, codes, input_scale, channels, (0, up.shape[1]),
+                torch.float32,
+            )
+            activated = functional.silu(gate_output) * up_output
+            maximum = activated.abs().amax(-1)
+            scale = torch.div(maximum, torch.full_like(maximum, 127))
+            factor = torch.div(torch.ones_like(scale), scale)
+            quantized = (activated * factor[..., None]).half().round()
+            output = self._integer_product(
+                down, quantized.to(torch.int8), scale,
+                (0, down.shape[0]), channels,
+            )
+            partials.append(output)
+        return tuple(partials)
 
     def _floating_product(self, prefix, x, rows=None, columns=None):
         weight = self.tensor(prefix + ".weight", rows, columns, x.dtype)

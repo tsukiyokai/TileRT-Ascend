@@ -150,6 +150,13 @@ def run(args, report):
     report["weight_arithmetic"] = engine.weights.contract
     if args.mla_preprocess == "prolog_v3":
         report["expert_combine"] = engine.weights.contract["expert_combine"]
+        report["fused_expert_quantization"] = (
+            engine.weights.contract["fused_expert_quantization"]
+        )
+        report["fused_swiglu"] = (
+            "Dense/shared: FP32 SiLU/product, BF16 output; "
+            "routed: FP32 GMM1/SiLU/product before fused A8 quantization"
+        )
     prefixes = load_prefix(args, report)
     if prefixes is not None:
         engine.inject(prefixes)

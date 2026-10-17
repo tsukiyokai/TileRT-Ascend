@@ -115,16 +115,20 @@ class ReferenceMoe(nn.Module):
         self.prefix = prefix
         self.gate = gate
         self.output_scale = 1.0
+        self.fused_quantization = False
 
     def forward(self, hidden):
         with StableTopk():
             _, probabilities, choices = self.gate(hidden)
         probabilities = probabilities[0].to(torch.bfloat16)
         flat = hidden.reshape(1, -1)
-        expert_partials = [
-            ffn_partials(self.weights, f"{self.prefix}.experts.{expert}", flat)
-            for expert in choices[0].tolist()
-        ]
+        expert_partials = []
+        for expert in choices[0].tolist():
+            prefix = f"{self.prefix}.experts.{expert}"
+            values = (self.weights.fused_expert_partials(prefix, flat)
+                      if self.fused_quantization
+                      else ffn_partials(self.weights, prefix, flat))
+            expert_partials.append(values)
         shared = ffn_partials(
             self.weights, self.prefix + ".shared_experts", flat
         )
@@ -440,12 +444,17 @@ class HfReference:
             "Unscaled BF16 probabilities; FP32 weighted sum; BF16 output; "
             "BF16 routed scale; BF16 shared add; FP32 TP sum; BF16 output"
         )
+        self.weights.contract["fused_expert_quantization"] = (
+            "FP32 GMM1 and SwiGLU; scale=amax/127; reciprocal scale; "
+            "FP16 then INT8 nearest-even; BF16 GMM2"
+        )
         norm = self.model.model.layers[0].input_layernorm
         norm.forward = MethodType(prolog_input_norm, norm)
         for number, layer in enumerate(self.model.model.layers):
             if isinstance(layer.mlp, ReferenceMoe):
                 layer.mlp.output_scale = layer.mlp.gate.routed_scaling_factor
                 layer.mlp.gate.routed_scaling_factor = 1.0
+                layer.mlp.fused_quantization = True
             attention = layer.self_attn
             prefix = f"model.layers.{number}.self_attn"
             attention._reference_weights = self.weights
