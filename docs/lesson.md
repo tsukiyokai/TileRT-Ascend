@@ -84,11 +84,25 @@
   This checkpoint stores FP32 LM-head rows, but deployment loads BF16.
   BF16 output also merges distinct winning scores: 16.69348 and 16.75541
   both become 16.75. Diagnose output resolution before adjusting global
-  layer-error criteria or introducing token-specific tie rules.
-  [Exact head diagnostic](evidence/ascend-decode/layer-major-20261018/head-production-ties-exact-audit.json)
+  layer-error criteria or introducing token-specific tie rules. Existing
+  CANN BF16-input/FP32-output matmul recovers 32/32 labels on the frozen
+  full-layer outputs without expanding the weights.
+  [Head evidence](evidence/ascend-decode/layer-major-20261018/README.md)
 - Compare complete collective contracts. TP16 one-shot push includes
   publication and overwrite protection; its single-kernel p50 is 38.06 µs
   versus 59.18 µs for the consecutive BF16/FP32/HCCL/BF16 graph control.
   Keep shared-device screening, idle calibration and decoder timing
-  distinct. Replace synchronization only with an explicit causal argument.
+  distinct. Double payload/READY slots remove ACK with an explicit causal
+  retirement proof and pass at 35.72 µs. This still exceeds the 8 µs budget;
+  stop standalone flag tuning and move to producer fusion.
   [Complete protocol](evidence/ascend-decode/execution-gap-20261018/README.md#complete-one-shot-push)
+- A plausible smaller tile still needs a real-shape comparison. Existing
+  GMM1 baseN=128 preserves outputs and actually activates for M4, but its
+  shared-die p50 is 124.59 µs versus 121.52 µs for baseN=256. Retain the
+  existing tiling; a source-level occupancy argument is not a speedup.
+  [GMM1 screen](evidence/ascend-decode/gmm1-tiling-20261018/README.md)
+- Preserve pairs when summarizing an AB/BA comparison. Independent
+  resident-layer graph p50 values differ by 144.38 µs, but the 30 paired
+  differences have median 50.25 µs and compiled wins 20 pairs. Confirm
+  separate graph pools and outputs before interpreting the measurements.
+  [Compiled-layer timing](evidence/ascend-decode/execution-gap-20261018/compiled-resident-timing-audit.json)

@@ -72,7 +72,7 @@ def run(checkpoint, report):
     target = SimpleNamespace(
         config=config, device=torch.device("cpu"), capacity=9344,
         layout={"capacity_tokens": 9344}, checkpoint=str(checkpoint),
-        position=4,
+        position=4, attention_kernel="sfa", fp32_head=False,
         model=SimpleNamespace(model=SimpleNamespace(
             embed_tokens=torch.nn.Embedding(8, 8),
         )),

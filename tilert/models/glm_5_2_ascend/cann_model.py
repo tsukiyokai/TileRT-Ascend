@@ -69,7 +69,7 @@ class CannModel:
     def __init__(
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
-        attention_kernel="sfa",
+        attention_kernel="sfa", fp32_head=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -93,6 +93,7 @@ class CannModel:
         self.capacity = capacity
         self.position = 0
         self.attention_kernel = attention_kernel
+        self.fp32_head = fp32_head
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
         self.config = create_config(
@@ -111,6 +112,11 @@ class CannModel:
             self.worker.load_model()
             self.runner = self.worker.model_runner
             self.model = self.runner.get_model()
+            if self.fp32_head:
+                from .cann_head import install_fp32_head
+
+                install_fp32_head(self.model.lm_head,
+                                  self.model.logits_processor)
             if self.runner.drafter is not None:
                 raise ValueError("Target must not load a draft model")
             self._bind_cache()
@@ -422,6 +428,10 @@ class CannModel:
             from .cann_attention import gathered_fia
 
             objects.append(gathered_fia)
+        if self.fp32_head:
+            from .cann_head import fp32_projection
+
+            objects.append(fp32_projection)
         if not self.config.model_config.enforce_eager:
             from vllm.compilation.decorators import support_torch_compile
             from vllm.compilation.wrapper import (

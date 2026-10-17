@@ -43,8 +43,35 @@ installed packages in fresh server CPU processes: eager 14/14, compiled
 15/15 and six CLI cases pass. Guarded device calls remain zero, with NPU
 uninitialized. The checked eager-config snapshot matches the prior HEAD;
 the compiled variant changes compilation/graph settings, including the
-platform's `enable_npugraph_ex`. Model execution and speed remain untested.
-Run the serial/M4/graph/dirty-reset check before matched 1024-output timing.
+platform's `enable_npugraph_ex`.
+
+[Resident-layer execution](compiled-resident-audit.json) retains the original
+decorated backbone and AscendCompiler, with only layer0 resident. Real M4,
+8K KV, TP16 and FP32 TP sum execute under a 2 GiB Torch quota. All sixteen
+ranks compile one artifact; 848 driver checks and an independent audit of
+80 saved phase tensors pass. Graph/compiled and both variant resets are
+bit exact; compiled/eager hidden NRMSE is 0.00540412, cosine 0.99998540,
+maxabs 0.03125. Selected indices and new KV are exact between variants.
+The hidden boundary includes final norm after the truncated layer0.
+
+The audit binds 392 files, including 32 compiler artifacts and 16 original
+prefixes. Full prefixes were not saved per phase; their 480 exact checks
+belong to the driver. AOT function serialization warns on all ranks;
+in-process compilation/Graph pass, disk reload is unverified. This run
+supplies no latency. Full-model serial/M4/reset validation precedes
+1024-output timing.
+
+The [paired hot-graph measurement](compiled-resident-timing-audit.json)
+uses independent wrappers, graph handles and memory pools. Ten warmups
+precede 30 AB/BA pairs, each event covering ten replays. Rank-MAX event
+p50/p95 are 4112.45/4302.42 µs for eager and 3968.07/4171.79 µs for
+compiled. Compiled wins 20/30 pairs; the paired difference has median
+50.25 µs and mean 78.46 µs. The difference between the two p50 values,
+144.38 µs, is not the paired median gain. All 32 saved timed outputs
+match their own eager/compiled references bit for bit. This fixed-input
+shared-device graph excludes metadata, head and session work. Profile
+the remaining layer cost before selecting a fusion; do not extrapolate
+these timings to 78-layer TPOT.
 
 ## Symmetric-buffer reduction
 
@@ -158,6 +185,7 @@ blocks; binary load, graph capture, replay and unload complete successfully.
 |---|---|---|
 | Full push, separate producer/consumer kernels | 43.618 | 51.955 |
 | Full push, one batch-scheduled kernel | 38.059 | 47.747 |
+| Full push, double payload/READY slots, no ACK | 35.716 | 41.519 |
 | HCCL, BF16→FP32→SUM→BF16 | 59.183 | 74.837 |
 | Bare FP32 HCCL, 96 KiB | 56.826 | 64.903 |
 | Native BF16 HCCL, 48 KiB | 48.429 | 59.512 |
@@ -171,16 +199,18 @@ These are shared-device batch averages, not 156-call-chain or decoder
 measurements. The earlier 14.334 µs read-only number is not the complete
 protocol's latency.
 
-The complete primitive is faster than this matched HCCL screen, but still
-far above the 8 µs idle budget. Retain only a new mechanism that removes
-protocol work or fuses the producer. For strictly ordered per-tile P→C
-epochs, double payload/READY slots can replace ACK: every `P_i(e+2)`
+The double-slot variant also passes the changing-input, dirty-buffer,
+delayed-consumer and reuse checks: 1,572,864 oracle output elements and
+480 raw rank timings. Both READY banks finish at their expected epochs;
+external PIDs and sixteen healthy dies are preserved. For strictly ordered
+per-tile P→C epochs, double payload/READY slots replace ACK: every `P_i(e+2)`
 follows `C_i(e+1)`, which waits for all `P_j(e+1)`, each following
 `C_j(e)`. Thus every consumer has retired slot `e mod 2` before its reuse.
 Errors must stop later publication, and epoch counters must not wrap.
-This supports a bounded mechanism experiment, not a latency prediction.
-The 8 µs stopping criterion remains an idle-device calibration; model
-acceptance additionally needs measured fusion/overlap and lower read cost.
+The shared p50 improves from 38.059 to 35.716 µs but remains far above
+the 8 µs idle budget. Stop standalone flag-loop and tile-size tuning;
+the next mechanism must fuse the producer or overlap useful work.
+Idle calibration and a 156-call/model comparison remain separate measurements.
 
 ## Raw artifacts
 

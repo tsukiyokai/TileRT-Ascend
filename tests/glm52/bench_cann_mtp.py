@@ -102,6 +102,7 @@ def arguments():
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
+    parser.add_argument("--fp32-head", action="store_true")
     parser.add_argument("--cpu-affinity", action="store_true")
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
@@ -295,7 +296,8 @@ def run(args, report):
                        capacity=args.capacity,
                        gpu_memory_utilization=args.gpu_memory_utilization,
                        compile_target=args.compile_target,
-                       attention_kernel=args.attention_kernel)
+                       attention_kernel=args.attention_kernel,
+                       fp32_head=args.fp32_head)
     try:
         draft = CannMtp(target)
         if not draft.model.do_not_compile:
@@ -452,6 +454,7 @@ def run(args, report):
                 "target_graph": args.target_graph,
                 "compile_target": args.compile_target,
                 "attention_kernel": args.attention_kernel,
+                "fp32_head": args.fp32_head,
                 "ranks": [{key: item[key] for key in
                            ("rank", "report_sha256", "errors")}
                           for item in receipts],
@@ -475,6 +478,7 @@ def main():
         "measured_requests": args.requests, "target_graph": args.target_graph,
         "compile_target": args.compile_target,
         "attention_kernel": args.attention_kernel,
+        "fp32_head": args.fp32_head,
         "scope": "M4 internal TP16 session delivery; HTTP/HIXL excluded",
         "clock": "perf_counter_ns; rank-local host clocks",
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",

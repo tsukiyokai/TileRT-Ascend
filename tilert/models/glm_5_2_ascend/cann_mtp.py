@@ -148,6 +148,10 @@ class CannMtp:
                 raise ValueError("Official loader did not load the MTP head")
             process_weights_after_loading(model, model_config, self.device)
         model.model.embed_tokens = self.target.model.model.embed_tokens
+        if self.target.fp32_head:
+            from .cann_head import install_fp32_head
+
+            install_fp32_head(model.lm_head, model.model.logits_processor)
         return model.eval()
 
     def _bind_cache(self):

@@ -324,6 +324,7 @@ def execute(args):
         engine.rank, engine.device = rank, device
         engine.capacity, engine.position = args.capacity, 0
         engine.attention_kernel = "sfa"
+        engine.fp32_head = False
         engine.checkpoint = str(args.checkpoint.resolve())
         engine.config, engine.worker = config, worker
         engine.runner, engine.model = runner, runner.model

@@ -38,6 +38,7 @@ def arguments():
                         help="Full CANN layer traces for every requested row")
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
+    parser.add_argument("--fp32-head", action="store_true")
     return parser.parse_args()
 
 
@@ -387,6 +388,7 @@ def execute(args):
     engine.capacity, engine.position = CAPACITY, 8192
     engine.checkpoint = str(args.checkpoint.resolve())
     engine.attention_kernel = args.attention_kernel
+    engine.fp32_head = args.fp32_head
     engine._tp_sum_group, engine.graph = None, None
     torch.npu.set_device(engine.device)
     total = torch.npu.get_device_properties(engine.device).total_memory
@@ -421,6 +423,14 @@ def execute(args):
             checked("base_postprocess", lambda: process_weights_after_loading(
                 engine.model, engine.config.model_config, engine.device,
             ))
+            if engine.fp32_head:
+                from tilert.models.glm_5_2_ascend.cann_head import (
+                    install_fp32_head,
+                )
+
+                checked("fp32_head", lambda: install_fp32_head(
+                    engine.model.lm_head, engine.model.logits_processor,
+                ))
             engine.layout = {"capacity_tokens": CAPACITY}
             engine._allocate_inputs()
             engine.norm_units = torch.ones(6144, dtype=torch.bfloat16,
@@ -516,6 +526,7 @@ def execute(args):
                 "greedy_total": len(predictions),
                 "full_model_executed": args.layers == 78,
                 "attention_kernel": args.attention_kernel,
+                "fp32_head": args.fp32_head,
                 "model_tp_reduction": engine.tp_reduction,
                 "checkpoint_sha256": fingerprint, "inputs": inputs,
                 "teacher_source": teacher_source,

@@ -41,6 +41,12 @@
     "source_review": {
       "path": "hccl-peer-probe-20261018-01/push-root-source-review.json",
       "sha256": "d7d6df103ff3049c881f6f3af8e0f1476ec023aa4bf8c3e5e230dd33ac94012e"
+    },
+    "double_slot_no_ack": {
+      "path": "hccl-peer-probe-20261018-01/push-pingpong-01/root-audit.json",
+      "sha256": "beb3d280118848fb7f8aaf020f3863463e2281f6e71f4cc42da6dc43f62382fb",
+      "causal_proof_sha256": "3cfaa3d32bbe8893576f85a96831fda493aaa379ef774e9ea324a4b92c61b35f",
+      "source_build_sha256": "932b8943c8a96718d34fceac2b678bf1e7c43f85e3d367696ec72a76daccb86e"
     }
   },
   "audits": {
@@ -416,7 +422,111 @@
           85
         ]
       }
+    },
+    "double_slot_no_ack": {
+      "status": "pass",
+      "scope": "TP16 48KiB double-slot no-ACK push",
+      "double_payload_and_ready": true,
+      "ack_used": false,
+      "shared_device": true,
+      "decoder_performance_measured": false,
+      "source_build_sha256": "932b8943c8a96718d34fceac2b678bf1e7c43f85e3d367696ec72a76daccb86e",
+      "functional_output_elements": 1572864,
+      "integer_rne_oracle_sha256": {
+        "1": "e4f9e1af524f8f3f381b2b1453347e01077ae5aea79ad230cfcc4e3a0abf5415",
+        "-1": "62acd135d49ec01066fe7e88a714c58168c58018353d6599c008af865458bb37"
+      },
+      "raw_rank_timing_samples": 480,
+      "rank_max_us_per_call": {
+        "p50": 35.71600019931793,
+        "p95": 41.518800258636475,
+        "min": 28.19400131702423,
+        "max": 44.648000597953796
+      },
+      "control_flags": "Driver-reported retirement/canary checks; raw flags not archived",
+      "ranks": [
+        {
+          "rank": 0,
+          "report_sha256": "3951f446a63a9dbc48a11cded5cfb67d8d9a61dca2cba875ef47bd04e91a7cb3",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 1,
+          "report_sha256": "36f0c251b8ad0230d49db2c68ed4cbc3caac5fc7d39f54e827171eeed2dfef02",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 2,
+          "report_sha256": "2f7c687d44a30550a9e4bab189e422c0cdbe11c3505d3121905fb22f1c3e6270",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 3,
+          "report_sha256": "c561998b61fd044a2203cb27e23c8d05a442c559e239985cd36d7f3ff0a158ac",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 4,
+          "report_sha256": "1e91c0e4368279d384389f5947ce6d77a6137582d2f48012335848afb353b6b0",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 5,
+          "report_sha256": "26079f481ab04e96853b397fa8f39ca6eeea5bfa743052ff95aef972a0b33db2",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 6,
+          "report_sha256": "4506472a651acea2093f9649cdb33686a9bb131098ecc080f7135a38a2fe0dc0",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 7,
+          "report_sha256": "e35422b7bd203068cba01bce6b1e4afc88b1e91c2afadcaa393786ce48161e5e",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 8,
+          "report_sha256": "b22aaa44dc8a1cda74c8937de4828531b1c29a99a54b456dce4d1af048a74c39",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 9,
+          "report_sha256": "9eeaca6996419a9fccd3c9958ef689c9511f513dc42266184095300f185eea89",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 10,
+          "report_sha256": "c7af08c10146a8f7686fc3a5620b4710eba570028c4b70a75325214c079b258b",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 11,
+          "report_sha256": "db71fa63952e6da49833af78047cb96f0acc6763892309287429d75fd380f029",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 12,
+          "report_sha256": "2fceb78c911d53021af96746bd10f849fdccf6315da189e7498d9dc2c9a59e11",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 13,
+          "report_sha256": "3266d9babab8550ae7a13b143dfe759bbafcfb89d9052b45b72b679905072024",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 14,
+          "report_sha256": "4c3fb80739890b3bd061671cca9a6ff82c1249424e973b8083ab7d5236a1a22f",
+          "reported_driver_checks": 13
+        },
+        {
+          "rank": 15,
+          "report_sha256": "a2a56b6adca5c762f1fe55b301abc3fadce53d2af1147a11eca0ad7676598aac",
+          "reported_driver_checks": 13
+        }
+      ]
     }
   },
-  "decision": "Complete push establishes reusable TP16 peer writes and graph epochs. Shared p50 is below the matched HCCL contract but above the 8us idle target. Only causal protocol removal or producer fusion justifies another mechanism experiment; no decoder speedup is measured."
+  "decision": "Double payload and READY slots remove ACK under the checked causal retirement argument; TP16 changing-input and graph-reuse checks pass. Shared p50 35.716us remains far above 8us. Stop standalone flag/tiling tuning; pursue producer fusion and compiled execution. Idle calibration and decoder TPOT gain remain unmeasured."
 }

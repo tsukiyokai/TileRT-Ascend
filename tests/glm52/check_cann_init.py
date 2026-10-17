@@ -38,8 +38,9 @@ def run(args):
         def __init__(self, config, **kwargs):
             calls.append(("construct", kwargs))
             self.device = torch.device(f"npu:{kwargs['local_rank']}")
+            model = torch.nn.Module()
             self.model_runner = SimpleNamespace(
-                model=torch.nn.Module(), drafter=None,
+                get_model=lambda: model, drafter=None,
             )
 
         def init_device(self):

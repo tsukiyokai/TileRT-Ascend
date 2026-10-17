@@ -37,11 +37,11 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。[真实路由采集](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)的 303 轮中，target 四行专家并集均值 27.121，MTP 为 29.729，16 rank 记录逐字节一致。代入固定 8K 逻辑模型，每轮 6.833–7.481 GB、HBM 情景 1.753–1.919 ms/token，未重叠预算仅 0.247–0.081 ms/token；实际 HBM 读取、cache 复用及模型带宽另测。[表示依据](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
 
-[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 长测比同源全词表慢，保留全词表；编译 M4 主干仍待同源整机对照。TP16 完整 one-shot push 已通过换输入、脏缓冲、延迟消费者及 epoch 复用，包含 ready／ACK；单 kernel 的十次依赖 SUM 热图 rank-MAX p50 为 38.059 µs，对照 BF16→FP32→HCCL→BF16 为 59.183 µs。原 14.334 µs 只读归约不代表完整协议。上述共享设备结果不是模型收益；下一次通信实验只验证双槽因果关系消除 ACK，随后转生产端融合。空闲定标 p50 超过 8 µs 则停止独立全量复制归约调优，融合收益须实测。
+[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 长测比同源全词表慢，保留全词表；单层驻留已在 TP16 跑通真实 AscendCompiler、Graph 与 reset。共享环境配对热图 p50：eager 4.112 ms、compiled 3.968 ms；30 对样本的配对差中位数仅 50.25 µs，编译快 20 对。先 profile 剩余层成本，再选融合；完整主干另作整机同源对照。TP16 完整 one-shot push 通过换输入、脏缓冲、延迟消费者及 epoch 复用；单 kernel 的十次依赖 SUM 热图 p50 为 38.059 µs，双 payload／READY 槽按因果关系消除 ACK 后为 35.716 µs，对照 BF16→FP32→HCCL→BF16 为 59.183 µs。原 14.334 µs 只读归约不代表完整协议。暂停独立通信核的 flag／tiling 调优，转生产端融合；保留 8 µs 空闲定标及实际模型验证。
 
 [现有 CANN attention 复用](evidence/ascend-decode/sfa-reuse-20261018/README.md)：保留连续 KV，去掉页址计算后，真实 layer-0 M4 完整热图的 p50 从 SFA 89.05 µs 降至 INT32 gather＋FIA 69.15 µs。两类内核各自 A/B/reset 的 819,200 个输出元素逐位通过；跨内核 NRMSE 为 0.000628，作诊断。主干和 MTP 已接入 `--attention-kernel gather_fia`，默认仍为 SFA；下一步验冻结 teacher，再做同源 1024 输出对照。该共享 die 结果不是模型 TPOT。已有 `GatherPaKvCache` 显式传零 offset 后正确，但合成 M4 完整图为 858.42 µs，停止该性能分支。
 
-[逐层驻留的 teacher 验证](evidence/ascend-decode/layer-major-20261018/README.md)保持每次 M1，分别携带 hidden／residual，并逐 token 恢复共享索引。前 7 层×2 token 的 1472 组张量与冻结同配置执行逐位一致；完整 78 层×32 步现已执行，16 rank 的最终 logits 逐位一致，峰值约 897 MiB/die。后继标签为 31/32：唯一分歧在位置 8211，279／64019 的 BF16 logit 同为 16.75。按生产 BF16 权重的精确点积，两者为 16.69348／16.75541；三处并列最大值的精确赢家均与 teacher 一致。下一步复用 CANN BF16 输入／FP32 输出 head 验证，不改第 4 节门槛。teacher 与 KV 来自不同配置、不同请求；原生同配置路径也选 279，不能将这处差异直接归因于 TileRT 接线。该驻留顺序不量 TPOT。
+[逐层驻留的 teacher 验证](evidence/ascend-decode/layer-major-20261018/README.md)保持 M1 与 hidden／residual 分离，逐 token 恢复共享索引。完整 78 层×32 步已执行，16 rank 的 logits 逐位一致，峰值约 897 MiB/die；BF16 head 为 31/32，位置 8211 的 279／64019 同为 16.75。生产 BF16 权重的精确分数为 16.69348／16.75541。现有 CANN BF16 输入／FP32 输出 head 按真实 `[9680,6144]` 分片重建后，M1／M4 均为 32/32；官方 TP16 M1／M4 processor／gather／裁剪也与同形状参考逐位一致，权重保持 BF16。`--fp32-head` 已接入主干及独立 MTP head，默认 BF16；head Graph 及完整 MTP 轨迹继续验证，不改第 4 节门槛。teacher 与 KV 来自不同配置、不同请求；驻留顺序不量 TPOT。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
@@ -128,6 +128,6 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部计时已交付；在线 HIXL→M1 decode→HTTP、M4 分阶段 trace、1024 输出诊断及 AIV 对照已完成。编译主干待空闲整机同源对照；共享环境继续验证 head 输出分辨率、GMM tiling 和有因果证明的通信简化。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部计时已交付；在线 HIXL→M1 decode→HTTP、M4 分阶段 trace、1024 输出诊断及 AIV 对照已完成。单层真实编译与 Graph 已验证并计时，FP32 head 已通过 TP16 M1／M4；继续做单层 profiling、head Graph 与独立 MTP head 验证，整机空闲后测同源长轨迹。GMM1 baseN=128 的真实 M4 对照未见收益，停止该 tiling 分支；完整双槽归约保留给生产端融合。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
 
 [实验日志](probe.md)记录最新测量与下一项实验；[经验](lesson.md)保留可复用的执行与数值结论。

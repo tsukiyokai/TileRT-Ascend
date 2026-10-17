@@ -424,6 +424,7 @@ def execute(args):
     engine.rank, engine.device = rank, torch.device(f"npu:{rank}")
     engine.capacity, engine.position = CAPACITY, 8192
     engine.attention_kernel = "sfa"
+    engine.fp32_head = False
     engine.checkpoint = str(args.checkpoint.resolve())
     engine._tp_sum_group = None
     torch.npu.set_device(engine.device)

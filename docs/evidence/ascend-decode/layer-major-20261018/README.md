@@ -57,9 +57,29 @@ forms exact rational dot products with the frozen BF16 normalized hidden.
 Scores for 279 and 64019 are 16.6934759437 and 16.7554145380: both correctly
 round to 16.75. All three tied-maximum rows, seven candidates in total,
 select the frozen labels at this higher output resolution. This is a
-CPU diagnostic, not a deployed FP32-head result. Earlier raw-FP32-weight
-dot products in the server artifacts are superseded by this dtype-correct
-calculation. Verify existing CANN BF16-input/FP32-output matmul next.
+CPU diagnostic. Earlier raw-FP32-weight dot products in the server artifacts
+are superseded by this dtype-correct calculation.
+
+The [CANN FP32-head audit](head-fp32-audit.json) then executes the existing
+`aten.mm.dtype(BF16, BF16, FP32)` on those frozen normalized outputs.
+All sixteen actual `[9680,6144]` vocabulary shards run sequentially on one
+die; weights remain BF16. M1 and M4 each match 32/32 successor labels,
+with 4,956,160 FP32 logits bit identical between query widths. All winners
+are unique; the smallest margin is 0.00261688. Peak allocation is
+142,149,120 bytes. Seven exact production-weight dot products differ by
+at most 1.1684e-5, six FP32 ULP; this is not a correctly-rounded FP32 claim.
+The production constructor uses default global padding 64 and needs no
+extra rows at vocabulary 154880. Earlier manually padded 9728-row probes
+are superseded for product-shape comparisons.
+
+The target and independent MTP head expose `--fp32-head` through the
+precision/timing runners, retaining BF16 weights and the original gather
+and vocabulary crop. The default remains BF16. The [actual TP16 M1/M4
+processor, gather and crop](head-tp-audit.json) match the same-shape frozen
+FP32 reference on all ranks, including all 32 teacher successors. Each width
+checks 79,298,560 logits against the reference and between ranks. Head
+Graph, the MTP own-head execution and live PD remain separate checks. No
+TPOT is measured by these head-only executions.
 
 The [reference configuration audit](reference-config-audit.json) binds
 the baseline's original vendor, MTP3/graph4/async settings, and the
@@ -86,3 +106,6 @@ Use the validated SwiGLU overlay, deterministic AI_CPU HCCL and 200 MiB
 HCCL buffers, as in the frozen controls. Server artifacts reside under
 `/home/shanshan/trt-asc/offline/cann-layer-major-20261018-{01,02}/`:
 frozen source, launch/environment records, raw per-layer tensors and audits.
+The command above retains the BF16 head and its 31/32 result. Add
+`--fp32-head` to exercise the new output dtype through the complete runner;
+the head-only evidence does not substitute for that execution.
