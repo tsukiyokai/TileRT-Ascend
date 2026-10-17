@@ -88,6 +88,11 @@ establish AIV resources and inspect the opaque context. It needs verified
 peer-table ABI before a 32-byte device-read check. Keep initialization,
 mapping, ordered reduction and end-to-end latency as separate results.
 
+The [initial resource queries](hccl-query-audit.json) both hit the 60 s
+timeout. In the phased second run, all sixteen ranks first pass the
+6144-element FP32 control, then enter the native shim without returning.
+The individual API wait is not yet localized; no peer read ran.
+
 ## Raw artifacts
 
 Under `/home/shanshan/trt-asc/offline/` on a3-gs:
@@ -99,3 +104,5 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
 - `cann-route-unions-20261018-02/`: final expert IDs and CPU audit.
 - `shmem-oneshot-20261017-01/`: both source variants, binaries, per-rank
   logs, CSV samples and ELF audit. The failed prototype stays here.
+- `hccl-peer-probe-20261018-01/`: installed-header query shim, sources,
+  bounded runs and host phase markers.

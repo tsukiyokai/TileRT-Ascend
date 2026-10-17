@@ -1,0 +1,67 @@
+{
+  "status": "audited",
+  "environment": "a3-gs:trt-asc, CANN9.2.0, AIV, deterministic, TP16",
+  "scope": "Bounded HCCL resource query, not peer access or reduction acceptance",
+  "cases": [
+    {
+      "case": "query-01",
+      "exit_code": 124,
+      "finished_at": "2026-10-17T16:55:49.807199+00:00",
+      "wall_seconds": 61.40373370423913,
+      "rank_reports": 0,
+      "peer_read_executed": false
+    },
+    {
+      "case": "query-02",
+      "exit_code": 124,
+      "finished_at": "2026-10-17T16:58:14.799985+00:00",
+      "wall_seconds": 61.37788656074554,
+      "rank_reports": 0,
+      "peer_read_executed": false,
+      "control_shape": [
+        6144
+      ],
+      "control_dtype": "FP32",
+      "all_rank_control_passed": true,
+      "last_python_phase": "resource_query_start",
+      "scope": "Native shim call did not return; its individual API boundary is not yet localized"
+    }
+  ],
+  "postflight_no_running_npu_processes": true,
+  "next_probe": "Localize the native API wait before interpreting context or launching peer reads",
+  "input_sha256": {
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-01/exit.json": "8890e2ad80de5b0e7cb392bb136bdf5fa5cdd819a3d41b247cd6c39207c57622",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-01/launch.json": "575fd7756a93e0e5b61900da378d37c4b148c5dce44b4c87fd818411d06313d2",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-01/run.log": "4ce31be242c6eb6fb0da7b693936f1ecaebcc820f4bde900d0fcab9615f6eac7",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/exit.json": "68aab4c9658d1add361674573dcc3405493e915f8f487e57771fa5e1d3fe00ae",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/launch.json": "99af36558f8fe394dec145323dc4661e69f845192a7d33a72f086e0213ec24a6",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/run.log": "8fa4b21f5eeb0a715d79e68682c3de6a5fc05342057a2cf2eb869581bd342376",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-0.json": "8a84ff4ceecea14aa6ba300c9c26c5b6f3865dceaccd1e6839e85e75f5a64fa3",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-1.json": "cf1b2e72c701ca8887ef4d2c2d195089d5cc9cad055d81e3f65920cc04b94b61",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-2.json": "daee1cbc6c89cf9003a90207a5d35e51eb6c9073a76812438ff7f72d3cb83661",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-3.json": "8504da729d9aadeeb9b0a039f8fa1b2dd55b2a98869617aacdaa0dc4c52fa618",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-4.json": "ebde59e72e46eb42f406595119b3bfae4df9854478f171e4cea520a6433d058c",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-5.json": "24971ce2bc76a190b3b0e3f2133c64bae20a5eb65e269751dc2ecc992035d147",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-6.json": "a61a4ff5d68334f8cf87c3d1a298c60fb35a7c8806d3a8da2a9d98822c2e722d",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-7.json": "5e9e7457577acb9286a71a84fee33d9502383188cc664ee9711100022e72425e",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-8.json": "7f999fa40754c41846fdfcd846953b73abf452922c472fd894d1fcaccaf0b356",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-9.json": "93cdf3cae9c1ca1d4f51aa644a3f5209f3c973613b09a0f003aa800df47d3a55",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-10.json": "cb39e30ceff511ace45c557bdb0a9faaae6fcf2b78c9a1af76095f3b1332905d",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-11.json": "717036a3420809c4fa774c704a1bf9163bba2740a02ef7af6c2e05cabc1fdc2b",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-12.json": "30638fb533fa5c01f22bce26c84f7e86dc283357e6927cb682d47da96a6d543b",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-13.json": "1c7a073e0317f6ce2a48258df5316948a42acae9bf0ef180745b5ea182e7bde7",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-14.json": "0c6dcba5ecde3f1b75966879d2c6003deb235538bc5c6ce342fa63990dae36bb",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query-02/queried/stage-rank-15.json": "4e0fc58bb6a7e2c89a549960cd70ea74d455e9ae64eea2af65c25deb27e5daf1",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/build.json": "a5eab36240a3aa04123dbf7888b0ae4be91704933a524236320789bb79384af9",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query.py": "926a93b69003efd6c0a4c195ef730b4a422fc6e71b01d0f2a082501abb535dd9",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/query.cpp": "99722debed81b7d190bb9b778dc05307f6d3b5b76a255c5bbf15bb6367e5f110",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/libquery.so": "6e175593ef8ae1bf3d8265daa8c584230962a48fdadd08e1bdfe6f93c869de57",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/stage-source/build.json": "586e8afbd09bab2e9a38f8a0e2f24ea8596f4c91226c3ec27fdf3de50231ba0a",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/stage-source/query.py": "a45ae6be981d187eed061f0c069eb2ad02ca67e8f759c76cdd88f089cd44714d",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/stage-source/query.cpp": "99722debed81b7d190bb9b778dc05307f6d3b5b76a255c5bbf15bb6367e5f110",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/stage-source/libquery.so": "6e175593ef8ae1bf3d8265daa8c584230962a48fdadd08e1bdfe6f93c869de57",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/stage-source/build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/postflight-npu-smi.txt": "157ee96751a8bd2b079228e33109d10e9643f8f9e1f9f05e766c139757514c75"
+  }
+}
