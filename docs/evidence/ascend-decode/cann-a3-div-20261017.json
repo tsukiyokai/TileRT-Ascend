@@ -989,7 +989,8 @@
           ]
         }
       ]
-    }
+    },
+    "source_path": "/workspace/offline/cann-div-probe-20261017/independent-cpu-01.py"
   },
   "cpu_reference": {
     "path": "/workspace/offline/cann-div-reference-20261017/indexer-reference-02.json",
@@ -1117,6 +1118,22 @@
         "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/reference_prolog.py": "20d184e9a17b139ed2cd2f82c9d929c0a6f0fa84778991d6e818f7f1f2e0b864",
         "/workspace/offline/cann-div-reference-20261017/source/tests/glm52/check_cann_prolog.py": "d60ff89193fdd1da880187bb99c7b122ec09d6679ab2ed0d596f4fdc5512dab5"
       }
+    }
+  },
+  "moe_dispatch_reference": {
+    "path": "/workspace/offline/cann-div-reference-20261017/dispatch-quant-reference-01.json",
+    "sha256": "f9f87aa3b3b78c76f8a1ddfe6168ff5ce64cc300d2a2ac1931715f9adda84895",
+    "summary": {
+      "status": "pass",
+      "scope": "Captured layer-4 AllGather dispatch A8; 16 ranks, two positions, initial/reset",
+      "performance_measured": false,
+      "dispatch_rows": 512,
+      "code_elements": 3145728,
+      "source_sha256": {
+        "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/reference_weights.py": "1ae887983d3edf6a9006df7c8b849691b34775c50e8bf8738a1300220348d533"
+      },
+      "captured_cases": 64,
+      "all_codes_and_scales_exact": true
     }
   }
 }

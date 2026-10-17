@@ -48,8 +48,29 @@ codes and 4,096 final BF16 query values are bitwise equal to CANN. Reusing
 the already verified FLOAT key/head-weight outputs reproduces all 2,048
 selected indices; the cutoff gap is 0.35972595. Prolog's internal FP32
 query scale still differs by one ULP (`4.6566e-10`), without changing the
-BF16 query. Full TP16 reset and numerical acceptance follow this local
-check; no performance measurement is attached to these results.
+BF16 query. The [updated 8K HF reference](hf-8k-div-calibrated-20261017.json)
+passes all 1,273 two-step/reset checks at positions 8192 and 8193 and
+predicts `[382,262]`. Its raw directory is
+`/workspace/offline/cann-div-reference-20261017/hf-8k`.
+Full TP16 reset and numerical acceptance follow these checks.
+
+An additional CPU replay covers the captured layer-4 MoE dispatch on all
+16 ranks at both positions, before and after reset: 512 dispatched rows,
+3,145,728 INT8 elements and all scales are exact. Raw report:
+`/workspace/offline/cann-div-reference-20261017/dispatch-quant-reference-01.json`.
+No performance measurement is attached to these results.
+
+The independent rational audit's source is
+`/workspace/offline/cann-div-probe-20261017/independent-cpu-01.py`, SHA256
+`cc18f3a31c9c8484d45dbb4f510c11556b88fc4f052b21962f21fe19b5877248`.
+Its entry binds the source text to the report:
+
+```python
+from pathlib import Path
+path = Path("/workspace/offline/cann-div-probe-20261017/independent-cpu-01.py")
+ANALYSIS_SOURCE = path.read_text()
+exec(compile(ANALYSIS_SOURCE, str(path), "exec"))
+```
 
 ## Reproduce on the server
 

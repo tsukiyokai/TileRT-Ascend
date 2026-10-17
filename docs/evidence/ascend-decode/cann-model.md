@@ -154,7 +154,17 @@ codes and its scale differs by one FP32 ULP. The
 the updated CPU reference reproduces all 6,144 input codes, 2,048 query
 codes, final BF16 query and the complete 2,048-choice set. Complete TP16
 continuation with the barrier overlay and updated HF reference remains
-the full-model acceptance.
+the full-model acceptance. The
+[updated CPU reference](hf-8k-div-calibrated-20261017.json) passes 1,273
+two-step/reset checks at 8K. Use
+`/workspace/offline/cann-div-reference-20261017/hf-8k` as `--reference`.
+
+The [frozen 8K attention differential](mla-8k-differential.md) closes the
+same-input norm/dense branch under CPU merging: rank-ordered FP32
+accumulation of device partials followed by BF16 cast is bitwise equal to HF.
+The remaining layer-0 hidden-state NRMSE is 0.003889. An isolated CPU oneDNN
+intervention changes BF16 attention arithmetic and reduces that hidden-state
+NRMSE to 0.003595. Full-model numerical acceptance remains open.
 
 ## Device acceptance
 
