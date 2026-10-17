@@ -29,6 +29,12 @@
   `full_logits=False` still gathers the full vocabulary before discarding
   logits. Expert-union scenarios estimate logical reads, not measured HBM
   traffic. [Representation audit](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
+- Reducing collective bytes can add eager device work. The small-packet
+  head matches all checked IDs but measures 22.12 ms TPOT versus the
+  immediate full-vocabulary control's 20.67 ms; retain the faster path.
+  A mapped SHMEM peer pointer also needs actual device-access validation:
+  two PEs pass while TP16 fails before timing.
+  [Execution boundaries](evidence/ascend-decode/execution-gap-20261018/README.md)
 - Compare matched execution paths before rewriting a shared kernel.
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large
