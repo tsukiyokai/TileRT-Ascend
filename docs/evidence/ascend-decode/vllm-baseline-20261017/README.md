@@ -25,6 +25,8 @@ master20260917. vLLM is `c4df37df`; vLLM-Ascend is `f558b58c`.
 [Build patches](source-patches.json) adjust dependencies and custom-op
 compilation. `TORCHINDUCTOR_AUTOGRAD_CACHE=0` preserves npugraph compilation
 and ACL Graph replay while avoiding the AOT OutputCode cache assertion.
+The [32 recorded compiler entries](compiler-options.json) all enable
+npugraph_ex and disable static kernels and SuperKernel.
 
 Output sequences were not reproducible in this MTP3/graph4 service run:
 all 32 saved 1024-token sequences are unique despite `temperature=0` and

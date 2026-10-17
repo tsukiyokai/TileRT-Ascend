@@ -80,6 +80,10 @@
   resident layer then validates actual M1 numerics under a small memory
   quota while other jobs retain the machine.
   [Reorder and device control](evidence/ascend-decode/layer-major-20261018/README.md)
+- Reduced-residency probes still need the actual model constructor.
+  GLM's constructor registers fused-QKV quantization mappings inherited by
+  MTP. An embedding-only stub omits them and fails at weight loading.
+  [MTP own-head check](evidence/ascend-decode/layer-major-20261018/README.md#mtp-own-head)
 - Convert reference weights to the executing dtype before exact arithmetic.
   This checkpoint stores FP32 LM-head rows, but deployment loads BF16.
   BF16 output also merges distinct winning scores: 16.69348 and 16.75541

@@ -93,14 +93,30 @@ concatenated reference bit for bit. Within-rank, cross-rank and M1/M4
 comparisons also agree; each variant retains 32/32 successors. Sixty-four
 captures supply 1,280 replays, with output poisoned to NaN before each
 replay and every graph reset before shutdown. Peak allocation is
-143,805,952 bytes/die. The independent MTP head and complete new-head
-trajectory remain separate checks. These head-only runs supply no TPOT.
+143,805,952 bytes/die. These head-only runs supply no TPOT.
 
-The process exits normally and postflight shows sixteen healthy dies with
-only the existing external jobs. One CPU `resource_tracker` shared-memory
-warning remains in the log; explicit process-group destruction was not
-observed. Raw head-Graph artifacts and audit stay in
+The process exits normally; sixteen dies remain healthy and external PIDs
+unchanged. The log retains one CPU shared-memory warning. Raw artifacts stay in
 `/home/shanshan/trt-asc/offline/cann-fp32-head-tp-graph-20261018-01/`.
+
+## MTP own head
+
+The [MTP head audit](head-mtp-audit.json) loads the actual layer-78 model,
+its separate BF16 head and norm, then shares the target embedding. One real
+M4 forward produces four pre-norm inputs. Its 9,912,320 initial logits and
+118,947,840 M1/M4 head outputs across sixteen ranks match the independent
+raw-shard references bit for bit. Norm runs once per row. Sixty-four head
+captures supply 320 changing-input/reset replays; peak reserved memory is
+1,868,562,432 bytes/die. M1/M4 differences remain diagnostic.
+
+The [first probe](head-mtp-load-failure.json) omitted the target constructor's
+packed quantization mapping and failed during loading. The corrected probe
+uses the actual constructor with empty decoder slots; product loading is unchanged.
+Graphs here cover norm, projection, gather and crop. Complete MTP-forward
+graphs and the new-head session trajectory are the next checks. Artifacts
+remain in `/home/shanshan/trt-asc/offline/cann-mtp-own-head-20261018-02/`.
+
+## Reference scope
 
 The [reference configuration audit](reference-config-audit.json) binds
 the baseline's original vendor, MTP3/graph4/async settings, and the
