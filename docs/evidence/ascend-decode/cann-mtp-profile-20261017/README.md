@@ -72,3 +72,36 @@ Raw artifacts remain on a3-gs under
 `summarize.py` regenerate the exported stage/communication analysis on CPU.
 The source is `ed3cbc0` plus the three overrides recorded in the audit;
 HTTP and HIXL are outside this capture.
+
+## AIV decode comparison
+
+The [paired capture audit](aiv-profile-audit.json) binds the same source,
+input, sixteen validation trajectories and marker order; the normalized
+launch changes only AI_CPU to AIV. The [CPU extraction](aiv-comparison.json)
+exports ranks 0/14. Both execute 501 AllReduce and fourteen AllGather
+calls. AIV uses `AivKernel` throughout; AI_CPU uses
+`allreduceAicpuKernel` for the reductions. The AIV model did not fall back.
+
+Rank zero, target ModelID49 in rounds two and three, in milliseconds:
+
+| Interval | AI_CPU | AIV |
+|---|---|---|
+| Target device span | 45.380 / 45.719 | 46.422 / 46.205 |
+| Compute union | 38.221 / 38.090 | 37.534 / 37.423 |
+| HCCL envelope union | 5.291 / 5.775 | 7.064 / 6.972 |
+
+Each target has 2335 compute tasks, 157 communication envelopes and 157
+communication kernels. Intervals overlap; they are not additive costs.
+AI_CPU kernel lifetimes overlap compute and are not exposed link time.
+
+In one AIV chained-draft reduction, rank zero's interval is 4.23996 ms;
+rank 14 enters 4.209045 ms later, spans 0.03202 ms, and ends only
+1.105 us later. This establishes arrival waiting in that collective.
+It does not identify the globally latest rank or prove Vector contention.
+
+The [pure communication chain](../tp-mode-20261017/README.md) improves
+from 10.93 to 5.04 ms, but this model capture shows no target-window gain.
+The non-profiled 20.44/21.47 ms session results remain the performance
+measurements. Keep compiler and communication scheduling as separate
+experiments. Raw AIV capture and CPU analysis remain on a3-gs under
+`/home/shanshan/trt-asc/offline/cann-mtp-profile-aiv-20261017-01/`.
