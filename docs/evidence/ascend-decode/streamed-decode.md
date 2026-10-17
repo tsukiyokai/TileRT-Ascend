@@ -35,6 +35,16 @@ logits maximum-absolute-error limit of 0.1. The HF criteria are unchanged.
 | 3 | 0.009019 | 0.093750 | 2,044 |
 | 4 | 0.009431 | 0.140625 | 2,044 |
 
+The [layer-1 input counterfactual](layer1-index-input-20261017.json) holds
+the checkpoint, 8K index cache, position and HF implementation fixed.
+Its control reproduces the frozen HF choices and new key exactly.
+Replacing only the merged input before layer-1 normalization with the
+actual CANN input changes agreement from 2,046 to all 2,048 selected
+positions. Selection order still differs. The new BF16 key passes the
+existing numerical bound but differs in 10/128 values. This locates the
+selection-set discrepancy in the incoming trajectory; the earlier
+operator that introduced that input difference remains to be isolated.
+
 ## Residency
 
 The original million-position RoPE tables occupy 384 MiB. The verifier
