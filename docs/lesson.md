@@ -28,3 +28,6 @@
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large
   operator cost does not establish its incremental cost versus vLLM.
+  Switching only AI_CPU to AIV preserves all outputs but raises this
+  session's median from 20.44 to 21.47 ms; the mode flag alone gives no
+  gain. Native BF16 reduction remains a separate comparison.

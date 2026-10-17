@@ -20,7 +20,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [M4 target graph](evidence/ascend-decode/cann-graph-20261017/README.md#m4-target-graph-and-session-timing)已通过 16-token 串行／投机／图／dirty reset 对照，三组各 47,088 行新 KV 逐位一致。32-token 短测中，eager 三次请求中位 TPOT 为 152.46 ms；target graph 三十次为 p50=38.70、p95=39.02 ms，每请求实际 A=31/17=1.824。最新[同源 1024-output 诊断](evidence/ascend-decode/cann-graph-20261017/README.md#m4-1024-output-diagnostic)预热三次、测量三次，TPOT 中位数 20.44 ms，距 2 ms 约 10.22 倍；每请求 303 轮，实际 A=1023/303=3.376，轮均值约 69 ms。该下降来自长轨迹接受数，代码未改。内部 callback 计时包含 seed、draft、verify、接受与交付，不含注入、reset、HTTP／HIXL；draft 仍为 eager。
 
-[三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，且 AIV／原生归约与当前 AI_CPU／FP32 归约不同。先对编译、归约及控制逐项作差分，不能把共有 GMM 成本当作双方差距。长诊断尚未完成 teacher 精度与正式 32 请求验收。
+[三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，归约 dtype、custom OPP 与调度也不同。[仅切 AIV 的长测](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control)中，16 rank 的全部 token、提议与接受一致，TPOT 中位数却升至 21.47 ms，未获收益。保留 AI_CPU，先验证编译主干，再分别测归约和控制，不能把共有 GMM 成本当作双方差距。长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
 ## 开发主线与停止条件
 
@@ -122,6 +122,6 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部计时已交付；在线 HIXL→M1 decode→HTTP、M4 分阶段 trace 与三次 1024 输出诊断已完成；当前推进编译／归约配置差分。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部计时已交付；在线 HIXL→M1 decode→HTTP、M4 分阶段 trace、1024 输出诊断及 AIV 单变量对照已完成；下一项为编译主干。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
 
 [实验日志](probe.md)记录最新测量与下一项实验；[经验](lesson.md)保留可复用的执行与数值结论。

@@ -214,3 +214,26 @@ reset remain excluded. This three-request diagnostic establishes neither
 teacher parity nor the 32-request performance acceptance. Raw reports,
 launch, source and the CPU audit remain on a3-gs under
 `/home/shanshan/trt-asc/offline/cann-mtp-target-graph-long-bench-20261017-01/`.
+
+## AI_CPU versus AIV control
+
+The [paired audit](mtp-aiv-bench-audit.json) changes only
+`HCCL_OP_EXPANSION_MODE=AI_CPU` to `AIV`. Source, input, FP32 TP sums,
+custom kernels, graph and request lengths stay fixed. All sixteen ranks'
+six 1024-token trajectories, proposals, predictions, acceptance and cache
+positions agree exactly between runs. Each run has three warmup and
+three measured requests.
+
+| Profiler-off metric | AI_CPU | AIV |
+|---|---|---|
+| Median internal TPOT (ms) | 20.441157 | 21.473259 |
+| Mean internal TPOT (ms) | 20.606968 | 21.316405 |
+| Backend round wall median (ms) | 69.518428 | 72.029132 |
+| Actual tokens/round | 3.376238 | 3.376238 |
+
+AIV does not improve this session; its measured median is 5.05% higher.
+This sequential three-request control does not measure bare collective
+latency or vLLM's native BF16 reduction. Retain AI_CPU for the next
+compiled-target comparison. Raw AIV reports, launch and `paired-audit.py`
+remain on a3-gs under
+`/home/shanshan/trt-asc/offline/cann-mtp-long-aiv-20261017-01/`.
