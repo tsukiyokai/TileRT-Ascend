@@ -144,6 +144,14 @@ across rank-0/12/15 replays. The complete vendor overlay preserves original
 host libraries and other operators; actual file reads identify the patched
 kernel. Full TP16 reset and HF parity still require a new continuation.
 
+The independent [layer-0 indexer replay](indexer-input-quant.md) reproduces
+the first HF choice difference on one die. Fixed HF q/k/weights give exact
+2,048-choice parity through the same CANN selector. The actual path first
+differs at input DynamicQuant: ten half-amax values round to magnitude 63
+instead of 64. With those actual A8 inputs, CPU Prolog reproduces all query
+codes and its scale differs by one FP32 ULP. This is the next numerical
+boundary to resolve before the complete continuation.
+
 ## Device acceptance
 
 After a complete HIXL prefix capture, stop the producer and receiver and
