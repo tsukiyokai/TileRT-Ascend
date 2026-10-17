@@ -56,3 +56,8 @@
   Communication-only gains and end-to-end gains need separate evidence;
   resource contention or arrival skew remain hypotheses until localized.
   [Matched modes](evidence/ascend-decode/tp-mode-20261017/README.md)
+- Launch blocks do not measure active workers. The current SFA M4 source
+  assigns four queries to four AIC workers despite a 24-block launch.
+  Splitting heads repeats KV traffic; splitting KV adds partial rounding
+  and merging. Compare complete existing-CANN pipelines before rewriting.
+  [Attention replay](evidence/ascend-decode/sfa-reuse-20261018/README.md)

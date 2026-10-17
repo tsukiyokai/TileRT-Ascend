@@ -195,5 +195,19 @@
     "query.py": "8c63f635687d2c61d477bd8fb96a472c5ef22b20127eea240ecc09f95107d0b4",
     "libquery.so": "52d085f07429186d4ff4171d2e1c84540e2b6658a6d871553409fe34b82de198",
     "build.json": "baa9996fe9324345579db8fd096d6131e9d02483e776e79e6a254bfd2beca9d8"
+  },
+  "peer_table_host_copy": {
+    "ranks": 16,
+    "pointer_pairs_checked": 256,
+    "nonzero_aligned_pointer_fields": 512,
+    "self_pairs_match_context": 16,
+    "device_peer_read_executed": false,
+    "performance_measured": false,
+    "external_pids_preserved": true,
+    "all_dies_health_ok": true,
+    "root_audit": {
+      "path": "/home/shanshan/trt-asc/offline/hccl-peer-probe-20261018-01/peer-table-01/root-audit.json",
+      "sha256": "9e91374bf3b52ee2c8ee61adba650acfec3d16b4062d43398fb94a1a77b7826b"
+    }
   }
 }

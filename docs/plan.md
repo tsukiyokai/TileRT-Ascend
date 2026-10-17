@@ -39,6 +39,8 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但长测 22.12 ms，比同源全词表对照 20.67 ms 更慢，保留全词表路径。用 `--compile-target --target-graph` 比较编译 M4 主干，MTP 保持 eager；先过串行／M4／图／reset，再量 1024 输出。HCCL 资源查询已在共享 TP16 通过，后续依次验证 32 B peer 读取、有序归约和生产者／消费者融合。全量复制比同 dtype 的分片归约增加约 8 倍网络量，以实际依赖链和融合后的请求 TPOT 决定取舍。
 
+[现有 CANN attention 复用](evidence/ascend-decode/sfa-reuse-20261018/README.md)：SFA 的 M4 路径按四个 query 分核，每核串行处理四段 512 个索引；约 7 ms 的 profiled 总耗时已超过整轮预算。共享 die 上，合成 M4 完整图的 p50 为原 SFA 88.44 µs、paged gather＋FIA 136.26 µs、分段 SFA＋合并 95.59 µs；各自图／eager 输出逐位一致。短 trace 中 FIA 本体为 36.24 µs，映射与 gather 为 96.46 µs。下一步利用现有连续 KV 布局去掉页址计算，比较直接 gather 与已有 `GatherPaKvCache`，再以真实 M4 与冻结 teacher 验证候选。原 SFA 保持默认；共享设备热输入筛选不作为 TPOT 收益。
+
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
 | 1. 修参考与定位 | 关闭 HF oneDNN，保留 Div 修正和 CANN SwiGLU 屏障，重比五层；随后提交 78 层 hidden NRMSE、cosine、logits 最大绝对差曲线，另报索引诊断与 logits 分辨率。 | 五层重比和完整三曲线完成、执行与 KV 状态正确，即可采集该输入的短 profiling；不要求逐层指标收敛到旧阈值。端到端冻结轨迹验收继续推进。 |

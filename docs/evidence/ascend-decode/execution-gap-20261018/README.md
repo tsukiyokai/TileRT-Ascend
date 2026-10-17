@@ -118,6 +118,11 @@ context fields and self entry before launch. Device peer reads and ordered
 reduction still require execution. Resource setup, peer access and fused
 request latency remain separate results.
 
+A subsequent host-only table copy passes on all sixteen ranks: 256 pointer
+pairs are nonzero and aligned, and all sixteen self entries match the
+owned context. No custom peer kernel runs. The audit binds this result
+to `peer-table-01/root-audit.json`; device access remains the next probe.
+
 ## Raw artifacts
 
 Under `/home/shanshan/trt-asc/offline/` on a3-gs:
