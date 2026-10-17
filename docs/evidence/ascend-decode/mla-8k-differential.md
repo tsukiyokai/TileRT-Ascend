@@ -19,7 +19,7 @@ is 130 MiB under a 1.5 GiB limit. No HCCL group or complete model loads.
 | SFA context vs FP32 compressed oracle | 23/2,048 | 0.000468 |
 | Value projection from the actual SFA context vs CPU | 0/1,024 | 0 |
 | Complete local output vs FP32 compressed oracle | 170/1,024 | 0.001642 |
-| Complete local output vs frozen full-HF pre-O slice | 676/1,024 | 0.005195 |
+| Frozen full-HF pre-O slice vs local CANN output | 676/1,024 | 0.005195 |
 
 The separate four-head probe expands only the selected keys and gives
 0.004494 NRMSE against its HF endpoint. It does not reproduce the full
@@ -52,12 +52,23 @@ rank shards, sequentially on die 15. Normalized inputs, all gate/up outputs,
 all 12,288 SwiGLU values and quantization pairs are bitwise equal to CPU.
 One rank-8 down-projection value differs by 4.77e-7. CPU rank-ordered FP32
 accumulation followed by BF16 cast, and the completed BF16 residual, are
-bitwise equal to HF. Peak Torch reservation is 118 MiB. The report has 146/148 exact
-checks; its two failures compare that same partial value twice. No device
+bitwise equal to HF. Peak Torch reservation is 118 MiB. The report has
+146/148 exact checks; its two failures compare that same partial value twice. No device
 collective executes in this experiment.
 
-This closes the fixed-input norm/dense branch with that CPU merge. The open
-propagation boundary is attention through the output projection and TP sum.
+## Output projection
+
+The original full-HF pre-O tensor also supplies sixteen real W8 O shards,
+each with 1,024 input columns and 6,144 outputs. All INT8 codes and FP32
+scales match. Rank 7 has one BF16 partial differing by 3.81e-6; the CPU
+rank-ordered FP32 sum followed by BF16 cast matches all 6,144 HF output
+values. The device report has 49/50 exact checks and 58 MiB peak Torch
+reservation. It uses the production loader, NZ postprocessing and linear
+method, with no device collective.
+
+The fixed-input norm, dense and O-projection branches close at their tested
+BF16 merged outputs. Independent attention trajectories and the complete
+TP16 execution remain open.
 The complete 8K continuation must also execute the
 [SwiGLU barrier overlay](swiglu-barrier.md) before reset and full-model
 numerical acceptance can pass.
@@ -72,6 +83,8 @@ Under `/workspace/offline` on `a3-gs:trt-asc`:
   `pre-o.{json,pt}`, `device_replay-01.py` and `device-01.{json,pt}`.
 - `cann-layer0-dense-20261017/no-onednn`: the isolated CPU replay and
   `pre-o.{json,pt}`. Original frozen artifacts remain unchanged.
+- `cann-layer0-dense-20261017/o-proj`: `device_replay.py`, CPU
+  `prepared.{json,pt}` and the actual `device-15.{json,pt}`.
 
 The scripts and reports retain commands, checkpoint/input hashes and source
 hashes. These experiments measure numerical behavior; they contain no

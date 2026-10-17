@@ -18,6 +18,33 @@ class CannStep:
     token_ids: object
 
 
+def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85):
+    """Construct the pinned eager TP16 configuration."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.platforms import current_platform
+
+    current_platform.pre_register_and_update()
+    return EngineArgs(
+        model=str(Path(checkpoint).resolve()), trust_remote_code=True,
+        dtype="bfloat16", quantization="ascend",
+        tensor_parallel_size=16, pipeline_parallel_size=1,
+        data_parallel_size=1,
+        distributed_executor_backend="external_launcher",
+        attention_config={"indexer_kv_dtype": "int8"},
+        kv_cache_dtype="auto", block_size=PAGE_SIZE,
+        max_num_seqs=1, max_num_batched_tokens=16,
+        max_model_len=capacity,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=False, enable_chunked_prefill=True,
+        enforce_eager=True, async_scheduling=False,
+        speculative_config=None, kv_transfer_config=None,
+        additional_config={
+            "enable_flashcomm1": False, "enable_dsa_cp": False,
+            "enable_shared_expert_dp": False, "enable_fused_mc2": 0,
+        },
+    ).create_engine_config()
+
+
 class CannModel:
     """One request, TP16, full-P injection and M=1/2/4 target forwards.
 
@@ -42,8 +69,6 @@ class CannModel:
         import torch
         import torch_npu  # noqa: F401
         from vllm.config import set_current_vllm_config
-        from vllm.engine.arg_utils import EngineArgs
-        from vllm.platforms import current_platform
         from vllm_ascend.worker.worker import NPUWorker
 
         self.device = torch.device(device)
@@ -54,26 +79,9 @@ class CannModel:
         self.position = 0
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
-        current_platform.pre_register_and_update()
-        self.config = EngineArgs(
-            model=self.checkpoint, trust_remote_code=True,
-            dtype="bfloat16", quantization="ascend",
-            tensor_parallel_size=16, pipeline_parallel_size=1,
-            data_parallel_size=1,
-            distributed_executor_backend="external_launcher",
-            attention_config={"indexer_kv_dtype": "int8"},
-            kv_cache_dtype="auto", block_size=PAGE_SIZE,
-            max_num_seqs=1, max_num_batched_tokens=16,
-            max_model_len=capacity,
-            gpu_memory_utilization=gpu_memory_utilization,
-            enable_prefix_caching=False, enable_chunked_prefill=True,
-            enforce_eager=True, async_scheduling=False,
-            speculative_config=None, kv_transfer_config=None,
-            additional_config={
-                "enable_flashcomm1": False, "enable_dsa_cp": False,
-                "enable_shared_expert_dp": False, "enable_fused_mc2": 0,
-            },
-        ).create_engine_config()
+        self.config = create_config(
+            self.checkpoint, capacity, gpu_memory_utilization,
+        )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
                 self.config, local_rank=self.device.index, rank=rank,

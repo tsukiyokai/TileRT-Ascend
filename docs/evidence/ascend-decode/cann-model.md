@@ -176,11 +176,28 @@ original TP16 shard shapes. Performance measurements require competing
 device and communication work to be absent. The capture manifest must
 include all 16 rank receipts and the original 8192 prompt token IDs.
 
+The [processed-weight offload probe](weight-offload-20261017.json) reaches
+the production prefetch offloader with one real W4 bank. Copying its
+processed INT32/NZ parameter into CPU storage fails in Identity/TransData
+with an invalid allocator stream. Separate snapshot checks fail at the
+same conversion with implicit, early-enabled and disabled expandable
+segments. These runs use die 15 and a 1.5 GiB allocator cap; full-model
+prefetch has not executed.
+
+The [layer-streamed check](streamed-decode.md) instead reconstructs raw
+CPU weights one layer at a time. Its first layer passes 560/560 checks
+across the real TP16 group on the shared host, using `AI_CPU` communication
+and less than 908 MiB peak Torch allocation per rank. The bounded-RoPE
+five-layer path passes 3,568/3,568 execution/reconstruction checks; its
+independent HF comparison passes 70/80 and retains the original criteria.
+
 ```bash
 source /workspace/environment/activate.sh
 cd /workspace/src/TileRT-Ascend
-ASCEND_CUSTOM_OPP_PATH=/workspace/src/vllm-ascend-unified/vllm_ascend/_cann_ops_custom/vendors/custom_transformer \
-  HCCL_BUFFSIZE=200 HCCL_OP_EXPANSION_MODE=AIV \
+cann_overlay=/workspace/offline/cann-workspace-owner-20261017/kernel-overlay/vendors/custom_transformer
+cann_vendor=/workspace/src/vllm-ascend-unified/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+ASCEND_CUSTOM_OPP_PATH="$cann_overlay:$cann_vendor" \
+  HCCL_BUFFSIZE=200 HCCL_OP_EXPANSION_MODE=AI_CPU \
   HCCL_NPU_SOCKET_PORT_RANGE=auto HCCL_HOST_SOCKET_PORT_RANGE=auto \
   OMP_NUM_THREADS=1 TASK_QUEUE_ENABLE=1 \
 PYTHONPATH="$PWD:${PYTHONPATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \

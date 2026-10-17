@@ -11,7 +11,8 @@
     "/workspace/offline/cann-layer0-dense-20261017/report.json": "b5c43cfb7ea3c1f3a2450dabd00a0ee6b6e72c70fb0b03c1e2946ef065e554d4",
     "/workspace/offline/cann-layer0-dense-20261017/pre-o.json": "cafdf8a93716143bf1c75c4099eee5ac4815c31a2b5b7b6abfb7ba01f1e19539",
     "/workspace/offline/cann-layer0-dense-20261017/device-01.json": "265e83580974142b5bd5591080cfa1b2c639f92355c50b74e6e8784fe4fccdd0",
-    "/workspace/offline/cann-layer0-dense-20261017/no-onednn/pre-o.json": "360273bba15549a6784ce734463da48fa7c5fc964d1841f4a534d1b64f097826"
+    "/workspace/offline/cann-layer0-dense-20261017/no-onednn/pre-o.json": "360273bba15549a6784ce734463da48fa7c5fc964d1841f4a534d1b64f097826",
+    "/workspace/offline/cann-layer0-dense-20261017/o-proj/device-15.json": "bbe7fe3af93e537cbc43284457c0fbf12a1879a8f2dccb78c8a7f8ffa22fdd79"
   },
   "mla": {
     "device": "npu:15",
@@ -630,6 +631,82 @@
     "output": {
       "path": "/workspace/offline/cann-layer0-dense-20261017/device-01.pt",
       "sha256": "075cacdb8fde349208e14474ede22ae6e8ad3b6c979e44d22f0fb2e19c8d111a"
+    }
+  },
+  "fixed_input_o_projection": {
+    "scope": "Fixed pre-O; CPU rank-order FP32 sum then BF16",
+    "device": "npu:15",
+    "hccl_executed": false,
+    "timed": false,
+    "checks": 50,
+    "bitwise_equal_checks": 49,
+    "different_checks": {
+      "rank7.partial": {
+        "equal": false,
+        "shape": [
+          1,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "different": 1,
+        "max_abs": 3.814697265625e-06,
+        "nrmse": 2.7413338102633134e-05
+      }
+    },
+    "merged_outputs": {
+      "cpu_reference_sum": {
+        "equal": true,
+        "shape": [
+          1,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "different": 0,
+        "max_abs": 0.0,
+        "nrmse": 0.0
+      },
+      "device_cpu_sum": {
+        "equal": true,
+        "shape": [
+          1,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "different": 0,
+        "max_abs": 0.0,
+        "nrmse": 0.0
+      }
+    },
+    "peak_reserved_bytes": 60817408,
+    "allocator_limit_bytes": 1610612736,
+    "input": {
+      "path": "/workspace/offline/cann-layer0-dense-20261017/pre-o.pt",
+      "sha256": "5c092b39d6f9cb1f563e9ead13c8fa377d2b8690dac1241399f65f045080320e"
+    },
+    "output": {
+      "path": "/workspace/offline/cann-layer0-dense-20261017/o-proj/device-15.pt",
+      "sha256": "52acac3536d56a9c3647ca02b55ece7711f33969cf8631a8adf5fb4c5eb22823"
+    },
+    "source_sha256": {
+      "/workspace/offline/cann-div-reference-20261017/source/tests/glm52/run_hf_reference.py": "a2c261470f9baf1c141746035da8950f61c1f81ac99af3bf86a3c31936d4fa01",
+      "/workspace/offline/cann-div-reference-20261017/source/tests/glm52/run_native_decode.py": "bc40b579824eb6def8fa9fc7fb2acd045774088f1e841e514279aa6818870adc",
+      "/workspace/offline/cann-div-reference-20261017/source/tests/glm52/prefix_io.py": "b0f1a76b565d6d97b3ef1e64b7810d1efe7c22470e2b1c46bd64911341559c90",
+      "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/reference.py": "1074977dc263e7e45290280aa423c5e1072b8a63bdbebc11225e6f83ed3ab827",
+      "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/reference_weights.py": "1ae887983d3edf6a9006df7c8b849691b34775c50e8bf8738a1300220348d533",
+      "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/ops/indexer.py": "b8536fd5f41fe1f194ef4f3f34d30d4090c3b943c69d69a0445666d41396172a",
+      "/workspace/offline/cann-div-reference-20261017/source/tilert/models/glm_5_2_ascend/reference_prolog.py": "20d184e9a17b139ed2cd2f82c9d929c0a6f0fa84778991d6e818f7f1f2e0b864",
+      "/opt/trt-asc/venv/lib/python3.11/site-packages/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py": "adb8317a21716b01273046e46c807f14f0dbaf035af59b60d52bd6bc3007cf72",
+      "/opt/trt-asc/venv/lib/python3.11/site-packages/transformers/models/glm_moe_dsa/configuration_glm_moe_dsa.py": "5a81164be746307431ad998f789b6b0bca20eb4c14a726552eb3730268413997",
+      "/opt/trt-asc/venv/lib/python3.11/site-packages/transformers/cache_utils.py": "ee7902fbd031ed332b5e26d07756a33f09b5c90a435b8363b9330876dc33ce0e",
+      "/opt/trt-asc/venv/lib/python3.11/site-packages/transformers/utils/output_capturing.py": "28921dca36f8892e6f50c8b92ebfff3e9aff945f32a88c275e41b1dc0f1b65c1",
+      "/workspace/offline/cann-layer0-dense-20261017/pre_o_replay.py": "f399797423e33f4e638bfdf3686f301576d61aa95b42c22cb6d2de57aa55cc16",
+      "/workspace/offline/cann-div-reference-20261017/source/tests/glm52/check_cann_router.py": "774dcd49516a6a09c9b37943272f13e50132ae3cf7f8da6b91bbe5fc67cfd423",
+      "/workspace/src/vllm-unified/vllm/model_executor/model_loader/utils.py": "e6e3477d926deb12fd1b50d4e6a7d649f97a5c2b6524cc2e4a604c80bb653f20",
+      "/workspace/src/vllm-ascend-unified/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py": "47444be0a5017d012401685d89134200f39c5e706f7941797fa7ecfccf1bba0d",
+      "/workspace/src/vllm-ascend-unified/vllm_ascend/ops/linear.py": "7654777d9252fc6a3cc2c95f92b67a42410a0de24a5912ef20e807cf64ab74e6",
+      "/workspace/src/vllm-ascend-unified/vllm_ascend/quantization/method_adapters.py": "341d93cae5774414a810444a50eb752cd425330156f404d1b9a10381e6bc0138",
+      "/workspace/offline/cann-layer0-dense-20261017/device_replay-01.py": "09c43e235e68212f1df1a3b25b476b7185c4138c765a079d3ccb7c3713cb2662",
+      "/workspace/offline/cann-layer0-dense-20261017/o-proj/device_replay.py": "4ea1a11d921ecf60408397edfa34e7cba607e6aeba0e868edb3d31f142f69aac"
     }
   }
 }
