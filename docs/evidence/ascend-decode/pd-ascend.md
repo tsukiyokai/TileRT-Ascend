@@ -17,6 +17,8 @@ MTP width 2/4 request loop; its numerical acceptance remains in progress.
   on this single host, destination rank r uses die `(r+1)%16` to avoid
   HIXL self-device connections. TP shard ownership remains logical rank r.
   Equal virtual addresses in different processes are separate allocations.
+  Each endpoint port also selects that instance's internal HCCL listener;
+  P and D ports must be distinct on every shared die.
 - The [V1 connector](../../../tilert/pd_vllm/ascend_connector.py) binds the
   actual cache views and scheduler block tables. Its `wait_for_save` returns
   after producer synchronization, synchronous WRITE and the matching
@@ -126,6 +128,10 @@ uses an 8192-token budget, MTP1, eager execution and synchronous scheduling;
 its default destination is the capture receiver on control port 5557.
 Set `TRT_HIXL_IP` to the prefill host's business IP. `TRT_DECODE_HOST`
 defaults to that address; set `TRT_CTRL_PORT=5556` for the decode service.
+Build the current HIXL bridge and set `TRT_HIXL_LIBRARY` to its output;
+pass the same library to the receiver's `--hixl-library`. The
+[co-resident transport check](pd-hixl-20261017/hixl-listen-port-20261017.json)
+verifies the listener isolation required by shifted P/D placement.
 The [launcher argument checks](pd-hixl-20261017/prefill-launcher.json)
 exercise both destinations and a changed host without starting vLLM.
 The [prefix capture receiver](measurement.md#capture-original-vllm-prefixes)

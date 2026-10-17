@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -eo pipefail
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 source /workspace/environment/activate.sh
 set -u
 
@@ -7,7 +8,8 @@ set -u
 decode_host=${TRT_DECODE_HOST:-$TRT_HIXL_IP}
 ctrl_port=${TRT_CTRL_PORT:-5557}
 transfer_config=$(python3 -S - "$TRT_HIXL_IP" "$decode_host" "$ctrl_port" \
-    "${TRT_MTP_PARENT_HIDDEN:-0}" <<'PY'
+    "${TRT_MTP_PARENT_HIDDEN:-0}" \
+    "${TRT_HIXL_LIBRARY:-/workspace/experiments/hixl-build/build-sync-contract/libtilert_hixl.so}" <<'PY'
 import json
 import sys
 
@@ -24,10 +26,7 @@ print(json.dumps({
         "tilert_max_seq_len": 8192,
         "hixl_host": sys.argv[1],
         "hixl_port_base": 26000,
-        "hixl_library": (
-            "/workspace/experiments/hixl-build/build-sync-contract/"
-            "libtilert_hixl.so"
-        ),
+        "hixl_library": sys.argv[5],
         "tilert_timeout_s": 1800,
         "transfer_mtp_parent_hidden": sys.argv[4] == "1",
     },
@@ -35,7 +34,7 @@ print(json.dumps({
 PY
 )
 
-cd /workspace/src/TileRT-Ascend
+cd "$repo_dir"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 run_dir=${1:-/workspace/experiments/glm52/vllm-prefill-20261017}

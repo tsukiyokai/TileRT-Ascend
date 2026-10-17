@@ -1,13 +1,14 @@
 # A3 HIXL handoff checks
 
 Environment: `a3-gs:trt-asc`, CANN 9.2.0, Torch/Torch-NPU 2.12.0. The
-transport bridge SHA256 is
+initial transport bridge SHA256 is
 `cee498b49da610c77a50d00de200b7bc4ddf1c1304bf6a3dea19cb6f870864f5`.
 
 | Check | Observation |
 |---|---|
 | Independent processes, die 0 → die 0 | [Connect status 103900](same-die.json); receive allocation remains unchanged. |
 | Independent processes, die 0 → die 1 | [1 KiB WRITE passes](cross-die.json); all receiver bytes equal the source pattern. |
+| Two processes per die, 0 → 1 held while 1 → 0 runs | [Both 1 KiB WRITEs pass](hixl-listen-port-20261017.json); four explicit internal listener ports are observed. |
 | Production host command channel | [16 real Gloo processes](gloo-idle.json) receive all four commands in order after 141 seconds of idle time; none imports Torch-NPU. |
 | TP16 metadata and admission | [30 PD checks](check-shifted-pd.json), [29 connector checks](check-shifted-connector.json), and [20 session checks](check-session.json) pass on CPU. |
 
@@ -39,4 +40,15 @@ occupied all sixteen dies before prefill initialization completed:
 [occupancy snapshot](prefix-8k-20261017/occupancy-conflict.json).
 Only this experiment's passive receiver was stopped;
 [the external processes remain](prefix-8k-20261017/occupancy-after-stop.json).
-Full 8K KV transfer and decode continuation await an idle A3.
+That run did not complete 8K transfer or decode continuation.
+
+With shifted placement, P and D share each die. Their default internal
+HCCL port 16666 conflicts even when HIXL endpoint ports differ. The bridge
+now sets `GlobalResourceConfig` with
+`{"comm_resource_config.listen_port":"<endpoint port>"}` at initialization.
+The [four-process check](hixl-listen-port-20261017.json) observes ports
+29200–29203 and exact bytes in both directions while the first pair remains
+alive. All four processes exit. The rebuilt bridge is byte-identical to the
+tested library, SHA256
+`9d1421f2033d1ee0e9d11325e7d5bdd34aa5bbc78d50c42a80079af305c3ea5d`.
+This check covers co-resident transport; the TP16 8K capture is separate.

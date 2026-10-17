@@ -97,8 +97,17 @@ EXPORT int tilert_hixl_open(const char* endpoint, int device, void** result) {
         checked(aclrtSetDevice(device), "aclrtSetDevice");
         auto instance = std::make_unique<Engine>();
         checked(aclrtGetCurrentContext(&instance->context), "aclrtGetCurrentContext");
-        checked(instance->transport.Initialize(hixl::AscendString(endpoint), {}),
-                "Initialize");
+        // P and D on one die need distinct HCCL listeners.
+        const std::string local(endpoint);
+        const auto port = local.substr(local.rfind(':') + 1);
+        const auto resources =
+            "{\"comm_resource_config.listen_port\":\"" + port + "\"}";
+        const std::map<hixl::AscendString, hixl::AscendString> options{
+            {hixl::AscendString("GlobalResourceConfig"),
+             hixl::AscendString(resources.c_str())},
+        };
+        checked(instance->transport.Initialize(hixl::AscendString(endpoint),
+                                               options), "Initialize");
         *result = instance.release();
     });
 }
