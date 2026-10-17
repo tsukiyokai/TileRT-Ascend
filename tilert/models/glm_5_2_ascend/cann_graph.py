@@ -1,11 +1,11 @@
-"""Fixed-width ACL graph for the eager CANN model and fixed cache storage."""
+"""Fixed-width ACL graph for the CANN model and fixed cache storage."""
 
 
 class CannGraph:
     """Capture model forward; prepare metadata and sample outside the graph.
 
-    All TP ranks must finish eager warmup before the first call. The caller
-    updates CannModel's inputs and metadata before every forward, retaining
+    All TP ranks must finish uncaptured warmup before the first call.
+    The caller updates inputs and metadata before each forward, retaining
     their storage through close(). Returned hidden storage is reused on replay.
     """
 
@@ -16,7 +16,9 @@ class CannGraph:
 
     def __init__(self, engine, width=1):
         import torch
-        from vllm.config import CUDAGraphMode, set_current_vllm_config
+        from vllm.config import (
+            CompilationMode, CUDAGraphMode, set_current_vllm_config,
+        )
         from vllm.forward_context import BatchDescriptor
         from vllm_ascend.attention.sfa_v1 import AscendSFABackend
         from vllm_ascend.compilation.acl_graph import (
@@ -39,7 +41,14 @@ class CannGraph:
         self._addresses = None
         self._closed = False
         if not self.config.model_config.enforce_eager:
-            raise ValueError("CannGraph requires the eager CANN model")
+            backbone = self.model.model
+            compiled = getattr(backbone, "compiled", False) or callable(
+                getattr(backbone, "aot_compiled_fn", None),
+            )
+            if (width != 4 or self.config.compilation_config.mode
+                    != CompilationMode.VLLM_COMPILE
+                    or backbone.do_not_compile or not compiled):
+                raise ValueError("Warm the compiled M4 target before capture")
         if self.config.speculative_config is not None:
             raise ValueError("CannGraph captures only the target model")
         with torch.npu.device(self.device), (

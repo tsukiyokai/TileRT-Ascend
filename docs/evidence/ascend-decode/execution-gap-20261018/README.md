@@ -29,6 +29,23 @@ Fewer bytes do not establish lower latency; additional eager device work
 has not been separately timed. These three-request measurements exclude
 HTTP/HIXL and do not satisfy teacher or formal performance acceptance.
 
+## Compiled target comparison
+
+The precision runner and session benchmark accept
+`--compile-target --target-graph`; the precision runner requires width four.
+The target uses the installed AscendCompiler, with static/super kernels
+disabled. MTP keeps both model configs eager and separate registration
+state. An uncaptured forward compiles before manual M4 ACL capture.
+Benchmark reports retain compiler counters and cache-artifact hashes.
+
+[Configuration precheck](compiled-config-audit.json) uses the actual
+installed packages in fresh server CPU processes: eager 14/14, compiled
+15/15 and six CLI cases pass. Guarded device calls remain zero, with NPU
+uninitialized. The checked eager-config snapshot matches the prior HEAD;
+the compiled variant changes compilation/graph settings, including the
+platform's `enable_npugraph_ex`. Model execution and speed remain untested.
+Run the serial/M4/graph/dirty-reset check before matched 1024-output timing.
+
 ## Symmetric-buffer reduction
 
 [SHMEM audit](shmem-audit.json) binds source, binaries, launch parameters
@@ -65,8 +82,8 @@ and model bandwidth remain unmeasured; the trajectory grows toward 9K.
 
 ## Communication decision
 
-Continue one bounded HCCL-resource probe, then a producer/consumer fusion
-experiment if peer access passes. The [open A3 deterministic executor](https://gitcode.com/cann/hcomm/blob/2b4f2a4ed628cbeb48d76eead015ef220ea5400b/src/legacy/ascend910/algorithm/base/alg_aiv_template/all_reduce/aiv_all_reduce_91093_deter.h)
+Continue with device peer reads, ordered reduction and producer/consumer
+fusion. The [open A3 deterministic executor](https://gitcode.com/cann/hcomm/blob/2b4f2a4ed628cbeb48d76eead015ef220ea5400b/src/legacy/ascend910/algorithm/base/alg_aiv_template/all_reduce/aiv_all_reduce_91093_deter.h)
 already performs peer pull and reduction within one AIV kernel. This is
 the source model; the installed trace proves AIV execution, without binding
 it to that exact algorithm. Full
@@ -83,19 +100,23 @@ scenario, not a predicted TPOT gain. It still consumes 0.370 ms/token,
 more than the unoverlapped budget above. Fusion/overlap and reduced reads
 are therefore part of this route's acceptance, alongside standalone speed.
 
-The next probe uses the installed `HcomGetAlgExecParam` interface to
-establish AIV resources and inspect the opaque context. It needs verified
-peer-table ABI before a 32-byte device-read check. Keep initialization,
-mapping, ordered reduction and end-to-end latency as separate results.
-
 The [initial resource queries](hccl-query-audit.json) both hit the 60 s
 timeout. In the phased second run, all sixteen ranks first pass the
 6144-element FP32 control, then enter the native shim without returning.
-The individual API wait is not yet localized; no peer read ran.
-Source inspection identifies a graph-workspace registration prerequisite.
-A variant registers 64 KiB under the same tag and marks individual native
-calls; it is CPU-built. Its launch preflight finds another job on all
-sixteen dies, so this variant has no device result yet.
+The registered-workspace variant then passes on all sixteen ranks under
+concurrent external load: same-tag 64 KiB scratch, successful registration,
+resource/context copies. All 256 public remote-buffer queries return zero
+status but null addresses and sizes; they establish no peer mapping.
+The prepared device reader uses the graph context's peer table. Installed ELF
+and copied context agree on 336 bytes, field offsets and ranks 0–15; scratch
+starts at the caller's allocation. All process groups are destroyed, the
+external PIDs remain and every die reports healthy. This functional run
+has no communication latency measurement.
+
+A CPU-built 32-byte-per-peer reader checks the installed library hashes,
+context fields and self entry before launch. Device peer reads and ordered
+reduction still require execution. Resource setup, peer access and fused
+request latency remain separate results.
 
 ## Raw artifacts
 
@@ -106,6 +127,8 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
 - `cann-small-top1-long-20261018-01/`: candidate timing and CPU audit.
 - `cann-full-vocab-control-20261018-01/`: matched control and CPU audit.
 - `cann-route-unions-20261018-02/`: final expert IDs and CPU audit.
+- `cann-compiled-config-20261018-02/`: frozen compiler candidate and CPU
+  configuration/CLI checks; reuses the prior HEAD check in `-01/`.
 - `shmem-oneshot-20261017-01/`: both source variants, binaries, per-rank
   logs, CSV samples and ELF audit. The failed prototype stays here.
 - `hccl-peer-probe-20261018-01/`: installed-header query shim, sources,

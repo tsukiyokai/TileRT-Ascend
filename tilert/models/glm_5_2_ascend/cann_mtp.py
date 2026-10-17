@@ -38,7 +38,7 @@ def weight_sources(checkpoint):
 
 def draft_config(target_config):
     """Keep target parallel settings and isolate draft registration state."""
-    from vllm.config import SpeculativeConfig
+    from vllm.config import CompilationMode, CUDAGraphMode, SpeculativeConfig
 
     parallel = target_config.parallel_config
     if (parallel.tensor_parallel_size != 16
@@ -62,12 +62,20 @@ def draft_config(target_config):
         target_model_config=target_config.model_config,
         target_parallel_config=parallel,
     )
+    config.speculative_config.draft_model_config.enforce_eager = True
     config.model_config = copy.copy(target_config.model_config)
     config.model_config.runner_type = "draft"
+    config.model_config.enforce_eager = True
     config.attention_config = copy.copy(target_config.attention_config)
     config.attention_config.backend = None
     config.compilation_config = copy.copy(target_config.compilation_config)
+    config.compilation_config.mode = CompilationMode.NONE
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    config.compilation_config.cudagraph_capture_sizes = []
+    config.compilation_config.max_cudagraph_capture_size = 0
+    config.compilation_config.compile_sizes = []
     config.compilation_config.static_forward_context = {}
+    config.compilation_config.static_all_moe_layers = []
     config.quant_config = copy.copy(target_config.quant_config)
     config.load_config = copy.copy(target_config.load_config)
     config.load_config.load_format = "safetensors"

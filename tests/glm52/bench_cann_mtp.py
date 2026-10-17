@@ -6,6 +6,8 @@ and Gloo commands. Prefix readiness and reset are outside that window.
 """
 
 import argparse
+import ast
+from dataclasses import asdict
 from datetime import datetime, timezone
 from importlib.metadata import version
 import json
@@ -97,12 +99,15 @@ def arguments():
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--target-graph", action="store_true")
+    parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--cpu-affinity", action="store_true")
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
     if args.target_graph and args.warmup < 1:
         parser.error("Graph capture requires an unmeasured warmup request")
+    if args.compile_target and not args.target_graph:
+        parser.error("--compile-target requires --target-graph")
     if args.capacity < PREFIX_LENGTH + args.max_tokens + WIDTH - 2:
         parser.error("Capacity must permit full M4 verification at the end")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -264,6 +269,7 @@ def run(args, report):
     import torch.distributed as distributed
     import torch_npu  # noqa: F401
     from vllm.distributed import get_world_group
+    from vllm.compilation.counter import compilation_counter
     from tilert.models.glm_5_2_ascend.cann_model import CannModel
     from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
     from tilert.models.glm_5_2_ascend.tp_runtime import (
@@ -285,9 +291,12 @@ def run(args, report):
         raise ValueError("Use the captured full-P 8K prefix")
     target = CannModel(args.checkpoint, f"npu:{rank}", rank,
                        capacity=args.capacity,
-                       gpu_memory_utilization=args.gpu_memory_utilization)
+                       gpu_memory_utilization=args.gpu_memory_utilization,
+                       compile_target=args.compile_target)
     try:
         draft = CannMtp(target)
+        if not draft.model.do_not_compile:
+            raise ValueError("MTP must remain eager in both target variants")
         if target.tp_reduction != "float32":
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
@@ -295,12 +304,61 @@ def run(args, report):
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():
             if args.target_graph:
+                counters_before = asdict(compilation_counter)
                 engine.inject(prefix)
                 engine.start_mtp(first, args.max_tokens, WIDTH, ())
                 engine.advance_mtp()
                 engine.finish_mtp(engine.position)
                 engine.reset()
-                report["eager_graph_warmup"] = engine.requests.pop()
+                warmup_key = ("compiled_graph_warmup" if args.compile_target
+                              else "eager_graph_warmup")
+                report[warmup_key] = engine.requests.pop()
+                if args.compile_target:
+                    backbone = target.model.model
+                    config = target.config.compilation_config
+                    cache = (Path(config.local_cache_dir)
+                             if config.local_cache_dir else None)
+                    artifacts = {}
+                    if cache is not None:
+                        index = cache / "vllm_compile_cache.py"
+                        if index.is_file():
+                            artifacts[str(index)] = digest(index)
+                            for entry in ast.literal_eval(
+                                index.read_text(),
+                            ).values():
+                                path = entry["graph_handle"][1]
+                                if path and Path(path).is_file():
+                                    artifacts[path] = digest(Path(path))
+                    report["target_compilation"] = {
+                        "mode": str(config.mode), "backend": config.backend,
+                        "cudagraph_mode": str(config.cudagraph_mode),
+                        "capture_sizes": config.cudagraph_capture_sizes,
+                        "ascend_compilation_config": (
+                            target.config.additional_config
+                            ["ascend_compilation_config"]),
+                        "backbone_compiled": backbone.compiled,
+                        "aot_callable": callable(getattr(
+                            backbone, "aot_compiled_fn", None,
+                        )),
+                        "aot_loaded": getattr(
+                            backbone, "was_aot_compile_fn_loaded_from_disk",
+                            False,
+                        ),
+                        "counters_before": counters_before,
+                        "counters_after": asdict(compilation_counter),
+                        "artifacts_sha256": artifacts,
+                        "draft_do_not_compile": draft.model.do_not_compile,
+                        "draft_mode": str(
+                            draft.config.compilation_config.mode,
+                        ),
+                        "draft_cudagraph_mode": str(
+                            draft.config.compilation_config.cudagraph_mode,
+                        ),
+                        "separate_context": (
+                            draft.config.compilation_config
+                            .static_forward_context is not
+                            config.static_forward_context),
+                    }
                 target.enable_graph(width=WIDTH)
             sources = source_hashes(target, draft)
             for name in ("mtp_session.py", "tp_runtime.py"):
@@ -389,6 +447,7 @@ def run(args, report):
                 "warmup": args.warmup, "requests": args.requests,
                 "output_tokens_per_request": args.max_tokens,
                 "target_graph": args.target_graph,
+                "compile_target": args.compile_target,
                 "ranks": [{key: item[key] for key in
                            ("rank", "report_sha256", "errors")}
                           for item in receipts],
@@ -410,6 +469,7 @@ def main():
         "width": WIDTH, "max_tokens": args.max_tokens,
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
+        "compile_target": args.compile_target,
         "scope": "M4 internal TP16 session delivery; HTTP/HIXL excluded",
         "clock": "perf_counter_ns; rank-local host clocks",
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",

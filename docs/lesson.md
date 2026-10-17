@@ -41,6 +41,12 @@
   Full-replication reduction trades more traffic for fewer stages; count
   its network work and remaining unoverlapped budget before choosing it.
   [Observed unions and budget](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)
+- Separate functional setup from latency measurement. The TP16 HCCL
+  resource query passes under external load after registering graph scratch
+  under the same tag; it needs little device memory. Reserve idle devices
+  for model timing. Host context, device peer reads and dependent-chain
+  latency are separate gates.
+  [Registered query](evidence/ascend-decode/execution-gap-20261018/hccl-query-audit.json)
 - Compare matched execution paths before rewriting a shared kernel.
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large

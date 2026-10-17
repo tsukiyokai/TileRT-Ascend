@@ -18,8 +18,10 @@ class CannStep:
     token_ids: object
 
 
-def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85):
-    """Construct the pinned eager TP16 configuration."""
+def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
+                  *, compile_target=False):
+    """Construct TP16 config, optionally compiling the M4 target backbone."""
+    from vllm.config import CompilationMode, CUDAGraphMode
     from vllm.engine.arg_utils import EngineArgs
     from vllm.platforms import current_platform
 
@@ -36,11 +38,21 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85):
         max_model_len=capacity,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=False, enable_chunked_prefill=True,
-        enforce_eager=True, async_scheduling=False,
+        enforce_eager=not compile_target, async_scheduling=False,
+        compilation_config={
+            "mode": CompilationMode.VLLM_COMPILE,
+            "cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
+            "cudagraph_capture_sizes": [4],
+            "max_cudagraph_capture_size": 4,
+            "custom_ops": ["all"],
+        } if compile_target else {},
         speculative_config=None, kv_transfer_config=None,
         additional_config={
             "enable_flashcomm1": False, "enable_dsa_cp": False,
             "enable_shared_expert_dp": False, "enable_fused_mc2": 0,
+            "ascend_compilation_config": {
+                "enable_static_kernel": False, "enable_super_kernel": False,
+            },
         },
     ).create_engine_config()
 
@@ -56,7 +68,7 @@ class CannModel:
 
     def __init__(
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=0.85, *, compile_target=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -81,6 +93,7 @@ class CannModel:
         torch.npu.set_device(self.device)
         self.config = create_config(
             self.checkpoint, capacity, gpu_memory_utilization,
+            compile_target=compile_target,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
@@ -93,7 +106,7 @@ class CannModel:
                 raise ValueError("Worker remapped the requested physical NPU")
             self.worker.load_model()
             self.runner = self.worker.model_runner
-            self.model = self.runner.model
+            self.model = self.runner.get_model()
             if self.runner.drafter is not None:
                 raise ValueError("Target must not load a draft model")
             self._bind_cache()
@@ -391,6 +404,17 @@ class CannModel:
                    type(self.model), type(self.model.model),
                    set_ascend_forward_context]
         objects.extend(type(builder) for _, builder in self.builders)
+        if not self.config.model_config.enforce_eager:
+            from vllm.compilation.decorators import support_torch_compile
+            from vllm.compilation.wrapper import (
+                TorchCompileWithNoGuardsWrapper,
+            )
+            from vllm_ascend.compilation.compiler_interface import (
+                AscendCompiler,
+            )
+
+            objects.extend((AscendCompiler, support_torch_compile,
+                            TorchCompileWithNoGuardsWrapper))
         if self.graph is not None:
             objects.append(type(self.graph))
         paths = {Path(inspect.getfile(inspect.unwrap(value))).resolve()

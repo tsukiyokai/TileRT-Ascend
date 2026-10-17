@@ -55,7 +55,9 @@ def parse_arguments(argv=None):
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--target-graph", action="store_true",
-                        help="Compare fixed-width target graph after eager")
+                        help="Compare graph after uncaptured execution")
+    parser.add_argument("--compile-target", action="store_true",
+                        help="Compile the target; keep MTP eager")
     parser.add_argument("--profile-output", type=Path,
                         help="Capture M4 stages after device checks pass")
     parser.add_argument("--device-offset", type=int, choices=range(16),
@@ -67,6 +69,8 @@ def parse_arguments(argv=None):
         parser.error("Positive output budget and capacity >= 128 required")
     if args.target_graph and args.max_tokens < 2:
         parser.error("Graph comparison requires a decode round")
+    if args.compile_target and (not args.target_graph or args.width != 4):
+        parser.error("--compile-target requires --target-graph --width 4")
     if args.profile_output and args.width != 4:
         parser.error("The bounded MTP capture requires width four")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -319,8 +323,11 @@ def execute(args):
     target = CannModel(
         args.checkpoint, f"npu:{physical}", rank, args.init_method,
         args.capacity, args.gpu_memory_utilization,
+        compile_target=args.compile_target,
     )
     draft = CannMtp(target)
+    if not draft.model.do_not_compile:
+        raise ValueError("MTP must remain eager in both target variants")
     source = source_hashes(target, draft)
     group = get_world_group().cpu_group
 
@@ -443,6 +450,7 @@ def execute(args):
         "checkpoint_sha256": checkpoint, "inputs": inputs,
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
+        "compile_target": args.compile_target,
         "graph": None if target.graph is None else {
             "width": target.graph.width,
             "captures": target.graph.capture_count,

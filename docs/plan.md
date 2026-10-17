@@ -37,7 +37,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。[真实路由采集](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)的 303 轮中，target 四行专家并集均值 27.121，MTP 为 29.729，16 rank 记录逐字节一致。代入固定 8K 逻辑模型，每轮 6.833–7.481 GB、HBM 情景 1.753–1.919 ms/token，未重叠预算仅 0.247–0.081 ms/token；实际 HBM 读取、cache 复用及模型带宽另测。[表示依据](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
 
-[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但同源长测 22.12 ms，比紧随其后的全词表对照 20.67 ms 更慢，保留全词表路径。编译主干作独立对照；对称缓冲继续一次基于 HCCL 资源接口的可达性穿刺，通过后验证有序归约及生产者／消费者融合。TP16 全量复制比同 dtype 的分片归约增加约 8 倍网络量；以实际依赖链与融合后的请求 TPOT 决定取舍。
+[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但长测 22.12 ms，比同源全词表对照 20.67 ms 更慢，保留全词表路径。用 `--compile-target --target-graph` 比较编译 M4 主干，MTP 保持 eager；先过串行／M4／图／reset，再量 1024 输出。HCCL 资源查询已在共享 TP16 通过，后续依次验证 32 B peer 读取、有序归约和生产者／消费者融合。全量复制比同 dtype 的分片归约增加约 8 倍网络量，以实际依赖链和融合后的请求 TPOT 决定取舍。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
