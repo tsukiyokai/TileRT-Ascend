@@ -26,10 +26,28 @@ master20260917. vLLM is `c4df37df`; vLLM-Ascend is `f558b58c`.
 compilation. `TORCHINDUCTOR_AUTOGRAD_CACHE=0` preserves npugraph compilation
 and ACL Graph replay while avoiding the AOT OutputCode cache assertion.
 
-All first tokens are 6500. With temperature zero and seed zero, the 32
-complete output sequences differ; [one fixed trajectory](teacher-32.json)
-provides teacher tokens for subsequent decode comparisons. Numerical
-acceptance uses layer, logit and cache comparisons separately.
+Output sequences were not reproducible in this MTP3/graph4 service run:
+all 32 saved 1024-token sequences are unique despite `temperature=0` and
+`seed=0`. The [client](../../../../tests/glm52/bench_vllm_decode.py), whose
+source hash matches `benchmark.json`, reuses one 8192-ID prompt and checks
+the returned prompt IDs on every response. All responses report 8192
+prompt tokens, 1024 completion tokens and `finish_reason="length"`.
+
+All sequences start with `[6500, 382, 262, 576]`. Against the first saved
+request, `cmpl-9aa86ab6d6f99327`, the other 31 sequences first differ at
+these one-based output positions (position: request count):
+`5:17, 8:1, 12:3, 21:1, 33:3, 74:2, 82:1, 84:2, 110:1`.
+[teacher-32.json](teacher-32.json) freezes that request's first 32 tokens
+and their next-token sequence as a trajectory anchor for teacher forcing.
+HF remains the primary independent numerical diagnostic; this frozen
+trajectory supplies fixed teacher inputs and greedy successor labels for
+end-to-end acceptance. A new request to the running service does not
+supply a reproducible token oracle or intermediate layer reference.
+
+This repeatability result applies to the recorded MTP3/graph4 service
+configuration. Fixed eager M1/FP32 comparisons establish only their own
+recorded trajectory. TileRT did not execute these P+D requests, so their
+output divergence cannot be attributed to TileRT.
 
 At p50, reaching 2 ms requires an 8.20-fold reduction from this baseline,
 which already includes MTP and decode graph replay.

@@ -28,18 +28,21 @@ def parse_arguments():
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--mla-preprocess", choices=("native", "prolog_v3"),
                         default="native")
+    parser.add_argument("--layers", type=int, choices=range(1, 79), default=78)
     args = parser.parse_args()
     if args.generate < 1 or args.capacity < 1:
         parser.error("Generation and cache capacity must be positive")
     return args
 
 
-def validate_trace(trace):
+def validate_trace(trace, layer_count=78):
     position = trace["position"]
     if trace["committed_position"] != position + 1:
         raise ValueError("HF did not commit exactly one token")
-    counts = {"hidden_states": 79, "layer_logits": 78, "indices": 78,
-              "routes": 78, "cache_rows": 78}
+    counts = {"hidden_states": layer_count + 1, "layer_logits": layer_count,
+              "indices": layer_count, "routes": layer_count,
+              "cache_rows": layer_count, "index_scores": layer_count,
+              "attention_weights": layer_count}
     for name, count in counts.items():
         if len(trace[name]) != count:
             raise ValueError(f"Incomplete HF {name}")
@@ -56,6 +59,15 @@ def validate_trace(trace):
             raise ValueError(f"Missing attention selection at layer {layer}")
         if (trace["routes"][layer] is not None) != (layer >= 3):
             raise ValueError(f"Wrong routing presence at layer {layer}")
+        scores = trace["index_scores"][layer]
+        if (scores is not None) != full or (
+            full and tuple(scores.shape) != (position + 1,)
+        ):
+            raise ValueError(f"Wrong index score shape at layer {layer}")
+        if tuple(trace["attention_weights"][layer].shape) != (
+            64, position + 1,
+        ):
+            raise ValueError(f"Wrong attention weight shape at layer {layer}")
 
 
 def load_prefix(args, report):
@@ -96,6 +108,7 @@ def load_prefix(args, report):
 
 
 def check_lengths(engine, expected, report, label):
+    layer_count = len(engine.model.model.layers)
     lengths = [layer.get_seq_length() for layer in engine.cache.layers]
     index_lengths = []
     for cached, layer in zip(engine.cache.layers, engine.model.model.layers):
@@ -114,7 +127,7 @@ def check_lengths(engine, expected, report, label):
         "name": label, "expected_position": expected,
         "actual_position": engine.position, "mla_lengths": lengths,
         "index_lengths": index_lengths,
-        "passed": len(lengths) == 78 and engine.position == expected
+        "passed": len(lengths) == layer_count and engine.position == expected
         and all(length == expected for length in lengths)
         and all(length == (expected if layer < 3 or (layer - 2) % 4 == 0
                            else None)
@@ -124,7 +137,42 @@ def check_lengths(engine, expected, report, label):
     })
 
 
-def run(args, report):
+def compare_replay(label, trace, previous, checks, layer_count):
+    from run_native_decode import compare_tensor, compare_trace
+
+    if layer_count == 78:
+        compare_trace(label, trace, previous, checks, exact=True)
+    else:
+        checks.append({
+            "name": label + ".position_and_input",
+            "passed": all(trace[key] == previous[key] for key in (
+                "token", "position", "committed_position")),
+        })
+        compare_tensor(label + ".logits", trace["logits"],
+                       previous["logits"], checks, exact=True)
+        for field in ("hidden_states", "layer_logits", "indices", "routes"):
+            for layer, (left, right) in enumerate(zip(
+                trace[field], previous[field],
+            )):
+                compare_tensor(f"{label}.{field}.{layer}", left, right,
+                               checks, exact=True)
+        for layer, (left, right) in enumerate(zip(
+            trace["cache_rows"], previous["cache_rows"],
+        )):
+            for field in ("latent", "rope", "index", "index_scale"):
+                compare_tensor(f"{label}.cache.{layer}.{field}",
+                               left[field], right[field], checks, exact=True)
+    compare_tensor(label + ".last_merged_hidden", trace["last_merged_hidden"],
+                   previous["last_merged_hidden"], checks, exact=True)
+    for field in ("index_scores", "attention_weights"):
+        for layer, (left, right) in enumerate(zip(
+            trace[field], previous[field],
+        )):
+            compare_tensor(f"{label}.{field}.{layer}", left, right,
+                           checks, exact=True)
+
+
+def run_reference(args, report):
     import torch
     import transformers
     from transformers import GlmMoeDsaForCausalLM
@@ -133,7 +181,6 @@ def run(args, report):
     from transformers.utils import output_capturing
 
     from tilert.models.glm_5_2_ascend.reference import HfReference
-    from run_native_decode import compare_trace
 
     torch.set_num_threads(8)
     report["versions"].update(
@@ -146,7 +193,8 @@ def run(args, report):
             Path(cache_utils.__file__), Path(output_capturing.__file__),
         )
     }
-    engine = HfReference(args.checkpoint, args.mla_preprocess)
+    engine = HfReference(args.checkpoint, args.mla_preprocess,
+                         layer_count=args.layers)
     report["weight_arithmetic"] = engine.weights.contract
     if args.mla_preprocess == "prolog_v3":
         report["expert_combine"] = engine.weights.contract["expert_combine"]
@@ -173,7 +221,7 @@ def run(args, report):
             if offset < len(args.tokens):
                 token = args.tokens[offset]
             trace = engine.step(token)
-            validate_trace(trace)
+            validate_trace(trace, args.layers)
             check_lengths(engine, initial + offset + 1, report,
                           f"step{initial + offset}.cache_lengths")
             name = f"step-{initial + offset:05d}.pt"
@@ -191,15 +239,16 @@ def run(args, report):
         check_lengths(engine, initial, report, "reinjected.cache_lengths")
         for offset, token in enumerate(consumed):
             trace = engine.step(token)
-            validate_trace(trace)
+            validate_trace(trace, args.layers)
             check_lengths(engine, initial + offset + 1, report,
                           f"replay{initial + offset}.cache_lengths")
             previous = torch.load(
                 args.output / f"step-{initial + offset:05d}.pt",
                 map_location="cpu", weights_only=True,
             )
-            compare_trace(f"reset.step{initial + offset}", trace, previous,
-                          report["checks"], exact=True)
+            validate_trace(previous, args.layers)
+            compare_replay(f"reset.step{initial + offset}", trace, previous,
+                           report["checks"], args.layers)
     report["teacher_tokens"] = consumed
     report["generated_tokens"] = generated
     report["position"] = engine.position
@@ -207,6 +256,21 @@ def run(args, report):
     report["status"] = (
         "pass" if all(item["passed"] for item in report["checks"]) else "fail"
     )
+
+
+def run(args, report):
+    import torch
+
+    with torch.backends.mkldnn.flags(
+        enabled=False, deterministic=None, allow_tf32=None,
+        fp32_precision=None,
+    ):
+        report["cpu_matmul"] = {
+            "mkldnn_enabled": torch.backends.mkldnn.enabled,
+            "mkldnn_available": torch.backends.mkldnn.is_available(),
+            "scope": "Prefix expansion, HF forward and diagnostic projections",
+        }
+        run_reference(args, report)
 
 
 def main():
@@ -223,7 +287,10 @@ def main():
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "implementation": "transformers.GlmMoeDsaForCausalLM", "tp_size": 16,
-        "scope": "CPU HF traces with selected MLA arithmetic and exact reset",
+        "scope": (
+            "CPU HF traces with oneDNN disabled and selected MLA arithmetic; "
+            "exact reset checks reference repeatability"
+        ),
         "status": "running", "hostname": platform.node(),
         "git_head": args.source_commit, "command": [sys.executable, *sys.argv],
         "checkpoint": str(args.checkpoint), "versions": {
@@ -231,6 +298,13 @@ def main():
         },
         "prompt_tokens": args.tokens, "requested_generation": args.generate,
         "mla_preprocess": args.mla_preprocess,
+        "layer_count": args.layers,
+        "last_merged_hidden": "Last decoder output before the final RMSNorm",
+        "partial_layer_logits": (
+            "Use the full-model intermediate norm/head projection formula"
+        ),
+        "attention_weights": "HF expanded-KV softmax weights; BF16 [64,P]",
+        "index_scores": "Masked indexer scores [P]; None on shared layers",
         "rms_norm_eps": {"ordinary": 1e-5, "q_a": 1e-5, "kv_a": 1e-5},
         "index_rope_basis": "interleaved",
         "tie_rule": "stable descending score; ascending expert/position ID",

@@ -22,10 +22,17 @@ The [result and rank receipts](streamed-five-20261017.json) bind all
 and outputs are under
 `/workspace/offline/cann-streamed-five-20261017/source-01` and `device-01`.
 
-The independent HF comparison passes 70/80 checks. All five layers pass
-the 1% hidden/logits NRMSE bound and retain the same greedy token. The
-first exact-index difference is layer 1; layer 4 exceeds the original
-logits maximum-absolute-error limit of 0.1. The HF criteria are unchanged.
+The original HF comparison recorded 70/80 under a CPU BF16 matmul
+reference subsequently falsified by exact dot products. The table below
+is historical, not an acceptance result. The corrected reference disables
+oneDNN, retains the calibrated Div boundary, and is rerun before the
+78-layer curves. Index equality becomes a diagnostic; logits report their
+BF16 spacing before interpreting a fixed absolute difference. Hidden
+NRMSE and cosine thresholds await the full curves. End-to-end frozen
+teacher trajectories determine acceptance, as specified in
+[the plan](../../plan.md#4-可独立验收).
+The [corrected five-layer diagnostics](hf-corrected-20261017/README.md)
+use the same frozen CANN execution and the repaired HF reference.
 
 | Layer | Hidden NRMSE | Logits max-abs | Common indices / 2,048 |
 |---|---:|---:|---:|

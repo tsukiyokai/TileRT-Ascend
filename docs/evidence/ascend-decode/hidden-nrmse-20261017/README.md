@@ -1,5 +1,12 @@
 # Hidden-state differences across 78 decoder boundaries
 
+This historical reference used the default CPU BF16 matmul provider.
+Exact-dot-product evidence subsequently identified 417/1024 incorrect
+BF16 results in its frozen PV witness; disabling oneDNN removes those
+differences. These curves remain a record of the original run and do not
+calibrate thresholds. The corrected reference retains Div calibration
+and is compared with the same frozen CANN tensors.
+
 ![Per-layer NRMSE](hidden-nrmse.png)
 
 This is a cross-configuration diagnostic: CANN compressed MLA versus the
@@ -35,14 +42,16 @@ differences. Native vLLM-Ascend deployment equivalence is a separate check.
 Artifacts: [CSV](hidden-nrmse.csv), [SVG](hidden-nrmse.svg),
 [input hashes and FP64 values](hidden-nrmse.json).
 
-## Reproduce
+## Original command
 
-Run the [plotter](../../../../tests/glm52/plot_cann_hf_layers.py) on the
-server; it reads frozen CPU tensors and does not initialize an NPU.
+The original plotter is preserved at commit `91ec6bd`. The current
+[plotter](../../../../tests/glm52/plot_cann_hf_layers.py) requires the
+corrected reference and produces three curves.
 
 ```bash
 source /workspace/environment/activate.sh
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/glm52/plot_cann_hf_layers.py \
+git show 91ec6bd:tests/glm52/plot_cann_hf_layers.py > /tmp/plot_hf_legacy.py
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python /tmp/plot_hf_legacy.py \
   --native-run /workspace/offline/cann-full8k-barrier-20261017/continuation8k \
   --reference /workspace/offline/cann-div-reference-20261017/hf-8k \
   --output /workspace/offline/cann-full8k-barrier-20261017/layer-curves-new

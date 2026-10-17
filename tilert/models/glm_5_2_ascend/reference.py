@@ -306,12 +306,14 @@ class ReferenceIndexer(nn.Module):
         self.scales = None
         self.last_key = None
         self.last_scale = None
+        self.last_scores = None
         self.query_projection = ReferenceLinear(weights, prefix + ".wq_b")
 
     def reset(self):
         self.scales = None
         self.last_key = None
         self.last_scale = None
+        self.last_scores = None
 
     def encode(self, x):
         if not self.quantized:
@@ -391,6 +393,7 @@ class ReferenceIndexer(nn.Module):
             scores = scores.masked_fill(
                 torch.arange(keys.shape[0]) > position_ids.item(), -torch.inf
             )
+        self.last_scores = scores.detach().clone()
         indices = scores.argsort(descending=True, stable=True)[:2048]
         return indices.to(torch.int32).reshape(1, 1, -1)
 
@@ -398,9 +401,12 @@ class ReferenceIndexer(nn.Module):
 class HfReference:
     """Run the installed HF model without CANN or production weight helpers."""
 
-    def __init__(self, checkpoint, mla_preprocess="native"):
+    def __init__(self, checkpoint, mla_preprocess="native",
+                 layer_count=LAYERS):
         if mla_preprocess not in ("native", "prolog_v3"):
             raise ValueError("MLA preprocess must be native or prolog_v3")
+        if type(layer_count) is not int or not 1 <= layer_count <= LAYERS:
+            raise ValueError("The reference layer count must be in [1, 78]")
         self.mla_preprocess = mla_preprocess
         self.weights = ReferenceWeights(checkpoint)
         self.weights.contract["rotary"] = dict(ROTARY_CONTRACT)
@@ -415,6 +421,8 @@ class HfReference:
                 or config.topk_group != 1 or config.n_shared_experts != 1
                 or config.rms_norm_eps != 1e-5):
             raise ValueError("The reference requires the GLM-5.2 TP16 layout")
+        config.num_hidden_layers = layer_count
+        config.layer_types = config.layer_types[:layer_count]
         with torch.device("meta"):
             self.model = GlmMoeDsaForCausalLM(config).to(torch.bfloat16)
         self.config = config
@@ -516,9 +524,19 @@ class HfReference:
                 layer.mlp = ReferenceMlp(self.weights, mlp)
 
     def _attach_trace_hooks(self):
+        def record_last_merged(module, inputs):
+            if inputs[0].ndim == 3:
+                self.last_merged_hidden = inputs[0][:, -1].detach().clone()
+
+        self.model.model.norm.register_forward_pre_hook(record_last_merged)
         for number, layer in enumerate(self.model.model.layers):
             def record_attention(module, inputs, output, index=number):
                 self.indices[index] = output[2][0, -1].detach().clone()
+                self.attention_weights[index] = (
+                    output[1][0, :, -1, :].detach().clone()
+                )
+                if module.indexer is not None:
+                    self.index_scores[index] = module.indexer.last_scores
                 if self.mla_preprocess == "prolog_v3":
                     self.latents[index] = module._prolog["latent"][0].clone()
 
@@ -543,6 +561,10 @@ class HfReference:
     def position(self):
         return self.cache.get_seq_length()
 
+    @torch.backends.mkldnn.flags(
+        enabled=False, deterministic=None, allow_tf32=None,
+        fp32_precision=None,
+    )
     def inject(self, prefixes):
         prefix_length(prefixes)
         if self.position:
@@ -564,10 +586,18 @@ class HfReference:
                 )
 
     @torch.inference_mode()
+    @torch.backends.mkldnn.flags(
+        enabled=False, deterministic=None, allow_tf32=None,
+        fp32_precision=None,
+    )
     def step(self, token):
+        layer_count = len(self.model.model.layers)
         self.indices, self.routes, self.latents = (
-            [None] * LAYERS for _ in range(3)
+            [None] * layer_count for _ in range(3)
         )
+        self.index_scores = [None] * layer_count
+        self.attention_weights = [None] * layer_count
+        self.last_merged_hidden = None
         position = self.position
         output = self.model(
             input_ids=torch.tensor([[token]]), past_key_values=self.cache,
@@ -575,13 +605,24 @@ class HfReference:
         )
         self.cache = output.past_key_values
         hidden = tuple(value[:, -1].clone() for value in output.hidden_states)
-        intermediate = torch.cat(hidden[1:-1])
-        normalized = (prolog_input_norm(self.model.model.norm, intermediate)
-                      if self.mla_preprocess == "prolog_v3"
-                      else self.model.model.norm(intermediate))
-        projected = self.model.lm_head(normalized)
+        if self.last_merged_hidden is None:
+            raise ValueError("HF final norm did not expose its merged input")
         logits = output.logits[:, -1].clone()
-        layer_logits = (*projected.split(1, dim=0), logits)
+        layer_logits = (logits,)
+        projected_hidden = hidden[1:-1]
+        if layer_count < LAYERS:
+            projected_hidden = (*projected_hidden, self.last_merged_hidden)
+        if projected_hidden:
+            intermediate = torch.cat(projected_hidden)
+            normalized = (
+                prolog_input_norm(self.model.model.norm, intermediate)
+                if self.mla_preprocess == "prolog_v3"
+                else self.model.model.norm(intermediate)
+            )
+            projected = self.model.lm_head(normalized)
+            layer_logits = tuple(projected.split(1, dim=0))
+            if layer_count == LAYERS:
+                layer_logits = (*layer_logits, logits)
         rows = []
         for number, layer in enumerate(self.model.model.layers):
             indexer = layer.self_attn.indexer
@@ -598,6 +639,9 @@ class HfReference:
             "token": token, "position": position,
             "committed_position": self.position, "logits": logits,
             "hidden_states": hidden, "layer_logits": layer_logits,
+            "last_merged_hidden": self.last_merged_hidden,
+            "index_scores": tuple(self.index_scores),
+            "attention_weights": tuple(self.attention_weights),
             "indices": tuple(self.indices), "routes": tuple(self.routes),
             "cache_rows": tuple(rows),
         }
