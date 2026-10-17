@@ -56,6 +56,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--target-graph", action="store_true",
                         help="Compare fixed-width target graph after eager")
+    parser.add_argument("--profile-output", type=Path,
+                        help="Capture M4 stages after device checks pass")
     parser.add_argument("--device-offset", type=int, choices=range(16),
                         default=0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -65,6 +67,8 @@ def parse_arguments(argv=None):
         parser.error("Positive output budget and capacity >= 128 required")
     if args.target_graph and args.max_tokens < 2:
         parser.error("Graph comparison requires a decode round")
+    if args.profile_output and args.width != 4:
+        parser.error("The bounded MTP capture requires width four")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0, 1]")
     return args
@@ -488,6 +492,22 @@ def execute(args):
         }
         atomic_json(args.output / "summary.json", summary)
         print(json.dumps(summary))
+    if success and args.profile_output:
+        from profile_cann_decode import capture_validated_mtp
+        from tilert.pd_vllm.ascend_cache import FullRankPrefix
+
+        prefix = FullRankPrefix(main_prefix, mtp_prefix,
+                                saved_parent.to(target.device), initial)
+        capture_validated_mtp(target, draft, prefix, first, rank,
+                              args.profile_output)
+        atomic_json(args.output / f"profile-binding-rank-{rank}.json", {
+            "validation_summary_sha256": digest(args.output / "summary.json"),
+            "validation_report_sha256": digest(path),
+            "profile_report_sha256": digest(
+                args.profile_output / f"rank-{rank}.json",
+            ),
+            "capture_manifest_sha256": inputs["capture_manifest_sha256"],
+        })
     target.shutdown()
     return 0 if success else 1
 

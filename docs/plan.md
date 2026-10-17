@@ -18,7 +18,9 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [M1 ACL Graph](evidence/ascend-decode/cann-graph-20261017/README.md)已完成实际执行与计时：16 rank 的 32 步 graph／eager、reset／eager、reset／graph 三组对照各有 100,352 个张量逐位一致；位置、长度、RoPE、int64 slot 与图内共享 indices 均随执行更新。无 profiler 短测中位 TPOT 为 44.68 ms，距 2 ms 仍约 22.34 倍。同版本 eager 对照为 256.84 ms；单独绑核为 246.65 ms，仅约 4% 差异且范围重叠。主机逐算子提交已被图替代，后续按 M4 路径的 trace 优化 CANN 算子与归约。
 
-[M4 target graph](evidence/ascend-decode/cann-graph-20261017/README.md#m4-target-graph-and-session-timing)已通过 16-token 串行／投机／图／dirty reset 对照，三组各 47,088 行新 KV 逐位一致。真实 session 的 32-token 短测中，eager 三次请求中位 TPOT 为 152.46 ms；target graph 三十次为 p50=38.70、p95=39.02 ms，距 2 ms 约 19.35 倍，draft 仍为 eager。每请求 17 轮，实际 A=31/17=1.824，自然 A=33/17=1.941；图路径轮耗时中位数 69.86 ms。该内部 callback 口径包含 seed、draft、verify、接受与交付，不含注入、reset、HTTP／HIXL。下一步采集该路径的分阶段 trace；长轨迹接受数与正式 1024-token 验收另测。
+[M4 target graph](evidence/ascend-decode/cann-graph-20261017/README.md#m4-target-graph-and-session-timing)已通过 16-token 串行／投机／图／dirty reset 对照，三组各 47,088 行新 KV 逐位一致。32-token 短测中，eager 三次请求中位 TPOT 为 152.46 ms；target graph 三十次为 p50=38.70、p95=39.02 ms，每请求实际 A=31/17=1.824。最新[同源 1024-output 诊断](evidence/ascend-decode/cann-graph-20261017/README.md#m4-1024-output-diagnostic)预热三次、测量三次，TPOT 中位数 20.44 ms，距 2 ms 约 10.22 倍；每请求 303 轮，实际 A=1023/303=3.376，轮均值约 69 ms。该下降来自长轨迹接受数，代码未改。内部 callback 计时包含 seed、draft、verify、接受与交付，不含注入、reset、HTTP／HIXL；draft 仍为 eager。
+
+[三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，且 AIV／原生归约与当前 AI_CPU／FP32 归约不同。先对编译、归约及控制逐项作差分，不能把共有 GMM 成本当作双方差距。长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
 ## 开发主线与停止条件
 
@@ -33,7 +35,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 归纳步骤：设本轮 target 预测为 y，前 k 个 draft 满足 `c[i+1]=y[i]`。因 causal verify 的前 k+1 行与串行输入一致，`y[0:k+1]` 正是后续 greedy 输出；主干消费 `c[0:k+1]` 后仍留下最后一个 y 未消费，前缀不变量保持。由这些行的 target hidden 重算 MTP，再截断到 `L+A`，保持 MTP 不变量。现有[状态穷举](../tests/glm52/check_mtp_state.py)覆盖接受位置、parent 标签和 reset；真实 CANN 数值、因果索引及 HIXL 可见性由设备对照封闭。
 
-性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。按第 1 节的流式模型，若有效带宽为 1.12 TB/s、平均 A=3.2，每轮 HBM 字节上限是 7.17 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.05 GB。当前 7.54–8.19 GB 的场景需要减少读取量或提高实际接受数／有效带宽，Graph 的启动收益须与这项差距一起核算。
+性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。当前 7.54–8.19 GB 的估算场景仍需减少读取量或提高有效带宽；该流量尚非实测专家并集，单 die 流式带宽也不等于模型带宽。Graph 的启动收益须与轮预算一起核算。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
@@ -64,7 +66,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 | 单 rank 读取 | 权重 3.844 GB；MLA `78×2048×576×2=184 MB`；index KV `8192×(16×130+5×256)=27.5 MB`；合计约 4.056 GB。INT8 index 层携带 FP16 scale，其余 5 个主干 indexer 保持 BF16。[精度契约](evidence/ascend-decode/weight-contract.md) |
 | AllReduce | 主干每层 attention、FFN 各一次，共 156 次，目标单 token 为 `6144×2=12 KiB` BF16；当前 FP32 精度基线为 24 KiB。TP16 同缓冲区依赖链的图重放 event p50：24 KiB FP32 为 5.028 ms，96 KiB FP32 为 5.074 ms；Python 提交的 24 KiB 链为 26.756 ms。[实测与复现](evidence/ascend-decode/tp-sum.md) |
 
-流式读取模型给出 `T_HBM=4.056 GB/(1.6 TB/s×η)`：峰值带宽下为 2.53 ms，约 394 tok/s；取 70% 带宽为 3.62 ms，约 276 tok/s。加上当前 HCCL 图路径实测的 5.03 ms 归约链，串行预算为 7.56／8.65 ms，即约 132／116 tok/s；理想通算重叠预算为 `max(T_HBM,5.03 ms)`，约 199 tok/s。图链包含重放提交、rank 偏差和依赖调度，不能将总时长除以 156 当作裸 HCCL α；HBM 有效带宽与完整 decode 速度仍待实测。
+流式读取模型给出 `T_HBM=4.056 GB/(1.6 TB/s×η)`：峰值带宽下为 2.53 ms，约 394 tok/s；取 70% 带宽为 3.62 ms，约 276 tok/s。加上当前 HCCL 图路径实测的 5.03 ms 归约链，串行预算为 7.56／8.65 ms，即约 132／116 tok/s；理想通算重叠预算为 `max(T_HBM,5.03 ms)`，约 199 tok/s。图链包含重放提交、rank 偏差和依赖调度，不能将总时长除以 156 当作裸 HCCL α；[die 0 流式读取](evidence/a3-hbm-20261017.json)现测得中位 1.155 TB/s：四个 513 MiB 输入轮换，预热 100 次、测量 1000 次，15 组 checksum 通过；该带宽代入 4.056 GB 场景约需 3.51 ms。16 die 并行最低带宽及 W4 模型实际带宽另测，流式读数不等于模型带宽。
 
 因此，只消除 Python 提交开销仍不足以达到 2 ms。关键是复制的低秩投影、router、indexer、156 次归约，以及小 M 下的解包和计算效率。2 ms 路线从 MTP 共享权重读取、减少复制读取、tile 流水和生产端融合归约展开。
 
@@ -120,6 +122,6 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部短测已交付；在线 HIXL→M1 decode→HTTP 已闭环；当前推进 M4 分阶段 profiling。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+修参考、五层重比、78 层三曲线、M1 profiling、M1／M4 target graph 数值对照与内部计时已交付；在线 HIXL→M1 decode→HTTP、M4 分阶段 trace 与三次 1024 输出诊断已完成；当前推进编译／归约配置差分。端到端八输入／32 步和长 MTP 轨迹继续验收；按热点实测 HBM、通信与相关算子，再推进修改、融合和 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
 
 [实验日志](probe.md)记录最新测量与下一项实验；[经验](lesson.md)保留可复用的执行与数值结论。

@@ -20,5 +20,11 @@
   differences; frozen teacher trajectories define release acceptance.
   [Precision policy](plan.md#4-可独立验收)
 - Measure accepted tokens, not verification width. The measured M4 session
-  commits 31 tokens in 17 rounds; its 38.70 ms median remains 19.35 times
-  the 2 ms target. Profile this path before choosing its next optimization.
+  commits 31 tokens in 17 rounds for 32 outputs, but 1023 in 303 rounds
+  for 1024 outputs. With unchanged code, median TPOT changes from 38.70
+  to 20.44 ms; round means remain near 69 ms. Use the long workload to
+  budget the 2 ms target, and retain short captures for diagnosis.
+- Compare matched execution paths before rewriting a shared kernel.
+  Graph4 can capture an eager model or a compiled model; short and long
+  MTP requests also have different acceptance distributions. A large
+  operator cost does not establish its incremental cost versus vLLM.

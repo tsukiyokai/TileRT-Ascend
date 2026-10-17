@@ -155,10 +155,11 @@ class _Rank(_Proxy):
             return self.wrapped.reset()
 
 
-def instrument_engine(target, draft, markers):
+def instrument_engine(target, draft, markers, *,
+                      engine_class=AscendRankEngine):
     """Wrap calls without replacing verification, acceptance or cache logic."""
     state = _TraceState(markers)
-    engine = AscendRankEngine(_Target(target, state), _Draft(draft, state))
+    engine = engine_class(_Target(target, state), _Draft(draft, state))
     return _Rank(engine, state)
 
 

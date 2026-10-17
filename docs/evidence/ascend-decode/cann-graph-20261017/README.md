@@ -173,3 +173,44 @@ and benchmark `d38609fbd685`. The receipt preserves their full hashes,
 checkpoint metadata, input identities and all 32 rank-report hashes.
 The copied benchmark audit SHA256 is
 `384313a9e37b4187d0b7d2e5eb3b0510e6c88f7dd9206a315a82313c91e4cd55`.
+
+## M4 1024-output diagnostic
+
+The [long-session audit](mtp-long-bench-audit.json) uses the same frozen
+source, checkpoint, full 8K prefix and runtime configuration as the
+32-output graph benchmark. Three warmups precede three measured requests;
+all six produce the same 1024 tokens. All sixteen ranks agree on command
+history, acceptance and reset. Main and MTP positions finish at 9215 and
+reset to zero; one target graph is captured and replayed 1818 times.
+
+| Measured request | Internal TPOT (ms) | Rounds | Actual tokens/round |
+|---|---|---|---|
+| 1 | 20.441157 | 303 | 3.376238 |
+| 2 | 20.422166 | 303 | 3.376238 |
+| 3 | 20.957581 | 303 | 3.376238 |
+
+Median TPOT is 20.441157 ms, mean 20.606968 ms. Each request commits
+1023 tokens in 303 rounds; natural acceptance is 1025/303 = 3.382838,
+with the last round trimmed by two tokens. Backend round wall means,
+including Gloo, are 68.997/68.933/70.741 ms. The first 32 tokens and first
+17 proposal sequences match the earlier short request, whose lower
+acceptance was 31/17. The TPOT change from
+38.70 to 20.44 ms comes from the measured trajectory length, with no
+kernel change. It is not an optimization speedup.
+
+The original vLLM baseline has median client TPOT 16.390 ms over 32
+1024-output requests. The observed median ratio is now 1.247, rather
+than the 2.361 ratio obtained from the short TileRT request. The
+[baseline log extraction](../cann-mtp-profile-20261017/baseline-comparison.json)
+records backbone compilation, ACL replay and aggregate natural acceptance
+3.268 over 69 windows including warmup. The windows cannot be assigned to
+individual requests. Its compiled model, AIV/native reduction, scheduler,
+custom kernels and generated trajectories differ from this run; the ratio
+does not isolate any of those costs. Both launch configurations set draft
+`enforce_eager=true`; the baseline also logs eagle-head compilation.
+
+The internal callback formula is `(last - first) / 1023`; HTTP/HIXL and
+reset remain excluded. This three-request diagnostic establishes neither
+teacher parity nor the 32-request performance acceptance. Raw reports,
+launch, source and the CPU audit remain on a3-gs under
+`/home/shanshan/trt-asc/offline/cann-mtp-target-graph-long-bench-20261017-01/`.
