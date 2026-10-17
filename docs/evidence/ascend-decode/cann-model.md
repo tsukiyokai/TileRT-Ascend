@@ -135,8 +135,14 @@ Of 48 expert-phase rows, 37 have exact fused A8 codes and scales; the other
 remain incorrect. All 48 GMM2 outputs match the independent reconstruction
 from their actual fused inputs. All 64 captured calls reconstruct finalize
 and post-TP output exactly; routing metadata passes 1,088 checks. The open
-numerical boundary is inside fused GMM1: gate/up, SwiGLU or quantization.
-These traces do not retain its internal device intermediates.
+boundary is the fused GMM1/SwiGLU/A8 output in the original capture.
+
+The [SwiGLU barrier fix](swiglu-barrier.md) closes that frozen local
+boundary: all 11 incorrect scales equal the old gate amax/127, bitwise.
+A vector barrier after the SwiGLU UB copy gives 832/832 exact expert rows
+across rank-0/12/15 replays. The complete vendor overlay preserves original
+host libraries and other operators; actual file reads identify the patched
+kernel. Full TP16 reset and HF parity still require a new continuation.
 
 ## Device acceptance
 
