@@ -75,6 +75,9 @@ The [CANN-arithmetic HF run](hf-prolog-cold-20261017.json) passes all
 at `/workspace/offline/hf-prolog-integration-20261017/two-step-v2`; use
 that directory for the CANN cold test's `--reference`. This is CPU
 reference execution; full CANN numerical acceptance remains pending.
+The [rank-local MLA check](cann-mla.md) passes 57 device checks using the
+two frozen Prolog rows, including HF expanded-KV comparison and exact
+cache preservation. It uses one die and no model loading or collectives.
 
 ## Device acceptance
 

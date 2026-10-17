@@ -70,6 +70,9 @@ The [full CPU reference](hf-prolog-cold-20261017.json) consumes teacher
 tokens `[154820,198]` and passes 1,273/1,273 two-step/reset checks,
 including all layer logits, choices and cache rows. Full CANN comparison
 and 8K continuation remain the numerical acceptance work.
+The next [single-die MLA check](cann-mla.md) consumes these actual device
+outputs and passes the sparse attention/value-projection comparison at
+positions 0/1.
 
 ## Reproduce
 
