@@ -8,9 +8,11 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 实施顺序：直接复用 CANN 9.2.0 已有算子，先跑通真实 W4A8C8、batch=1、TP16 decode，并通过逐层精度、路由、索引和缓存检查；随后采集 profiling，建立正确执行路径的算子、搬运、启动与同步基线；再按采集结果调整 tiling、布局、流水与融合范围。只有能力缺失或已有实现难以达到预算时，才用 TileLang Ascend／AscendC 重写。每次替换保留同输入、同精度、同计时范围的 CANN 对照。[已有算子与精度入口](evidence/ascend-decode/cann-operators.md)
 
-精度收敛先重比冻结张量，再将首个分歧的算子或 rank 本地计算片段放到单 die 验证，保持真实 TP16 分片、量化和缓存布局。完整 TP16 运行负责验收跨卡归约、状态提交和独立生成轨迹，按实际 HBM 与通信资源准入；整机空闲用于性能测量。每轮以一个可重放的数值分歧为单位，修复后先重比原输入，再扩大覆盖。
+精度以 vLLM-Ascend 的部署路径为主标准。同 CANN kernel、dtype、layout、NPU 和 batch 的浮点结果要求 bit-exact 或 ≤1 ULP；跨配置优化用分布指标验收。HF 独立差分在 kernel 改动后及周期性回归时运行，用于识别共模误差。精度定位先重比冻结张量，再将首个有意义的分歧放到单 die 验证；完整 TP16 运行检查跨卡归约、状态提交和生成轨迹，按实际 HBM 与通信资源准入；整机空闲用于性能测量。
 
-[逐层换入验证](evidence/ascend-decode/streamed-decode.md)已在共享 A3 上执行真实 8K、TP16 的连续 layer 0–4，3,568/3,568 项执行与重建重放检查通过。原 RoPE 表前缀逐位一致地裁至 8,320 行，配合小消息 HCCL 缓冲，两轮结束后 Torch 分配量均为 245.5 MiB/die。独立 HF 比较为 70/80：layer 1 开始有少量索引差异，layer 4 的 logits 最大差为 0.140625，超过原门槛 0.1；继续定位压缩 MLA 的误差传播，精度标准保持不变。
+[逐层换入验证](evidence/ascend-decode/streamed-decode.md)已在共享 A3 上执行真实 8K、TP16 的连续 layer 0–4，3,568/3,568 项执行与重建重放检查通过。原 RoPE 表前缀逐位一致地裁至 8,320 行，配合小消息 HCCL 缓冲，两轮结束后 Torch 分配量均为 245.5 MiB/die。早期 HF 比较记录了 layer 1 的少量索引变化及 layer 4 的 logits 最大差 0.140625；这些跨配置差异按下述分布指标评估。
+
+[完整 78 层的两步续算](evidence/ascend-decode/hidden-nrmse-20261017/README.md)已完成，16 rank 均输出 `[382,262]`，38,048 项 reset 检查通过。独立 HF 差分曲线在 L39／L38 达到 18.00%／20.89%，随后回落；该跨配置结果没有停在 u 量级。原生 vLLM 对照仍待执行，当前不据此放行 profiling，也不据单个索引变化判定故障。
 
 ## 开发主线与停止条件
 
@@ -29,7 +31,7 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
-| 1. 封闭精度 | 复用已有 HF、main、MTP 和 session 入口；主干先短前缀、再一个 8K 输入的 32 步，随后验证同一请求的 MTP 和 session。补齐执行所需的阶段输入接线。 | 所选 backend／width 的 `validate_precision` 通过，greedy、有效 KV 和逐层 logits 满足第 4 节标准，即可采集该输入的短 profiling。 |
+| 1. 封闭精度 | 建立原生 vLLM-Ascend 主对照，保留 HF 独立差分；主干先短前缀、再一个 8K 输入的 32 步，随后验证同一请求的 MTP 和 session。补齐执行所需的阶段输入接线。 | 所选 backend／width 的精度报告覆盖主对照，逐层结果、分布指标与有效 KV 满足第 4 节标准，即可采集该输入的短 profiling。 |
 | 2. 定标成本 | M1／M4 短 profiling；profiler 关闭后记录轮耗时、实际 A、专家／KV 并集；实测 HBM 和 12／48 KiB HCCL。 | 用实际字节、带宽及暴露的通信／主机时间解释每轮成本，选出支配 2 ms 差距的一项。 |
 | 3. 压缩关键路径 | 主机同步／启动占主导时，验证设备 indices 路径及已有 device GMM，再做固定阶段 Graph；流量占主导时减少复制读取并复用多行权重；归约占主导时融合生产端并重叠通信。每次只推进其中一项。 | 同输入精度保持、profiler 关闭的请求耗时下降，且校准后的预算仍能指向 2 ms；随后重测并选择下一项。 |
 | 4. 完成验收 | 八个不同 8K 输入全部通过精度，预热后执行 32 个 1024-token 请求，保留实际接受数和交付时间。 | 请求 TPOT 的 p50／p95 均≤2 ms。 |
@@ -85,7 +87,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 
 已验证的起点：单 die 四层 BF16 缩小模型已执行，TileLang RMSNorm＋Torch/NPU 计算路径在 CPU、A3 上各通过 1,729 项检查；NPU 最大 NRMSE 为 0.008435，greedy token、索引、专家选择和 reset 重放通过。完整 W4A8C8／TP16／MTP 与 2 ms 性能验收按下表推进。[复现与原始结果](evidence/ascend-decode/README.md)
 
-当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。[真实 8K 两步续算](evidence/ascend-decode/cann-model.md#frozen-8k-continuation)在全部 rank 上输出 `[382,262]`，与 HF 一致；原始数值与 reset 验收仍失败。layer 4 首个重放分歧已定位到 SwiGLU 写回后缺少向量流水屏障；[一行修复](evidence/ascend-decode/swiglu-barrier.md)使 rank 0/12/15 的 832/832 条专家输出逐位通过。完整 vendor 仅改三个文件，保留原 host 库；[原生 Div 校准](evidence/ascend-decode/dynamic-quant-div.md)覆盖 31,744 个 BF16 amax，修正 CPU 参考后，layer 0 输入码、query 及全部 2,048 个索引与冻结 CANN 输出逐位／集合一致。下一步以新 HF 参考和屏障补丁验收 TP16 完整 8K 续算。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。先完成真实 8K 精度验收，再采集 profiling。[验证入口](evidence/ascend-decode/offline-development.md)
+当前代码已接入 CANN TP16 的 M=1/2/4 验证、按专家分组、KV 截断、分布式 top1、MTP78、完整轮次编排与服务请求循环。layer 4 首个重放分歧已定位到 SwiGLU 写回后缺少向量流水屏障；[一行修复](evidence/ascend-decode/swiglu-barrier.md)先使 rank 0/12/15 的 832/832 条专家输出逐位通过，随后[完整 8K 两步重放](evidence/ascend-decode/cann-full8k-barrier-20261017.json)在全部 16 rank 上通过 38,048 项 reset 检查，输出 `[382,262]`。完整 vendor 仅改三个文件，保留原 host 库；[原生 Div 校准](evidence/ascend-decode/dynamic-quant-div.md)覆盖 31,744 个 BF16 amax，修正 CPU 参考后，layer 0 输入码、query 及全部 2,048 个索引与冻结 CANN 输出逐位／集合一致。下一步建立同配置原生 vLLM 主对照，依据 78 层曲线中的突跃区分局部算术差异与输入轨迹传播。服务通过 `--mtp-width 1/2/4` 选择串行或 MTP，支持按实际交付裁剪取消请求的 KV；默认保留串行精度基线。MTP 缓存行 p 使用 normalized target hidden[p] 与 token[p+1]；链式 indices 复用，接受后按 target hidden 重算 MTP KV。先完成真实 8K 精度验收，再采集 profiling。[验证入口](evidence/ascend-decode/offline-development.md)
 
 [测量入口](evidence/ascend-decode/measurement.md) 将精度报告与原始 8K prompt、权重、源码和版本绑定；各 rank 在执行线程中采集短 profiling，独立关闭 profiler 的 PD 请求同时记录生产端 callback 与客户端 token 到达时间。2 ms 判定要求实测覆盖八个不同的已验收输入。
 
@@ -101,7 +103,7 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | 稀疏 attention | M=1、4 heads、2K×576 BF16 的 MLA≤8 µs；完整 32-head indexer 在 8K 上投影＋打分＋top-2048≤20 µs。M=4 同时报专家／KV 并集与实际读取量。 |
 | LM head | BF16 `[9680,6144]` 分片，M=1 的 norm＋投影＋local top1≤120 µs；跨 rank 选词另计。 |
 | 接口覆盖 | 175/175 名称有归属；GLM-5.2 的 48/48 契约标明实现、等价适配或范围外。实际 decode 路径的算子及初始化／reset／采样／MTP 状态接口，样例通过率 100%，报告通过数／应实现数；4 个辅助 MFMA 入口及 DSV32/GLM5 专属入口单列，不计入已实现数。 |
-| 数值 parity | HF eager reference 逐层加载并反量化同一 checkpoint，显式模拟 TP16 局部 A8、INT8 index cache、scale/offset/bias、旋转与融合舍入边界；qA/kvA RMS epsilon 显式对齐 Ascend prefill 的 `1e-5`，indexer 使用其交错坐标及 raw head weights。固定 8 个 8K 输入，各 teacher-force 32 步；78 层及 MTP 层逐层比较 hidden states，并以同一 final norm＋LM head 得到逐层 logits：`NRMSE=‖x−ref‖₂/max(‖ref‖₂,1e−12)≤1e−2`、cosine≥0.999；logits 的 max-abs≤0.1、greedy token 100% 一致。路由 top-8、index top-2048、位置／cache 提交亦逐项核对；tie 规则固定。 |
+| 数值 parity | 固定 8 个 8K 输入，各验证 32 步及 MTP 状态。主基准为原生 vLLM-Ascend：同 kernel、dtype、layout、NPU、batch 要求浮点结果 bit-exact 或 ≤1 ULP。压缩／展开、MTP 开关、tiling／图模式等跨配置比较使用逐层 NRMSE 增长及其与 u 的量级关系、indexer overlap、切点分数间隙相对扰动、错配位置的真实注意力质量、logits top-1 一致率与 KL、固定 prompt 集 greedy 续写一致率，不用逐 token bitwise 作闸门。索引 overlap≥99% 且错配注意力质量<1e−3 视为噪声；逻辑位置、有效 KV 长度与提交规则保持一致。HF 差分在 kernel 改动后及周期回归执行。曲线分析前不调整阈值。 |
 | 2 ms 目标 | 预热后串行运行 32 个请求，各输入 8K、输出 1024 tokens；每请求 `(t_last−t_first)/(N−1)` 的 p50/p95 均≤2 ms，同时报告逐 token 间隔、真实 A 和轮耗时，包含接受、采样和输出交付。另做 10,000 轮 reset、短接受／全拒绝交替：主干有效 KV 对齐非 MTP reference，额外 MTP 层 KV 对齐 MTP teacher-forced reference，使用上述数值容差；提交位置和有效长度完全一致。 |
 
-交付顺序：[8K indexer 校准](evidence/ascend-decode/dynamic-quant-div.md)已封闭首个 HF 索引分歧，CPU 参考重建的 BF16 query 和全部 2,048 个选择与 CANN 一致。先以新 HF 参考和 SwiGLU 屏障重放完整 8K 续算，完成逐层、32 步及 MTP 精度验收；随后采集完整 decode profiling，按热点实测 HBM、通信与相关算子，推进修改、融合并完成 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+交付顺序：[完整两步续算与 78 层曲线](evidence/ascend-decode/hidden-nrmse-20261017/README.md)已交付；接着建立同配置 vLLM-Ascend 主对照，完成逐层、32 步及 MTP 精度验收。随后采集完整 decode profiling，按热点实测 HBM、通信与相关算子，推进修改、融合并完成 2 ms 验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
