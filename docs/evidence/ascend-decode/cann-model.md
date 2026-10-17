@@ -58,19 +58,33 @@ the host interfaces; they do not execute weights or NPU kernels. The
 [PD entry check](cann-model-host-checks-20261017/check_cann_pd_entry.json)
 also verifies explicit Torch-NPU registration before NPU device parsing.
 
-The [current CPU HF reference](hf-cold-current-20261017.json) completes
-teacher tokens `[154820, 198]` and exact reset replay. Its raw traces remain
-at `/workspace/experiments/glm52/hf-cold-current-20261017-attempt-01`.
+The [Native-arithmetic HF reference](hf-cold-current-20261017.json)
+completes teacher tokens `[154820, 198]` and exact reset replay. Its raw
+traces remain at
+`/workspace/experiments/glm52/hf-cold-current-20261017-attempt-01`.
 The [comparison check](cann-layer-comparison-cpu-20261017.json) accepts the
 identical trace and rejects changed or missing intermediate hidden/logits.
-For the cold device test, use `--tokens 154820 198 --steps 2 --layer-trace`
-and `--reference` with that trace directory.
+For the cold device test, use `--tokens 154820 198 --steps 2 --layer-trace`.
+
+The [single-die Prolog check](mla-prolog.md) isolates the first difference
+against that reference. `--mla-preprocess prolog_v3` keeps fused MLA
+intermediates in FP32 before the HF attention core. Select the arithmetic
+contract matching the executed path when generating its oracle.
+The [CANN-arithmetic HF run](hf-prolog-cold-20261017.json) passes all
+1,273 two-step/reset checks with those teacher tokens. Its raw traces are
+at `/workspace/offline/hf-prolog-integration-20261017/two-step-v2`; use
+that directory for the CANN cold test's `--reference`. This is CPU
+reference execution; full CANN numerical acceptance remains pending.
 
 ## Device acceptance
 
 After a complete HIXL prefix capture, stop the producer and receiver and
-run the continuation alone on an idle A3. The capture manifest must include
-all 16 rank receipts and the original 8192 prompt token IDs.
+run the TP16 continuation when all ranks have sufficient HBM and
+communication resources. Numerical checks may share a host. Frozen tensor
+comparisons run on CPU; rank-local operator checks use one die with the
+original TP16 shard shapes. Performance measurements require competing
+device and communication work to be absent. The capture manifest must
+include all 16 rank receipts and the original 8192 prompt token IDs.
 
 ```bash
 source /workspace/environment/activate.sh

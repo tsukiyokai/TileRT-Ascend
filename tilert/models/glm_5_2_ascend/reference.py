@@ -11,7 +11,7 @@ from torch.overrides import TorchFunctionMode
 from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
 from transformers.cache_utils import DynamicCache
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-    GlmMoeDsaRotaryEmbedding,
+    GlmMoeDsaRotaryEmbedding, eager_attention_forward,
 )
 
 from .reference_weights import ReferenceWeights, quantize_a8, tp_sum
@@ -172,6 +172,84 @@ def install_attention_rope(attention):
     attention.forward = MethodType(adapted, attention)
 
 
+def prolog_attention_forward(
+    self, hidden_states, position_embeddings, attention_mask,
+    past_key_values=None, position_ids=None, prev_topk_indices=None, **kwargs,
+):
+    """Use CPU Prolog arithmetic before HF cache, attention and projection."""
+    from .reference_prolog import preprocess
+
+    batch, length, hidden = hidden_states.shape
+    cosine, sine = position_embeddings
+    prepared = preprocess(
+        self._reference_weights, self._reference_prefix,
+        hidden_states.reshape(-1, hidden),
+        cosine.reshape(-1, cosine.shape[-1]),
+        sine.reshape(-1, sine.shape[-1]),
+    )
+    self._prolog = prepared
+    query = torch.cat((prepared["q_nope"], prepared["q_rope"]), dim=-1)
+    query = query.view(batch, length, self.num_heads, -1).transpose(1, 2)
+    expanded = self.kv_b_proj(prepared["latent"].view(batch, length, -1))
+    expanded = expanded.view(batch, length, self.num_heads, -1).transpose(1, 2)
+    key, value = expanded.split((self.qk_nope_head_dim, self.v_head_dim), -1)
+    rope = prepared["k_rope"].view(batch, 1, length, self.qk_rope_head_dim)
+    key = torch.cat((key, rope.expand(*key.shape[:-1], -1)), dim=-1)
+    if past_key_values is not None:
+        key, value = past_key_values.update(key, value, self.layer_idx)
+    if self.indexer is not None:
+        mask = attention_mask[:, 0] if attention_mask is not None else None
+        indices = self.indexer(
+            hidden_states, prepared["q_norm"].view(batch, length, -1),
+            position_embeddings, mask, position_ids,
+            past_key_values=past_key_values,
+        )
+    else:
+        if prev_topk_indices is None:
+            raise ValueError("Shared DSA requires the preceding index choices")
+        indices = prev_topk_indices
+    excluded = indices.new_ones((batch, length, key.shape[2]),
+                               dtype=torch.bool)
+    excluded.scatter_(-1, indices.long(), False)
+    excluded = excluded.unsqueeze(1)
+    if attention_mask is None:
+        positions = torch.arange(key.shape[2], device=hidden_states.device)
+        excluded = excluded | (positions[None, None, None]
+                               > position_ids[:, None, :, None])
+        attention_mask = hidden_states.new_zeros((batch, 1, length,
+                                                  key.shape[2]))
+    attention_mask = attention_mask.masked_fill(
+        excluded, torch.finfo(hidden_states.dtype).min,
+    )
+    output, weights = eager_attention_forward(
+        self, query, key, value, attention_mask, dropout=0.0,
+        scaling=self.scaling, **kwargs,
+    )
+    output = output.reshape(batch, length, -1).contiguous()
+    return self.o_proj(output), weights, indices
+
+
+def prolog_input_norm(self, hidden):
+    """Keep FP32 normalized values through gamma before the BF16 output."""
+    values = hidden.float()
+    variance = values.square().mean(-1, keepdim=True)
+    normalized = values * torch.rsqrt(variance + self.variance_epsilon)
+    return (normalized * self.weight.float()).to(hidden.dtype)
+
+
+class PrologIndexerQuery(nn.Module):
+    def __init__(self, weights, prefix):
+        super().__init__()
+        self.weights = weights
+        self.prefix = prefix
+
+    def forward(self, normalized):
+        from .reference_prolog import index_query
+
+        return index_query(self.weights, self.prefix,
+                           normalized.reshape(-1, normalized.shape[-1]))
+
+
 def hadamard_matrix():
     signs = [
         [1 if (row & column).bit_count() % 2 == 0 else -1
@@ -221,6 +299,7 @@ class ReferenceIndexer(nn.Module):
         self.scales = None
         self.last_key = None
         self.last_scale = None
+        self.query_projection = ReferenceLinear(weights, prefix + ".wq_b")
 
     def reset(self):
         self.scales = None
@@ -250,9 +329,7 @@ class ReferenceIndexer(nn.Module):
     ):
         if hidden_states.shape[:2] != (1, 1) or past_key_values is None:
             raise ValueError("The reference indexer requires cached M=1")
-        query = self.weights.linear(
-            self.prefix + ".wq_b", q_resid, partition="replicated"
-        )
+        query = self.query_projection(q_resid)
         query = query.reshape(1, 1, 32, 128)
         key = self.weights.linear(
             self.prefix + ".wk", hidden_states, partition="replicated"
@@ -314,7 +391,10 @@ class ReferenceIndexer(nn.Module):
 class HfReference:
     """Run the installed HF model without CANN or production weight helpers."""
 
-    def __init__(self, checkpoint):
+    def __init__(self, checkpoint, mla_preprocess="native"):
+        if mla_preprocess not in ("native", "prolog_v3"):
+            raise ValueError("MLA preprocess must be native or prolog_v3")
+        self.mla_preprocess = mla_preprocess
         self.weights = ReferenceWeights(checkpoint)
         self.weights.contract["rotary"] = dict(ROTARY_CONTRACT)
         self.weights.contract["c8_index_scoring"] = (
@@ -332,6 +412,8 @@ class HfReference:
             self.model = GlmMoeDsaForCausalLM(config).to(torch.bfloat16)
         self.config = config
         self._install_adapters()
+        if mla_preprocess == "prolog_v3":
+            self._install_prolog()
         self.model.model.rotary_emb = GlmMoeDsaRotaryEmbedding(
             config=config, device="cpu"
         )
@@ -343,6 +425,26 @@ class HfReference:
             raise ValueError(f"Unreplaced HF meta tensors: {remaining}")
         self._attach_trace_hooks()
         self.reset()
+
+    def _install_prolog(self):
+        from .reference_prolog import CONTRACT
+
+        self.weights.contract["mla_preprocess"] = {
+            **CONTRACT,
+            "input_norm": "Layer0 FP32 norm and gamma; one BF16 output",
+        }
+        norm = self.model.model.layers[0].input_layernorm
+        norm.forward = MethodType(prolog_input_norm, norm)
+        for number, layer in enumerate(self.model.model.layers):
+            attention = layer.self_attn
+            prefix = f"model.layers.{number}.self_attn"
+            attention._reference_weights = self.weights
+            attention._reference_prefix = prefix
+            attention.forward = MethodType(prolog_attention_forward, attention)
+            if attention.indexer is not None:
+                attention.indexer.query_projection = PrologIndexerQuery(
+                    self.weights, prefix + ".indexer",
+                )
 
     def _norm(self, module, prefix):
         module.weight = nn.Parameter(self.weights.tensor(
@@ -398,6 +500,8 @@ class HfReference:
         for number, layer in enumerate(self.model.model.layers):
             def record_attention(module, inputs, output, index=number):
                 self.indices[index] = output[2][0, -1].detach().clone()
+                if self.mla_preprocess == "prolog_v3":
+                    self.latents[index] = module._prolog["latent"][0].clone()
 
             def record_latent(module, inputs, output, index=number):
                 self.latents[index] = output[0, -1].detach().clone()
@@ -452,7 +556,10 @@ class HfReference:
         )
         self.cache = output.past_key_values
         hidden = tuple(value[:, -1].clone() for value in output.hidden_states)
-        normalized = self.model.model.norm(torch.cat(hidden[1:-1]))
+        intermediate = torch.cat(hidden[1:-1])
+        normalized = (prolog_input_norm(self.model.model.norm, intermediate)
+                      if self.mla_preprocess == "prolog_v3"
+                      else self.model.model.norm(intermediate))
         projected = self.model.lm_head(normalized)
         logits = output.logits[:, -1].clone()
         layer_logits = (*projected.split(1, dim=0), logits)

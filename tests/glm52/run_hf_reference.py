@@ -26,6 +26,8 @@ def parse_arguments():
     parser.add_argument("--capacity", type=int, default=9216)
     parser.add_argument("--prefix", type=Path)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--mla-preprocess", choices=("native", "prolog_v3"),
+                        default="native")
     args = parser.parse_args()
     if args.generate < 1 or args.capacity < 1:
         parser.error("Generation and cache capacity must be positive")
@@ -144,7 +146,7 @@ def run(args, report):
             Path(cache_utils.__file__), Path(output_capturing.__file__),
         )
     }
-    engine = HfReference(args.checkpoint)
+    engine = HfReference(args.checkpoint, args.mla_preprocess)
     report["weight_arithmetic"] = engine.weights.contract
     prefixes = load_prefix(args, report)
     if prefixes is not None:
@@ -207,16 +209,19 @@ def main():
     files.extend(root / "tilert/models/glm_5_2_ascend" / name for name in (
         "reference.py", "reference_weights.py", "ops/indexer.py",
     ))
+    if args.mla_preprocess == "prolog_v3":
+        files.append(root / "tilert/models/glm_5_2_ascend/reference_prolog.py")
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "implementation": "transformers.GlmMoeDsaForCausalLM", "tp_size": 16,
-        "scope": "CPU HF traces and exact reset replay; native parity pending",
+        "scope": "CPU HF traces with selected MLA arithmetic and exact reset",
         "status": "running", "hostname": platform.node(),
         "git_head": args.source_commit, "command": [sys.executable, *sys.argv],
         "checkpoint": str(args.checkpoint), "versions": {
             "python": platform.python_version(),
         },
         "prompt_tokens": args.tokens, "requested_generation": args.generate,
+        "mla_preprocess": args.mla_preprocess,
         "rms_norm_eps": {"ordinary": 1e-5, "q_a": 1e-5, "kv_a": 1e-5},
         "index_rope_basis": "interleaved",
         "tie_rule": "stable descending score; ascending expert/position ID",

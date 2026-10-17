@@ -8,6 +8,8 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 实施顺序：直接复用 CANN 9.2.0 已有算子，先跑通真实 W4A8C8、batch=1、TP16 decode，并通过逐层精度、路由、索引和缓存检查；随后采集 profiling，建立正确执行路径的算子、搬运、启动与同步基线；再按采集结果调整 tiling、布局、流水与融合范围。只有能力缺失或已有实现难以达到预算时，才用 TileLang Ascend／AscendC 重写。每次替换保留同输入、同精度、同计时范围的 CANN 对照。[已有算子与精度入口](evidence/ascend-decode/cann-operators.md)
 
+精度收敛先重比冻结张量，再将首个分歧的算子或 rank 本地计算片段放到单 die 验证，保持真实 TP16 分片、量化和缓存布局。完整 TP16 运行负责验收跨卡归约、状态提交和独立生成轨迹，按实际 HBM 与通信资源准入；整机空闲用于性能测量。每轮以一个可重放的数值分歧为单位，修复后先重比原输入，再扩大覆盖。
+
 ## 开发主线与停止条件
 
 主线固定 M4，M1 保留为精度与性能对照。将设备执行看作串行 greedy decode 的精化。设 prompt 长度为 P，正常轮次提交边界的逻辑输出数为 N，主干有效长度为 L；最后一个输出是尚未被主干消费的 pending token。优化保持以下四个不变量。
@@ -36,9 +38,9 @@ vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP
 
 精度定位按 `F_N(s_N)−F_H(s_H)=[F_N(s_N)−F_H(s_N)]+[F_H(s_N)−F_H(s_H)]` 分解；s 包含 hidden、有效 KV 和共享 indices。[同输入逐层检查](../tests/glm52/check_saved_layers.py)定位局部算术误差，[独立轨迹重比](../tests/glm52/compare_saved_decode.py)保留误差传播结果。局部已通过的分支收束，整体未通过时检查共同传播机制；真实 8K 精度验收决定能否进入 profiling。生产路径修改后重跑设备检查，reference 修改先重比已有设备张量。
 
-精度基线提前注册并初始化 vLLM SFA vendor，保留 RMSNorm 的 `BF16(normalized) × gamma` 舍入边界，并将各 rank 的 BF16 partial 转为 FP32 做 HCCL、最后转回 BF16。M=1／4 的基线消息为 24／96 KiB；通信优化以 BF16 传输、FP32 累加恢复 12／48 KiB 消息，融合保持上述数值合同。
+精度基线提前注册并初始化 vLLM SFA vendor。M1 AddRmsNorm 保留 `BF16(normalized) × gamma` 边界；CANN 普通 input norm 与 fused MLA prolog 按各自的 FP32 中间精度建立独立参考，[单 die 同输入证据](evidence/ascend-decode/mla-prolog.md)已封闭首个前处理分歧。各 rank 的 BF16 partial 转为 FP32 做 HCCL、最后转回 BF16；M=1／4 的基线消息为 24／96 KiB。通信优化以 BF16 传输、FP32 累加恢复 12／48 KiB 消息，融合保持上述数值合同。
 
-[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；同输入检查仍有 38/1,572 项失败。下一设备窗口先完成真实 8K HIXL 交接和完整 P 行注入；按同输入逐层差分定位续算中的数值差异。[通信修复与设备证据](evidence/ascend-decode/pd-hixl-20261017/README.md)
+[W4 MSD 合同](evidence/ascend-decode/w4-msd.md)保留两个 FP16 部分积及 FP32 的 `16H+L+checkpoint_bias` 合成顺序，32/32 同输入 M1／M4 投影逐位通过；[A8 合同](evidence/ascend-decode/a8-rounding.md)按 `Div(127,amax)` 生成倍率，184 个冻结样例逐位通过。[RoPE 合同](evidence/ascend-decode/rope-rounding.md)保留 BF16 系数、FP32 乘加及末尾一次 BF16 舍入，42 个冻结 index key 逐位通过；此前同输入检查仍有 38/1,572 项失败。继续用冻结输入和单 die 差分封闭 CANN 前处理、MLA 与专家链，再以真实 8K HIXL 交接和完整 P 行注入验证续算。[通信修复与设备证据](evidence/ascend-decode/pd-hixl-20261017/README.md)
 
 ## 1. 先算速度边界
 
