@@ -107,21 +107,50 @@ The registered-workspace variant then passes on all sixteen ranks under
 concurrent external load: same-tag 64 KiB scratch, successful registration,
 resource/context copies. All 256 public remote-buffer queries return zero
 status but null addresses and sizes; they establish no peer mapping.
-The prepared device reader uses the graph context's peer table. Installed ELF
+The device reader uses the graph context's peer table. Installed ELF
 and copied context agree on 336 bytes, field offsets and ranks 0–15; scratch
 starts at the caller's allocation. All process groups are destroyed, the
 external PIDs remain and every die reports healthy. This functional run
 has no communication latency measurement.
 
-A CPU-built 32-byte-per-peer reader checks the installed library hashes,
-context fields and self entry before launch. Device peer reads and ordered
-reduction still require execution. Resource setup, peer access and fused
-request latency remain separate results.
+The [device-read and reduction audit](peer-reduction-audit.json) binds the
+subsequent TP16 runs. The 32-byte reader checks all 256 rank/peer pairs
+and 2048 INT32 words exactly. Ordered BF16 peer pull then checks 393,216
+output elements against an independent integer round-to-nearest-even
+oracle; 17,526 positions/rank require final BF16 rounding. Accumulation
+uses FP32 in ascending rank order and rounds to BF16 once.
 
-A subsequent host-only table copy passes on all sixteen ranks: 256 pointer
-pairs are nonzero and aligned, and all sixteen self entries match the
-owned context. No custom peer kernel runs. The audit binds this result
-to `peer-table-01/root-audit.json`; device access remains the next probe.
+| Constant-input 48 KiB peer pull | Rank-MAX p50 (µs) | p95 (µs) |
+|---|---|---|
+| Wait after each peer load | 21.815 | 32.368 |
+| Issue sixteen peer loads, then wait once | 14.334 | 25.621 |
+
+Each graph contains ten calls; thirty batches supply 480 raw rank timings.
+Sixteen AIV workers each handle a 3 KiB tile. The burst variant reserves
+64,768 UB bytes and retains the same ordered arithmetic. These separate
+shared-device hot runs exclude input publication, ready/done and overwrite
+protection. They are not complete AllReduce latency or decoder speedups.
+At observed acceptance, 156×14.334 µs corresponds to 0.662 ms/token before
+those missing costs. The current pull implementation does not meet 8 µs.
+
+The registered scratch extent follows the installed executor's allocation
+formula, not the caller's allocation size: FP32 count 6144 exports 50,308
+bytes. Increasing the count to 131072 under a new tag exports a formula
+extent of 1,049,732 bytes inside a 1,114,112-byte owned allocation.
+All sixteen ranks read both endpoint regions correctly: 4096 independently
+encoded words. This proves those reads; remote writes and epoch reuse have
+not yet run. All groups close and subsequent snapshots preserve the same
+external PIDs and sixteen healthy dies; the burst timing run has no
+immediate postflight snapshot.
+
+Continue once with complete one-shot push: 768 KiB of sender-indexed
+mailboxes/rank, ordered local FP32 sum, ready/ACK publication and retirement
+before reuse. Measure changing inputs and a dependent graph chain with all
+protocol work included. Shared-device screening needs a same-load HCCL
+control; the 8 µs stopping criterion applies to idle-device calibration.
+Stop standalone replicated-reduction tuning if that p50 exceeds 8 µs.
+Producer fusion needs its own measured overlap
+mechanism; a constant-input read time cannot justify that benefit.
 
 ## Raw artifacts
 

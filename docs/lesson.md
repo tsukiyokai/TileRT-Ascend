@@ -68,3 +68,15 @@
   before selecting a model default. An optional tensor can also be
   uninitialized: this CANN GatherPA needs explicit zero `seq_offset`.
   [Contiguous-cache evidence](evidence/ascend-decode/sfa-reuse-20261018/README.md#contiguous-cache-and-real-m4)
+- Peer access and a constant-input sum do not establish a reusable
+  collective. Include payload publication, ready/ACK and overwrite
+  protection in the timed dependency chain. Registered executor scratch
+  can also be smaller than the caller's allocation; grow the actual
+  resource request under a fresh tag before enlarging mailboxes.
+  [Peer reduction evidence](evidence/ascend-decode/execution-gap-20261018/peer-reduction-audit.json)
+- Frozen teacher inputs permit layer order followed by token order without
+  batching tokens together. Keep both BF16 hidden/residual components and
+  restore that token's shared top-k before each dependent layer. One
+  resident layer then validates actual M1 numerics under a small memory
+  quota while other jobs retain the machine.
+  [Reorder and device control](evidence/ascend-decode/layer-major-20261018/README.md)

@@ -37,9 +37,11 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。[真实路由采集](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)的 303 轮中，target 四行专家并集均值 27.121，MTP 为 29.729，16 rank 记录逐字节一致。代入固定 8K 逻辑模型，每轮 6.833–7.481 GB、HBM 情景 1.753–1.919 ms/token，未重叠预算仅 0.247–0.081 ms/token；实际 HBM 读取、cache 复用及模型带宽另测。[表示依据](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
 
-[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但长测 22.12 ms，比同源全词表对照 20.67 ms 更慢，保留全词表路径。用 `--compile-target --target-graph` 比较编译 M4 主干，MTP 保持 eager；先过串行／M4／图／reset，再量 1024 输出。HCCL 资源查询已在共享 TP16 通过，后续依次验证 32 B peer 读取、有序归约和生产者／消费者融合。全量复制比同 dtype 的分片归约增加约 8 倍网络量，以实际依赖链和融合后的请求 TPOT 决定取舍。
+[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 长测比同源全词表慢，保留全词表；编译 M4 主干仍待同源整机对照。共享 TP16 的 peer 读取和 48 KiB BF16／FP32 有序归约已通过精确舍入检查；合并搬运握手后，只读热图 rank-MAX p50 为 14.334 µs，尚不含发布／复用协议，不能充作 AllReduce 时延。仅保留一次完整 one-shot push 穿刺，含 ready／ACK、覆盖前退休和依赖链；共享环境先与同负载 HCCL 对照，空闲定标 p50 超过 8 µs 则停止独立全量复制归约调优，生产端融合须另证重叠收益。
 
 [现有 CANN attention 复用](evidence/ascend-decode/sfa-reuse-20261018/README.md)：保留连续 KV，去掉页址计算后，真实 layer-0 M4 完整热图的 p50 从 SFA 89.05 µs 降至 INT32 gather＋FIA 69.15 µs。两类内核各自 A/B/reset 的 819,200 个输出元素逐位通过；跨内核 NRMSE 为 0.000628，作诊断。主干和 MTP 已接入 `--attention-kernel gather_fia`，默认仍为 SFA；下一步验冻结 teacher，再做同源 1024 输出对照。该共享 die 结果不是模型 TPOT。已有 `GatherPaKvCache` 显式传零 offset 后正确，但合成 M4 完整图为 858.42 µs，停止该性能分支。
+
+[逐层驻留的 teacher 验证](evidence/ascend-decode/layer-major-20261018/README.md)保持每次 M1，层内按 token 顺序推进，分别携带 hidden／residual，并逐 token 保存／恢复共享索引。共享 A3 上，前 7 层×2 token、16 rank 的 1472 组张量、571.6 万元素与冻结同配置执行逐位一致，覆盖稠密、共享索引 MoE 和 INT8 indexer；峰值约 896 MiB/die。该顺序用于完整 78 层×32 步冻结 teacher 验证，不量 TPOT，也不改变第 4 节端到端标准。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
