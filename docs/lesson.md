@@ -28,6 +28,8 @@
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large
   operator cost does not establish its incremental cost versus vLLM.
-  Switching only AI_CPU to AIV preserves all outputs but raises this
-  session's median from 20.44 to 21.47 ms; the mode flag alone gives no
-  gain. Native BF16 reduction remains a separate comparison.
+  AIV lowers the isolated FP32 96 KiB graph chain from 10.93 to 5.04 ms,
+  while the decode-session median changes from 20.44 to 21.47 ms.
+  Communication-only gains and end-to-end gains need separate evidence;
+  resource contention or arrival skew remain hypotheses until localized.
+  [Matched modes](evidence/ascend-decode/tp-mode-20261017/README.md)

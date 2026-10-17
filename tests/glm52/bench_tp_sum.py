@@ -57,8 +57,8 @@ def main():
     device = int(os.environ["LOCAL_RANK"])
     if int(os.environ["WORLD_SIZE"]) != 16 or not 0 <= device < 16:
         raise ValueError("Launch sixteen local ranks")
-    if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV":
-        raise ValueError("This measurement requires HCCL AIV")
+    if os.environ.get("HCCL_OP_EXPANSION_MODE") not in ("AIV", "AI_CPU"):
+        raise ValueError("Select HCCL AIV or AI_CPU explicitly")
     toolkit = (Path(os.environ["ASCEND_HOME_PATH"])
                / "aarch64-linux/ascend_toolkit_install.info")
     cann_version = toolkit.read_text()

@@ -33,6 +33,30 @@ def measure(torch, distributed, graph, stream, control):
     return raw
 
 
+def capture_graph(torch, distributed, graph, stream, control, directory, rank):
+    """Capture two diagnostic replays after the latency samples."""
+    from profile_native_session import (
+        make_profiler, npu_range, profiler_identity, trace_inventory,
+    )
+    import torch_npu
+
+    directory = directory / f"rank-{rank}"
+    directory.mkdir(parents=True, exist_ok=False)
+    identity = profiler_identity(torch_npu)
+    torch.npu.synchronize()
+    distributed.barrier(group=control)
+    with make_profiler(directory, rank):
+        for _ in range(2):
+            with npu_range("tp_sum_graph_replay"):
+                with torch.npu.stream(stream):
+                    graph.replay()
+                torch.npu.synchronize()
+    distributed.barrier(group=control)
+    return {"calls_per_replay": 156, "replays": 2,
+            "dtype": "torch.float32", "elements": 24576,
+            "profiler_api": identity, "files": trace_inventory(directory)}
+
+
 def summarize(reports):
     result = {"status": "pass" if all(r["passed"] for r in reports)
               else "fail", "cases": []}
@@ -55,12 +79,14 @@ def summarize(reports):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile-output", type=Path,
+                        help="Capture two FP32 96 KiB chain replays separately")
     args = parser.parse_args()
     rank, device = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     if int(os.environ["WORLD_SIZE"]) != 16 or not 0 <= device < 16:
         raise ValueError("Launch sixteen local ranks")
-    if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AIV":
-        raise ValueError("This measurement requires HCCL AIV")
+    if os.environ.get("HCCL_OP_EXPANSION_MODE") not in ("AIV", "AI_CPU"):
+        raise ValueError("Select HCCL AIV or AI_CPU explicitly")
     if any(os.environ.get(k) == "1" for k in
            ("TORCH_HCCL_BLOCKING_WAIT", "HCCL_BLOCKING_WAIT")):
         raise ValueError("Host-blocking HCCL wait cannot be captured")
@@ -77,7 +103,7 @@ def main():
     control = distributed.new_group(backend="gloo")
     stream = torch.npu.Stream(device=device)
     args.output.mkdir(parents=True, exist_ok=True)
-    cases, checks = [], []
+    cases, checks, diagnostic = [], [], None
     for dtype in (torch.bfloat16, torch.float32):
         for elements in ELEMENTS:
             with torch.npu.stream(stream):
@@ -110,6 +136,12 @@ def main():
                     "scope": f"graph_replay_{calls}_dependent_inplace_sums",
                     "zero_after_samples": zero, **raw,
                 })
+                if (args.profile_output and dtype == torch.float32
+                        and elements == 24576 and calls == 156):
+                    diagnostic = capture_graph(
+                        torch, distributed, graph, stream, control,
+                        args.profile_output, rank,
+                    )
                 graph.reset()
             checks.append({"dtype": str(dtype), "elements": elements,
                            "captured_single_sum_exact_136": exact})
@@ -140,12 +172,14 @@ def main():
             "wall": "Replay submission and final device synchronization.",
             "excluded": "Capture, correctness, pre-sync and Gloo barrier.",
             "batch_average": "156-node total/156, not individual call tails.",
+            "profile": "Optional diagnostic replay follows all timing samples.",
         },
         "cases": cases, "correctness": checks,
         "passed": all(c["captured_single_sum_exact_136"] for c in checks)
         and all(c["zero_after_samples"] for c in cases),
         "decoder_executed": False, "profiler": False, "graphs": True,
         "bare_hccl_latency_measured": False,
+        "diagnostic_profile": diagnostic,
     }
     save(args.output / f"rank-{rank}.json", report)
     reports = [None] * 16

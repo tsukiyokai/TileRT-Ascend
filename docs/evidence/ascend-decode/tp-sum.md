@@ -37,6 +37,28 @@ and fewer synchronization boundaries alongside weight reuse. Decode TPOT
 and model precision are measured separately. Real BF16 partials retain
 the [FP32 accumulation contract](cann-tp-sum-20261017.json).
 
+## Matched AI_CPU and AIV
+
+The newer [mode comparison](tp-mode-20261017/README.md) uses the same
+scripts and protocol, changing only the configured engine within each
+submission method. All 64 rank reports pass. The table is event rank-MAX
+p50 in milliseconds for 156 dependent graph sums, without a profiler.
+
+| Payload | AI_CPU | AIV |
+|---|---|---|
+| BF16, 12 KiB | 10.951 | 5.455 |
+| BF16, 48 KiB | 10.896 | 4.970 |
+| FP32, 24 KiB | 10.925 | 4.976 |
+| FP32, 96 KiB | 10.931 | 5.044 |
+
+Separate post-timing traces identify actual AICPU and AIV kernels, not
+just environment settings. AIV improves these communication-only chains.
+The existing decode-session medians, 20.44 ms for AI_CPU and 21.47 ms for
+AIV, cannot be used to deny that gain or identify its loss in the model.
+Use the full decode trace to locate the additional time before changing
+the communication design. The chain includes replay and scheduling;
+it remains distinct from bare HCCL latency and decode TPOT.
+
 Run the [Python entry](../../../tests/glm52/bench_tp_sum.py) and
 [graph entry](../../../tests/glm52/bench_tp_sum_graph.py) sequentially with
 fresh output directories:

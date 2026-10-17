@@ -12,6 +12,7 @@ Experiments run on `a3-gs:trt-asc`; raw artifacts stay on that server.
 | 2026-10-17 | [M4 stage capture](evidence/ascend-decode/cann-mtp-profile-20261017/README.md) | Sixteen ranks revalidate; three captured rounds. Later target windows ≈49 ms; expert GMM sums ≈13.3 ms. These are profiled values. | Compare compiler/reduction settings before relative attribution. |
 | 2026-10-17 | [M4 long diagnostic](evidence/ascend-decode/cann-graph-20261017/README.md#m4-1024-output-diagnostic) | Same source/prefix; three warmups and three 1024-output requests. Median TPOT 20.44 ms; 303 rounds, actual acceptance 1023/303. All six requests agree. | Isolate eager-vs-compiled target, FP32/AI_CPU reduction and round-control costs. |
 | 2026-10-17 | [AIV control](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control) | Only HCCL mode changes; all sixteen ranks' tokens, proposals, acceptance and state match. Median TPOT 21.47 ms versus AI_CPU 20.44 ms; no gain. | Retain AI_CPU and compare compiled target execution next. |
+| 2026-10-17 | [Matched HCCL modes](evidence/ascend-decode/tp-mode-20261017/README.md) | FP32 96 KiB, 156 dependent graph sums: rank-MAX event p50 AI_CPU 10.931 ms, AIV 5.044 ms. Separate traces confirm actual AICPU/AIV kernels. | Locate why this communication gain does not reach decode TPOT. |
 
 The live check loads D after P exits while keeping device KV alive. Its
 117.59 s request includes weight loading and first-use initialization;
