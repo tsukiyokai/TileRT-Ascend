@@ -96,6 +96,12 @@
   retirement proof and pass at 35.72 µs. This still exceeds the 8 µs budget;
   stop standalone flag tuning and move to producer fusion.
   [Complete protocol](evidence/ascend-decode/execution-gap-20261018/README.md#complete-one-shot-push)
+- More send workers do not establish lower collective latency. Three
+  disjoint peer groups preserve the full protocol but win only 14/30
+  pairs, with a −0.196 µs median gain. Stop the branch. Bind fusion to the
+  executed producer's actual tile: O key24 has one N wave of 24 complete
+  `[4,256]` tiles, so additional waves cannot supply overlap here.
+  [Producer and paired screen](evidence/ascend-decode/execution-gap-20261018/README.md#actual-o-producer)
 - A plausible smaller tile still needs a real-shape comparison. Existing
   GMM1 baseN=128 preserves outputs and actually activates for M4, but its
   shared-die p50 is 124.59 µs versus 121.52 µs for baseN=256. Retain the
@@ -106,3 +112,9 @@
   differences have median 50.25 µs and compiled wins 20 pairs. Confirm
   separate graph pools and outputs before interpreting the measurements.
   [Compiled-layer timing](evidence/ascend-decode/execution-gap-20261018/compiled-resident-timing-audit.json)
+- Split collective waiting from transport before attributing a graph span.
+  One shared-layer sample spends 3.657 ms waiting inside O AllReduce, with
+  7.62 µs exported transit; another shifts time into Prolog. Three replays
+  were already submitted before the first completed. The 4 ms graph span
+  is not evidence of Python submission cost or an intrinsic compute floor.
+  [Resident-layer profile](evidence/ascend-decode/execution-gap-20261018/resident-profile-audit.json)

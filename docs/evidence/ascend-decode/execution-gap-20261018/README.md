@@ -73,6 +73,30 @@ shared-device graph excludes metadata, head and session work. Profile
 the remaining layer cost before selecting a fusion; do not extrapolate
 these timings to 78-layer TPOT.
 
+The [short profile](resident-profile-audit.json) captures three replays per
+case on ranks 0/14. This graph contains embedding, layer0 and final norm:
+three AllReduce calls, including embedding. The helper's frozen two-role
+annotation omitted that first collective. Compiled execution replaces
+AddRmsNormBias plus DynamicQuant with one AddRmsNormDynamicQuant; compute
+task count falls from 45 to 44.
+
+| Replay 1 | Rank | Graph span (ms) | Compute union (ms) | O wait (ms) | Prolog span (µs) |
+|---|---|---|---|---|---|
+| Eager | 0 | 4.445 | 0.377 | 3.657 | 30.96 |
+| Eager | 14 | 4.444 | 0.394 | 3.648 | 39.74 |
+| Compiled | 0 | 4.572 | 1.865 | 2.255 | 1495.80 |
+| Compiled | 14 | 4.573 | 2.907 | 1.200 | 2553.00 |
+
+These are individual profiled samples. Exported O transit is 7.62–7.84 µs
+in these four samples; its envelope includes waiting. All three replay
+APIs finish before the first graph completes on each profiled rank.
+Kernel-uncovered intervals are 6.64–20.78 µs and contain exported runtime
+tasks; they do not establish launch gaps. RoPE tasks with missing CSV model
+IDs are bound to this graph through trace model/stream/task identifiers.
+No PMU or cross-rank device-clock alignment was captured. The shared
+4 ms graph span is not a layer compute floor; the slowest of all sixteen
+ranks and the source of individual task stalls remain unmeasured here.
+
 ## Symmetric-buffer reduction
 
 [SHMEM audit](shmem-audit.json) binds source, binaries, launch parameters
@@ -212,6 +236,41 @@ the 8 µs idle budget. Stop standalone flag-loop and tile-size tuning;
 the next mechanism must fuse the producer or overlap useful work.
 Idle calibration and a 156-call/model comparison remain separate measurements.
 
+The [paired sender-parallelism screen](sender3-pair-audit.json) assigns three
+AIV groups to disjoint peers, using all 48 allowed vector workers. Local
+sender-done flags protect the in-place input before group zero writes back.
+Five changing-input/delay cases supply 1,966,080 exact integer-oracle output
+elements; all sixteen ranks reach epoch 842 and close both libraries.
+Thirty same-process AB/BA pairs give baseline/sender3 rank-MAX p50
+32.476/32.537 µs. The paired baseline-minus-candidate median is −0.196 µs;
+the candidate wins 14/30. Its positive mean difference is dominated by one
+182 µs baseline sample. Retain all samples and stop this branch.
+
+## Actual O producer
+
+The captured layer0 M4 call uses INT8 `[4,1024]` activations, NZ INT8
+`[1024,6144]` weights, BF16 channel scales and FP32 token scales. The
+installed dispatch is QuantBatchMatmulV3 key 24, CV 1:1, 24 cores. Its
+376-byte tiling selects one M/N wave: each core completes K=1024 and
+produces a BF16 `[4,256]` tile. The full output has row stride 6144.
+There is no later N wave to hide communication in this shape.
+
+An independent INT32 dot followed by the actual FP32 scale order matches
+all sixteen frozen partials: 393,216 BF16 elements. The
+[isolated rebuild](o-producer-audit.json) reuses the installed pertoken
+implementation unchanged, with the same template and tiling. Two single-die
+executions match the original partial and integer reference bit for bit
+(49,152 output elements, 23.6 MB peak allocation). The audit rehashes 854
+source/artifact bindings. No global operator installation changes.
+
+The original local projection's separate hot graph measures p50/p95
+19.229/108.962 µs over 30 samples of ten calls, under external load. This
+excludes dynamic quantization and TP reduction; the roughly 6 MB weights
+remain hot. Next compare complete O plus sum: original O with HCCL,
+original O with the complete peer protocol, and O with fused publication
+plus its consumer. Preserve the BF16 production point and require net
+latency improvement before integrating it into decode.
+
 ## Raw artifacts
 
 Under `/home/shanshan/trt-asc/offline/` on a3-gs:
@@ -227,3 +286,9 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
   logs, CSV samples and ELF audit. The failed prototype stays here.
 - `hccl-peer-probe-20261018-01/`: installed-header query shim, sources,
   bounded runs, complete push variants, matched HCCL samples and audits.
+- `cann-resident-profile-20261018-01/`: raw ranks 0/14 traces, CPU exports
+  and all sixteen frozen O projection calls, captured after profiling.
+- `cann-o-producer-20261018-01/`: actual dispatch dump, integer references
+  and the existing projection's hot-graph baseline.
+- `cann-o-key24-20261018-01/`: isolated build, exact tiling, generated ABI,
+  two device outputs and independent CPU audit.
