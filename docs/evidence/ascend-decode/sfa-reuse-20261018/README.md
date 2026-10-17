@@ -73,7 +73,7 @@ ten; mapping, gather, input transforms and merging are included.
 All 120 saved graph outputs match their eager outputs bit for bit before
 and after timing. Sixteen external jobs share the host; p95 spans
 437–506 µs. These hot-input measurements screen candidates, not idle-device
-latency or decode TPOT. Retain original SFA for M4.
+latency or decode TPOT. These generic M4 candidates leave SFA as baseline.
 
 A short eager trace contains all six pipeline labels and 44 kernels;
 all six contexts match the nonprofiled replay. In its second iteration,
@@ -83,10 +83,48 @@ The full pipeline takes 132.70 µs versus SFA's 88.38 µs. Split SFA takes
 call is a 2734.84 µs outlier. This shared-device Level0 trace supplies no
 active-core or HBM counters.
 
-TileRT's current cache is contiguous and its block table is identity.
-Next compare direct token-index gathers with existing dual-cache
-`GatherPaKvCache`, then feed FIA. Capture real M4 inputs and retain the
-frozen-teacher end-to-end gate before changing the model default.
+## Contiguous cache and real M4
+
+TileRT's cache uses identity block tables. Direct INT32 token indexing
+removes page division, lookup, remainder and dtype conversion, then feeds
+the same existing FIA. Two gathers remain inside the captured pipeline.
+
+The [real M4 capture](real-m4-input-audit.json) runs layer 0 on all sixteen
+ranks with the frozen 8K prefix and teacher tokens `[6500,382,262,576]`.
+Checkpoint embeddings, original prefix fields and causal 2048-slot indices
+are independently checked. Only one layer is resident, below 1 GiB/die.
+
+The [runtime replay audit](contiguous-graph-audit.json) checks the actual
+[per-instance implementation](../../../../tilert/models/glm_5_2_ascend/cann_attention.py)
+and [benchmark](../../../../tests/glm52/bench_cann_contiguous_attention.py).
+Changing-input A/B/reset graphs and post-timing outputs agree with each
+kernel's eager execution across 819,200 BF16 elements. SFA reproduces the
+original real M1/M4 capture contexts bit for bit.
+
+| Complete hot graph | Real M1 p50 (µs) | Real M4 p50 (µs) |
+|---|---|---|
+| SFA | 86.36 | 89.05 |
+| Direct INT32 gathers → FIA | 46.52 | 69.15 |
+
+Thirty interleaved samples per pipeline include both gathers and graph
+scheduling. The real-M4 median difference is 19.89 µs, or 22.3%; applying
+that difference to all 78 layers would save 0.460 ms/token at A=1023/303.
+That is a scenario, not a model speedup. Shared-device p95 remains
+404–464 µs. FIA differs from SFA in 115/8192 real-M4 elements, maximum
+absolute difference 0.0078125 and NRMSE 0.000628; these are diagnostics.
+
+Both MTP runners expose `--attention-kernel gather_fia`, selecting the
+candidate for the 78 target layers and layer-78 MTP. Each query must have
+2048 valid causal indices in the contiguous BF16 cache. Default SFA and
+the frozen-teacher release gate remain in effect. Full-model precision
+and matched 1024-output timing are the next acceptance steps.
+
+[Existing GatherPaKvCache](contiguous-candidates-audit.json) also copies
+the same rows exactly when given explicit INT32 zero `seq_offset`. In
+this installed CANN build, omitting it creates an uninitialized optional
+tensor; the device reads offset 1066385309 and faults. Passing zero fixes
+that defect. The complete synthetic-M4 graph still takes 858.42 µs versus
+64.34 µs for direct gathers; this implementation is not selected.
 
 ## Raw artifacts
 
@@ -95,6 +133,10 @@ Under `/home/shanshan/trt-asc/offline/` on a3-gs:
 - `cann-attention-reuse-20261018-01/`: repository runner, real M1 and
   synthetic M4 inputs, graph samples, short trace, raw outputs and
   independent CPU audits.
+- `cann-sfa-m4-input-20261018-01/`: all-rank layer-0 capture, original
+  three-field KV and rank-0 real-M4 attention fixture.
+- `cann-gather-fia-20261018-01/`: frozen repository runtime, real M1/M4
+  dynamic graph replays, interleaved samples and independent CPU audit.
 - `cann-sfa-head-batch-20261018/`: pinned SFA source/profile contract and
   head-as-batch numerical diagnostic.
 - `cann-fia-gather-20261018-01/`: FIA schema/source contract, independently

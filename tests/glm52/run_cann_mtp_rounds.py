@@ -58,6 +58,8 @@ def parse_arguments(argv=None):
                         help="Compare graph after uncaptured execution")
     parser.add_argument("--compile-target", action="store_true",
                         help="Compile the target; keep MTP eager")
+    parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
+                        default="sfa")
     parser.add_argument("--profile-output", type=Path,
                         help="Capture M4 stages after device checks pass")
     parser.add_argument("--device-offset", type=int, choices=range(16),
@@ -324,6 +326,7 @@ def execute(args):
         args.checkpoint, f"npu:{physical}", rank, args.init_method,
         args.capacity, args.gpu_memory_utilization,
         compile_target=args.compile_target,
+        attention_kernel=args.attention_kernel,
     )
     draft = CannMtp(target)
     if not draft.model.do_not_compile:
@@ -451,6 +454,7 @@ def execute(args):
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
         "compile_target": args.compile_target,
+        "attention_kernel": args.attention_kernel,
         "graph": None if target.graph is None else {
             "width": target.graph.width,
             "captures": target.graph.capture_count,

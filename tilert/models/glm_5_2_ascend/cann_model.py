@@ -69,6 +69,7 @@ class CannModel:
     def __init__(
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
+        attention_kernel="sfa",
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -76,6 +77,8 @@ class CannModel:
             raise ValueError("Capacity must be at least one 128-token page")
         if int(os.environ.get("WORLD_SIZE", "16")) != 16:
             raise ValueError("Launch exactly 16 ranks")
+        if attention_kernel not in ("sfa", "gather_fia"):
+            raise ValueError("attention_kernel must be sfa or gather_fia")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
         import torch
@@ -89,6 +92,7 @@ class CannModel:
         self.rank = rank
         self.capacity = capacity
         self.position = 0
+        self.attention_kernel = attention_kernel
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
         self.config = create_config(
@@ -189,6 +193,7 @@ class CannModel:
 
         groups, caches = {}, {}
         main_layers, index_layers = set(), set()
+        attention_names = []
         for name, spec in self.runner.get_kv_cache_spec().items():
             match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
             if match is None or int(match[1]) >= 78:
@@ -204,6 +209,7 @@ class CannModel:
                 builder_type = AscendSFAIndexerMetadataBuilder
             elif isinstance(spec, AscendMLAAttentionSpec):
                 main_layers.add(layer)
+                attention_names.append(name)
                 values = (
                     self.views[f"mla_latent.{layer}"],
                     self.views[f"mla_rope.{layer}"],
@@ -220,6 +226,12 @@ class CannModel:
         bind_kv_cache_to_layers(
             caches, self.config.compilation_config.static_forward_context,
         )
+        if self.attention_kernel == "gather_fia":
+            from .cann_attention import install_gather_fia
+
+            context = self.config.compilation_config.static_forward_context
+            for name in attention_names:
+                install_gather_fia(context[name].impl)
         self.builders = [
             (names, kind(spec, names, self.config, self.device))
             for (kind, spec), names in groups.items()
@@ -341,6 +353,8 @@ class CannModel:
             raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
+        if self.attention_kernel == "gather_fia" and self.position < 2047:
+            raise ValueError("Gather/FIA requires 2048 valid selected rows")
         use_graph = self.graph is not None and self.graph.width == width
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
@@ -404,6 +418,10 @@ class CannModel:
                    type(self.model), type(self.model.model),
                    set_ascend_forward_context]
         objects.extend(type(builder) for _, builder in self.builders)
+        if self.attention_kernel == "gather_fia":
+            from .cann_attention import gathered_fia
+
+            objects.append(gathered_fia)
         if not self.config.model_config.enforce_eager:
             from vllm.compilation.decorators import support_torch_compile
             from vllm.compilation.wrapper import (

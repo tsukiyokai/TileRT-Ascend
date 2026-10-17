@@ -423,6 +423,7 @@ def execute(args):
     engine = CannModel.__new__(CannModel)
     engine.rank, engine.device = rank, torch.device(f"npu:{rank}")
     engine.capacity, engine.position = CAPACITY, 8192
+    engine.attention_kernel = "sfa"
     engine.checkpoint = str(args.checkpoint.resolve())
     engine._tp_sum_group = None
     torch.npu.set_device(engine.device)

@@ -39,7 +39,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但长测 22.12 ms，比同源全词表对照 20.67 ms 更慢，保留全词表路径。用 `--compile-target --target-graph` 比较编译 M4 主干，MTP 保持 eager；先过串行／M4／图／reset，再量 1024 输出。HCCL 资源查询已在共享 TP16 通过，后续依次验证 32 B peer 读取、有序归约和生产者／消费者融合。全量复制比同 dtype 的分片归约增加约 8 倍网络量，以实际依赖链和融合后的请求 TPOT 决定取舍。
 
-[现有 CANN attention 复用](evidence/ascend-decode/sfa-reuse-20261018/README.md)：SFA 的 M4 路径按四个 query 分核，每核串行处理四段 512 个索引；约 7 ms 的 profiled 总耗时已超过整轮预算。共享 die 上，合成 M4 完整图的 p50 为原 SFA 88.44 µs、paged gather＋FIA 136.26 µs、分段 SFA＋合并 95.59 µs；各自图／eager 输出逐位一致。短 trace 中 FIA 本体为 36.24 µs，映射与 gather 为 96.46 µs。下一步利用现有连续 KV 布局去掉页址计算，比较直接 gather 与已有 `GatherPaKvCache`，再以真实 M4 与冻结 teacher 验证候选。原 SFA 保持默认；共享设备热输入筛选不作为 TPOT 收益。
+[现有 CANN attention 复用](evidence/ascend-decode/sfa-reuse-20261018/README.md)：保留连续 KV，去掉页址计算后，真实 layer-0 M4 完整热图的 p50 从 SFA 89.05 µs 降至 INT32 gather＋FIA 69.15 µs。两类内核各自 A/B/reset 的 819,200 个输出元素逐位通过；跨内核 NRMSE 为 0.000628，作诊断。主干和 MTP 已接入 `--attention-kernel gather_fia`，默认仍为 SFA；下一步验冻结 teacher，再做同源 1024 输出对照。该共享 die 结果不是模型 TPOT。已有 `GatherPaKvCache` 显式传零 offset 后正确，但合成 M4 完整图为 858.42 µs，停止该性能分支。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|

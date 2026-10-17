@@ -110,6 +110,7 @@ class CannMtp:
         self.capacity = target.capacity
         self.layout = target.layout
         self.position = 0
+        self.attention_kernel = target.attention_kernel
         self.checkpoint = target.checkpoint
         self.weight_files = weight_sources(self.checkpoint)
         self.config = draft_config(target.config)
@@ -178,6 +179,10 @@ class CannMtp:
         bind_kv_cache_to_layers(
             {MAIN_CACHE: (latent, rope), INDEX_CACHE: (index,)}, context,
         )
+        if self.attention_kernel == "gather_fia":
+            from .cann_attention import install_gather_fia
+
+            install_gather_fia(context[MAIN_CACHE].impl)
         main_spec = AscendMLAAttentionSpec(
             block_size=128, num_kv_heads=1, head_size=576,
             num_heads=4, dtype=torch.bfloat16, cache_dtype_str="auto",
@@ -245,6 +250,8 @@ class CannMtp:
             raise ValueError("MTP parent must be device BF16 [M,6144]")
         if self.position + width > self.capacity:
             raise ValueError("MTP exceeds cache capacity")
+        if self.attention_kernel == "gather_fia" and self.position < 2047:
+            raise ValueError("Gather/FIA requires 2048 valid selected rows")
         if external_indices is not None and (
             external_indices.shape != (width, TOPK)
             or external_indices.dtype not in (torch.int32, torch.int64)

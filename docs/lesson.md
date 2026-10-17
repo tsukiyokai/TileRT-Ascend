@@ -61,3 +61,10 @@
   Splitting heads repeats KV traffic; splitting KV adds partial rounding
   and merging. Compare complete existing-CANN pipelines before rewriting.
   [Attention replay](evidence/ascend-decode/sfa-reuse-20261018/README.md)
+- Specialize known cache ownership before replacing an attention kernel.
+  Identity pages allow two direct INT32 gathers into existing FIA; real
+  M4 hot graphs fall from 89.05 to 69.15 µs, including the gathers. Keep
+  cross-kernel numerical differences diagnostic and verify frozen teachers
+  before selecting a model default. An optional tensor can also be
+  uninitialized: this CANN GatherPA needs explicit zero `seq_offset`.
+  [Contiguous-cache evidence](evidence/ascend-decode/sfa-reuse-20261018/README.md#contiguous-cache-and-real-m4)

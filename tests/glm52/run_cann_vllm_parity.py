@@ -323,6 +323,7 @@ def execute(args):
         engine = CannModel.__new__(CannModel)
         engine.rank, engine.device = rank, device
         engine.capacity, engine.position = args.capacity, 0
+        engine.attention_kernel = "sfa"
         engine.checkpoint = str(args.checkpoint.resolve())
         engine.config, engine.worker = config, worker
         engine.runner, engine.model = runner, runner.model
