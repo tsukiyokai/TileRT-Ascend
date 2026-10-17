@@ -35,6 +35,12 @@
   A mapped SHMEM peer pointer also needs actual device-access validation:
   two PEs pass while TP16 fails before timing.
   [Execution boundaries](evidence/ascend-decode/execution-gap-20261018/README.md)
+- MTP acceptance does not divide every byte by the verification width.
+  Observed M4 target expert unions average 27.121 versus eight for M1.
+  The logical-read saving is about 1.72–1.89×, not the 3.376× acceptance.
+  Full-replication reduction trades more traffic for fewer stages; count
+  its network work and remaining unoverlapped budget before choosing it.
+  [Observed unions and budget](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)
 - Compare matched execution paths before rewriting a shared kernel.
   Graph4 can capture an eager model or a compiled model; short and long
   MTP requests also have different acceptance distributions. A large

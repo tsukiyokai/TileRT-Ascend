@@ -35,9 +35,9 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 归纳步骤：设本轮 target 预测为 y，前 k 个 draft 满足 `c[i+1]=y[i]`。因 causal verify 的前 k+1 行与串行输入一致，`y[0:k+1]` 正是后续 greedy 输出；主干消费 `c[0:k+1]` 后仍留下最后一个 y 未消费，前缀不变量保持。由这些行的 target hidden 重算 MTP，再截断到 `L+A`，保持 MTP 不变量。现有[状态穷举](../tests/glm52/check_mtp_state.py)覆盖接受位置、parent 标签和 reset；真实 CANN 数值、因果索引及 HIXL 可见性由设备对照封闭。
 
-性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。按当前 CANN 表示修正后，32 专家并集场景每轮逻辑读取 7.30–7.94 GB，仍需减少读取量并实现重叠；专家并集、重复读取及模型有效带宽待实测。[表示与修正依据](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
+性能以请求交付计时 `TPOT=(t_last−t_first)/(N−1)` 为准。稳态每轮只允许花 `2 ms×平均实际提交数`；初次 seed、控制与交付另占请求预算。本次单输入实测 A=3.376，轮预算为 6.752 ms。以 die 0 流式中位 1.155 TB/s 作场景标尺，轮读取上限约 7.80 GB；若再给 HBM 之外未被掩盖的工作留 1 ms，则降至 6.64 GB。[真实路由采集](evidence/ascend-decode/execution-gap-20261018/README.md#observed-expert-unions)的 303 轮中，target 四行专家并集均值 27.121，MTP 为 29.729，16 rank 记录逐字节一致。代入固定 8K 逻辑模型，每轮 6.833–7.481 GB、HBM 情景 1.753–1.919 ms/token，未重叠预算仅 0.247–0.081 ms/token；实际 HBM 读取、cache 复用及模型带宽另测。[表示依据](evidence/ascend-decode/cann-traffic-source-audit-20261017.json)
 
-[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但同源长测 22.12 ms，比紧随其后的全词表对照 20.67 ms 更慢，保留全词表路径；对称缓冲原型仅通过两 die，TP16 设备访问仍失败。当前主线为编译主干的独立对照，并采集真实专家并集校准轮预算。
+[执行边界对照](evidence/ascend-decode/execution-gap-20261018/README.md)：小包 top1 精度一致，但同源长测 22.12 ms，比紧随其后的全词表对照 20.67 ms 更慢，保留全词表路径。编译主干作独立对照；对称缓冲继续一次基于 HCCL 资源接口的可达性穿刺，通过后验证有序归约及生产者／消费者融合。TP16 全量复制比同 dtype 的分片归约增加约 8 倍网络量；以实际依赖链与融合后的请求 TPOT 决定取舍。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
