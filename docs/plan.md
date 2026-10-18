@@ -18,6 +18,7 @@ width 8 不确定,所以它的 12.7–13.3 ms 不作为结果。已定位到 **T
 |---|---|---|
 | width 8（`max_num_seqs` 一个字面量） | **撤回**：本树三请求三条不同轨迹（轮数 220/236/238），TPOT 与接受数混在一起 | 归因于未安装的 `gmm1-swiglu-barrier.patch`，见[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md) |
 | metadata 与 mc2 掩码提升 | −0.7967 ms/token（−5.001%） | 下发 313→91，191712 项检查零失败 |
+| 单边归约（bf16） | 16.571 µs/次对 HCCL 图内 32.340（1.95 倍），每轮 157 次约 2.48 ms | 三种 payload 各 400 轮零错、16 rank 零非零退出；[更正](evidence/ascend-decode/onesided-corrected-20261019/README.md) |
 | 专家声明压缩（w4a8） | 2.39 ms/轮（保守 1.97） | 真 checkpoint 逐位门过，prefill 五形状 ND 全不劣 |
 | GMM 三份 kernel 补丁 | 8.5 µs/次 × 78 ≈ 0.66 ms/轮 | p=1.8e-12，输出逐位相同 |
 

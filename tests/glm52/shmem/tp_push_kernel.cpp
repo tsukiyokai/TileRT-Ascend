@@ -458,6 +458,38 @@ ACLSHMEM_DEVICE void tp_push_once(__gm__ float* partial, __gm__ float* out, __gm
         aclshmemx_sync_vec_all();
         return;
     }
+    // Stages 10 and 11 run one protocol -- pipelined push, one quiet, one
+    // cross-PE sync, pipelined ordered sum -- over bf16 and over float32, so
+    // the pair prices the element type and nothing else. The reduction's
+    // staging tensor is the addend's buffer rather than the push's, so the
+    // narrowed slot never shares UB with a store that may still be in flight.
+    if (stage == 10) {
+        TpPushPublishBf16(layout, (__gm__ bfloat16_t*)partial, core, my_pe, pe_size,
+                          stage_tensor.ReinterpretCast<bfloat16_t>(), stage_second.ReinterpretCast<bfloat16_t>());
+        aclshmem_quiet();
+        aclshmemx_sync_vec_all();
+        TpPushReduceBf16(layout, (__gm__ bfloat16_t*)out, core, cores, pe_size, acc, term,
+                         term_second.ReinterpretCast<bfloat16_t>());
+        return;
+    }
+    if (stage == 11) {
+        TpPushPublishPipelined(layout, partial, core, my_pe, pe_size, stage_tensor, stage_second);
+        aclshmem_quiet();
+        aclshmemx_sync_vec_all();
+        TpPushReducePipelined(layout, out, core, cores, pe_size, acc, term, term_second);
+        return;
+    }
+    // Stage 12 drops the sync from stage 10 exactly as stage 7 drops it from
+    // stage 11, so the four stages price the element type at both protocol
+    // levels. A sum taken without the sync may read a slot its peer has not
+    // written, so stages 7 and 12 are timing probes and not reductions.
+    if (stage == 12) {
+        TpPushPublishBf16(layout, (__gm__ bfloat16_t*)partial, core, my_pe, pe_size,
+                          stage_tensor.ReinterpretCast<bfloat16_t>(), stage_second.ReinterpretCast<bfloat16_t>());
+        TpPushReduceBf16(layout, (__gm__ bfloat16_t*)out, core, cores, pe_size, acc, term,
+                         term_second.ReinterpretCast<bfloat16_t>());
+        return;
+    }
     if (stage == 4) {
         TpPushPublishDirect(layout, partial, core, my_pe, pe_size, stage_tensor);
     } else if (stage == 5 || stage == 6 || stage == 7 || stage == 8 || stage == 9) {
@@ -474,8 +506,6 @@ ACLSHMEM_DEVICE void tp_push_once(__gm__ float* partial, __gm__ float* out, __gm
         // No peer may begin its next push until every peer has finished
         // reading, which is what makes a single plane safe.
         aclshmemx_sync_vec_all();
-    } else if (stage == 10) {
-        // Stage 10 orders and synchronises inside its own branch.
     } else if (stage == 8) {
             TpPushSignal(window, core, my_pe, pe_size, round % PLANES, (int32_t)round + 1);
         } else {
