@@ -641,3 +641,11 @@
   reasoning about its return value, and set the device context explicitly when
   bringing a device library up from inside someone else's worker.
   [Torch operator](evidence/ascend-decode/torch-allreduce-20261018/README.md)
+- A faster collective is not the same change as a fused one. The one-sided
+  reduction is 2.84 times the vendor's and still a standalone kernel, so it
+  pays its own launch and overlaps the compute it follows by exactly zero --
+  the structure the AMD write-up explicitly rejects. Shrinking an 11.29 ms
+  item is bounded by that item; hiding it behind the weight stream, which has
+  to happen anyway, is not. Measure what a change removes from the critical
+  path, not what it removes from its own cost.
+  [Fused projection](evidence/ascend-decode/fused-proj-reduce-20261018/README.md)
