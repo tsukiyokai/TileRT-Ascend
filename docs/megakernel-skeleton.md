@@ -149,11 +149,39 @@ to scanning 248 empty `group_list` slots and 23% to the kernel launch floor.
 The weight stream is the floor for a *perfect* kernel, not the cost of the
 present one, and the two must not be confused when ranking work.
 
-### 5. Then the arithmetic
+### 5. Then the arithmetic, and the order to fill it in
 
 Normalisation, quantisation, projection, push, ordered reduction, residual,
 next normalisation. Each is small and each is replaceable without touching
 anything above.
+
+Fill it in cheapest-prize-first, which the census settles and which is not the
+order intuition suggests:
+
+**The elementwise family first.** 941 calls a round carrying 1.5–2.9 ms of
+intercept against 0.4–0.9 ms of element work — `Cast` at the model's 8×6144 is
+1.589 µs of intercept and 0.418 of work, `RmsNorm` 3.040, `DynamicQuant` 2.810,
+`LayerNorm` 4.356. A resident kernel that normalises, quantises and casts
+without re-entering is worth more than the expensive grouped matmul's entire
+prologue, and it needs no cube and no int4 multiply, so none of tonight's
+refutations touch it. This is the brick to write.
+[census](evidence/ascend-decode/prologue-census-20261019/README.md)
+
+**The expert matmul second, and on the cube.** The vector unit loses 1.32× at
+full occupancy — not the 3.90× a single-operator substitution suggested, but
+still a loss, and the cube is idle at batch one anyway so there is nothing to
+buy by moving it.
+[vector-only](evidence/ascend-decode/vector-only-20261019/README.md)
+
+**The collective third.** Worth 1.4–2.0 ms a round against HCCL's measured
+32.340 µs in-graph, and it is the piece that most needs to be *inside* the
+pipeline rather than merely faster, since a standalone collective overlaps
+compute by exactly 0.000000 ms.
+
+**The routing table's redundant traversal is not part of this.** 4.27 ms a
+round across two grouped operators, removable without any fusion, and the cost
+belongs to whichever consumer touches the table first — so a megakernel
+inherits it unless the compression is done too.
 
 ## The first measurable brick
 
@@ -168,10 +196,42 @@ It has no number yet. The gate is ≥1.3× against the operators it replaces, at
 the real shapes, with bank rotation to defeat L2, and with a payload that
 varies per round so the check can see a stale buffer.
 
-And one discipline the GMM work made non-negotiable: **measure inside a
-captured graph, never eager**. That operator is host-bound in eager mode and
-an event pair around it reads the host — 109.90 µs of enqueue against a
-113.04 µs reading — which silently inverted one conclusion already.
+Three disciplines the night made non-negotiable for any measurement of this
+kernel:
+
+**Measure inside a captured graph, never eager.** The W4A8 operator is
+host-bound in eager mode and an event pair around it reads the host — 109.90 µs
+of enqueue against a 113.04 reading — which silently inverted one conclusion.
+Where the host cost is genuinely small the eager reading is safe, and one
+`perf_counter` beside the event pair is what tells you which case you are in.
+
+**Churn an allocation between calls or the determinism check lies.** Eight
+identical calls in a tight loop read a known-racy kernel as deterministic in
+all ten cells of a matrix, because the loop never changes the workspace the
+operator receives. The churn is faithful, not adversarial: a real round
+allocates and frees hundreds of tensors between two expert matmuls.
+
+**Vary the payload with the round.** A constant input is blind to a stale
+plane, to round crosstalk, and to an implementation that communicates once and
+re-reads the same buffer afterwards — which would also report a *lower*
+per-round cost. Use a period coprime to any buffer parity.
+[audit](evidence/ascend-decode/onesided-audit-20261018/README.md)
+
+## What the round's budget looks like once the skeleton is paid for
+
+A round may cost 6.866 ms at acceptance 3.433. Device work is 40.7 ms of which
+the arithmetic needs 3.886 at the die's marginal read rate, so about 35 ms is
+overhead; the census locates 20 of it — 15.4 ms of per-call intercept and
+4.27 of redundant table traversal — and the remainder is inside kernels where
+a per-operator method cannot reach.
+
+So the skeleton's prize is the 15.4 plus whatever of the unlocated 15 ms is
+re-entry rather than arithmetic, against a 3.5 ms cost if the expert matmul
+moves to the vector unit and nothing if it stays on the cube. That is the
+first accounting all night in which the target is not arithmetically absurd,
+and it is also the reason no incremental combination reaches it: the host's
+5.861 ms, the collectives' 3.70 and the weight stream's 3.886 already exceed
+6.866 between any two of them.
 
 ## What this document must not become
 
