@@ -1009,3 +1009,26 @@
   stacks, and the attribution becomes exact for the cost of one run -- far
   cheaper than inferring from containment, which had already produced two
   withdrawals.
+- An override's position has to be verified in the run's own environment, not
+  argued from the string you exported. The bootstrap prepends a vendor path
+  derived from `dirname(vllm_ascend.__file__)`, so putting an overlay first on
+  PYTHONPATH made it prepend that overlay's own unpatched vendor copy ahead of
+  my barrier -- which sat at index 4 and did nothing in every run I published
+  from. Spelling the in-tree path second does not help, because the bootstrap
+  does not prepend that string. Read the recorded runtime environment back out
+  of the run.
+- A hypothesis that fits the threshold exactly can still be a coincidence. A
+  size test in the sparse attention kernel puts its boundary precisely between
+  width 4 and width 6, matching the observed asymmetry, and at width 4 half the
+  vector cores early-exit for exactly the predicted reason -- and replacing the
+  kernel changes nothing. Fit is not evidence; the differential is.
+- "Call it twice and compare" is unusable on a collective. Wrapping the TP sum
+  that way reported 314 of 314 results unequal with a difference fifteen times
+  the value being measured, because two calls on one symmetric window without a
+  barrier let the second overwrite what peers are still reading. The probe
+  created the non-determinism it measured.
+- A race's ignition point is not a line of code. Three independent bisections
+  of the same divergence named three different first-differing operators, while
+  agreeing that the dense layers are clean and 73 of 75 MoE layers differ. The
+  stable statement is the region and the per-forward re-ignition, and looking
+  for the one line would have been looking for something that does not exist.

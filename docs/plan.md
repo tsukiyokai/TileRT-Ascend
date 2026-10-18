@@ -8,7 +8,7 @@
 
 确定测得的最好点是 **14.533 ms**（width 4，装屏障 overlay，三请求同一轨迹、轮数同为 307、跨度 0.141）。此前记录的 14.247 ms 口径不同（用 `gather_fia`），且产出它那次运行的 `summary.status` 因一条过期时钟断言恒为 fail，该断言已修。
 
-width 8 在三个独立假设下仍不确定（三请求三条轨迹、轮数跨 218–255），所以它的 12.7–13.3 ms 不作为结果。已排除：厂商 epilogue 竞争（装屏障后仍发散）、`HCCL_DETERMINISTIC`（设为 true 后仍发散）。在查：请求间状态泄漏。[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
+width 8 不确定,所以它的 12.7–13.3 ms 不作为结果。已定位到 **TP 下 W4A8 routed-expert MoE 段里一个每次 forward 都重新点火的竞争**:同一进程对同一输入连做 6 次 verify 得 6 个不同 hidden(相对 7.1–17.5%),dense 层与其 all-reduce 逐位一致而 75 个 MoE 层里 73 个全差,而点火位置在三次独立二分里是随机的。`--expert-parallel` 是唯一恢复可复现的改动(249/249/249 轮)但吃掉 width 8 全部收益,只能当对照。阈值在 width 4 与 6 之间,不在 8。两个候选带 file:line:`shared_experts.py:546` 的 `npu_dequant_swiglu_quant`(`dequant_swiglu_quant.h:793`/`:797` 两个 Cast 之间只有不定序的 `SetDeqScale`,而紧随其后两对都有 `PipeBarrier<PIPE_V>`),以及 `apply_gmm2` 的内建 `GroupedMatmul` A8W4 split-K 配 `SetAtomicAdd<half>`(splitDim 由 host tiling 按 M 选,M=32 对 M=64)。[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
 
 已配对测得、各自在自己配置上成立、尚未合测：metadata 与 mc2 掩码提升 −0.7967 ms/token（下发 313→91，191712 项检查零失败）；专家声明压缩 2.39 ms/轮（真 checkpoint 逐位门过）；GMM 三份 kernel 补丁约 0.66 ms/轮（p=1.8e-12）。
 
