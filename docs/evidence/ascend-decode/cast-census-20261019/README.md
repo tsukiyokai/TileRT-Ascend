@@ -36,7 +36,36 @@ norm-quant kernel would be redoing a pass that already runs; the open question
 is why it matches so rarely, which is a pattern-matching question in the pass
 rather than a kernel one.
 
-## 314 of the casts are this project's own choice
+## What the casts actually are, and two attributions withdrawn
+
+In `trace_view.json` the task name is
+`aclnnInplaceCopy_CastAiCore_Cast`, and it accounts for **1590 of the 1669**
+Cast tasks — 95%, 4550.7 µs over the export, 1512 µs a round. So these are
+`copy_` operations whose source and destination dtypes differ, not standalone
+`Cast` calls.
+
+**Withdrawn, first attribution.** I had written that 314 of them are the FP32
+TP reduction's `value.float()` and `.bfloat16()` round trip. That was inferred
+from the call count matching, not measured, and a search of the quantisation
+and operator paths does not support it. The reduction's round trip is real and
+visible in the code (`cann_model.py:254-259`), but nothing establishes that it
+produces these tasks.
+
+**Withdrawn, second attribution.** Matching each task to its innermost
+enclosing `python_function` frame puts 1434 of the 1590 inside three `tolist`
+frames, 478 each at about 1429 µs. That is an artefact: `tolist` is a blocking
+host read, and the device tasks executing inside its window belong to other
+streams. The heuristic credits the blocking call rather than the producer —
+the same error as reading a `aclrtSynchronizeStream` duration as a cost.
+
+What stands: Cast is 554 calls and 1.54 ms a round, 22% of the budget, and
+95% of it is dtype-converting in-place copies. Finding the producer needs the
+trace's correlation identifiers rather than time containment, which has not
+been done.
+
+## The FP32 reduction's round trip, which is still worth removing
+
+
 
 `cann_model.py:254-259` overrides the TP sum to force FP32:
 

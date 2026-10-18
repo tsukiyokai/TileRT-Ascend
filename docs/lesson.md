@@ -988,3 +988,13 @@
   16.6 unfused norms -- so the opportunity is in the pass's pattern matching,
   not in a new kernel, and a kernel would have re-implemented work that is
   already running.
+- Time containment is not attribution. Matching device tasks to the innermost
+  Python frame enclosing them credited 1434 of 1590 casts to three tolist
+  calls, because tolist blocks the host for 1429 microseconds and every device
+  task from every other stream runs inside that window. It is the same error as
+  reading a stream synchronisation's duration as a cost, and I made both in one
+  night. Use correlation identifiers, or attribute nothing.
+- A matching count is not a mechanism. I wrote that 314 of the round's 554
+  casts were the FP32 reduction's bfloat16 round trip because 157 reductions
+  times two is 314, and the code search afterwards did not support it. The
+  arithmetic coincidence was the whole of the evidence.
