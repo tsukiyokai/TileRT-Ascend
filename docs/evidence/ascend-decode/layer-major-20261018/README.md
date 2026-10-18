@@ -183,6 +183,90 @@ This stage excludes target verification, conditioned MTP and delivery;
 it is not TPOT. Raw data stay in
 `/home/shanshan/trt-asc/offline/cann-mtp-chain-bench-20261018-01/`.
 
+## MTP output projection sharding
+
+`--draft-projection-tp` in the precision/timing runners replaces replicated
+`rot` and `eh_proj` with existing CANN column-parallel linear modules.
+Each rank keeps 384 output rows and the complete K dimension, then gathers
+the BF16 result before its consumer. Weights stay BF16 ND. The two matrices
+occupy 212,336,640 fewer bytes/die; two M1 chains plus conditioned M4 avoid
+637,009,920 logical weight bytes per steady round and add six AllGathers.
+M4 also restores the gathered output layout. Defaults remain unchanged.
+
+The [projection-path measurement](mtp-projection-module-audit.json) includes
+rot, norms, concatenation, eh, AllGather and layout restoration on real
+checkpoint weights and frozen parents. Thirty AB/BA pairs take rank-MAX
+device-event times before aggregation:
+
+| Projection path | Original p50 (ms) | Sharded p50 (ms) | Paired median saved (ms) | Wins |
+|---|---|---|---|---|
+| M1 | 2.98914 | 0.56152 | 2.38907 | 30/30 |
+| M4 | 2.95538 | 0.58270 | 2.36528 | 30/30 |
+
+Own-configuration changing-input/reset outputs match bit for bit in
+9,830,400 compared elements. The weighted `2*M1+M4` result is an isolated
+budget proxy; it does not time a decode round.
+
+The [complete MTP audit](mtp-projection-graph-audit.json) uses the actual
+product loader and opt-in. Eager seed, two dependent chain calls, rollback,
+dirty reset, recapture and conditioned M4 compare 64,979,328 output and
+405,504 valid KV elements bit for bit within the new configuration. The
+old/new seed outputs and seed-written KV agree exactly. Across projection
+configurations, recycle NRMSE is 0.017567 at C1 and 0.080302 at C2; C2 logits
+NRMSE is 0.061923 and KL is 0.011759. All eight saved top-1 positions agree.
+The [fixed-C1 experiment](mtp-projection-fixed-c1-audit.json) restores the
+same parent, token, full valid prefix and ordered indices for four choices:
+original, rot-only, eh-only and both. Plain/hooked results and saved full
+prefixes agree on all sixteen ranks. Rot-only changes one BF16 value by
+one ULP; that difference disappears at eh output. Eh-only changes four
+BF16 values by one ULP, then attention output NRMSE becomes 0.011584 and
+final recycle NRMSE 0.017567. Both-sharded matches eh-only from eh output
+onward. All choices select the same eight experts; their weights change.
+
+An [exact integer/rational dot oracle](mtp-projection-dot-oracle.json)
+checks the four changed eh rows against the frozen BF16 input and actual
+checkpoint weights. All four sharded values are correctly rounded; each
+original value is one ULP away. This establishes those four local results,
+not full-projection or trajectory accuracy. Keep cross-configuration drift
+diagnostic and measure proposal coverage and eventual accepted tokens.
+
+The [complete-chain timing](mtp-projection-timing-audit.json) retains the
+actual original `nn.Linear` objects and switches them with the new modules
+on one model. Each variant captures one graph, runs three unmeasured
+two-chain warmups, then one measured sample. Seed, restore, capture,
+validation and cleanup are outside the window; both token reads are inside.
+
+| Two-chain Graph wall time | p50 (ms) | p95 (ms) |
+|---|---|---|
+| Original projections | 28.30291 | 30.93028 |
+| Sharded projections | 27.42619 | 29.92008 |
+
+Thirty paired rank-MAX differences have median 0.522182 ms and p10/p90
+−2.34552/+3.06099 ms; sharding wins 19/30 pairs. AB/BA median savings are
+0.535997/0.453317 ms. The microbenchmark gain has not established a stable
+complete-chain gain. All 960 saved C2 samples match their own frozen
+references; each rank closes 60 captures after 480 replays. Peak reserved
+memory is 1,788,870,656 bytes/die. Target verification, conditioned M4 and
+delivery are outside this measurement. A short trace must identify the
+exposed matmul, gather and collective waits before further tuning.
+
+Raw data and reproducible auditors stay under
+`/home/shanshan/trt-asc/offline/cann-mtp-projection-{shard,product,chain-bench}-20261018-01/`.
+
+## Two chain calls in one Graph
+
+The [unrolled Graph prototype](mtp-two-chain-graph-audit.json) keeps the
+original projections and captures C1, device argmax/recycle feedback, and
+C2 in one graph. Two private metadata/RoPE/slot sets advance independently;
+one host read returns both candidates. A/B change positions from 8192/8193
+to 8193/8194, then dirty reset restores A. On TP16, 16,244,832 output and
+191,488 valid KV elements match the corresponding eager runs bit for bit.
+Saved device-bridge tensors also match C1 recycle/token and seed indices.
+Each rank captures once and replays three times, with peak reserved memory
+1,835,008,000 bytes/die. This prototype has no latency measurement or
+product-session integration yet. Artifacts stay in
+`/home/shanshan/trt-asc/offline/cann-mtp-two-chain-20261018-01/`.
+
 ## Reference scope
 
 The [reference configuration audit](reference-config-audit.json) binds

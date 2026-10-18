@@ -108,7 +108,7 @@ class CannMtp:
     model still appends that row's latent, RoPE and BF16 index key.
     """
 
-    def __init__(self, target):
+    def __init__(self, target, *, shard_projections=False):
         import torch
         from vllm.config import set_current_vllm_config
 
@@ -118,6 +118,7 @@ class CannMtp:
         self.layout = target.layout
         self.position = 0
         self.graph = None
+        self.shard_projections = shard_projections
         self.attention_kernel = target.attention_kernel
         self.checkpoint = target.checkpoint
         self.weight_files = weight_sources(self.checkpoint)
@@ -160,6 +161,10 @@ class CannMtp:
             from .cann_head import install_fp32_head
 
             install_fp32_head(model.lm_head, model.model.logits_processor)
+        if self.shard_projections:
+            from .cann_mtp_projection import shard_mtp_projections
+
+            shard_mtp_projections(model)
         return model.eval()
 
     def _bind_cache(self):

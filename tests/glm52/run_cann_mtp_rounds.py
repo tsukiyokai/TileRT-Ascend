@@ -58,6 +58,8 @@ def parse_arguments(argv=None):
                         help="Compare graph after uncaptured execution")
     parser.add_argument("--draft-graph", action="store_true",
                         help="Graph shared-index M1 draft chains")
+    parser.add_argument("--draft-projection-tp", action="store_true",
+                        help="Shard MTP rot and eh_proj outputs over TP16")
     parser.add_argument("--compile-target", action="store_true",
                         help="Compile the target backbone")
     parser.add_argument("--super-kernel", action="store_true",
@@ -305,6 +307,7 @@ def source_hashes(target, draft):
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py")
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_graph.py")
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_mtp_graph.py")
+    paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_mtp_projection.py")
     paths.update(ROOT / f"tilert/pd_vllm/{name}.py" for name in
                  ("ascend_layout", "ascend_cache", "prefix_capture"))
     return {**target.source_metadata(),
@@ -340,7 +343,7 @@ def execute(args):
         attention_kernel=args.attention_kernel,
         fp32_head=args.fp32_head,
     )
-    draft = CannMtp(target)
+    draft = CannMtp(target, shard_projections=args.draft_projection_tp)
     if not draft.model.do_not_compile:
         raise ValueError("MTP backbone compilation must be disabled")
     source = source_hashes(target, draft)
@@ -478,6 +481,7 @@ def execute(args):
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
+        "draft_projection_tp": args.draft_projection_tp,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,

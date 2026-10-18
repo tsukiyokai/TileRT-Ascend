@@ -101,6 +101,8 @@ def arguments():
     parser.add_argument("--target-graph", action="store_true")
     parser.add_argument("--draft-graph", action="store_true",
                         help="Graph shared-index M1 draft chains")
+    parser.add_argument("--draft-projection-tp", action="store_true",
+                        help="Shard MTP rot and eh_proj outputs over TP16")
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
@@ -312,7 +314,7 @@ def run(args, report):
                        fp32_head=args.fp32_head)
     draft = None
     try:
-        draft = CannMtp(target)
+        draft = CannMtp(target, shard_projections=args.draft_projection_tp)
         if not draft.model.do_not_compile:
             raise ValueError("MTP backbone compilation must be disabled")
         if target.tp_reduction != "float32":
@@ -474,6 +476,7 @@ def run(args, report):
                 "output_tokens_per_request": args.max_tokens,
                 "target_graph": args.target_graph,
                 "draft_graph": args.draft_graph,
+                "draft_projection_tp": args.draft_projection_tp,
                 "compile_target": args.compile_target,
                 "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
@@ -502,6 +505,7 @@ def main():
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
+        "draft_projection_tp": args.draft_projection_tp,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,

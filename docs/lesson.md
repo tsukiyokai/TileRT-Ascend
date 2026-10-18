@@ -138,6 +138,19 @@
   were already submitted before the first completed. The 4 ms graph span
   is not evidence of Python submission cost or an intrinsic compute floor.
   [Resident-layer profile](evidence/ascend-decode/execution-gap-20261018/resident-profile-audit.json)
+- Measure a changed primitive in its complete consumer chain. MTP projection
+  sharding saves a paired 2.389 ms in the isolated M1 path, including gather,
+  but only 0.522 ms across two complete draft calls and wins 19/30 pairs.
+  Retain actual original modules, include new communication/layout work,
+  and trace the exposed dependency path before attributing the difference.
+  [Projection and chain measurements](evidence/ascend-decode/layer-major-20261018/README.md#mtp-output-projection-sharding)
+- Exact replay and agreement with the previous implementation answer
+  different questions. Four one-ULP changes in MTP eh output amplify to
+  1.76% recycle NRMSE, yet exact rational dots confirm all four new values
+  and reject the corresponding old rounding. Fix the same input/state,
+  locate the first change, then evaluate proposal quality and acceptance.
+  [Fixed-input diagnosis](evidence/ascend-decode/layer-major-20261018/mtp-projection-fixed-c1-audit.json)
+  · [Exact dots](evidence/ascend-decode/layer-major-20261018/mtp-projection-dot-oracle.json)
 - A numerically exact rebuild is not a performance-equivalent baseline.
   O publication fusion wins 9.025 µs against rebuilt O plus push, but its
   paired gain is −0.328 µs against the installed O plus push. The same-run
