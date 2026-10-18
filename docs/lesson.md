@@ -1,4 +1,40 @@
-# Lessons
+# The bitter lesson
+
+167 entries below, each with the measurement that produced it. They fall into
+six shapes, and naming the shape is faster than remembering the instance.
+
+**An instrument reading its own overhead.** A bandwidth ceiling measured one
+read at a time is a launch latency. An eager event pair can read the host. A
+per-call figure can be one launch divided by the repeat count. A tight loop
+reads a racy kernel as deterministic because it never changes the workspace.
+
+**A check that cannot fail.** Rank-index contributions make every partial sum
+an integer below 2²⁴, so the result is constant across all 16! orderings. A
+constant payload is blind to a stale buffer. A harness that defines the
+constant the patch forgot to import turns a crash into a pass.
+
+**Attribution by coincidence.** Time containment credits a blocking `tolist`
+with every concurrent task. A matching count is not a mechanism. Ablating one
+stage of a fused kernel gives a lower bound. A hypothesis that fits a threshold
+exactly can still be coincidence — check the differential.
+
+**A fix that was never installed.** An override at the wrong index in
+`ASCEND_CUSTOM_OPP_PATH` fails silently. A build script that installs some of
+its inputs discards a patch and reports success. `ast.parse` passing excludes
+syntax errors and nothing else. Read the position back out of the run.
+
+**Reasoning where a control was available.** Dividing bytes by a peak
+bandwidth figure has been wrong by several times every time. An instruction
+count is only as good as the data type it assumed. A symptom you caused
+yourself is not a code defect, and the fix for it can break what worked.
+
+**Correct-looking output from incorrect computation.** Bit-reproducible tokens
+can come from margins absorbing a corrupted operator rather than from right
+arithmetic. A release gate that compares tokens cannot see it.
+
+The working rule, in one line: **where a control is available, do not reason.**
+[workflow.md](workflow.md) carries that as a table of what each error cost
+against what its control would have cost.
 
 - Captured workspaces outlive a forward. Three MTP graphs exhausted the
   2 GiB probe quota; each bucket independently passes with serial graph
