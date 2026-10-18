@@ -750,3 +750,15 @@
   Ranking work by the perfect kernel's bottleneck put weight bandwidth first
   when the real item was a dense table nobody needed to read.
   [GMM decomposition](evidence/ascend-decode/gmm-fastpath-20261019/README.md)
+- Subtracting one stage's work from a fused kernel measures a lower bound, not
+  that stage's cost. The call's duration is the critical path after the vector
+  and cube paths join at a barrier, so removing work off the critical path
+  changes nothing, while a variable that shortens both paths reports the full
+  effect. I published an ablation table as a decomposition and it was not one.
+- "Linear in N, therefore removing the N things removes the time" skips a step.
+  The expert GMM's cost is certainly linear in the routing table's length, and
+  only a tenth of it could be attributed to code anyone can delete; the
+  per-slot term is thirty times the cost of the scalar reads that were found,
+  so the mechanism is not the reads. Localise before paying for an interface
+  change.
+  [Correction](evidence/ascend-decode/gmm-fastpath-20261019/README.md)

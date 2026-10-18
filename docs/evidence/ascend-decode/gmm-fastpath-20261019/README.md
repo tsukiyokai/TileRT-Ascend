@@ -19,21 +19,31 @@ rather than 0.037.
 
 ## The call, decomposed
 
-| item | µs | share |
-|---|---|---|
-| **scanning 248 empty `group_list` slots** | **39.9** | **40%** |
-| kernel launch floor | ~23 | 23% |
-| cube matmul | ~12 | 12% |
-| mandatory mixed barriers | 4.6 | 5% |
-| removable barrier pair | 3.5 | 4% |
-| vector tail | 5.9 | 6% |
-| weight stream's HBM increment | 3.4 | 3% |
-| MSD activation split | 0.1 | 0.1% |
+**This is not a decomposition and an earlier version of this page presented it
+as one.** A call's duration is the critical path after the AIV and AIC paths
+join at two mixed barriers, so removing one core type's work shortens the call
+only when that core type was the critical path, while shortening the table
+shortens both paths. The ablation figures are therefore lower bounds.
 
-Two independent routes agree: ablation puts the floor of launch plus table
-scan plus the two kept barriers at 67.05–69.88 µs over six runs, which after
-subtracting 4.6 leaves 64.2, while the table-length difference gives
-256 × 0.161 = 41.2 and leaves 23.0 for launch.
+| item | µs | status |
+|---|---|---|
+| **cost linear in `group_list` length** | **37–50** | mechanism certain, 4.157 attributed |
+| kernel launch floor | ~23 | by subtraction, so inherits the above |
+| cube matmul | ≥12 | ablation lower bound |
+| mandatory mixed barriers | 4.6 | priced directly, additive |
+| removable barrier pair | 3.5 | priced directly, landed |
+| vector tail | ≥5.9 | ablation lower bound |
+| weight stream's HBM increment | 3.4 | measured directly |
+| MSD activation split | 0.1 | measured directly |
+
+Ablation puts the floor of launch plus table scan plus the two kept barriers
+at 67.05–69.88 µs over six runs. **That figure contradicts the ~8 µs in-graph
+per-call floor measured in `fixed-cost-20261018` by eightfold, and which is
+right decides the size of the prize for the whole programme**: a verify
+forward is 2,416 calls, which is 19.3 ms of floor at 8 µs and 162 ms at 67 —
+the latter exceeding the entire round. The likely resolution is that the 67 is
+not a dispatch floor but this operator's own prologue, and settling it is now
+the board's most important open question.
 
 **The operator is not weight-bound at batch one.** Thirty-two windows crossing
 L2 against one window inside it is 98.665 versus 95.301 µs, a 3.36 µs
@@ -57,9 +67,34 @@ With mLimit 4681 against 8 total rows, `rightMatrixExpertEndIndex` always
 reaches `groupListLen - 1`, so where the active experts sit does not matter —
 only the table's length does.
 
-**78 layers × 39.9 µs = 3.11 ms per round, 21.8% of the current 14.247 ms** —
+**78 layers × ~40 µs = 3.11 ms per round, 21.8% of the current 14.247 ms** —
 larger than the weight stream, the MSD round trip, the barriers and the vector
 tail combined.
+
+But **only 4.157 µs of it is attributed to code and removable**, and the rest
+is reproducibly caused by table length while being localised to nothing. The
+two walks that can go are `InitWorkSpaceSplitConfig`, which sums the table
+when it needs only the row total that tiling already holds
+(`base_tiling.cpp:201,434`, read by `post.h:106`), worth 0.908 and 1.517 µs;
+and `UpdateWorkSpaceSplitConfig`, whose span is closed-form at one split,
+worth 3.574 and 1.566. Together 4.157 µs, additive, bit-identical.
+
+`midProcess` genuinely needs per-slot counts, because its weight addressing
+accumulates `wBaseOffset` (`mid.h:141-153`) rather than indexing by
+`groupIdx`, so an empty slot must still be walked. A fourth consumer walks it
+twice more: `postProcess` sums the table at `post.h:271-273`, reads it per
+group at 279-283, and runs to the table's end at 338.
+
+Batching the table into UB cannot reach the rest. The 769 global scalar reads
+the two patches remove cost 5.4 ns each — about ten cycles at 1.85 GHz, so
+already cached — while the per-slot length term is 0.16 µs, about 296 cycles.
+Thirty times apart. And `midProcess` has no `TPipe` at all (`mid.h:88-113`),
+so giving it UB staging is not a local change.
+
+Localising the remaining 33–46 µs needs per-stage device timestamps at two
+table lengths, which has not been run. An op-prototype change for index-based
+routing would mean a full package build rather than the 21.3 s single-operator
+rebuild these patches use, so it is not worth paying blind.
 
 ## The straight-line path at one split: 0.50 ms per round, ready to land
 
