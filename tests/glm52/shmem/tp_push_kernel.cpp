@@ -419,6 +419,10 @@ ACLSHMEM_DEVICE void TpPushReduceBf16(const TpPushLayout& layout, __gm__ bfloat1
                 Add(acc, acc, term, count);
             }
             PipeBarrier<PIPE_V>();
+            // The next load must not overwrite the staging buffer while the
+            // cast above is still reading it.
+            SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+            WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         }
         Cast(narrow, acc, AscendC::RoundMode::CAST_RINT, count);
         SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);

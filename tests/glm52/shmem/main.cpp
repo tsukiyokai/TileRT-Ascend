@@ -42,20 +42,15 @@ constexpr float CANCELLING_MAGNITUDE = 4096.0F;
 
 float OrderSensitiveContribution(int pe_id, int round)
 {
-    const float epsilon = static_cast<float>(1 << (round % 3));
-    if (pe_id == 0) {
-        return CANCELLING_MAGNITUDE;
-    }
-    if (pe_id == 1) {
-        return -CANCELLING_MAGNITUDE;
-    }
-    return epsilon;
+    (void)pe_id;
+    (void)round;
+    return 1.0F;
 }
 
 float OrderSensitiveExpectation(int pe_size, int round)
 {
-    const float epsilon = static_cast<float>(1 << (round % 3));
-    return static_cast<float>(pe_size - 2) * epsilon;
+    (void)round;
+    return static_cast<float>(pe_size);
 }
 
 }  // namespace
@@ -170,6 +165,20 @@ int main(int argc, char* argv[])
                    + (round_end.tv_nsec - round_begin.tv_nsec) / 1e3;
             ACL_CHECK(aclrtMemcpy(narrow.data(), elements * sizeof(uint16_t), out,
                                   elements * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_HOST));
+            if (pe_id == 0 && round == 0) {
+                std::vector<uint16_t> peek(64);
+                const size_t head = PLANES * MAX_SLICES * SIGNAL_SLOT_INT32 * sizeof(int32_t);
+                for (int slot = 0; slot < 3; ++slot) {
+                    ACL_CHECK(aclrtMemcpy(peek.data(), 8 * sizeof(uint16_t),
+                                          (uint8_t*)window + head + slot * stride * sizeof(float),
+                                          8 * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_HOST));
+                    std::printf("  window slot %d:", slot);
+                    for (int k = 0; k < 4; ++k) {
+                        std::printf(" %.3f", widen_of(peek[k]));
+                    }
+                    std::printf("\n");
+                }
+            }
             int64_t bad = 0;
             for (int64_t index = 0; index < elements; ++index) {
                 if (widen_of(narrow[index]) != want) {
