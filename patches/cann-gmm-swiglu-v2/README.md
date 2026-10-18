@@ -79,6 +79,88 @@ serial round trips, which is kernel-internal and needs no prototype change. It
 is measured in size, 38.55 µs per call or about 3.0 ms per round, and
 unmeasured as a fix.
 
+## `w4a8-compact.patch` — 2.39 ms per round, and it changes where the fix goes
+
+Applies at the root of the `vllm-ascend-unified` checkout. Two changes, both
+behind the module constant `_COMPACT_EXPERT_DECLARATION`: `w4a8.py:379` stops
+converting `w2` to FRACTAL_NZ, and `apply_gmm2` calls a new module-level
+`_compact_expert_declaration` when `group_list_type == 1`.
+
+The route changed because **`index_select` does not work on an NZ tensor**, and
+the earlier claim that it did was a false positive: the probe's `attempt()`
+lacked `torch.npu.synchronize()`, and TransData failures are asynchronous, so
+every expression read as passing. Re-measured one expression per process with
+the synchronisation inside the `try`:
+
+| expression on production `w2` (format 29) | result |
+|---|---|
+| narrow view `w2[32:40]` | passes, stays format 29, contiguous |
+| narrow view plus `.contiguous()` | passes |
+| `index_select` | **fails** (TransData) |
+| per-expert `copy_` into a preallocated NZ destination | **fails** |
+| `npu_format_cast(w2, 2)`, NZ back to ND | **fails** |
+| the built-in accepting ND (format 2) weights | passes |
+
+So a scattered gather is only expressible if `w2` never becomes NZ, which
+means the change belongs at load time. That is not a cost — ND is faster here
+even before compression. Down shape, K=128 N=6144, three banks, 32 calls per
+graph, 25 rounds, median:
+
+| arm | µs per call |
+|---|---|
+| NZ, declared 256, scattered — **today's production** | 76.644 |
+| NZ, declared 8, contiguous view | 31.240 |
+| ND, declared 256, scattered | 71.041 |
+| ND, declared 8, gathered | 29.530 |
+
+ND at full declaration already beats NZ by 5.603 µs. End to end, 76.644
+against 29.530 plus the 15.190 gather is **31.924 µs saved per layer, 2.39 ms
+per round** over the round's ~75 built-in grouped calls. Charging the gather in
+full against the ND declaration effect alone gives the conservative 26.3 µs
+per layer, 1.97 ms per round. Both exceed the 1.01 ms figured earlier, because
+that baseline was ND with a contiguous window while production is NZ with a
+scattered one.
+
+### The gates it passed
+
+Real checkpoint, layer 3, rank 0's eight experts' `down_proj` through the real
+`process_weights_after_loading`: 49,152 output elements bit-identical to the
+full-bank call, `torch.equal` true. The dead tail beyond `sum(group_list)` is
+all-zero and bit-identical in both arms, so nothing downstream indexing by
+global expert id can see a difference.
+
+The patch's own expression — `torch.sort(torch.topk(group_list, active).indices).values`
+plus `index_select` into a resident buffer — was validated separately across
+four routing shapes, each run twice to cover buffer reuse: ascending scattered,
+contiguous window, unsorted counts, and four at each end. All bit-identical.
+It is device-side with static shapes and no read-back, so capture survives.
+
+An operator property found on the way: `npu_grouped_matmul` **overwrites its
+activation in place** (max int8 drift 251), identically in both arms;
+`per_token_scale` is untouched. A first gate run reported a 1.11 mismatch
+purely because both arms shared one `x`.
+
+### What is deliberately not in it
+
+No view path. Selecting it requires testing the group list's contents, which
+inside a captured graph is a device-to-host read that would break capture and
+insert a synchronisation into the decode stream. The view itself works and
+remains available to eager callers.
+
+`index_select(..., out=)` into a resident buffer is kept but is worth nothing
+in a graph: 16.439 µs allocating against 16.477 resident, a difference inside
+the noise, because graph allocation is decided at capture and replay never
+reaches the allocator. It still matters on the eager path.
+
+### Open before landing
+
+`maybe_trans_nz` on `w2` may be the right choice at prefill shapes; ND was
+only measured faster at decode shapes. The module constant exists for this —
+if NZ wins clearly at prefill, the switch has to become per-phase rather than
+global. And the merged run putting the patch's expression and the real
+checkpoint together in one pass was stopped mid-load; the two halves are
+covered separately but not in one.
+
 ## A third patch this repository already carries
 
 `tests/glm52/patches/gmm1-swiglu-barrier.patch` is not an optimisation. The

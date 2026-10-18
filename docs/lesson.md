@@ -846,3 +846,23 @@
 - A benchmark that requires a flag will exit in seven seconds, and a detached
   launch makes that look like a long-running job. Read the log's first lines
   before setting a waiter, not after it times out.
+- A failure that arrives asynchronously lands outside the try block. A probe
+  that tested four tensor expressions on an NZ weight reported all four
+  passing, because TransData fails after the call returns and the probe never
+  synchronised inside the guard. Three of the four actually fail, which moved
+  the fix from the call site to load time. One expression per process, with the
+  synchronisation inside the try.
+- An operator may rewrite its own input. npu_grouped_matmul overwrites its
+  int8 activation in place, with a drift up to 251, which made a bit-exactness
+  comparison fail at 1.11 until each arm took its activation from a frozen
+  copy. A differential harness has to re-source every mutable input per arm,
+  not just per experiment.
+- A resident output buffer buys nothing inside a captured graph. Allocation is
+  decided at capture and replay never reaches the allocator, so index_select
+  with out= measured 16.477 against 16.439 microseconds allocating -- inside
+  the noise. The optimisation is real on the eager path and empty in the graph,
+  which is where production runs.
+- Do not race your own agents for an exclusive machine. Three attempts at a
+  sixteen-rank measurement failed on free-memory checks because an agent's job
+  started inside the window between my settle check and init_device. The
+  machine has no lock; the discipline has to be mine.
