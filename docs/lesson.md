@@ -998,3 +998,14 @@
   casts were the FP32 reduction's bfloat16 round trip because 157 reductions
   times two is 314, and the code search afterwards did not support it. The
   arithmetic coincidence was the whole of the evidence.
+- A task with no launching API event is a task inside a captured graph. 1491
+  of 1590 in-place casts failed to join on connection_id, which is not missing
+  data but the signature of replay: no host code runs, so there is nothing to
+  join to. That single fact localised them to the target graph and explained
+  why they never appeared in the host launch accounting while costing 1.43 ms
+  of device time a round.
+- When a trace cannot attribute something because it is inside a graph, turn
+  the graph off. The same operations reappear as eager calls carrying their
+  stacks, and the attribution becomes exact for the cost of one run -- far
+  cheaper than inferring from containment, which had already produced two
+  withdrawals.

@@ -58,10 +58,39 @@ host read, and the device tasks executing inside its window belong to other
 streams. The heuristic credits the blocking call rather than the producer —
 the same error as reading a `aclrtSynchronizeStream` duration as a cost.
 
-What stands: Cast is 554 calls and 1.54 ms a round, 22% of the budget, and
-95% of it is dtype-converting in-place copies. Finding the producer needs the
-trace's correlation identifiers rather than time containment, which has not
-been done.
+## Attributed properly, through `connection_id`
+
+A device task carries `connection_id` in its `args` and so does the launching
+AscendCL event, so joining on it gives the producer where time containment gave
+the blocking call. Joining 1590 tasks:
+
+| | calls | joined to an API |
+|---|---|---|
+| total | 1590 | **99** |
+
+**1491 of them have no launching API event at all**, which is what a task
+inside a captured graph looks like: replay runs no host code, so there is
+nothing to join to. That also explains why they never appeared in the
+launch-class count the host accounting tracked — 313 falling to 91 — while
+still costing device time.
+
+By graph:
+
+| Model Id | calls | µs | per round | µs per round |
+|---|---|---|---|---|
+| 48, the target graph, stream 81 | 1437 | 4300.8 | **477** | **1429** |
+| 4294967295, eager, stream 17 | 99 | 167.3 | 33 | 55.6 |
+| 49, the draft graph, stream 83 | 54 | 82.6 | 18 | 27.5 |
+
+So **94% of the cost is inside the target graph**, which is the verify
+forward's 78 layers: 477 calls over 78 layers is **about six dtype-converting
+in-place copies per layer**, and 1.429 ms a round.
+
+Which six cannot be read from this trace, because a replayed task has neither
+an API event nor a Python frame. The experiment that would settle it is one
+profile with `--target-graph` off: the same operations then appear as eager
+`aclnn` calls with their stacks, and the join above becomes exact. That is one
+run and it has not been done.
 
 ## The FP32 reduction's round trip, which is still worth removing
 
