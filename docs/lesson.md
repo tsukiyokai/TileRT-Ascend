@@ -301,3 +301,17 @@
   configuration, which is why the composed set's 57.12 ms round has no
   decomposition. Check that the profiler records the flags you passed.
   [Capture receipt](evidence/ascend-decode/draft-collectives-20261018/README.md)
+- A hardcoded field in a receipt can retire a whole line of inquiry. A
+  capture requested with `--draft-graph` reported `draft_execution: eager`
+  because that string was a literal in `profile_cann_decode.py`, which led to
+  the conclusion that the production path cannot be profiled. The receipt's
+  own `draft_graph_state` showed one capture and 28 replays. Check a flag
+  against a field that is derived, not written.
+  [Five-flag profile](evidence/ascend-decode/five-flag-profile-20261018/README.md)
+- A round-time difference between two configurations is not a kernel
+  difference when the trajectories differ. Dropping `gather_fia` shortens the
+  round by 0.95 ms, which read as the screen failing to transfer; the profile
+  shows the attention path is in fact 21.3 µs per layer cheaper, and the two
+  cases run 307 and 298 rounds at different acceptance over different expert
+  sets. Compare kernels with kernels.
+  [Retraction](evidence/ascend-decode/five-flag-profile-20261018/README.md#gather_fia-works-and-an-earlier-objection-to-it-was-wrong)
