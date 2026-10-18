@@ -54,6 +54,11 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
     ranks (EP16, sixteen full experts each, intermediate stays 2048) and
     selects the fused MC2 MoE: dispatch, both GMMs, SwiGLU and combine in
     one vendor operator per layer, removing the MoE's TP reduction.
+
+    `enable_fused_mc2` is 2 rather than 1 deliberately. vLLM-Ascend rolls
+    megamoe back for 1 and reaches `dispatch_ffn_combine` instead; only 2
+    leaves `_MEGA_MOE_SUPPORTED` true, after which it rewrites the value to
+    1 itself (`ascend_config.py:663-673`).
     """
     if super_kernel and not compile_target:
         raise ValueError("SuperKernel requires the compiled M4 target")
@@ -89,7 +94,7 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         additional_config={
             "enable_flashcomm1": False, "enable_dsa_cp": False,
             "enable_shared_expert_dp": False,
-            "enable_fused_mc2": int(expert_parallel),
+            "enable_fused_mc2": 2 if expert_parallel else 0,
             "ascend_compilation_config": {
                 "enable_static_kernel": super_kernel,
                 "enable_super_kernel": super_kernel,

@@ -422,3 +422,22 @@
   were. When a bug and a feature are measured together, re-measure the feature
   alone before keeping its number.
   [Aliasing](evidence/ascend-decode/devtok-aliasing-20261018/README.md)
+- Cutting the number of collectives is necessary but not sufficient. EP16
+  removes 78 of the round's 157 reductions and still loses to TP16 by 1.09 ms
+  per round, with the vendor's fused MegaMoe adding another 1.41 ms. At batch
+  one there is no statistical smoothing, so the busiest of sixteen buckets
+  holds four to five whole experts behind a per-layer combine barrier; the run
+  spread grows 0.252 → 0.521 → 0.756 ms across the three cases, which is that
+  tail becoming visible. Trade a fixed cost for a tail only where the tail is
+  averaged.
+  [EP16](evidence/ascend-decode/ep-megamoe-20261018/README.md)
+- A vendor flag can be a no-op by design. `enable_fused_mc2=1` is rolled back
+  internally to `dispatch_ffn_combine` and only 2 reaches `MegaMoe`, after
+  which it rewrites itself to 1, so the effective config echoes the same value
+  either way. Confirm an operator engaged by finding its name in the run, not
+  by reading back the switch.
+- `python3 -I` is not free. Isolated mode drops the PYTHONPATH entry that puts
+  CANN's `site-packages` on the path, so a capability probe reported a vendor
+  package missing when the real benchmark, launched without `-I`, could import
+  it. The hygiene habit for untrusted downloads manufactured a false negative
+  about our own environment.
