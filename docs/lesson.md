@@ -360,3 +360,17 @@
   batch-one decode cannot supply. Probe the operator on the target SoC at the
   target shape before planning on it.
   [Vendor fusions](evidence/ascend-decode/fused-collective-ops-20261018/README.md)
+- Benchmark the layout production uses, or measure an artefact. An int8 matmul
+  moved half the bytes of its bfloat16 twin in the same time, which looked like
+  a two-fold read amplification worth halving the cube's 22.80 ms. Production
+  never sees it: `act_quant_type` defaults to `torch.int8`, so
+  `process_weights_after_loading` casts the weight to FRACTAL_NZ. The same
+  mistake sat in my own kernel, whose ND tile copy has 256-byte runs and
+  reaches 0.18× the vendor regardless of tiling.
+  [Streaming rate](evidence/ascend-decode/matmul-streaming-20261018/README.md)
+- The bfloat16 matmul is at 93.8% of the die's streaming ceiling at four rows,
+  and a chain of thirty-two costs the same per call as one. So there is no
+  bandwidth and no launch overhead to win by fusing matmuls together; what a
+  fused kernel buys is on-chip activations across the round's ~637 cube-vector
+  handoffs and a collective in its epilogue. Aim a megakernel at what
+  surrounds the matmul.
