@@ -532,3 +532,14 @@
   and prefetch scheduled across the whole forward pass -- were absent from my
   plan entirely, and both are the reason the third one works.
   [Reread](evidence/tilert-ascend/amd-article-reread-20261018.md)
+- Split the kernel before blaming the mechanism. My one-sided reduction
+  measured 543 us and the obvious suspect was the push; switching
+  communication off entirely left 557 us, so the whole cost was my own
+  reduction loop. A stage flag that disables half the kernel is cheaper than
+  any amount of reasoning about which half is slow.
+  [TP push](evidence/ascend-decode/tp-push-20261018/README.md)
+- Copying an example's loop shape imports its assumptions. combine_classic
+  accumulates with a scalar for-loop because it reduces only bs tokens; reused
+  for a full [4, 6144] sum that is sixteen global reads per element. The
+  example was right for its own shape and wrong for mine, and the resemblance
+  hid the difference.
