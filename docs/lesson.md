@@ -224,3 +224,10 @@
   cost is inside the kernels. Measure the in-graph floor before proposing
   fusion to save dispatch.
   [Chain probe](evidence/ascend-decode/graph-chain-20261018/README.md)
+- Bytes divided by total time is not a streaming rate when the call is mostly
+  fixed cost. The expert GMM looks like a fifth of bandwidth at the model's
+  shape, but raising the active groups shows it streams at 1152–1261 GB/s,
+  the HBM event median, over a 35.8–39.5 µs floor. Sweep the traffic before
+  calling a kernel bandwidth bound, and do not spend effort on bytes that are
+  already hidden under a fixed cost.
+  [GMM shape scaling](evidence/ascend-decode/gmm-shape-20261018/README.md)
