@@ -835,3 +835,14 @@
   accepted, keeps its NZ format and is bit-identical, so a contiguous active
   window costs nothing at all. One check turned a mandatory 15 microseconds
   into a conditional one.
+- `pgrep -f` inside `ssh ... docker exec` matches the diagnostic command's own
+  argv, so it reports a process that is only itself. I read "two runs are
+  contending" from it and spent a turn killing a job that did not exist, while
+  the real state was that nothing had started at all.
+- `source /workspace/environment/activate.sh` blocks when stdout is not a tty.
+  A background launch under `bash -c` hangs there forever and writes an empty
+  log; the same script under `bash -lc` runs. Every working launch in this
+  project had used `-lc` and I did not notice it was load-bearing.
+- A benchmark that requires a flag will exit in seven seconds, and a detached
+  launch makes that look like a long-running job. Read the log's first lines
+  before setting a waiter, not after it times out.
