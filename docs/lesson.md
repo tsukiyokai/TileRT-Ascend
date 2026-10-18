@@ -715,3 +715,25 @@
   the fence as free was correct and the inference that ordering was therefore
   cheap was not: a DataCopy to a peer is an ordinary MTE3 store that no SHMEM
   call tracks, and the writer must drain its own queue.
+- A check that cannot fail is not a check. Having each rank contribute its own
+  index makes every subset sum an integer below 2^24, so float32 never rounds
+  and the result is constant over all 16! summation orders -- 200000 random
+  orders gave one distinct value. "Agrees with HCCL element for element" was
+  the same illusion, since the compared values are exactly representable. Both
+  claims cannot even hold at once on an order-sensitive input, because a
+  rank-ordered sum and HCCL's rotation are different sums. Design the input so
+  that the failure you are excluding would change the answer.
+- A constant payload hides time, not just order. Writing the input once and
+  reusing it for four hundred rounds makes the check blind to a stale plane, to
+  round crosstalk, and to an implementation that communicates in round zero
+  and re-reads the same buffer 399 times -- which would also report a lower
+  per-round cost. Vary the payload with the round, on a period coprime to any
+  buffer parity.
+- Evidence that something survives graph capture must exercise the mechanism
+  the production path uses. The vendor demo carries its per-round variable
+  through device memory; mine was a kernel immediate the host incremented, and
+  replay runs no host code, so the parity froze at capture. With an odd number
+  of reductions per captured graph and two planes, back-to-back replays put the
+  same plane on consecutive rounds with one sync between -- a race the constant
+  payload could never show.
+  [Audit](evidence/ascend-decode/onesided-audit-20261018/README.md)

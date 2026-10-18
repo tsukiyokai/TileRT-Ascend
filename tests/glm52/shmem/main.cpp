@@ -86,6 +86,9 @@ int main(int argc, char* argv[])
     ACL_CHECK(aclrtMemcpy(out, elements * sizeof(float), sentinel.data(), elements * sizeof(float),
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
+    void* errors = nullptr;
+    ACL_CHECK(aclrtMalloc(&errors, 1024 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMemset(errors, 1024 * sizeof(int32_t), 0, 1024 * sizeof(int32_t)));
     const uint64_t ffts = util_get_ffts_config();
     // The push needs one core per peer; the reduction wants every core it can
     // get, so the launch is sized for the reduction and the push uses the
@@ -99,14 +102,14 @@ int main(int argc, char* argv[])
     aclshmem_barrier_all();
 
     // Signal values continue across both launches, so neither needs a reset.
-    tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, rows, hidden, warmup, 0, stage);
+    tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, (int32_t*)errors, rows, hidden, warmup, 0, stage);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     aclshmem_barrier_all();
 
     struct timespec begin;
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &begin);
-    tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, rows, hidden, rounds, warmup, stage);
+    tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, (int32_t*)errors, rows, hidden, rounds, warmup, stage);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -132,11 +135,18 @@ int main(int argc, char* argv[])
             ++untouched;
         }
     }
+    std::vector<int32_t> error_counts(1024, 0);
+    ACL_CHECK(aclrtMemcpy(error_counts.data(), 1024 * sizeof(int32_t), errors, 1024 * sizeof(int32_t),
+                          ACL_MEMCPY_DEVICE_TO_HOST));
+    int64_t probe_failures = 0;
+    for (int32_t value : error_counts) {
+        probe_failures += value;
+    }
     if (pe_id == 0) {
         std::printf("pe_size %d rows %d hidden %d bytes %ld rounds %d blocks %u\n", pe_size, rows,
                     hidden, (long)(elements * sizeof(float)), rounds, blocks);
-        std::printf("RESULT stage %d per_reduction_us %.3f wrong %ld untouched %ld of %ld expected %.1f got %.1f\n",
-                    stage, total_us / rounds, (long)wrong, (long)untouched, (long)elements, expected, result[0]);
+        std::printf("RESULT stage %d per_reduction_us %.3f probe_failures %ld wrong %ld untouched %ld of %ld expected %.1f got %.1f\n",
+                    stage, total_us / rounds, (long)probe_failures, (long)wrong, (long)untouched, (long)elements, expected, result[0]);
     }
 
     aclshmem_free(window);
