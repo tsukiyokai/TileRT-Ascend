@@ -468,3 +468,17 @@
   first-class lever rather than a tuning knob -- and a projection costs the
   same at 1, 4, 16 and 64 rows, so widening MTP is nearly free where it
   matters most.
+- Recompute the keystone before building on it. The weight read per rank per
+  round was recorded as 6.83 GB and 6.00 ms, making 84% of a 2 ms budget look
+  unavoidable; counted from the checkpoint's own headers it is 4.24 GB and
+  3.56 ms, 52%. Every strategic claim that leaned on the old number -- that
+  fusion could not reach the target, that the collective count had to fall,
+  that EP was a prerequisite -- inherited its error.
+  [Budget](evidence/ascend-decode/budget-20261018/README.md)
+- A measured per-call cost is not a constant of nature. 63.5 us per reduction
+  became an axiom in my reasoning, and multiplying it by 157 "proved" the
+  count had to fall, which sent EP16 to the front of the queue where it lost.
+  48 KiB across sixteen ranks at 63.5 us is 11 GB/s, two orders off any
+  bandwidth limit, so the figure describes rounds and rendezvous and falls by
+  an order of magnitude under a one-shot push. Before dividing a budget by a
+  measured cost, ask what that cost is made of.
