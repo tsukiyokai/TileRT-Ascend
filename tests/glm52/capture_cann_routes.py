@@ -49,7 +49,7 @@ def main():
             ids = result[1]
             if (ids.dtype not in (torch.int32, torch.int64)
                     or ids.ndim != 2 or ids.shape[1] != 8
-                    or ids.shape[0] not in (1, 2, 4)):
+                    or ids.shape[0] not in (1, 2, 4, 6, 8, 12, 16)):
                 raise ValueError("Expected integer expert IDs [M,8]")
             destination[:ids.shape[0]].copy_(ids)
             return result
@@ -67,7 +67,7 @@ def main():
             else:
                 layers = [(78, backbone.layers["78"].mtp_block)]
             with torch.npu.device(engine.device), torch.inference_mode():
-                buffer = torch.full((len(layers), 4, 8), -1,
+                buffer = torch.full((len(layers), 16, 8), -1,
                                     dtype=torch.int32, device=engine.device)
             collectors[kind] = buffer, [number for number, _ in layers]
             buffers[kind] = {"shape": list(buffer.shape),
@@ -95,7 +95,7 @@ def main():
                 buffer.fill_(-1)
                 result = original(engine, *values, **options)
                 width = engine.position - start
-                if width not in (1, 2, 4):
+                if width not in (1, 2, 4, 6, 8, 12, 16):
                     raise ValueError("Forward did not append M valid rows")
                 ids = buffer[:, :width].cpu().tolist()
             if any(len(set(row)) != 8 or min(row) < 0 or max(row) >= 256
@@ -103,7 +103,7 @@ def main():
                 raise ValueError("Missing, repeated or invalid expert IDs")
             external = options.get("external_indices") is not None
             stage = ("target" if kind == "target" else "chain" if external
-                     else "conditioned" if width == 4 else "seed")
+                     else "conditioned" if width > 1 else "seed")
             record = {"call": sequence, "request": request, "kind": kind,
                       "stage": stage, "position": start, "width": width,
                       "position_after": engine.position,

@@ -561,7 +561,7 @@ class MtpSessionChecks(unittest.TestCase):
 
     def test_invalid_width_prefix_and_sampling_do_not_start(self):
         backend, _, channel = make_backend()
-        for width in (1, 3, 8, True, 2.0):
+        for width in (1, 3, 16, True, 2.0):
             with self.assertRaises(ValueError):
                 AscendMtpPDEngine(backend, width)
         session = AscendMtpPDEngine(backend)

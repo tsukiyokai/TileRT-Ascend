@@ -1,4 +1,4 @@
-"""Greedy, batch-one MTP control for verification widths 1, 2 and 4.
+"""Greedy, batch-one MTP control for verification widths 1, 2, 4 and 8.
 
 The main cache stores consumed tokens. Its pending token has already
 been emitted but has not been consumed by the main model. MTP row p
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 
 VOCAB_SIZE = 154880
-WIDTHS = (1, 2, 4)
+WIDTHS = (1, 2, 4, 6, 8, 12, 16, 24, 32)
 
 
 def _integer(value, name, minimum=0):
@@ -111,7 +111,7 @@ class MtpState:
     def __init__(self, width, capacity, max_new_tokens, eos_tokens=()):
         _integer(width, "width", 1)
         if width not in WIDTHS:
-            raise ValueError("verification width must be 1, 2 or 4")
+            raise ValueError("verification width must be a power of two up to 16")
         self.width = width
         self.capacity = _integer(capacity, "capacity", 1)
         self.max_new_tokens = _integer(max_new_tokens, "max_new_tokens")

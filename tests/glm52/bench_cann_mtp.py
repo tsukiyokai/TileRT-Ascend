@@ -94,6 +94,9 @@ def arguments():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--width", type=int,
+                        choices=(2, 4, 6, 8, 12, 16, 24, 32),
+                        default=WIDTH)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--capacity", type=int, default=9344)
@@ -128,8 +131,8 @@ def arguments():
         parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
         parser.error("--super-kernel requires --compile-target")
-    if args.capacity < PREFIX_LENGTH + args.max_tokens + WIDTH - 2:
-        parser.error("Capacity must permit full M4 verification at the end")
+    if args.capacity < PREFIX_LENGTH + args.max_tokens + args.width - 2:
+        parser.error("Capacity must permit a full final verification")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0,1]")
     return args
@@ -139,7 +142,7 @@ def drive(backend, first, args):
     from tilert.pd_vllm.ascend_server import create_session
 
     timed = TimedBackend(backend)
-    session = create_session(timed, WIDTH, (),
+    session = create_session(timed, args.width, (),
                              rounds_per_command=args.rounds_per_command)
     records = []
     try:
@@ -197,14 +200,15 @@ def validate_local(report, args):
                 matched += 1
             accepted = predictions[:min(matched + 1,
                                         args.max_tokens - len(tokens))]
-            if (item["width"] != WIDTH
-                    or not len(candidates) == len(predictions) == WIDTH
+            if (item["width"] != args.width
+                    or not len(candidates) == len(predictions)
+                    == args.width
                     or candidates[0] != tokens[-1]
                     or item["accepted_tokens"] != accepted
                     or item["matched_drafts"] != matched
                     or item["natural_accepted"] != matched + 1
                     or item["before"] != position
-                    or item["written"] != position + WIDTH
+                    or item["written"] != position + args.width
                     or item["retained"] != position + len(accepted)
                     or item["draft_retained"] != item["retained"]
                     or not previous_end <= item["start_ns"] <= item["end_ns"]
@@ -227,15 +231,16 @@ def validate_local(report, args):
         raise ValueError("The Gloo command count differs from session rounds")
     if args.target_graph:
         graph = report["graph"]
-        if (graph["width"] != WIDTH or graph["captures"] != 1
+        if (graph["width"] != args.width or graph["captures"] != 1
                 or graph["replays"] != sum(len(h["rounds"]) for h in histories)
                 or len(graph["entries"]) != 1
                 or not graph["entries"][0]["has_aclgraph"]):
             raise ValueError("M4 graph capture/replay counts differ")
     if args.draft_graph:
         graph = report["draft_graph_state"]
-        if (graph["captures"] != 1 or graph["replays"] != 2 * sum(
-                len(history["rounds"]) for history in histories)):
+        if (graph["captures"] != 1
+                or graph["replays"] != (args.width - 2) * sum(
+                    len(history["rounds"]) for history in histories)):
             raise ValueError("M1 draft graph capture/replay counts differ")
     if report["rank"] == 0:
         validate_delivery(report["requests"], histories, args)
@@ -261,7 +266,8 @@ def validate_delivery(requests, histories, args):
                 or stats["round_calls"] != stats["completed_rounds"]
                 or stats["round_calls"] != len(rounds)
                 or len(stats["accepted_spans"]) != len(rounds)
-                or stats["verified_positions"] != WIDTH * len(rounds)
+                or stats["verified_positions"]
+                != args.width * len(rounds)
                 or stats["accepted"] != args.max_tokens - 1
                 or stats["output_tokens"] != args.max_tokens
                 or stats["initial_position"] != PREFIX_LENGTH
@@ -323,7 +329,8 @@ def run(args, report):
                        attention_kernel=args.attention_kernel,
                        fp32_head=args.fp32_head,
                        expert_parallel=args.expert_parallel,
-                       onesided_reduce=args.onesided_reduce)
+                       onesided_reduce=args.onesided_reduce,
+                       graph_width=args.width)
     draft = None
     try:
         draft = CannMtp(target, shard_projections=args.draft_projection_tp)
@@ -338,7 +345,8 @@ def run(args, report):
             if args.target_graph or args.draft_graph:
                 counters_before = asdict(compilation_counter)
                 engine.inject(prefix)
-                engine.start_mtp(first, args.max_tokens, WIDTH, ())
+                engine.start_mtp(first, args.max_tokens,
+                                 args.width, ())
                 engine.advance_mtp()
                 engine.finish_mtp(engine.position)
                 engine.reset()
@@ -392,7 +400,7 @@ def run(args, report):
                             config.static_forward_context),
                     }
                 if args.target_graph:
-                    target.enable_graph(width=WIDTH)
+                    target.enable_graph(width=args.width)
                 if args.draft_graph:
                     draft.enable_graph()
             sources = source_hashes(target, draft)
@@ -513,7 +521,7 @@ def main():
         "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv], "hostname": platform.node(),
         "source_commit": args.source_commit, "world_size": 16,
-        "width": WIDTH, "max_tokens": args.max_tokens,
+        "width": args.width, "max_tokens": args.max_tokens,
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
@@ -522,7 +530,7 @@ def main():
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
         "fp32_head": args.fp32_head,
-        "scope": "M4 internal TP16 session delivery; HTTP/HIXL excluded",
+        "scope": "internal TP16 session delivery; HTTP/HIXL excluded",
         "clock": "perf_counter_ns; rank-local host clocks",
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",
         "prefix_readiness": "Local synchronize then Gloo barrier before g0",

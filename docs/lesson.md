@@ -780,3 +780,16 @@
   discarded in silence: the build succeeds, the binary's hash is unchanged, the
   measurement shows nothing, and no error appears anywhere.
   [Floor](evidence/ascend-decode/gmm-fastpath-20261019/README.md)
+- A docstring that asserts an invariant is not evidence the invariant holds.
+  gather_fia passed no mask at all and justified it in prose -- selection
+  already enforces causality -- and that is true to width 6 and false at 8,
+  where 941 bit-wise KV checks fail and the output diverges from serial
+  decoding at the fourth token. The first round looked clean only because its
+  tail had been zeroed.
+- Look for the constant that silently bounds a parameter you are sweeping.
+  Widening the speculative round lost time until max_num_seqs stopped being
+  the literal 4, because the compiler filters its static kernel buckets by
+  that limit: the same switches worth 8.9 ms per round at four rows were worth
+  nothing at eight. The sweep had been measuring a compiler that had stopped
+  applying.
+  [Width](evidence/ascend-decode/width-20261019/README.md)

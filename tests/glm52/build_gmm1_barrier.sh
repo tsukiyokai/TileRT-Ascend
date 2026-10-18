@@ -63,6 +63,11 @@ cp -a --reflink=auto "$original_vendor" "$overlay"
 for header in "$kernel_header" "$pipeline_header"; do
     cp "$build_source/$header" "$overlay/$installed_headers/"
 done
+# opc compiles the entry from the installed copy, so a patch that touches it
+# takes effect only once that copy is replaced too. Without this the build
+# succeeds, the kernel is byte-identical to the unpatched one, and the
+# measurement reports no difference.
+cp "$build_source/gmm/$op/op_kernel/$op.cpp" "$overlay/$installed_headers/"
 
 kernel_output="$output_dir/kernel"
 mkdir -p "$kernel_output"
@@ -117,6 +122,8 @@ cp "$kernel_output/$variant.o" "$overlay/$binary_dir/$variant.o"
 sha256sum "$output_dir/input-param.json" "$kernel_output/$variant.o" \
     "$kernel_output/$variant.json" "$overlay/$wrapper" \
     "$build_source/$kernel_header" "$build_source/$pipeline_header" \
+    "$build_source/gmm/$op/op_kernel/$op.cpp" \
+    "$overlay/$installed_headers/$op.cpp" \
     "$overlay/$binary_dir/$variant.o" \
     "$overlay/$binary_dir/$variant.json" \
     "$original_vendor/op_api/lib/libcust_opapi.so" \

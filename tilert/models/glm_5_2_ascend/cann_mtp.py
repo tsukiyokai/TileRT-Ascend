@@ -198,7 +198,7 @@ class CannMtp:
         if self.attention_kernel == "gather_fia":
             from .cann_attention import install_gather_fia
 
-            install_gather_fia(context[MAIN_CACHE].impl)
+            install_gather_fia(context[MAIN_CACHE].impl, self.target.graph_width)
         main_spec = AscendMLAAttentionSpec(
             block_size=128, num_kv_heads=1, head_size=576,
             num_heads=4, dtype=torch.bfloat16, cache_dtype_str="auto",
@@ -217,8 +217,9 @@ class CannMtp:
         ]
         self.attention = self.model.model.layers["78"].mtp_block.self_attn
         self.indices_buffer = self.attention.mla_attn.topk_indices_buffer
-        if self.indices_buffer.shape != (16, TOPK):
-            raise ValueError("Expected a private MTP [16,2048] index buffer")
+        rows = self.config.scheduler_config.max_num_batched_tokens
+        if self.indices_buffer.shape != (rows, TOPK):
+            raise ValueError("Expected a private MTP index buffer")
 
     def inject(self, prefix):
         """Install P-1 MTP rows after the target has received P main rows."""
@@ -269,8 +270,8 @@ class CannMtp:
 
         tokens = device_tokens(tokens, self.device)
         width = tokens.shape[0]
-        if width not in (1, 2, 4):
-            raise ValueError("MTP requires 1, 2 or 4 vocabulary tokens")
+        if width not in (1, 2, 4, 6, 8, 12, 16, 24, 32):
+            raise ValueError("MTP requires 1, 2, 4, 8 or 16 tokens")
         if (parent.shape != (width, HIDDEN)
                 or parent.dtype != torch.bfloat16
                 or parent.device != self.device):

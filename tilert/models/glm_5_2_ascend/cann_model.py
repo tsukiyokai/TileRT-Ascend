@@ -47,7 +47,7 @@ class CannStep:
 
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
                   *, compile_target=False, super_kernel=False,
-                  expert_parallel=False):
+                  expert_parallel=False, graph_width=4):
     """Construct TP16 config, optionally compiling the M4 target backbone.
 
     ``expert_parallel`` reshards the 256 routed experts over the sixteen
@@ -77,7 +77,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         attention_config={"indexer_kv_dtype": "int8"},
         kv_cache_dtype="auto", block_size=PAGE_SIZE,
         # AscendCompiler filters static token buckets by this sequence limit.
-        max_num_seqs=4 if super_kernel else 1, max_num_batched_tokens=16,
+        max_num_seqs=max(4, graph_width) if super_kernel else 1,
+        max_num_batched_tokens=max(16, graph_width),
         max_model_len=capacity,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=False, enable_chunked_prefill=True,
@@ -86,8 +87,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         compilation_config={
             "mode": CompilationMode.VLLM_COMPILE,
             "cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
-            "cudagraph_capture_sizes": [4],
-            "max_cudagraph_capture_size": 4,
+            "cudagraph_capture_sizes": [graph_width],
+            "max_cudagraph_capture_size": graph_width,
             "custom_ops": ["all"],
         } if compile_target else {},
         speculative_config=None, kv_transfer_config=None,
@@ -116,7 +117,7 @@ class CannModel:
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
-        expert_parallel=False, onesided_reduce=None,
+        expert_parallel=False, onesided_reduce=None, graph_width=4,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -140,6 +141,7 @@ class CannModel:
         self.capacity = capacity
         self.position = 0
         self.attention_kernel = attention_kernel
+        self.graph_width = graph_width
         self.fp32_head = fp32_head
         # A config-store endpoint turns the TP sum into a one-sided push; the
         # vendor collective's 63.5 us is rendezvous rather than transfer.
@@ -150,7 +152,7 @@ class CannModel:
         self.config = create_config(
             self.checkpoint, capacity, gpu_memory_utilization,
             compile_target=compile_target, super_kernel=super_kernel,
-            expert_parallel=expert_parallel,
+            expert_parallel=expert_parallel, graph_width=graph_width,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
@@ -296,7 +298,7 @@ class CannModel:
 
             context = self.config.compilation_config.static_forward_context
             for name in attention_names:
-                install_gather_fia(context[name].impl)
+                install_gather_fia(context[name].impl, self.graph_width)
         self.builders = [
             (names, kind(spec, names, self.config, self.device))
             for (kind, spec), names in groups.items()
@@ -308,7 +310,7 @@ class CannModel:
 
         self.graph = None
         self._input_buffers = {}
-        for width in (1, 2, 4):
+        for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
             tokens = torch.empty(width, dtype=torch.int32, device=self.device)
             positions = torch.empty(
                 width, dtype=torch.long, device=self.device,
@@ -413,8 +415,8 @@ class CannModel:
 
         tokens = device_tokens(tokens, self.device)
         width = tokens.shape[0]
-        if width not in (1, 2, 4):
-            raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
+        if width not in (1, 2, 4, 6, 8, 12, 16, 24, 32):
+            raise ValueError("Verify requires 1, 2, 4, 8 or 16 tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
         if self.attention_kernel == "gather_fia" and self.position < 2047:

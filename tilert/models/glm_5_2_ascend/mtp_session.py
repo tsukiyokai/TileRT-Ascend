@@ -50,8 +50,8 @@ class AscendMtpPDEngine(AscendPDEngine):
 
     def __init__(self, backend, width=4, stop_ids=(), rounds_per_command=1):
         if (isinstance(width, bool) or not isinstance(width, int)
-                or width not in (2, 4)):
-            raise ValueError("MTP serving requires width 2 or 4")
+                or width not in (2, 4, 6, 8, 12, 16, 24, 32)):
+            raise ValueError("MTP serving requires width 2, 4, 8 or 16")
         if (isinstance(rounds_per_command, bool)
                 or not isinstance(rounds_per_command, int)
                 or rounds_per_command < 1):

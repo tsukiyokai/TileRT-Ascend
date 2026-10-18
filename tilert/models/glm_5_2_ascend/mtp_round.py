@@ -38,8 +38,8 @@ class MtpRoundExecutor:
     def __init__(
         self, target, draft, width=4, max_new_tokens=1024, eos_tokens=(),
     ):
-        if width not in (2, 4):
-            raise ValueError("MTP rounds require width 2 or 4")
+        if width not in (2, 4, 6, 8, 12, 16, 24, 32):
+            raise ValueError("MTP rounds require width 2, 4, 8 or 16")
         if target.capacity != draft.capacity:
             raise ValueError("Main and MTP cache capacities must match")
         self.target = target

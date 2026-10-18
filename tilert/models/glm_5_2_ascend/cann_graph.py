@@ -45,10 +45,11 @@ class CannGraph:
             compiled = getattr(backbone, "compiled", False) or callable(
                 getattr(backbone, "aot_compiled_fn", None),
             )
-            if (width != 4 or self.config.compilation_config.mode
+            if (width not in (4, 6, 8, 12, 16, 24, 32)
+                    or self.config.compilation_config.mode
                     != CompilationMode.VLLM_COMPILE
                     or backbone.do_not_compile or not compiled):
-                raise ValueError("Warm the compiled M4 target before capture")
+                raise ValueError("Warm the compiled target before capture")
         if self.config.speculative_config is not None:
             raise ValueError("CannGraph captures only the target model")
         with torch.npu.device(self.device), (

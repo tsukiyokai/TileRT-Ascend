@@ -58,7 +58,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--capture-case", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--width", type=int, choices=(2, 4), default=4)
+    parser.add_argument("--width", type=int,
+                        choices=(2, 4, 6, 8, 12, 16, 24, 32), default=4)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--ignore-eos", action="store_true")
@@ -88,8 +89,8 @@ def parse_arguments(argv=None):
         parser.error("Positive output budget and capacity >= 128 required")
     if (args.target_graph or args.draft_graph) and args.max_tokens < 2:
         parser.error("Graph comparison requires a decode round")
-    if args.draft_graph and args.width != 4:
-        parser.error("--draft-graph requires --width 4")
+    if args.draft_graph and args.width == 2:
+        parser.error("--draft-graph requires --width 4, 8 or 16")
     if args.compile_target and (not args.target_graph or args.width != 4):
         parser.error("--compile-target requires --target-graph --width 4")
     if args.super_kernel and not args.compile_target:
