@@ -498,3 +498,14 @@
   synchronisation stage, which is the thing a one-shot push removes -- not the
   rounds of transfer, which were already free.
   [Locating](evidence/ascend-decode/rendezvous-locate-20261018/README.md)
+- When an API is missing, check whether it is a separate component before
+  concluding the platform lacks it. CANN ships no aclshmem in 9.1.0 or 9.2.0
+  here, but the SDK is its own repository at gitcode.com/cann/shmem and builds
+  for A3 in ten seconds. A whole strategy was being reasoned around an absence
+  that was an installation gap.
+  [SHMEM install](evidence/ascend-decode/shmem-install-20261018/README.md)
+- The 507015 that killed TP16 symmetric memory was ours, not the chip's.
+  Sixteen PEs form a domain on the first attempt through the vendor SDK, so
+  the recorded conclusion that this hardware cannot do it at scale is
+  withdrawn. A negative result about a platform should name the
+  implementation it was observed through, or it will outlive its cause.
