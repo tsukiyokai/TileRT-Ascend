@@ -626,3 +626,9 @@
   STAGE_UB_BASE alongside a TPipe is two schemes dividing the same memory
   without knowing about each other, and "the TPipe allocates on top" is not
   something a TPipe can do. Take every buffer in a kernel from one allocator.
+- Check a replacement collective against the thing it replaces, not only
+  against a payload invariant. The one-sided reduction passes its own check
+  (every element must equal the rank sum) and differs from HCCL in zero of
+  24576 elements; the second check is what licenses swapping it into a path
+  whose trajectory gate compares tokens bit for bit.
+  [Torch operator](evidence/ascend-decode/torch-allreduce-20261018/README.md)
