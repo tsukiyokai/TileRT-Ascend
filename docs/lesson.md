@@ -649,3 +649,19 @@
   to happen anyway, is not. Measure what a change removes from the critical
   path, not what it removes from its own cost.
   [Fused projection](evidence/ascend-decode/fused-proj-reduce-20261018/README.md)
+- Read the vendor's own fused example before assembling a protocol out of its
+  library calls. The SHMEM tree ships a 4896-line megakernel that fuses
+  routing, dispatch, two GEMMs, SwiGLU and combine into one device pipeline,
+  and its entire use of the one-sided API is three calls: `aclshmem_ptr`,
+  `aclshmem_my_pe`, `aclshmem_n_pes`. Symmetric memory is addressable, so a
+  remote write is an ordinary `DataCopy` to the pointer `aclshmem_ptr`
+  returns. The wrapper I had built the kernel on -- `mte_put_nbi` with its
+  staging and its trailing `quiet` -- was costing 8 of 22.3 microseconds for
+  nothing.
+  [Direct store](evidence/ascend-decode/direct-store-push-20261018/README.md)
+- Communication overlaps compute by partitioning cores, not by interleaving on
+  one core. The official megakernel gives `vectorSubBlockIndex_ == 1` to
+  dispatch and `== 0` to driving the cube, for the kernel's whole life, coupled
+  by flags. A standalone collective cannot overlap anything because it has no
+  cores left running the work it should hide behind -- which is the mechanism
+  behind the measured 0.000000 ms of overlap, not a scheduling accident.
