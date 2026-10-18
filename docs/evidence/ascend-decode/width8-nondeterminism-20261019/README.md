@@ -45,6 +45,66 @@ five input tensors verified for zero drift around every call. Adding one
 `tests/glm52/patches/gmm1-swiglu-barrier.patch` carries that line and is not
 installed.
 
+## The barrier works, and my M-threshold guess was wrong
+
+Installed as a vendor overlay and measured at 64 consecutive calls per cell,
+two independent processes per cell, inputs rewritten from a frozen copy before
+every call, and **a scratch allocation churned between calls**:
+
+| object | M=8 | M=32 | M=64 |
+|---|---|---|---|
+| factory `2444c7e7` | 2 results, 1 of 64 wrong, max diff 68 | **4 results, 3–4 of 64, 115** | 2 results, 1 of 64, 114–115 |
+| barrier `2eb81546` | 1 result, 0 wrong | 1 result, 0 wrong | 1 result, 0 wrong |
+
+384 calls with the barrier, zero disagreements. The factory object mismatches
+10 of 384, and a difference of 114–115 on an int8 range of ±127 is an element
+written wrong rather than rounding drift.
+
+The load order was measured rather than inferred, because installing it in the
+wrong order fails silently: barrier first gives eight identical results;
+pristine first gives two distinct results with call 4 differing by 99. CANN
+takes the first matching vendor, so the prepend is
+
+```
+ASCEND_CUSTOM_OPP_PATH=<overlay>/vendors/custom_transformer:/workspace/src/vllm-ascend-unified/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+```
+
+with the second element spelled exactly so that `bootstrap_custom_op_env`
+(`utils.py:454-458`) finds it already present and leaves it in second place.
+
+**But my hypothesis that the race needs a large M is refuted.** The factory
+object is worst at M=32 — four distinct results, three or four of 64 wrong —
+and M=32 is width 4's verify shape, the arm I observed as clean. M=64 is only
+one in 64. So width 4's reproducibility is not because its shape fails to
+trigger the race, and the attribution behind this withdrawal is not yet
+established.
+
+Two candidates remain, and the decisive test is re-running the three arms with
+the overlay prepended. Either the trajectory's sensitivity differs — a
+corrupted expert row only probabilistically flips an argmax, and at width 4 a
+polluted draft the verifier rejects still yields the same accepted token,
+while at width 8 the measured quantity *is* the acceptance rate, so one
+flipped decision changes rounds, hash and TPOT together — or width 8 has a
+second source, with the `_int64_kv_slots` identity caching as the named
+candidate.
+
+## A tight loop is not a determinism test
+
+The first attempt at this matrix fired eight identical calls inside one
+process and read **all ten cells as deterministic, including the known-bad
+factory object**. A tight loop does not change the workspace the operator
+receives, so reads of regions it never writes return the same stale bytes
+every time and the race is hidden. Adding an allocation churn between calls
+exposed it immediately in three shapes.
+
+The churn is not adversarial, it is faithful: a real round allocates and frees
+hundreds of tensors between two expert matmuls.
+
+This pairs with the earlier finding that a harness locally defined a constant
+the patch had failed to import, turning a crash into a pass. Both are the same
+failure: **the test supplied something the thing under test was missing** —
+there a name, here a static environment it had no right to depend on.
+
 ## Why both measurements of width 8 can be right
 
 An earlier investigation reported five runs at width 8 emitting bit-identical

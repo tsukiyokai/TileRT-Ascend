@@ -946,3 +946,19 @@
   Before attributing a behavioural difference to your change, check which
   binary is actually loaded.
   [Width 8](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
+- A tight loop is not a determinism test. Eight identical calls in one process
+  read a known-racy kernel as deterministic in all ten cells of a matrix,
+  because the loop never changes the workspace the operator receives and reads
+  of regions it never writes return the same stale bytes every time. Churning
+  an allocation between calls exposed it in three shapes at once -- and the
+  churn is faithful rather than adversarial, since a real round allocates and
+  frees hundreds of tensors between two expert matmuls.
+- Two of tonight's bad tests share one shape: the test supplied what the thing
+  under test was missing. One locally defined a constant the patch had failed
+  to import, turning a NameError into a pass; the other held the environment
+  static in a way production never would, turning a race into determinism. Ask
+  what your harness is providing that the real caller will not.
+- Measure the load order of an override, do not infer it. With the overlay
+  first, eight calls agree; with the pristine vendor first, two results differ
+  by 99 at the fourth call. An override installed in the wrong order fails in
+  silence, which is the standard way a fix gets credited for nothing.
