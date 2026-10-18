@@ -1088,3 +1088,13 @@ against what its control would have cost.
   from two separate measurements; reading one run's own vendor resolution
   showed it had executed the unpatched object and still produced a single token
   stream over three requests, which is the claim directly.
+- Isolating the compile cache re-exposes a bug a warm cache was hiding.
+  `AOTAutogradCache.make_entry` asserts the compiled forward is one of torch's
+  own `OutputCode` types while the Ascend FX backend returns a
+  `_CompiledFxGraph`, and that assertion runs only on the cache *write* path —
+  so a warm `VLLM_CACHE_ROOT` never reaches it. Giving paired arms separate
+  cache roots, which is right for avoiding shared state, makes both arms cold
+  and kills the first one after it has loaded the model on all sixteen ranks.
+  `TORCHINDUCTOR_AUTOGRAD_CACHE=0` in both arms costs compile time, not TPOT,
+  and cannot bias the comparison. A good practice can arm a latent failure;
+  the precondition belongs in the recipe.
