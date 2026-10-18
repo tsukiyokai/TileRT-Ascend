@@ -337,3 +337,10 @@
   all day, and with it the 9% above. Warm a compiled module at the width you
   intend to use.
   [How it was found](evidence/ascend-decode/rope-contiguous-20261018/README.md#how-it-was-found)
+- Fusing the collectives away also hides them. Under AIV expansion with
+  SuperKernel, `allreduceAicpuKernel` and `allGather` leave the operator table
+  entirely and `communication.json` only keeps 0.03 ms bookkeeping entries, so
+  the three AIV groups that carry 37.1% of their type cannot be attributed by
+  the usual route. Gaining speed can cost observability; check that the thing
+  you optimised is still visible.
+  [Round composition](evidence/ascend-decode/profile-rope-20261018/README.md)
