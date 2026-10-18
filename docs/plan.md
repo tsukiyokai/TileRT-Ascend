@@ -32,6 +32,14 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，归约 dtype、custom OPP 与调度也不同。[仅切 AIV 的长测](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control)保持全部 token、提议与接受一致，TPOT 中位数升至 21.47 ms；但[纯通信对照](evidence/ascend-decode/tp-mode-20261017/README.md)的 FP32 96 KiB、156 次图归约链由 AI_CPU 10.93 ms 降至 AIV 5.04 ms。[新 M4 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md#aiv-decode-comparison)确认 AIV 实际生效，并在一次归约观察到 rank 14 晚到约 4.21 ms；尚未证明资源竞争。保留 AIV 路线，编译主干先作独立单变量对照。共有 GMM 成本不能当作双方增量差距；长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
+## 主要矛盾已易手：主机下发（2026-10-18 夜定）
+
+穷尽分解把每一轮拆到闭合后，**射程之外的主机地板是 5.861 ms/轮**——522 次下发类 API 的 5.503，加仅剩那一次 token 回读的 0.335，加 `advance` 的 Python 控制流 0.023。按 A=3.433 的 6.87 ms 轮预算，这是 85.3%，比 3.56 ms 的权重流更大；其中至少 0.404 ms 是严格暴露的（eager 区 154 个任务设备时间 1.220 ms，对自己的下发成本 1.624 ms，盖不住）。修法是把 eager 区捕进图，这是主机侧改造，再好的 kernel 也碰不到。[分解](evidence/ascend-decode/round-accounting-20261018/README.md)
+
+同时三项旧结论作废：不存在 49.92 ms 的 profiled round（开 profiler 是 133.93 ms，那个 7.4 ms 残差的分子分母不同源，重算是 10.1–10.4）；`aclrtSynchronizeStream` 的 24.255 ms 不是损失（13 次大调用全部在设备仍忙时返回，下一个设备任务 2.164–22.766 µs 内开始）；算子表里 4.32 ms/轮 是 `sk_1277` 吸收 rank 错位却被记成计算（156 个同名同族均值 36.0 µs）。
+
+设备侧真正能碰的是：156 次组内归约现 5.635 ms、按 10 µs/次地板可到约 1.57 ms，即约 4.1 ms；19 个独立 collective 的 0.866 ms 已贴硬件底。这就是单边路线的奖品——真实且有界。
+
 ## 单边语义集合通信（2026-10-18 夜，最大单项）
 
 权重预算重算后每轮 3.56 ms、占 2 ms/token 预算 6.87 ms 的 52%，余量 3.31 ms；而集合通信每轮 11.29 ms、与计算流重叠实测 0.000000 ms。所以这是棋盘上最大的单项，且它不是带宽问题：float32 `all_reduce` 在 4 字节要 157.43 µs、6 MiB 要 109.72 µs，跨 150 万倍不涨，**成本百分之百是会合**。[会合实证](evidence/ascend-decode/reduce-floor-20261018/README.md)
@@ -48,7 +56,11 @@ CANN 的 SHMEM 是独立组件（gitcode `cann/shmem` v1.7.0），不在 CANN �
 
 torch 算子化后 TP16 实测 **28.181 µs 对 HCCL eager 142.850 µs，5.07 倍**，`wrong 0` 且与 HCCL **逐元素零差异**——后者才是允许换进「逐位比较 token」那条轨迹门的依据。接入点无需新管线：`cann_model.py` 早就把 157 次归约全部收束在 `_tp_sum_group._all_reduce_out_place` 这一个覆写上。[torch 算子](evidence/ascend-decode/torch-allreduce-20261018/README.md)
 
-每轮 157 次从 9.97 ms 降到 3.50 ms 是省 6.47 ms，折合约 1.9 ms/token。端到端尚未报出，在它报出之前不计入收益。
+★ 2026-10-18 深夜续：照官方 `examples/shmem_mega_moe` 重写后再快 2.02 倍——库的 `mte_put_nbi` 换成 `aclshmem_ptr` 加普通 `DataCopy`（22.4→14.4），`PipeBarrier<PIPE_ALL>` 换成具名事件加双缓冲（→12.5），归约侧做成软件流水（→11.2），逐次 `probe_failures 0`。官方那个 4896 行 megakernel 全程只用三个单边调用，且通信与计算的重叠靠**按 sub-block 劈核**（一半常驻通信、一半驱动 cube），不是在同一个核上时分复用。[直接存储](evidence/ascend-decode/direct-store-push-20261018/README.md)
+
+拿掉最后那道全核栅栏（改逐对端 `signal_op` + `signal_wait_until`）仍挂，已交由 agent 定位机制；候选是 `core_ratio(0,1)` 下 16 块各向不同对端发信号是否合法，以及 `quiet` 能否为 `DataCopy` 式远程写定序。
+
+每轮 157 次归约的收益按新分解是约 4.1 ms/轮（不是旧估的 6.47 ms——那个估计用了被污染的 63.5 µs 基线）。端到端尚未报出，在它报出之前不计入收益。
 
 开放路线登记在 [approach-registry.md](approach-registry.md)：A 通信消除、B 每轮 token 数、C 权重字节与驻留、D 轮次结构与主机税、E 注意力块、F 对抗审计，另有 G 并行布局（已 blocked：EP16 实测每轮 +1.09 ms、加融合再 +1.41，离散 0.252→0.756 ms 是 batch=1 尾部签名）与 H 为融合而融合（已收窄：bf16 矩阵乘已达峰值 93.8%、32 连也不省,只剩图内 8 µs 算子地板）。A、B、C 攻击同一个不等式的不同项，可以同时成立，不因另一个漂亮而放弃。
 

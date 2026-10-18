@@ -665,3 +665,17 @@
   by flags. A standalone collective cannot overlap anything because it has no
   cores left running the work it should hide behind -- which is the mechanism
   behind the measured 0.000000 ms of overlap, not a scheduling accident.
+- A ratio whose numerator and denominator come from different captures is not
+  a measurement. The 7.4 ms "unexplained" residual divided a profiled
+  operator sum by an unprofiled wall clock; with the profiler on, the round is
+  133.93 ms, not 49.92. Before subtracting two numbers, check that both were
+  taken under the same instrument.
+- Time the host spends blocked is not time anyone pays. Every
+  `aclrtSynchronizeStream` over a millisecond returns while the device is
+  still busy, and the next device task starts within 23 microseconds, because
+  the call drains one stream and the model runs on others.
+- An operator table can book waiting as compute. One reduction group in the
+  round costs 4.32 ms where its 156 identically-named siblings average
+  36 microseconds; the difference is rank skew absorbed at the round's first
+  collective and attributed to the kernel that happened to be there.
+  [Round accounting](evidence/ascend-decode/round-accounting-20261018/README.md)
