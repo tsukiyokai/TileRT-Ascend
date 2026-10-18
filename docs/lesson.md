@@ -917,3 +917,19 @@
   The discriminating test was to run an agent's own frozen tree with the same
   flags: it completed, which located the fault in my tree rather than in the
   device or the configuration.
+- Apportion a performance gap before naming its cause. The vector-only
+  kernel's 61.5x shortfall factors as 2.2 for arithmetic intensity, 3.0 for
+  core occupancy and 6.2 for per-instruction overhead, so the hardware
+  property everyone reached for first -- no int4 vector multiply -- is the
+  smallest of the three and fixing it alone buys 2x. The factorisation also
+  showed that one of the three is an occupancy artefact: at full occupancy the
+  marginal byte cost lands within 6% of the DMA floor and the arithmetic
+  nearly disappears.
+- "This route is closed" has a margin, and the margin decides a different
+  question. Replacing one vendor operator with a vector kernel loses 3.90x;
+  replacing the whole family with one resident kernel loses 1.32x on the
+  arithmetic, which is ~3.5 ms a round against up to 15.4 ms of per-call
+  intercept. The first refutation closed the operator substitution and
+  accidentally looked like it closed the megakernel. Ask what the ratio is,
+  not only which way it points.
+  [Vector-only](evidence/ascend-decode/vector-only-20261019/README.md)
