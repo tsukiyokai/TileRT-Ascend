@@ -608,3 +608,21 @@
   containing put_nbi, signal_op and SyncAll bit-correct. This was the largest
   unknown in the whole one-sided programme, since production decode is
   entirely graph-captured.
+- `aclshmemx_mte_put_nbi`'s `pe` argument decides whose window the data lands
+  in, so passing `my_pe` is a local copy and nothing crosses a rank. My
+  one-sided all-reduce ran, passed a deadlock hunt and measured a number while
+  computing a sum over fifteen memset zeroes -- the premise that "every rank's
+  data is already local after publish" was a misreading of the API. A kernel
+  that runs is not a kernel that communicates; the payload check that catches
+  this is cheap and I had it, but only applied it to the stage that could not
+  fail.
+  [One-sided all-reduce](evidence/ascend-decode/onesided-allreduce-20261018/README.md)
+- A stage flag that disables one side of a handshake does not isolate it, it
+  deadlocks it. Turning the publish off while leaving the consumer's flag poll
+  running made consumers wait on a flag nobody would ever raise, and I read
+  that as "the reduction stalls". Both measurements taken that way were void.
+  When splitting a protocol for attribution, remove the wait with the writer.
+- Two allocators cannot share one UB. Hand-picked FLAG_UB_BASE and
+  STAGE_UB_BASE alongside a TPipe is two schemes dividing the same memory
+  without knowing about each other, and "the TPipe allocates on top" is not
+  something a TPipe can do. Take every buffer in a kernel from one allocator.
