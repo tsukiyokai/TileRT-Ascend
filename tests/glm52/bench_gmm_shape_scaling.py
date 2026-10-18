@@ -24,17 +24,38 @@ EXPERTS = 256
 HIDDEN = 6144
 LOCAL_INTERMEDIATE = 128
 PACK = 8
+TOP_K = 8
+L2_BYTES = 201326592
+EVICTION_FACTOR = 4
 PROJECTIONS = {"gate_up": (HIDDEN, 2 * LOCAL_INTERMEDIATE),
                "down": (LOCAL_INTERMEDIATE, HIDDEN)}
+
+
+def rotation_banks(group_bytes, groups):
+    """Rotate far enough that a bank leaves L2 before it is read again.
+
+    A call reads `groups × group_bytes`, and the reuse distance is one bank
+    short of the rotation, so a small group count needs a long rotation: at
+    the model's 27 groups a single bank is a tenth of L2. Banks are always
+    allocated in full, so the footprint grows as the measured shape shrinks
+    and small group counts cost gigabytes of HBM.
+
+    Four times L2 is the shortest reuse distance at which 256 groups stop
+    reporting a marginal rate above the measured single-die HBM maximum.
+    Rotating further than that raises the time again, so a longer rotation
+    is not a safer one.
+    """
+    call_bytes = groups * group_bytes
+    return 1 + -(-EVICTION_FACTOR * L2_BYTES // call_bytes)
 
 
 def build_banks(inputs, outputs, device, count):
     """Allocate `count` independent banks so a rotation defeats L2 reuse.
 
-    One bank of 256 groups is exactly the die's 192 MiB L2, so reading a
-    single bank repeatedly measures cache reread rather than HBM. Rotating
-    over several banks makes every call read memory the previous call did
-    not touch.
+    One bank of 256 `gate_up` groups is exactly the die's 192 MiB L2, so
+    reading a single bank repeatedly measures cache reread rather than HBM.
+    Rotating over several banks makes every call read memory the previous
+    calls did not touch.
     """
     return [{
         "weight": torch.randint(-2 ** 31, 2 ** 31 - 1,
@@ -48,14 +69,26 @@ def build_banks(inputs, outputs, device, count):
 
 
 def build_routing(experts, rows, device):
-    """One destination row per expert row, as the permuted layout implies."""
-    total = experts * rows
+    """Route as the model does: every token picks `TOP_K` experts.
+
+    The matmul produces `experts × rows` permuted rows, so that row count
+    is the token count times the fan-out, and `probs` carries one weight
+    per pick as a two-dimensional tensor. The combine therefore gathers
+    `tokens × TOP_K` rows, which is what the model pays at 27 groups over
+    four tokens. A group count that is not a multiple of the fan-out leaves
+    the last token's picks wrapping onto earlier rows.
+    """
+    permuted = experts * rows
+    tokens = -(-permuted // TOP_K)
     return {
-        "tokens": total,
-        "sorted_indices": torch.arange(total, dtype=torch.int32,
-                                       device=device),
-        "row_index": torch.arange(total, dtype=torch.int64, device=device),
-        "probs": torch.ones(total, dtype=torch.bfloat16, device=device),
+        "tokens": tokens,
+        "sorted_indices": torch.arange(tokens * TOP_K, dtype=torch.int32,
+                                       device=device).remainder(permuted),
+        "row_index": torch.arange(permuted, dtype=torch.int64,
+                                  device=device) // TOP_K,
+        "probs": torch.ones(tokens, TOP_K, dtype=torch.bfloat16,
+                            device=device),
+        "logit": torch.ones(permuted, dtype=torch.float32, device=device),
     }
 
 
@@ -100,7 +133,15 @@ def unpermuted_call(banks, activation, counts, routing):
 
 
 def finalize_routing_call(banks, activation, counts, routing):
-    """Time the fused alternative: grouped matmul with the combine inside."""
+    """Time the fused alternative: grouped matmul with the combine inside.
+
+    Float32 is this operator's only output dtype, it takes the W4A8 scale
+    in its int64 carrier form and rejects a float one, and on A3 a null
+    bias is an error, so the call cannot be made to mirror the unpermuted
+    path's bfloat16 output. Its W4A8 mode also demands k > 128, which the
+    `down` projection of a TP16 rank does not have, so that shape raises
+    instead of measuring.
+    """
     import torch_npu
 
     rotation = itertools.cycle(banks)
@@ -109,11 +150,10 @@ def finalize_routing_call(banks, activation, counts, routing):
         bank = next(rotation)
         return torch_npu.npu_grouped_matmul_finalize_routing(
             activation["x"], bank["weight"], counts,
-            scale=bank["scale"].view(-1).to(torch.float32),
+            scale=bank["scale"], bias=bank["scale_bias"],
             pertoken_scale=activation["per_token_scale"],
-            logit=routing["probs"].to(torch.float32),
-            row_index=routing["row_index"],
-            dtype=torch.bfloat16, output_bs=routing["tokens"],
+            logit=routing["logit"], row_index=routing["row_index"],
+            dtype=torch.float32, output_bs=routing["tokens"],
             group_list_type=1,
         )
 
@@ -139,7 +179,10 @@ def measure(args, report):
     torch_npu.npu.set_device(args.device)
     device = torch.device("npu", args.device)
     inputs, outputs = PROJECTIONS[args.projection]
-    banks = build_banks(inputs, outputs, device, args.banks)
+    group_bytes = inputs * (outputs // PACK) * 4
+    rotation = args.banks or rotation_banks(group_bytes, args.experts)
+    report["banks"] = rotation
+    banks = build_banks(inputs, outputs, device, rotation)
     activation = build_activation(args.experts * args.rows, inputs, device)
     counts = torch.zeros(EXPERTS, dtype=torch.int64, device=device)
     counts[:args.experts] = args.rows
@@ -152,7 +195,7 @@ def measure(args, report):
                      for _ in range(args.batches))
 
     median = statistics.median(samples)
-    read = args.experts * inputs * (outputs // PACK) * 4
+    read = args.experts * group_bytes
     report.update({
         "status": "pass", "weight_bytes": read,
         "median_us": median, "min_us": samples[0],
@@ -168,8 +211,8 @@ def arguments():
     parser.add_argument("--projection", choices=tuple(PROJECTIONS),
                         default="gate_up")
     parser.add_argument("--path", choices=tuple(PATHS), default="grouped")
-    parser.add_argument("--banks", type=int, default=5,
-                        help="rotate this many banks so a call misses L2")
+    parser.add_argument("--banks", type=int,
+                        help="override the rotation the shape derives")
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)
@@ -185,13 +228,13 @@ def main():
         "status": "error", "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv], "hostname": platform.node(),
         "path": args.path, "projection": args.projection,
-        "experts": args.experts, "banks": args.banks,
-        "rows": args.rows, "device": args.device, "calls": args.calls,
-        "warmup": args.warmup, "batches": args.batches,
+        "experts": args.experts, "rows": args.rows, "device": args.device,
+        "calls": args.calls, "warmup": args.warmup, "batches": args.batches,
         "scope": "one die, one rank, shared with another tenant",
         "value_note": "arbitrary bits; timing does not depend on values",
-        "bank_note": "counts select the active groups; banks rotate so that "
-                     "one call does not reread the previous call's weights",
+        "bank_note": "counts select the active groups; the rotation puts "
+                     f"{EVICTION_FACTOR} times L2 between two reads of one "
+                     "bank, so a call streams from HBM",
     }
     try:
         passed = measure(args, report)

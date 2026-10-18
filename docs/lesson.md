@@ -374,3 +374,9 @@
   fused kernel buys is on-chip activations across the round's ~637 cube-vector
   handoffs and a collective in its epilogue. Aim a megakernel at what
   surrounds the matmul.
+- Per-call fixed cost, not bandwidth, owns the batch-one expert GMM: at the
+  model's 27-group shape the call is 62–63 µs of prologue around ~18 µs of
+  streaming, and rows 1 vs 4 differ by less than the ±4 µs session jitter.
+  Measure across processes (median of process medians) — a single session's
+  twenty batches hide an additive offset that masquerades as a tiling effect.
+  [GMM outside L2](evidence/ascend-decode/gmm-clean-20261018/README.md)
