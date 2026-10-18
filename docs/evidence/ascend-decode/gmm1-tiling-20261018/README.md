@@ -54,8 +54,40 @@ host wall time was not recorded. This is a shared-die event screen.
 Changing row/scale inputs, poisoned outputs, dirty reuse and recapture
 compare 881,504 elements exactly. Actual ELF opens select the control and
 candidate binaries in those functional runs; timing processes retain the
-same bindings but do not capture opens. Changed routing counts and the
-complete router→dispatch→GMM1→GMM2→combine path remain to be checked at
-M1/M4 before a product patch. Raw artifacts stay under
+same bindings but do not capture opens. Raw artifacts stay under
 `/home/shanshan/trt-asc/offline/cann-gmm1-singlechunk-20261018-01/` and
 `/home/shanshan/trt-asc/offline/cann-gmm1-singlechunk-changing-20261018-01/`.
+
+The [kernel-only builder](../../../../tests/glm52/build_gmm1_barrier.sh)
+applies the SwiGLU and single-chunk patches in an isolated source copy,
+then calls the installed dynamic wrapper through `opc`. The
+[actual build](build-audit.json) completes in 19.82 s. Its selected ELF and
+descriptor are byte-identical to the measured candidate; installed
+host/API/tiling libraries retain their bytes. Relative to the original
+vendor, four non-cache files change: two headers, ELF and descriptor.
+Python cache differences are recorded separately. No package-wide host or
+protobuf rebuild is required.
+
+The [complete-MoE control](moe-baseline-audit.json) executes the genuine
+TP16 layer-3 router→dispatch→GMM1→GMM2→combine path. M1 uses two actual
+input rows separately; M4 compares the actual four rows with a synthetic
+repeated-row case. Routing changes from 32 experts with one row each to
+8 experts with four rows each. Own eager/Graph/dirty/reset/recapture and
+decoder-prehook comparisons cover 13,249,536 elements exactly, with
+1,539,309,568 bytes peak reserved/die. The launch then stops on an ELF-open
+receipt that also counted its verifier's hash reads. The corrected receipt
+separates the exact ordered verifier prefix from one runtime control open
+on every rank. Candidate execution and complete-MoE cross-configuration
+comparison remain unrun. Raw inputs and candidate-only continuation stay
+under `/home/shanshan/trt-asc/offline/cann-gmm1-singlechunk-moe-20261018-01/`.
+
+## Metadata candidates
+
+The [source and installed-host audit](metadata-contract-audit.json) finds
+that ordinary views of the existing five-dimensional NZ bank retain its
+storage descriptor, whereas the multi-tensor API checks for four-dimensional
+storage per weight. Passing active-expert views therefore does not satisfy
+that API contract; no device rejection or speedup was measured. Dense
+counts→prefix metadata is a smaller available experiment, but still leaves
+the matmul's group traversal. A production comparison must charge the
+dynamic prefix construction. Neither candidate has a benchmark driver yet.

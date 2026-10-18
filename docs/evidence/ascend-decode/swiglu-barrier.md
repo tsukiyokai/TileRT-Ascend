@@ -40,10 +40,14 @@ source, binary and raw tensor hashes.
 
 ## Build and replay
 
-The [builder](../../../tests/glm52/build_gmm1_barrier.sh) compiles this
-single operator in a new directory. Its complete vendor overlay preserves
-the original host libraries and other operators, replacing the A8W4 NZ
-kernel, matching metadata and source header.
+The [builder](../../../tests/glm52/build_gmm1_barrier.sh) recompiles the
+selected A8W4 NZ kernel through the installed CANN 9.2 `opc` wrapper in a
+new directory. It includes this numerical fix and the
+[single-chunk synchronization patch](gmm1-tiling-20261018/README.md#single-chunk-synchronization).
+The complete vendor overlay preserves the installed host/API/tiling and
+other operators, replacing the selected ELF, matching metadata and two
+source headers. The source and installed headers must match before patching;
+the output directory must be outside the original source.
 
 ```bash
 source /workspace/environment/activate.sh
@@ -64,6 +68,7 @@ Both vendor paths are required: `enable_custom_op()` prepends the original
 path if absent. An overlay-only launch therefore loses the intended
 selection order. The report's initial environment precedes that bootstrap.
 With the ordered paths, `strace openat` records successful reads of the
-overlay's original host library and patched `fa3d` kernel. Of 1,373 vendor
-entries, 1,370 remain byte-identical; only that kernel, its JSON metadata
-and the source header change. The original installation remains intact.
+overlay's original host library and patched `fa3d` kernel. The barrier-only
+overlay in the numerical report changes three of 1,373 vendor entries:
+that kernel, its JSON metadata and the source header. The current builder
+also changes the pipeline header for single-chunk synchronization.
