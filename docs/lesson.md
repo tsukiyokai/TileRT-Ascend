@@ -892,3 +892,16 @@
   --master-port then die on EADDRINUSE in seven seconds, which reads like a
   code error rather than residue from the run you stopped. Give each arm its
   own port.
+- Snapshotting one repository does not isolate a measurement whose model code
+  lives in another. Five successive sixteen-rank attempts failed for five
+  different reasons and none was a fault in the thing being measured; the last
+  was an agent's live edit to vllm-ascend-unified, which my TileRT-Ascend
+  snapshot never covered. Isolate by what the run imports, not by what the
+  work is nominally about.
+- Validate a long measurement's launch path with the shortest possible run
+  first. Each of those five attempts cost four to forty minutes and fixed one
+  symptom: a shared tree, a missing flag, activate.sh blocking off a tty, a
+  device-binding race, a bound rendezvous port. An eight-token smoke would
+  have surfaced every one of them in three minutes each, and running the real
+  1024-token measurement before the path was known-good is what turned one
+  debugging session into five.
