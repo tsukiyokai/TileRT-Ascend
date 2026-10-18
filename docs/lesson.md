@@ -217,3 +217,10 @@
   exception 507015 rather than a shape error; the existing screens move every
   case entry to the device.
   [Screen convention](../tests/glm52/bench_cann_sparse_attention.py)
+- A graph makes the kernel count affordable, so it cannot be blamed for the
+  round. Dependent trivial kernels cost 1.079 µs each inside a graph against
+  10.09 µs eager, which puts the 561 named calls of one M4 verify at 0.59 ms
+  of the 6.752 ms round budget. In-graph SFA is 84 times that floor, so the
+  cost is inside the kernels. Measure the in-graph floor before proposing
+  fusion to save dispatch.
+  [Chain probe](evidence/ascend-decode/graph-chain-20261018/README.md)
