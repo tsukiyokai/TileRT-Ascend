@@ -104,6 +104,8 @@ def arguments():
     parser.add_argument("--target-graph", action="store_true")
     parser.add_argument("--draft-graph", action="store_true",
                         help="Graph shared-index M1 draft chains")
+    parser.add_argument("--conditioned-graph", action="store_true",
+                        help="Graph the M4 target-conditioned MTP pass")
     parser.add_argument("--draft-projection-tp", action="store_true",
                         help="Shard MTP rot and eh_proj outputs over TP16")
     parser.add_argument("--compile-target", action="store_true")
@@ -127,6 +129,8 @@ def arguments():
         parser.error("--rounds-per-command must be positive")
     if (args.target_graph or args.draft_graph) and args.warmup < 1:
         parser.error("Graph capture requires an unmeasured warmup request")
+    if args.conditioned_graph and not args.draft_graph:
+        parser.error("--conditioned-graph requires --draft-graph")
     if args.compile_target and not args.target_graph:
         parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
@@ -242,6 +246,11 @@ def validate_local(report, args):
                 or graph["replays"] != (args.width - 2) * sum(
                     len(history["rounds"]) for history in histories)):
             raise ValueError("M1 draft graph capture/replay counts differ")
+    if args.conditioned_graph:
+        graph = report["conditioned_graph_state"]
+        if (graph["captures"] != 1 or graph["replays"] != sum(
+                len(history["rounds"]) for history in histories)):
+            raise ValueError("M4 conditioned graph counts differ")
     if report["rank"] == 0:
         validate_delivery(report["requests"], histories, args)
     return histories
@@ -254,10 +263,13 @@ def validate_delivery(requests, histories, args):
         tokens, clocks = request["tokens"], request["timestamps_ns"]
         stats, rounds = request["session"], history["rounds"]
         operations = request["operations"]
+        # The session drives rounds through advance_mtp_n, so an expectation
+        # written against advance_mtp never matched and rank 0 raised on every
+        # run -- including the one that recorded 14.247 ms.
         advances = [op for op in operations
-                    if op["operation"] == "advance_mtp"]
+                    if op["operation"] == "advance_mtp_n"]
         expected_ops = (["inject", "start_mtp"]
-                        + ["advance_mtp"] * len(rounds)
+                        + ["advance_mtp_n"] * len(advances)
                         + ["finish_mtp", "reset"])
         if (tokens != request["returned_tokens"] or tokens != history["tokens"]
                 or token_metrics(tokens, clocks)["tpot_ms"]
@@ -402,7 +414,7 @@ def run(args, report):
                 if args.target_graph:
                     target.enable_graph(width=args.width)
                 if args.draft_graph:
-                    draft.enable_graph()
+                    draft.enable_graph(conditioned=args.conditioned_graph)
             sources = source_hashes(target, draft)
             for name in ("mtp_session.py", "tp_runtime.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
@@ -446,6 +458,12 @@ def run(args, report):
                 "replays": draft.graph.replay_count,
                 "scope": "M1 shared-index chain, including own head",
             },
+            conditioned_graph_state=(
+                None if draft.conditioned_graph is None else {
+                    "captures": draft.conditioned_graph.capture_count,
+                    "replays": draft.conditioned_graph.replay_count,
+                    "scope": "M4 target-conditioned pass, including own head",
+                }),
             graph=None if graph is None else {
                 "width": graph.width, "captures": graph.capture_count,
                 "replays": graph.replay_count,
@@ -496,6 +514,7 @@ def run(args, report):
                 "output_tokens_per_request": args.max_tokens,
                 "target_graph": args.target_graph,
                 "draft_graph": args.draft_graph,
+                "conditioned_graph": args.conditioned_graph,
                 "draft_projection_tp": args.draft_projection_tp,
                 "compile_target": args.compile_target,
                 "super_kernel": args.super_kernel,
@@ -525,6 +544,7 @@ def main():
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
+        "conditioned_graph": args.conditioned_graph,
         "draft_projection_tp": args.draft_projection_tp,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
@@ -537,6 +557,8 @@ def main():
         "round_scope": "Gloo, draft chain, verify, MTP recompute, commit",
         "phase_device_timing": False,
         "draft_execution": "chain_graph" if args.draft_graph else "eager",
+        "conditioned_execution": (
+            "conditioned_graph" if args.conditioned_graph else "eager"),
         "ignore_eos": True, "precision_verified": False,
         "formal_1024_token_run": False, "profiled": False,
     }

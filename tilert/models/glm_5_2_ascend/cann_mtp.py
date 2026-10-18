@@ -117,6 +117,7 @@ class CannMtp:
         self.layout = target.layout
         self.position = 0
         self.graph = None
+        self.conditioned_graph = None
         self.shard_projections = shard_projections
         self.attention_kernel = target.attention_kernel
         self.checkpoint = target.checkpoint
@@ -244,20 +245,41 @@ class CannMtp:
         self.position = length
         self.model.model.set_skip_topk(False)
 
-    def enable_graph(self):
-        """Capture shared-index M1 chains after uncaptured TP warmup."""
+    def enable_graph(self, *, conditioned=False):
+        """Capture shared-index M1 chains after uncaptured TP warmup.
+
+        ``conditioned`` also captures the M4 target-conditioned pass, which
+        selects its own index set instead of replaying a shared one.
+        """
         import torch
         from .cann_mtp_graph import CannMtpGraph
 
-        if self.graph is None:
-            with torch.npu.device(self.device):
-                self.graph = CannMtpGraph(self)
+        with torch.npu.device(self.device):
+            if self.graph is None:
+                self.graph = CannMtpGraph(self, 1)
+            if conditioned and self.conditioned_graph is None:
+                self.conditioned_graph = CannMtpGraph(self, 4)
 
     def close(self):
-        """Release the draft graph before shutting down the target worker."""
+        """Release the draft graphs before shutting down the target worker."""
         if self.graph is not None:
             self.graph.close()
             self.graph = None
+        if self.conditioned_graph is not None:
+            self.conditioned_graph.close()
+            self.conditioned_graph = None
+
+    def _graph(self, width, shared_indices):
+        """Name the captured graph for this call, or None for eager.
+
+        An M1 chain replays only against a shared index set; the M4
+        target-conditioned pass replays only when it selects its own.
+        """
+        if width == 1 and shared_indices:
+            return self.graph
+        if width == 4 and not shared_indices:
+            return self.conditioned_graph
+        return None
 
     def forward(self, tokens, parent, *, external_indices=None,
                 full_logits=True):
@@ -296,11 +318,10 @@ class CannMtp:
             self.model.model.set_skip_topk(external_indices is not None)
             if external_indices is not None:
                 self.indices_buffer[:width].copy_(external_indices)
-            use_graph = (self.graph is not None and width == 1
-                         and external_indices is not None)
-            if use_graph:
+            graph = self._graph(width, external_indices is not None)
+            if graph is not None:
                 pre_norm, recycle, logits, token_ids, indices = (
-                    self.graph.forward(metadata, parent)
+                    graph.forward(metadata, parent)
                 )
             else:
                 with set_ascend_forward_context(

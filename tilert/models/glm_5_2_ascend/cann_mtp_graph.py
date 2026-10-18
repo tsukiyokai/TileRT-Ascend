@@ -1,23 +1,33 @@
-"""Fixed M1 graph for GLM-5.2's shared-index MTP draft chain."""
+"""Fixed-width graph for GLM-5.2's MTP draft layer and its own head."""
+
+
+WIDTHS = (1, 4)
 
 
 class CannMtpGraph:
     """Replay the draft and its own head; returned storage is reused.
 
-    Warm the eager M1 path on every TP rank before enabling this graph.
-    Seed and target-conditioned forwards retain eager execution.
+    Warm the eager path at this width on every TP rank before enabling
+    the graph. The caller owns ``set_skip_topk``: an M1 chain replays
+    against shared indices, the M4 target-conditioned pass selects its
+    own. Seed forwards retain eager execution.
     """
 
-    def __init__(self, draft):
+    def __init__(self, draft, width=1):
         import torch
 
+        if width not in WIDTHS:
+            raise ValueError("MTP graphs capture width 1 or 4")
         self.draft = draft
-        self.tokens, self.positions, self.slots = draft._input_buffers[1][:3]
+        self.width = width
+        self.tokens, self.positions, self.slots = (
+            draft._input_buffers[width][:3]
+        )
         self.parent = torch.empty(
-            1, 6144, dtype=torch.bfloat16, device=draft.device,
+            width, 6144, dtype=torch.bfloat16, device=draft.device,
         )
         self.slots_i64 = torch.empty(
-            1, dtype=torch.int64, device=draft.device,
+            width, dtype=torch.int64, device=draft.device,
         )
         self.graph = torch.npu.NPUGraph()
         self.pool = torch.npu.graph_pool_handle()
@@ -51,7 +61,7 @@ class CannMtpGraph:
         )
         logits = model.compute_logits(pre_norm, spec_step_idx=0)
         return (pre_norm, recycle, logits, logits.argmax(dim=-1),
-                self.draft.indices_buffer[:1].clone())
+                self.draft.indices_buffer[:self.width].clone())
 
     def forward(self, metadata, parent):
         import torch
@@ -67,7 +77,6 @@ class CannMtpGraph:
         # A chained parent can be this graph's previous recycle output.
         self.parent.copy_(parent)
         self.slots_i64.copy_(self.slots)
-        self.draft.model.model.set_skip_topk(True)
         if not self.capture_count:
             for value in metadata.values():
                 if isinstance(value, AscendSFAMetadata):
@@ -77,8 +86,9 @@ class CannMtpGraph:
         with (
             set_current_vllm_config(self.draft.config),
             set_ascend_forward_context(
-                metadata, self.draft.config, num_tokens=1,
-                num_actual_tokens=1, model_instance=self.draft.model,
+                metadata, self.draft.config, num_tokens=self.width,
+                num_actual_tokens=self.width,
+                model_instance=self.draft.model,
                 is_draft_model=True,
             ),
         ):

@@ -67,6 +67,8 @@ def parse_arguments(argv=None):
                         help="Compare graph after uncaptured execution")
     parser.add_argument("--draft-graph", action="store_true",
                         help="Graph shared-index M1 draft chains")
+    parser.add_argument("--conditioned-graph", action="store_true",
+                        help="Graph the M4 target-conditioned MTP pass")
     parser.add_argument("--draft-projection-tp", action="store_true",
                         help="Shard MTP rot and eh_proj outputs over TP16")
     parser.add_argument("--compile-target", action="store_true",
@@ -91,6 +93,8 @@ def parse_arguments(argv=None):
         parser.error("Graph comparison requires a decode round")
     if args.draft_graph and args.width == 2:
         parser.error("--draft-graph requires --width 4, 8 or 16")
+    if args.conditioned_graph and not args.draft_graph:
+        parser.error("--conditioned-graph requires --draft-graph")
     if args.compile_target and (not args.target_graph or args.width != 4):
         parser.error("--compile-target requires --target-graph --width 4")
     if args.super_kernel and not args.compile_target:
@@ -403,7 +407,7 @@ def execute(args):
                 if args.target_graph:
                     target.enable_graph(width=args.width)
                 if args.draft_graph:
-                    draft.enable_graph()
+                    draft.enable_graph(conditioned=args.conditioned_graph)
             parent = saved_parent.to(target.device)
             predicted = token_ids(target.predict(parent))[0]
             agree((predicted, target.position, draft.position))
@@ -516,6 +520,12 @@ def execute(args):
             "replays": draft.graph.replay_count,
             "scope": "M1 shared-index chain, including own head",
         },
+        "conditioned_graph_state": (
+            None if draft.conditioned_graph is None else {
+                "captures": draft.conditioned_graph.capture_count,
+                "replays": draft.conditioned_graph.replay_count,
+                "scope": "M4 target-conditioned pass, including own head",
+            }),
         "capacity": args.capacity, "eos_tokens": stops,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "packages": {name: version(name) for name in
