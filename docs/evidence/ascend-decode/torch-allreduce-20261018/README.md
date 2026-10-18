@@ -40,6 +40,31 @@ with `_tp_reduce` to force FP32 reductions, and that override is the single
 funnel through which all 157 reductions per round pass. Replacing its body
 with `reducer.compute` puts the one-sided path in production.
 
+## It coexists with HCCL, in the order production uses
+
+The decode path brings HCCL up first and keeps it for the session, so the
+symmetric domain has to come second. Verified at sixteen ranks:
+
+```
+attr_init after HCCL: status 0
+8 interleaved rounds: wrong 0, disagreeing with HCCL 0
+both domains alive: hccl_world 16, shmem_pes 16
+```
+
+Eight rounds alternating the two reductions, each checked against the rank sum
+and against the other. Both domains stay usable, which a session needs since
+vLLM keeps issuing its own collectives.
+
+## Wired in
+
+`onesided_reduce.py` owns the domain for one rank and exposes `install`,
+which replaces the override's body and inherits its bfloat16 round trip —
+the engine was already converting to FP32 for the vendor path, and the
+one-sided operator takes FP32. `CannModel` gains an `onesided_reduce`
+endpoint argument, installs it right after `_install_tp_sum`, and finalises
+the domain in `shutdown`. `bench_cann_mtp.py` exposes
+`--onesided-reduce tcp://127.0.0.1:9421`.
+
 ## Three build facts worth keeping
 
 `torch_binding` is gated behind `PYEXPAND_EXAMPLE`, not `USE_EXAMPLES`, so it

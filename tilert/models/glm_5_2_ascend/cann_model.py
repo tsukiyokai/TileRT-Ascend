@@ -116,7 +116,7 @@ class CannModel:
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
-        expert_parallel=False,
+        expert_parallel=False, onesided_reduce=None,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -141,6 +141,10 @@ class CannModel:
         self.position = 0
         self.attention_kernel = attention_kernel
         self.fp32_head = fp32_head
+        # A config-store endpoint turns the TP sum into a one-sided push; the
+        # vendor collective's 63.5 us is rendezvous rather than transfer.
+        self.onesided_endpoint = onesided_reduce
+        self._onesided = None
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
         self.config = create_config(
@@ -181,6 +185,10 @@ class CannModel:
         )
         self._tp_sum_group._all_reduce_out_place = self._tp_reduce
         self.tp_reduction = "float32"
+        if self.onesided_endpoint is not None:
+            from .onesided_reduce import install
+
+            self._onesided = install(self, self.onesided_endpoint)
 
     def _tp_reduce(self, value):
         import torch
@@ -204,6 +212,9 @@ class CannModel:
         if self.graph is not None:
             self.graph.close()
         self._restore_tp_sum()
+        if self._onesided is not None:
+            self._onesided.close()
+            self._onesided = None
         self.worker.shutdown()
 
     def _bind_cache(self):
