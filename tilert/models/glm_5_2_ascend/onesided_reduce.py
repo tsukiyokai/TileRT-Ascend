@@ -41,16 +41,17 @@ class OneSidedReduce:
         import torch
 
         _load()
-        # attr_init reads the calling thread's ACL device, and inside a vLLM
-        # worker that thread may have none: it then tries device -1 and
-        # setup_heap fails with ACLSHMEM_INNER_ERROR.
-        with torch.npu.device(device):
-            self.manager = torch.classes.ShmemOps.Manager()
-            status = self.manager.attr_init(rank, world_size, HEAP_BYTES,
-                                            endpoint)
-            if status != 0:
-                raise RuntimeError(f"aclshmem init returned {status}")
-            self.reducer = torch.classes.ShmemOps.AllReduce()
+        # The SDK latches its device once per process inside hybm_init, so
+        # binding the thread here is only about being bound at all; the -4 this
+        # used to return came from EINTR being classed as a link error in the
+        # bootstrap handshake, which a vLLM worker hits because it is full of
+        # signals and a quiet test process is not.
+        torch.npu.set_device(device)
+        self.manager = torch.classes.ShmemOps.Manager()
+        status = self.manager.attr_init(rank, world_size, HEAP_BYTES, endpoint)
+        if status != 0:
+            raise RuntimeError(f"aclshmem init returned {status}")
+        self.reducer = torch.classes.ShmemOps.AllReduce()
 
     def sum(self, value):
         """Return the TP sum of `value`, which the caller keeps in FP32."""

@@ -329,7 +329,7 @@ def run(args, report):
         draft = CannMtp(target, shard_projections=args.draft_projection_tp)
         if not draft.model.do_not_compile:
             raise ValueError("MTP backbone compilation must be disabled")
-        if target.tp_reduction != "float32":
+        if "float32" not in target.tp_reduction:
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
         engine = MeasuredRank(target, draft, channel.group)

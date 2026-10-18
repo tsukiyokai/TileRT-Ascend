@@ -696,3 +696,22 @@
   the budget. The slack and the host's 5.861 ms share one cause -- barriers
   that exist because the work is chopped into separately launched pieces.
   [Weight floor](evidence/ascend-decode/weight-floor-recount-20261018/README.md)
+- An eight-byte kernel parameter placed after a four-byte one is read from
+  past the argument buffer on this device. The SDK commits this in its own
+  barrier kernel, so aclshmem_barrier_all has never worked here -- one
+  sixteen-rank run logged 964 swallowed 507015 errors -- and every measurement
+  taken through that barrier was measuring something else. Eight-byte kernel
+  parameters go first.
+- "Works standalone, fails inside the worker" is a question about signals
+  before it is a question about devices. The bootstrap link classed EINTR as a
+  link error rather than retrying it, which a vLLM worker hits constantly and
+  a quiet torchrun process almost never does. I changed the device-binding call
+  three times against a symptom that said device -1, while the device was
+  bound correctly and latched once per process where no later call could
+  reach it. [Two defects](../patches/cann-shmem-1.7.0/README.md)
+- A fence that costs nothing may be doing nothing. aclshmem_quiet early-returns
+  when the transport mask is zero, which it is on single-machine HCCS, and
+  sync_vec_all states it does not complete outstanding communication. Measuring
+  the fence as free was correct and the inference that ordering was therefore
+  cheap was not: a DataCopy to a peer is an ordinary MTE3 store that no SHMEM
+  call tracks, and the writer must drain its own queue.
