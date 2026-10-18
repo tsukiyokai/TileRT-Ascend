@@ -50,6 +50,8 @@ torch 算子化后 TP16 实测 **28.181 µs 对 HCCL eager 142.850 µs，5.07 �
 
 每轮 157 次从 9.97 ms 降到 3.50 ms 是省 6.47 ms，折合约 1.9 ms/token。端到端尚未报出，在它报出之前不计入收益。
 
+开放路线登记在 [approach-registry.md](approach-registry.md)：A 通信消除、B 每轮 token 数、C 权重字节与驻留、D 轮次结构与主机税、E 注意力块、F 对抗审计，另有 G 并行布局（已 blocked：EP16 实测每轮 +1.09 ms、加融合再 +1.41，离散 0.252→0.756 ms 是 batch=1 尾部签名）与 H 为融合而融合（已收窄：bf16 矩阵乘已达峰值 93.8%、32 连也不省,只剩图内 8 µs 算子地板）。A、B、C 攻击同一个不等式的不同项，可以同时成立，不因另一个漂亮而放弃。
+
 ## decode 接管与融合的分层账（2026-10-18 定）
 
 参照物是本项目 AMD 侧的 `libtilert_glm52_rocm.so`：459 个 kernel、29 个基名，形态是层粒度融合加「归约做成生产者收尾」加形状特化，而非单个大 kernel。注意它也不是「一层一个算子」——`pure_mla_moe_layer_kernel` 是 MLA 加 MoE 合体（48 变体），但 `sparse_index`（63+57 变体，全库最大）与 `topk_select` 自成一族，真实形态是每层两到三个 kernel、层间无裸露。[kernel 清单](evidence/tilert-ascend/libtilert_glm52_rocm-elf.txt)
