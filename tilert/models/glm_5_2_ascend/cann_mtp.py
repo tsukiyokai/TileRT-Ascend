@@ -119,6 +119,7 @@ class CannMtp:
         self.graph = None
         self.conditioned_graph = None
         self.shard_projections = shard_projections
+        self.hoist_metadata = target.hoist_metadata
         self.attention_kernel = target.attention_kernel
         self.checkpoint = target.checkpoint
         self.weight_files = weight_sources(self.checkpoint)
@@ -312,13 +313,14 @@ class CannMtp:
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            metadata = CannModel._metadata(self, width)
+            graph = self._graph(width, external_indices is not None)
+            metadata = CannModel._metadata(self, width,
+                                           graphed=graph is not None)
             metadata[MAIN_CACHE].attn_state = AscendAttentionState.SpecDecoding
             self.input_ids.copy_(tokens)
             self.model.model.set_skip_topk(external_indices is not None)
             if external_indices is not None:
                 self.indices_buffer[:width].copy_(external_indices)
-            graph = self._graph(width, external_indices is not None)
             if graph is not None:
                 pre_norm, recycle, logits, token_ids, indices = (
                     graph.forward(metadata, parent)

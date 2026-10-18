@@ -108,6 +108,11 @@ def arguments():
                         help="Graph the M4 target-conditioned MTP pass")
     parser.add_argument("--draft-projection-tp", action="store_true",
                         help="Shard MTP rot and eh_proj outputs over TP16")
+    parser.add_argument("--hoist-metadata", action="store_true",
+                        help="Build SFA/indexer metadata once per captured"
+                             " width and refresh only its rope slices")
+    parser.add_argument("--hoist-forward-context", action="store_true",
+                        help="Serve a prebuilt MC2 mask per token width")
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
@@ -348,7 +353,9 @@ def run(args, report):
                        fp32_head=args.fp32_head,
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
-                       graph_width=args.width)
+                       graph_width=args.width,
+                       hoist_metadata=args.hoist_metadata,
+                       hoist_forward_context=args.hoist_forward_context)
     draft = None
     try:
         draft = CannMtp(target, shard_projections=args.draft_projection_tp)
@@ -522,6 +529,8 @@ def run(args, report):
                 "draft_graph": args.draft_graph,
                 "conditioned_graph": args.conditioned_graph,
                 "draft_projection_tp": args.draft_projection_tp,
+                "hoist_metadata": args.hoist_metadata,
+                "hoist_forward_context": args.hoist_forward_context,
                 "compile_target": args.compile_target,
                 "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
@@ -552,6 +561,8 @@ def main():
         "draft_graph": args.draft_graph,
         "conditioned_graph": args.conditioned_graph,
         "draft_projection_tp": args.draft_projection_tp,
+        "hoist_metadata": args.hoist_metadata,
+        "hoist_forward_context": args.hoist_forward_context,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,

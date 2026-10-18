@@ -54,6 +54,12 @@ class CannMtpGraph:
             raise ValueError("MTP graph metadata addresses changed")
 
     def _execute(self):
+        from .cann_model import CannModel
+
+        # Captured here rather than issued per round: the gather reads the
+        # resident positions and writes the rope slices this graph captured,
+        # so a replay refreshes them with no host launch at all.
+        CannModel.refresh_hoisted_rope(self.draft, self.width, self.positions)
         model = self.draft.model
         pre_norm, recycle = model(
             input_ids=self.tokens, positions=self.positions,

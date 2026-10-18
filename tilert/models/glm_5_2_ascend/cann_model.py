@@ -38,6 +38,55 @@ def device_tokens(tokens, device):
     ])
 
 
+def rope_buffers():
+    """Name the module holding the process-wide MLA cos/sin buffers."""
+    from vllm_ascend.ops import rotary_embedding
+
+    return rotary_embedding
+
+
+def rope_destinations(values, width):
+    """Name the rope slices a replay reads outside the shared MLA buffers.
+
+    A builder configured for speculative decoding keeps independent RoPE
+    storage and copies the shared gather into it, so hoisted metadata still
+    points at that copy and the copy has to be repeated every round.
+    """
+    rope = rope_buffers()
+    seen = {(rope._cos_mla[:width].data_ptr(),
+             rope._sin_mla[:width].data_ptr())}
+    destinations = []
+    for value in values:
+        if value.cos is None or value.sin is None:
+            continue
+        key = (value.cos.data_ptr(), value.sin.data_ptr())
+        if key in seen:
+            continue
+        seen.add(key)
+        destinations.append((value.cos, value.sin))
+    return destinations
+
+
+def refresh_rope(positions, width, destinations):
+    """Gather this round's cos/sin into the addresses a replay captured.
+
+    One gather serves every builder group because they all alias the same
+    module-global buffers. ``index_select`` writes the destination directly,
+    which the builders reach in two dispatches instead of four.
+    """
+    import torch
+
+    rope = rope_buffers()
+    columns = rope._cos_cache.shape[-1]
+    torch.index_select(rope._cos_cache, 0, positions,
+                       out=rope._cos_mla[:width].view(width, columns))
+    torch.index_select(rope._sin_cache, 0, positions,
+                       out=rope._sin_mla[:width].view(width, columns))
+    for cos, sin in destinations:
+        cos.copy_(rope._cos_mla[:width])
+        sin.copy_(rope._sin_mla[:width])
+
+
 @dataclass
 class CannStep:
     logits: object
@@ -118,6 +167,7 @@ class CannModel:
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
+        hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -134,6 +184,14 @@ class CannModel:
         from vllm.config import set_current_vllm_config
         from vllm_ascend.worker.worker import NPUWorker
 
+        if hoist_forward_context:
+            # Only the private vLLM-Ascend overlay carries this entry point, so
+            # importing it unconditionally would make every default run depend
+            # on the overlay being ahead of the installed package.
+            from vllm_ascend.ascend_forward_context import hoist_mc2_mask
+
+            hoist_mc2_mask(True)
+
         self.device = torch.device(device)
         if self.device.type != "npu" or self.device.index not in range(16):
             raise ValueError("device must name one of the 16 visible NPUs")
@@ -142,6 +200,7 @@ class CannModel:
         self.position = 0
         self.attention_kernel = attention_kernel
         self.graph_width = graph_width
+        self.hoist_metadata = hoist_metadata
         self.fp32_head = fp32_head
         # A config-store endpoint turns the TP sum into a one-sided push; the
         # vendor collective's 63.5 us is rendezvous rather than transfer.
@@ -309,6 +368,7 @@ class CannModel:
         import torch
 
         self.graph = None
+        self._hoisted = {}
         self._input_buffers = {}
         for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
             tokens = torch.empty(width, dtype=torch.int32, device=self.device)
@@ -353,7 +413,7 @@ class CannModel:
                     destination[:length].copy_(source[name])
         self.position = length
 
-    def _metadata(self, width=1):
+    def _metadata(self, width=1, *, graphed=False):
         import torch
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
         from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -372,6 +432,13 @@ class CannModel:
         else:
             self.slots.copy_(positions_cpu)
             self.positions.copy_(positions_cpu)
+        hoisted = self._hoisted.get(width) if graphed else None
+        if hoisted is not None:
+            metadata, values, _ = hoisted
+            for value in values:
+                value.max_seq_len = self.position + width
+                value.seq_lens_cpu = length_cpu
+            return metadata
         state = (AscendAttentionState.DecodeOnly if width == 1
                  else AscendAttentionState.ChunkedPrefill)
         common = AscendCommonAttentionMetadata(
@@ -394,7 +461,24 @@ class CannModel:
         for names, builder in self.builders:
             metadata = builder.build(0, common)
             result.update((name, metadata) for name in names)
+        if graphed and self.hoist_metadata:
+            values = list({id(value): value for value in result.values()}
+                          .values())
+            self._hoisted[width] = (
+                result, values, rope_destinations(values, width),
+            )
         return result
+
+    def refresh_hoisted_rope(self, width, positions):
+        """Rewrite rope values for a replay that reuses hoisted metadata.
+
+        Nothing else the metadata holds depends on the round: every other
+        field is either a view of a buffer the caller refreshes by H2D copy
+        or is invariant for the captured width.
+        """
+        hoisted = self._hoisted.get(width)
+        if hoisted is not None:
+            refresh_rope(positions, width, hoisted[2])
 
     def enable_graph(self, width=1):
         """Capture one query width; other widths retain eager execution."""
@@ -425,7 +509,9 @@ class CannModel:
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            metadata = self._metadata(width)
+            metadata = self._metadata(width, graphed=use_graph)
+            if use_graph:
+                self.refresh_hoisted_rope(width, self.positions)
             self.input_ids.copy_(tokens)
             with set_ascend_forward_context(
                 metadata, self.config, num_tokens=width,
