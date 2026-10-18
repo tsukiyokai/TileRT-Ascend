@@ -1032,3 +1032,10 @@
   agreeing that the dense layers are clean and 73 of 75 MoE layers differ. The
   stable statement is the region and the per-forward re-ignition, and looking
   for the one line would have been looking for something that does not exist.
+- Bit-reproducible output does not mean correct computation. The vendor expert
+  matmul is non-deterministic at exactly width 4's verify shape -- four distinct
+  results over 64 calls, int8 codes differing by 115 -- while width 4's tokens
+  are identical across seven processes. Both hold because the corruption never
+  flips an argmax at that width: the release gate passes on the distance
+  between the top two logits, not on the arithmetic. A gate that compares
+  tokens cannot see an error the margins absorb.

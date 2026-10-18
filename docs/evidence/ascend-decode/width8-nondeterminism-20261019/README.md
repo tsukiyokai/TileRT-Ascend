@@ -52,6 +52,33 @@ carry `PipeBarrier<PIPE_V>`. Or `apply_gmm2`'s built-in `GroupedMatmul` A8W4
 split-K with `SetAtomicAdd<half>`, whose split dimension is chosen by host
 tiling from M — and M is 32 at width 4 against 64 at width 8.
 
+## A consequence nobody has stated: width 4 passes on margin, not on correctness
+
+Two measured facts, placed together.
+
+The vendor epilogue race is **worst at M = 32** — four distinct results over 64
+consecutive calls, three or four of them wrong, int8 codes differing by 115 on
+a range of ±127. And M = 32 is exactly width 4's verify shape, since batch one
+at top-8 gives M = rows × 8.
+
+Width 4 is nevertheless bit-reproducible end to end, across seven independent
+processes, every one at 319 rounds with a single token stream.
+
+The only way both hold is that the corrupted values **do not flip any argmax**
+at width 4. That is margin, not correctness. The same mechanism explains why
+width 6's round-0 predictions agree while its round 1 diverges: that round's
+top-2 margins happen to be wide.
+
+So the barrier patch is needed at width 4 as well — not for reproducibility,
+which already holds, but because the arithmetic is wrong by up to 114 int8
+codes and the release gate is passing on the distance between the top two
+logits rather than on the computation being right. A gate that compares tokens
+bit for bit cannot see this, because the tokens are identical.
+
+This also sets the standard for the width-8 fix: making width 8 reproducible
+is not the same as making it correct, and a change that widens margins would
+do the first without the second.
+
 ## The threshold is between 4 and 6, not at 8
 
 Width 4 is deterministic **across processes**, not only across requests: seven
