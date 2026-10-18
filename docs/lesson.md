@@ -679,3 +679,20 @@
   36 microseconds; the difference is rank skew absorbed at the round's first
   collective and attributed to the kernel that happened to be there.
   [Round accounting](evidence/ascend-decode/round-accounting-20261018/README.md)
+- A bandwidth ceiling measured one read at a time is a launch latency. The
+  1190.77 GB/s figure that bounded this project's whole budget argument came
+  from an event pair around each single transfer; batching thirty reads inside
+  one pair gives 1527-1564 marginal, and the old method's own best sample
+  already exceeded its reported maximum.
+- An operator that ignores a cache is not evidence the cache is absent. The
+  expert GMM moves under 1% as its footprint sweeps from a tenth of L2 to
+  thirty-two times it, while a bf16 matmul in the same harness shows 2.21x --
+  because the GMM runs at 18% of the die's read rate and its bytes are already
+  free. Check whether the thing you are tuning is bound by what you are
+  tuning.
+- The 2 ms target is a statement about operator efficiency, not about
+  bandwidth or arithmetic. Device work is 37.7 ms per round against a 6.866 ms
+  budget, and the weight stream runs at 18% of hardware: 37.7 / 5.6 lands on
+  the budget. The slack and the host's 5.861 ms share one cause -- barriers
+  that exist because the work is chopped into separately launched pieces.
+  [Weight floor](evidence/ascend-decode/weight-floor-recount-20261018/README.md)
