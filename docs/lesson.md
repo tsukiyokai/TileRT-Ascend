@@ -586,3 +586,25 @@
   timeout that an untimed wait needs, and the SDMA precheck whose absence
   prints aclError=507015 -- the exact error we had. Searching the repository
   cost two minutes and replaced an evening of guessing.
+- Put every eight-byte kernel parameter first. An eight-byte parameter placed
+  after a four-byte one is written by the host stub at a non-eight-aligned
+  compact offset and read by the device from past the end of the args buffer,
+  so it arrives as something else entirely. CANN's own SHMEM does this in
+  aclshmemi_barrier_on_stream_kernel, which is why aclshmem_barrier_all has
+  never worked on this machine: it logs 507015 on every call and returns void,
+  swallowing the error. Nine more instances sit in the SDK's examples.
+  [ABI defect](evidence/ascend-decode/shmem-abi-20261018/README.md)
+- A silent no-op in a dependency can masquerade as a defect in your own code.
+  I spent an evening isolating stages, rewriting a protocol and reading vendor
+  demos while the deadlock was a host barrier failing before my first launch
+  ever ran. Worse, every measurement I took through it was of something else:
+  my push-versus-reduce attribution came out exactly backwards. When a
+  dependency's error path returns void, check its log before trusting any
+  measurement that crosses it.
+- One-sided symmetric memory survives ACL graph capture and replay on A3, and
+  the way to establish that was same-binary polarity rather than inference:
+  with capture bypassed the failure was identical but for the wrapper status,
+  so capture was not in the causal chain. 400 replays then ran 800 kernels
+  containing put_nbi, signal_op and SyncAll bit-correct. This was the largest
+  unknown in the whole one-sided programme, since production decode is
+  entirely graph-captured.
