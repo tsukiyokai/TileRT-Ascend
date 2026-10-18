@@ -380,3 +380,11 @@
   Measure across processes (median of process medians) — a single session's
   twenty batches hide an additive offset that masquerades as a tiling effect.
   [GMM outside L2](evidence/ascend-decode/gmm-clean-20261018/README.md)
+- The failure we probed blind is a documented design boundary one repo over.
+  hyper-parallel's bindings name aicore 507015 verbatim as what an untimed
+  device-barrier spin does under interconnect contention, and their whole
+  protocol — never DCCI a remote address, spin only on local flags, converge
+  on the host before first remote visibility — is the complement of our
+  failed one-shot push. Search for the error code in shipped source before
+  black-box bisection.
+  [HyperMPMD](evidence/ascend-decode/hyper-mpmd-20261018/README.md)
