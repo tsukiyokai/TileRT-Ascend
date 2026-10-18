@@ -32,6 +32,10 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，归约 dtype、custom OPP 与调度也不同。[仅切 AIV 的长测](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control)保持全部 token、提议与接受一致，TPOT 中位数升至 21.47 ms；但[纯通信对照](evidence/ascend-decode/tp-mode-20261017/README.md)的 FP32 96 KiB、156 次图归约链由 AI_CPU 10.93 ms 降至 AIV 5.04 ms。[新 M4 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md#aiv-decode-comparison)确认 AIV 实际生效，并在一次归约观察到 rank 14 晚到约 4.21 ms；尚未证明资源竞争。保留 AIV 路线，编译主干先作独立单变量对照。共有 GMM 成本不能当作双方增量差距；长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
+## 当前：13.338 ms（width 8）
+
+M=8 实测 13.338 ms（复测 12.894），对 M=4 的 14.485 与记录最好值 14.247 分别是 7.9–11.0% 与 6.4–9.5%；A(8)=4.5066，M=16 反而回到 14.037 故最优在 8。使能它的是 `cann_model.py:80` 一个字面量（`max_num_seqs` 从 4 改成 `max(4, graph_width)`，因为 AscendCompiler 按它筛静态 token 桶，`--super-kernel` 在 4 行值 8.9 ms/轮、在 8 行一分不值）。宽度在硬件上几乎免费——attention 16 倍行只贵 7.0%、dense 投影全平——贵的是每多一个宽度多跑一次串行链式 draft（2.19 ms/单位 M，由 replay 数 =(M−2)×轮数×请求数 佐证）。同时修了 `gather_fia` 在宽度 >6 时丢失因果性（941 个逐位 KV 检查失败，它完全不加 mask 而依赖 docstring 断言）。[宽度](evidence/ascend-decode/width-20261019/README.md)
+
 ## 2 ms 的算术，以及为什么只剩一条路（2026-10-19 定）
 
 一轮在 A=3.433 下可用 6.866 ms。三项各自的诚实值：
@@ -42,7 +46,9 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 | 157 次归约，单边 | 3.70（对 HCCL 5.08） | 已实测，但见下方正确性地板 |
 | 主机下发路径 | 5.861 | 只有捕图 |
 
-**任意两项已超预算，三项相加 13.4 ms（乐观端）。没有任何增量组合能到 6.866。** 所以路线必须同时做三件事：整条拿掉主机路径、把通信藏进计算而非仅仅缩短它、让权重流跑到 die 的边际速率。而这三件是一个改动——工作不再被切成分别下发的小块——它就是 megakernel。[骨架](megakernel-skeleton.md)
+**任意两项已超预算，三项相加 13.4 ms（乐观端）。没有任何增量组合能到 6.866。**
+
+而 megakernel 的奖金上限比下发地板大一个量级：profile 的 compute union 是 40.7 ms/轮，算术必需的权重流只有 3.886–5.873 ms，所以**约 35 ms 是某种开销**。下发地板只是其中确定可去的那部分（2416 次调用 × 1.2 µs = 2.9 ms）；其余压在按算子计的序幕里，而序幕跨算子相差六倍以上（`torch.add` 1.2 µs、`npu_dynamic_quant` 2.8–3.6、`npu_quant_matmul` 8.3、`npu_grouped_matmul` 59.1、自建 W4A8 GMM 88–93 其中序幕 16.4）。序幕普查在跑。 所以路线必须同时做三件事：整条拿掉主机路径、把通信藏进计算而非仅仅缩短它、让权重流跑到 die 的边际速率。而这三件是一个改动——工作不再被切成分别下发的小块——它就是 megakernel。[骨架](megakernel-skeleton.md)
 
 这比先前那个被夸大的集合通信定价是更强的论证：当时说集合通信值 8–10 ms/轮，对抗审计实测它只值 1.4–2.0；纲领没变，但理由从「最大单项」换成了「别无他途」。
 
