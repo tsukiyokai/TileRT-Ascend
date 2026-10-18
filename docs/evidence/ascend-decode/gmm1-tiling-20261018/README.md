@@ -1,4 +1,6 @@
-# Existing CANN GMM1 tiling screen
+# Existing CANN GMM1 screens
+
+## baseN=128
 
 A3 shared die 0, one TP16 weight shard, real layer-3 M4 routed inputs:
 32 active experts, each with one row. The [private host patch](base-n128.patch)
@@ -24,3 +26,36 @@ There is no measured gain. Retain the existing tiling and stop this branch.
 These shared-device times do not measure model TPOT. Raw fixtures, the
 58-check source audit, vendor package, launches and logs remain under
 `/home/shanshan/trt-asc/offline/cann-gmm1-basen128-20261018-01/` on a3-gs.
+
+## Single-chunk synchronization
+
+The [single-chunk audit](single-chunk-audit.json) keeps tiling, arithmetic,
+MSD boundaries and the SwiGLU barrier unchanged. Only `loopCount==1` skips
+the next-prefetch AIV barrier and the duplicate mixed barrier before final
+postprocessing. The pre→matmul and matmul→post mixed barriers remain.
+At K=6144/N=256, `mLimit=4681`; M1/M4 dispatch eight/thirty-two rows, so
+both execute one chunk. Other loop counts retain the original barriers.
+
+Four separate processes run baseline/candidate/candidate/baseline. Each
+records thirty event samples of ten captured clone+GMM1 calls:
+
+| Process order | Event p50 (µs/call) |
+|---|---|
+| Baseline | 116.814 |
+| Candidate | 111.299 |
+| Candidate | 112.741 |
+| Baseline | 114.584 |
+
+The mean of process medians improves by 3.679 µs, or 3.18%; AB/BA gains
+are 5.515/1.843 µs. Every process has six long batches, with roughly
+3.6 ms extra per ten-call batch; their cause is unresolved. Per-batch
+host wall time was not recorded. This is a shared-die event screen.
+
+Changing row/scale inputs, poisoned outputs, dirty reuse and recapture
+compare 881,504 elements exactly. Actual ELF opens select the control and
+candidate binaries in those functional runs; timing processes retain the
+same bindings but do not capture opens. Changed routing counts and the
+complete router→dispatch→GMM1→GMM2→combine path remain to be checked at
+M1/M4 before a product patch. Raw artifacts stay under
+`/home/shanshan/trt-asc/offline/cann-gmm1-singlechunk-20261018-01/` and
+`/home/shanshan/trt-asc/offline/cann-gmm1-singlechunk-changing-20261018-01/`.

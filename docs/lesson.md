@@ -151,6 +151,19 @@
   locate the first change, then evaluate proposal quality and acceptance.
   [Fixed-input diagnosis](evidence/ascend-decode/layer-major-20261018/mtp-projection-fixed-c1-audit.json)
   · [Exact dots](evidence/ascend-decode/layer-major-20261018/mtp-projection-dot-oracle.json)
+- Measure proposal quality on a fixed teacher trajectory before inferring
+  acceptance from hidden drift. Sharding changes five proposal slots across
+  thirty windows, yet every window keeps the same continuous coverage.
+  This conditioned screen does not execute M4 verification or measure
+  accepted tokens in a session.
+  [Teacher screen](evidence/ascend-decode/layer-major-20261018/mtp-teacher-proposal-audit.json)
+- Bound clock error before subtracting cross-rank timestamps. Empirical
+  causal envelopes preserve millisecond arrival skew, but do not resolve
+  microsecond completion spread or always identify the last rank. A long
+  AI Core TASK measures elapsed execution, not isolated arithmetic; CSV
+  Wait Time is a derived gap between summarized tasks. Nested HCCL child
+  waits can cross later operations and must not be added to their parents.
+  [Complete-chain trace](evidence/ascend-decode/layer-major-20261018/mtp-chain-profile-summary.json)
 - A numerically exact rebuild is not a performance-equivalent baseline.
   O publication fusion wins 9.025 µs against rebuilt O plus push, but its
   paired gain is −0.328 µs against the installed O plus push. The same-run

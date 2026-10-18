@@ -230,6 +230,18 @@ original value is one ULP away. This establishes those four local results,
 not full-projection or trajectory accuracy. Keep cross-configuration drift
 diagnostic and measure proposal coverage and eventual accepted tokens.
 
+The [teacher proposal screen](mtp-teacher-proposal-audit.json) restores one
+frozen trajectory at thirty overlapping positions. Each configuration
+commits one teacher-conditioned M1 row, drafts two scratch rows, then
+truncates them before the next position. Labels come from teacher JSON;
+the BF16-head trace's predictions are not substituted for those labels.
+Five proposal slots change across three windows, but all thirty continuous
+prefix lengths agree. Their L=1/2/3/4 histogram is 9/8/9/4; L includes the
+known input token. This is proposal coverage, not actual M4 acceptance or
+an end-to-end teacher check. The audit verifies 2,880 raw argmax results,
+prefix preservation and rollback. Artifacts stay under
+`/home/shanshan/trt-asc/offline/cann-mtp-teacher-coverage-20261018-01/`.
+
 The [complete-chain timing](mtp-projection-timing-audit.json) retains the
 actual original `nn.Linear` objects and switches them with the new modules
 on one model. Each variant captures one graph, runs three unmeasured
@@ -247,11 +259,38 @@ Thirty paired rank-MAX differences have median 0.522182 ms and p10/p90
 complete-chain gain. All 960 saved C2 samples match their own frozen
 references; each rank closes 60 captures after 480 replays. Peak reserved
 memory is 1,788,870,656 bytes/die. Target verification, conditioned M4 and
-delivery are outside this measurement. A short trace must identify the
-exposed matmul, gather and collective waits before further tuning.
+delivery are outside this measurement. The short trace below identifies
+task elapsed times and collective arrival skew.
 
 Raw data and reproducible auditors stay under
 `/home/shanshan/trt-asc/offline/cann-mtp-projection-{shard,product,chain-bench}-20261018-01/`.
+
+## Complete-chain short trace
+
+The [independently audited trace](mtp-chain-profile-summary.json) covers
+two two-chain replays per variant on all sixteen ranks: 128 chain windows
+and 640 collectives. Profiling is enabled; these are diagnostic durations.
+
+| Head TASK elapsed, 64 samples/variant | p50 (µs) | p90 (µs) | max (µs) |
+|---|---|---|---|
+| Original | 144.683 | 3129.756 | 3510.240 |
+| Sharded | 148.252 | 3222.114 | 3858.640 |
+
+All heads use AI_CORE MatMulV3, 24 blocks, BF16 ND input and weights with
+FP32 output. The preceding norms produce BF16 directly; the later Cast
+converts ArgMax integers. Similar millisecond tails occur in MLA prolog
+and the small router matmul. TASK spans do not separate useful arithmetic,
+memory stalls, device scheduling, active co-load or profiler effects.
+
+Empirical causal clock envelopes retain a head collective entry-spread
+lower bound of 2.931–3.101 ms for original and 3.093–3.526 ms for sharded
+using only the corresponding window. They do not prove microsecond
+completion spread or always identify the last rank. All 640 collective
+entries follow their local producer by 0.50–0.90 µs; this does not observe
+remote payload visibility. HCCL child waits cross operation boundaries in
+625/640 cases, so summing them with parent durations double-counts time.
+Raw profiles, exports, join keys, causal bounds and auditors stay under
+`/home/shanshan/trt-asc/offline/cann-mtp-projection-chain-profile-20261018-01/`.
 
 ## Two chain calls in one Graph
 
