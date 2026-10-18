@@ -905,3 +905,15 @@
   have surfaced every one of them in three minutes each, and running the real
   1024-token measurement before the path was known-good is what turned one
   debugging session into five.
+- The free-memory failure was residue I had created, and the fix I wrote for
+  it broke execution. Three sixteen-rank runs reported 33.12 of 61.27 GiB free
+  against 52.08 wanted while a single process saw 59.92 on the same device, so
+  I concluded the benchmark was missing an early set_device and added one.
+  After that every configuration faulted with an aicore exception and 507015 --
+  including one an agent had measured successfully an hour before. Removing
+  the line restored execution, and the original symptom was device state left
+  by the jobs I had been killing. Diagnosing a transient you caused as a code
+  defect, and then shipping the fix, costs twice.
+  The discriminating test was to run an agent's own frozen tree with the same
+  flags: it completed, which located the fault in my tree rather than in the
+  device or the configuration.

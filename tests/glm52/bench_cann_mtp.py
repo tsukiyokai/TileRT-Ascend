@@ -334,12 +334,6 @@ def run(args, report):
     )):
         raise ValueError("Run this measurement without profiling")
     torch.set_num_threads(1)
-    # Bind the device before anything allocates: load_inputs builds tensors,
-    # and without this every rank's first allocation lands on device 0, so
-    # rank 0 then sees sixteen ranks' contexts on its own die and fails its
-    # free-memory check. The failure is a race, which is why it appeared
-    # intermittently.
-    torch.npu.set_device(rank)
     checkpoint = checkpoint_fingerprint(args.checkpoint)
     main, mtp, parent, first, inputs = load_inputs(args, rank, checkpoint)
     if inputs["initial_position"] != PREFIX_LENGTH:
