@@ -1098,3 +1098,18 @@ against what its control would have cost.
   `TORCHINDUCTOR_AUTOGRAD_CACHE=0` in both arms costs compile time, not TPOT,
   and cannot bias the comparison. A good practice can arm a latent failure;
   the precondition belongs in the recipe.
+- Verify control flow by extraction and compilation, not by reading
+  indentation. A missing brace attached an else-if to a chain nested one level
+  in, so five stages of a kernel silently skipped their synchronisation and a
+  sixth was unreachable -- and the figure I quoted all night, 11.2
+  microseconds, was an unsynchronised floor rather than a correct all-reduce.
+  Lifting the forty lines out, replacing the calls with prints and compiling
+  them found it in one step.
+- An order-sensitive input is not automatically precision-sensitive. My
+  cancelling construction put the negation at rank 1, so the accumulator
+  returns to zero before the small terms arrive and a bf16 accumulator gives
+  the same answer as a float one. The discriminating input puts the negation
+  last, forcing the accumulator to carry 4096 through every addition where the
+  bf16 step is 32. Design the input against the specific claim, not against
+  "being sensitive".
+  [Corrected](evidence/ascend-decode/onesided-corrected-20261019/README.md)
