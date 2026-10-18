@@ -352,3 +352,11 @@
   `start_aiv_all_reduce_float` against `start_static_kernel_AddRmsNormBias`.
   Read the boundary, not just the contents.
   [Grouping boundary](evidence/ascend-decode/profile-rope-20261018/README.md#one-grouping-boundary-costs-436-ms-per-round)
+- A PyTorch binding is not a kernel. `torch.ops.npu.npu_mm_all_reduce_base`
+  has the widest schema in its family and nothing behind it on A3: the device
+  refuses with `SoC version ascend910_93 verification failed. This SoC is not
+  configured through the AddConfig API of the OpDef class`. Its neighbour
+  `npu_mm_reduce_scatter_base` runs but demands `M % world_size == 0`, which
+  batch-one decode cannot supply. Probe the operator on the target SoC at the
+  target shape before planning on it.
+  [Vendor fusions](evidence/ascend-decode/fused-collective-ops-20261018/README.md)
