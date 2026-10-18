@@ -34,6 +34,32 @@ int64_t AlignUp(int64_t value, int64_t alignment)
 
 }  // namespace
 
+namespace {
+
+// Ranks 0 and 1 cancel exactly; the rest contribute e. In bf16, 4096 + e is
+// 4096, so only a sum taken in ascending rank order keeps the fourteen e's.
+constexpr float CANCELLING_MAGNITUDE = 4096.0F;
+
+float OrderSensitiveContribution(int pe_id, int round)
+{
+    const float epsilon = static_cast<float>(1 << (round % 3));
+    if (pe_id == 0) {
+        return CANCELLING_MAGNITUDE;
+    }
+    if (pe_id == 1) {
+        return -CANCELLING_MAGNITUDE;
+    }
+    return epsilon;
+}
+
+float OrderSensitiveExpectation(int pe_size, int round)
+{
+    const float epsilon = static_cast<float>(1 << (round % 3));
+    return static_cast<float>(pe_size - 2) * epsilon;
+}
+
+}  // namespace
+
 int main(int argc, char* argv[])
 {
     if (argc < 8) {
@@ -89,6 +115,21 @@ int main(int argc, char* argv[])
     void* errors = nullptr;
     ACL_CHECK(aclrtMalloc(&errors, 1024 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMemset(errors, 1024 * sizeof(int32_t), 0, 1024 * sizeof(int32_t)));
+    // Stage 10 reduces bf16; the window and the partial hold bf16 at the same
+    // element count, so the host writes the narrowed values directly.
+    std::vector<uint16_t> narrow(elements);
+    auto narrow_of = [](float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return static_cast<uint16_t>(bits >> 16);
+    };
+    auto widen_of = [](uint16_t half) {
+        const uint32_t bits = static_cast<uint32_t>(half) << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    };
+
     const uint64_t ffts = util_get_ffts_config();
     // The push needs one core per peer; the reduction wants every core it can
     // get, so the launch is sized for the reduction and the push uses the
@@ -105,6 +146,54 @@ int main(int argc, char* argv[])
     tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, (int32_t*)errors, rows, hidden, warmup, 0, stage);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     aclshmem_barrier_all();
+
+    if (stage == 10) {
+        int64_t wrong_rounds = 0;
+        double total = 0.0;
+        for (int round = 0; round < rounds; ++round) {
+            const float mine = OrderSensitiveContribution(pe_id, round);
+            const float want = OrderSensitiveExpectation(pe_size, round);
+            for (int64_t index = 0; index < elements; ++index) {
+                narrow[index] = narrow_of(mine);
+            }
+            ACL_CHECK(aclrtMemcpy(partial, elements * sizeof(uint16_t), narrow.data(),
+                                  elements * sizeof(uint16_t), ACL_MEMCPY_HOST_TO_DEVICE));
+            aclshmem_barrier_all();
+            timespec round_begin;
+            timespec round_end;
+            clock_gettime(CLOCK_MONOTONIC, &round_begin);
+            tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window,
+                         (int32_t*)errors, rows, hidden, 1, round, stage);
+            ACL_CHECK(aclrtSynchronizeStream(stream));
+            clock_gettime(CLOCK_MONOTONIC, &round_end);
+            total += (round_end.tv_sec - round_begin.tv_sec) * 1e6
+                   + (round_end.tv_nsec - round_begin.tv_nsec) / 1e3;
+            ACL_CHECK(aclrtMemcpy(narrow.data(), elements * sizeof(uint16_t), out,
+                                  elements * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_HOST));
+            int64_t bad = 0;
+            for (int64_t index = 0; index < elements; ++index) {
+                if (widen_of(narrow[index]) != want) {
+                    ++bad;
+                }
+            }
+            if (bad != 0) {
+                ++wrong_rounds;
+                if (pe_id == 0 && wrong_rounds <= 3) {
+                    std::printf("  round %d want %.1f got %.1f wrong %ld of %ld\n", round, want,
+                                widen_of(narrow[0]), (long)bad, (long)elements);
+                }
+            }
+        }
+        if (pe_id == 0) {
+            std::printf("RESULT stage 10 per_reduction_us %.3f wrong_rounds %ld of %d\n",
+                        total / rounds, (long)wrong_rounds, rounds);
+        }
+        aclshmem_free(window);
+        aclshmem_finalize();
+        ACL_CHECK(aclrtResetDevice(pe_id));
+        ACL_CHECK(aclFinalize());
+        return wrong_rounds == 0 ? 0 : 1;
+    }
 
     struct timespec begin;
     struct timespec end;
