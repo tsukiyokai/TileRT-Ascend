@@ -509,3 +509,11 @@
   the recorded conclusion that this hardware cannot do it at scale is
   withdrawn. A negative result about a platform should name the
   implementation it was observed through, or it will outlive its cause.
+- The wire was never the cost. A one-sided put of 64 KiB between dies
+  measures 2.7484 us while HCCL's reduction of a comparable message costs
+  63.5 us in-graph and does not vary with size at all. Twenty-three to
+  forty-six fold, and the cheap number is the one that actually carries the
+  data. Every estimate of this gap today was derived; one vendor perftest
+  binary settled it in a minute, and it had been sitting in an uninstalled
+  SDK.
+  [One-sided put](evidence/ascend-decode/shmem-install-20261018/README.md#the-wire-measured-at-last)

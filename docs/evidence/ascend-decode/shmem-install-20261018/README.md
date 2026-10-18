@@ -71,8 +71,38 @@ about the data — HCCL reduction 63.5 µs in-graph, HCCL at two ranks and
 and none of them can measure the wire. A kernel writing into a mapped peer
 address can, and the SDK now provides the mapping.
 
-The examples worth reading next are `notifywait`, which is the local flag
-spin that replaces a barrier, and `aclgraph_demo`, which answers directly
-whether symmetric memory survives ACL graph capture — the one risk
-HyperMPMD's own code could not settle for us, since its guard exists for
-online heap rebuild and our message size is fixed.
+## The wire, measured at last
+
+`examples/shmem_perftest` builds `ascendc_perftest`, which issues a one-sided
+put between two named dies:
+
+```
+./build/bin/ascendc_perftest -t put -d float   --block-list 4,1024,98304,1572864 --device1 0 --device2 1 --loop-count 100
+
+block_size 98304, datasize 65536:  time 2.7484 us
+[Verification] SUCCESS: All cores' first values transferred correctly!
+```
+
+**A one-sided put of 64 KiB from die 0 to die 1 costs 2.7484 µs**, verified
+correct. Against HCCL's 63.5 µs in-graph and 126 µs eager for a 96 KiB
+reduction, that is 23 to 46 times cheaper — and the 2.75 µs already contains
+the transfer, which HCCL's figure did not depend on at all.
+
+So the derived "single-digit microseconds" is now a measurement. Everything
+the earlier localisation attributed to a scheduled synchronisation stage is
+confirmed as removable: the wire was never the cost.
+
+The run dies afterwards on `std::vector larger than max_size()` inside the
+example's own sizing code at `datasize=131072`, which is a harness bug
+unrelated to the transport.
+
+## Graph capture is a real risk, and it is the vendor's
+
+`aclgraph_demo` fails on this machine: `sync stream failed` with outputs
+stuck at zero across every size, `retCode=0x91` in the plog. That is the
+vendor's own demonstration of symmetric memory inside an ACL graph, not our
+code, so capture compatibility is now a named open risk rather than a
+hypothesis — and the production decode path is entirely graph-captured.
+
+`notifywait` remains to be read: it is the local flag spin that replaces a
+barrier.
