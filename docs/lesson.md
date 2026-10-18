@@ -401,3 +401,16 @@
   back fresh lists of immutable ints, so no host test could have caught the
   aliasing above. Model the awkward part of the real contract — reused storage
   — and verify the new case fails on the unfixed binary before trusting it.
+- A flat curve across every tuning knob means you are not measuring the thing
+  you are tuning. Twelve TileLang tilings all landed at 190–198 GB/s and I
+  concluded the kernel was slow; the flatness was the Cython adapter's ~130 µs
+  per-call dispatch floor. In an ACL graph the same kernel runs at 1141–1203
+  GB/s, 96–101% of the die's peak. Time a hand-written kernel the way
+  production will call it, and report the dispatch floor separately.
+  [Stack selection](evidence/ascend-decode/stack-selection-20261018/README.md)
+- Count the budget before choosing a mechanism. 157 reductions per round at
+  63.5 µs each is 9.97 ms, and a 2 ms/token round may only cost 6.87 ms, so no
+  amount of fusing or overlapping reaches the target — the number of
+  collectives has to fall. That turns EP (−78 reductions) and MTP replication
+  (−9) from optimisations into prerequisites, and it is an argument no profile
+  of the current round would have produced.
