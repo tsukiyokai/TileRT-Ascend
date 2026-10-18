@@ -36,7 +36,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 | 改动 | 配对收益 | 口径 |
 |---|---|---|
-| width 8（`max_num_seqs` 一个字面量） | 14.485 → 13.338 ms（复测 12.894） | 16 卡、1024 token、五跑逐位相同 |
+| width 8（`max_num_seqs` 一个字面量） | **撤回**：本树三请求三条不同轨迹（轮数 220/236/238），TPOT 与接受数混在一起 | 归因于未安装的 `gmm1-swiglu-barrier.patch`，见[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md) |
 | metadata 与 mc2 掩码提升 | −0.7967 ms/token（−5.001%） | 下发 313→91，191712 项检查零失败 |
 | 专家声明压缩（w4a8） | 2.39 ms/轮（保守 1.97） | 真 checkpoint 逐位门过，prefill 五形状 ND 全不劣 |
 | GMM 三份 kernel 补丁 | 8.5 µs/次 × 78 ≈ 0.66 ms/轮 | p=1.8e-12，输出逐位相同 |

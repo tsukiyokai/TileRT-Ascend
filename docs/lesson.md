@@ -933,3 +933,16 @@
   accidentally looked like it closed the megakernel. Ask what the ratio is,
   not only which way it points.
   [Vector-only](evidence/ascend-decode/vector-only-20261019/README.md)
+- Check determinism in the session that licenses the number, not once in
+  another session. Width 8 was reported bit-identical across five runs by one
+  investigation and gave three different token streams across three requests
+  in mine, and both are true because the cause is a race. A median TPOT over
+  requests whose round counts differ by eight percent is not a speed
+  measurement.
+- A patch sitting in the repository is not a patch that is installed. The
+  vendor kernel running in production was the original object, with the
+  epilogue race this project had already found, measured and written a
+  one-line fix for -- and that fix is why the width-8 trajectory diverges.
+  Before attributing a behavioural difference to your change, check which
+  binary is actually loaded.
+  [Width 8](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
