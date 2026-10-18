@@ -414,3 +414,11 @@
   collectives has to fall. That turns EP (−78 reductions) and MTP replication
   (−9) from optimisations into prerequisites, and it is an argument no profile
   of the current round would have produced.
+- A difference measured on a broken build does not survive the fix. Batching
+  rounds per broadcast looked worth 0.88 ms/token while acceptance was
+  collapsed and the request ran 492 rounds; with proposals correct at 298
+  rounds it is neutral at chunk 8 and 14.6% worse per round at chunk 32. The
+  per-round Gloo broadcast was never the cost — the `tolist` synchronisations
+  were. When a bug and a feature are measured together, re-measure the feature
+  alone before keeping its number.
+  [Aliasing](evidence/ascend-decode/devtok-aliasing-20261018/README.md)

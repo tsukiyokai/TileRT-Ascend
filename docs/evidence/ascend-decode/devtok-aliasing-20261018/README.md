@@ -53,13 +53,38 @@ Polarity checked both ways on the same binary: with the clone removed the
 case fails 2 subtests; with it restored, 10/10 pass. A test that only passes
 is not evidence it would have caught anything.
 
-## A measurement that survives the bug
+## The fixed build, and a retraction
 
-All three cases carry the same acceptance regression, so the differences
-between them isolate one variable — the per-round command broadcast. Batching
-32 rounds per command is 0.88 ms/token faster than one round per command
-(23.622 against 24.504). At 1023 tokens over 492 rounds that is about
-1.83 ms per round removed by dropping 31 of every 32 broadcasts, so **the
-per-round host command costs roughly 1.9 ms of the round**. The gap measured
-*between* commands is only 0.017 ms median, which is consistent: the
-broadcast is inside the operation's wall, not between operations.
+With the clone restored, every gate holds and the change is a win:
+
+| case | TPOT median (ms) | three runs | rounds | A | tokens vs reference |
+|---|---|---|---|---|---|
+| reference | 14.540 | — | 298 | 3.4329 | — |
+| chunk 1 | **14.247** | 14.442 / 14.247 / 14.190 | 298 | 3.4329 | identical |
+| chunk 8 | 14.255 | 14.115 / 14.385 / 14.255 | 298 | 3.4329 | identical |
+| chunk 32 | 14.624 | 14.602 / 14.645 / 14.624 | 298 | 3.4329 | identical |
+
+Removing three of the round's four host synchronisations is worth
+**0.293 ms per token**, with rounds, acceptance and output all unchanged.
+
+Batching rounds per command is dead, and the earlier claim derived from it is
+withdrawn. On the fixed build chunk 8 matches chunk 1 and chunk 32 is 0.38 ms
+worse. The arithmetic is worse than it looks: `tpot_ms` is
+`(last − first) / intervals`, and batching delays the first delivery to the
+end of the first batch, so chunk 32's span covers rounds 33–298 (266 rounds)
+against chunk 1's 2–298 (297). Equal per-round cost would put its span at
+0.896 × 14575 ≈ 13.06 s; it measured 14.96 s. Per round that is 56.24 ms
+against 49.07, a **14.6% regression**, and all three cases do identical work
+— 298 rounds, 298 `round_calls`, 1024 tokens.
+
+So the earlier "the per-round host command costs roughly 1.9 ms" is retracted:
+it came from the buggy build, where acceptance had collapsed to 2.079 and the
+request needed 492 rounds, and it does not reproduce once the proposals are
+correct. The per-round Gloo broadcast is cheap; what was expensive were the
+`tolist` synchronisations, which is why removing those paid and removing the
+broadcast does not. `rounds_per_command` stays at its default of 1.
+
+This also agrees with the independent audit, which attributes the round's host
+serialisation to `aclrtSynchronizeStream` (24.255 ms over 15 calls) and
+`tolist`, not to the broadcast
+([audit](../stack-selection-20261018/README.md)).
