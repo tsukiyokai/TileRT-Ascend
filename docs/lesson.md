@@ -490,3 +490,11 @@
   rides free", which is what makes a one-shot push attack all of it rather
   than part.
   [Reduction floor](evidence/ascend-decode/reduce-floor-20261018/README.md)
+- Locate a cost by what it does not depend on. The TP16 reduction turned out
+  independent of message size, of rank count and of peer identity, and two
+  ranks exchanging 64 bytes already cost 45.98 us; torch's cross-die copy is
+  160 us at every size and does not pipeline. Three vendor paths sharing a
+  per-operation floor that depends on nothing names the cost as a scheduled
+  synchronisation stage, which is the thing a one-shot push removes -- not the
+  rounds of transfer, which were already free.
+  [Locating](evidence/ascend-decode/rendezvous-locate-20261018/README.md)
