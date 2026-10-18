@@ -158,10 +158,30 @@ Peak allocated/reserved memory is 1,606,456,832/2,061,500,416 bytes/die.
 CPU contracts pass 15/15 and 163/163 checks plus six CLI cases. Two old
 cache-checker assertions now follow the established cross-width diagnostic
 policy; production comparisons are unchanged. Nonfinite cache values and
-same-configuration reset mutations still fail. The next measurement is
-the matched two-chain stage, followed by complete target/session validation.
+same-configuration reset mutations still fail. Complete target/session
+validation remains pending.
 Artifacts stay in
 `/home/shanshan/trt-asc/offline/cann-mtp-chain-product-20261018-01/`.
+
+The [paired stage measurement](mtp-chain-timing-audit.json) covers two
+dependent chain calls, including live recycle feedback and both token
+reads. Each sample restores the same prefix and runs its eager seed
+outside the timing window. Thirty AB/BA pairs first take the maximum
+of sixteen rank times, then compute paired statistics.
+
+| Two-chain wall time | p50 (ms) | p95 (ms) |
+|---|---|---|
+| Eager | 29.51294 | 29.71705 |
+| Graph | 28.88505 | 30.92198 |
+
+Paired savings have median 0.468161 ms, p10/p90 −2.51656/+2.97847 ms;
+Graph wins 19/30 pairs and has a worse tail. This shared-device result
+does not establish a stable gain. All 960 samples match the frozen eager
+C2 outputs (162,448,320 elements) and three new KV rows (2,027,520 elements)
+bit for bit. Seed equality and prefix preservation are driver checks.
+This stage excludes target verification, conditioned MTP and delivery;
+it is not TPOT. Raw data stay in
+`/home/shanshan/trt-asc/offline/cann-mtp-chain-bench-20261018-01/`.
 
 ## Reference scope
 

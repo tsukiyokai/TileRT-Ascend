@@ -127,9 +127,11 @@
   [GMM1 screen](evidence/ascend-decode/gmm1-tiling-20261018/README.md)
 - Preserve pairs when summarizing an AB/BA comparison. Independent
   resident-layer graph p50 values differ by 144.38 µs, but the 30 paired
-  differences have median 50.25 µs and compiled wins 20 pairs. Confirm
-  separate graph pools and outputs before interpreting the measurements.
+  differences have median 50.25 µs. The MTP chain graph saves a paired
+  median 0.468 ms but wins only 19/30 pairs and worsens p95; that does not
+  establish a stable gain. Confirm graph pools, outputs and timing scope.
   [Compiled-layer timing](evidence/ascend-decode/execution-gap-20261018/compiled-resident-timing-audit.json)
+  · [MTP chain timing](evidence/ascend-decode/layer-major-20261018/mtp-chain-timing-audit.json)
 - Split collective waiting from transport before attributing a graph span.
   One shared-layer sample spends 3.657 ms waiting inside O AllReduce, with
   7.62 µs exported transit; another shifts time into Prolog. Three replays
