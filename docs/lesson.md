@@ -572,3 +572,17 @@
   per-consumer allowance. Stacking a 190 KiB staging area and then addressing
   a reduction buffer at a 192 KiB offset put it out of bounds, and the stores
   failed silently rather than faulting.
+- Read the vendor's own demo before inventing a protocol. Mine was inverted
+  from examples/allgather in three ways at once -- flags at the tail instead
+  of the head and indexed per rank instead of per core, the producer pushing
+  to all peers instead of to itself, and the consumer blocking in
+  signal_wait_until instead of polling peers with int32_get_nbi and moving on.
+  The third is what cann/shmem PR 897 names as the source of 507015. Adopting
+  the demo's structure removed the deadlock outright.
+  [TP push](evidence/ascend-decode/tp-push-20261018/README.md)
+- A project's issue tracker is primary evidence. cann/shmem PR 913 and PR 897
+  describe, in their own words, the 64-byte signal slot that stops adjacent
+  ranks sharing a cache line, the inter-core sync before a receive wait, the
+  timeout that an untimed wait needs, and the SDMA precheck whose absence
+  prints aclError=507015 -- the exact error we had. Searching the repository
+  cost two minutes and replaced an evening of guessing.

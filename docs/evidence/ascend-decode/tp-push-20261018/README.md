@@ -135,6 +135,52 @@ writes is not the plane the host reads. That is a plain indexing error in my
 code and needs a rewrite rather than another single-line guess; stopping here
 rather than iterating blind.
 
+## Reading the official demo fixed the deadlock
+
+The protocol I had written was inverted from the SDK's, and
+`examples/allgather/allgather_kernel.cpp` shows it in three places.
+
+The window's head is the flag region and the payload follows it —
+`gva_sync_gm = (int32_t*)gva`, `gva_data_gm = (int32_t*)gva + aivNum *
+SYNC_FLAG_INTERVAL` — and the flags are indexed per core, sixteen int32 apart,
+not per rank. I had data first, flags last, one slot per rank 32 bytes apart.
+
+The producer pushes to **itself**: `aclshmemx_mte_put_nbi(..., my_rank, ...)`
+moves local GM into its own symmetric window and then
+`aclshmemx_signal_op(..., my_rank)` raises its own flag. I had every rank
+pushing into all fifteen peers.
+
+And the consumer never blocks. It pulls the peer's flag into UB with
+`aclshmem_int32_get_nbi(flags_ub2[g], gva_sync_gm + g * SYNC_FLAG_INTERVAL,
+1, x)`, tests it, and `continue`s to the next group if it is not ready —
+a non-blocking poll over all groups. I used `aclshmem_signal_wait_until`,
+which is an untimed spin on one slot, and that is exactly what cann/shmem
+PR 897 attributes `aclError=507015` to.
+
+Rewritten to that structure — flags at the head, publish to self, poll peers
+with `int32_get_nbi` — **the deadlock is gone**: the push half completes in
+**1.814 µs** at two PEs where it previously hung at every size down to 64
+elements.
+
+Also applied from upstream before that, and worth keeping: PR 913 widens the
+READY slot so adjacent ranks' flags do not share a cache line, adds an
+inter-core sync before the receive wait, and puts a timeout on the wait; PR 897
+checks `aclshmemx_set_qp_num`'s return and the SDMA QP count against the
+device's vector-core count before launching.
+
+## Still open: producer and consumer in one kernel
+
+The full path still hangs while the halves pass separately — push 1.814 µs,
+reduction 0.869 µs with `untouched 0`, both correct. So the remaining fault is
+in how the two cooperate inside one kernel. `allgather` splits the cores into
+two disjoint groups, `core_group_num = aivNum / 2`, with the first half
+staging into symmetric memory and the second half reading peers; my version
+gives core 0 to the producer and the rest to consumers, which is not the same
+partition and leaves one producer core feeding fifteen consumers across
+sixteen peers. Aligning fully with the two-group structure is the next step,
+and it wants doing properly rather than by another single-line edit — four
+such edits tonight produced no information.
+
 ## Where this leaves the argument
 
 Nothing here contradicts the case for the one-sided route, and one thing

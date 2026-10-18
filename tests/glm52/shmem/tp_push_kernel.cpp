@@ -1,16 +1,15 @@
 /**
- * One-shot push plus ordered local reduction for the TP16 decode reduction.
+ * One-sided TP reduction, built on the structure the SDK's allgather uses.
  *
- * Each rank publishes its own [rows, hidden] float partial into its slot on
- * every peer, announces it with one signal, then waits on its own slots and
- * sums them in rank order. The only synchronisation is a local spin on local
- * flags: no barrier and no collective. The fixed order makes the result
- * bit-reproducible, which the trajectory gate needs.
+ * Each rank writes its own partial into its own symmetric window and raises
+ * its own flag; consumers then pull each peer's flag into UB with a
+ * non-blocking get and read that peer's data once the flag says it is there.
+ * Nothing blocks on a remote condition, which is what an untimed
+ * `aclshmem_signal_wait_until` does and what earned aicore 507015 here.
  *
- * Two planes alternate so a round's push cannot overwrite data the previous
- * round is still reducing. The plane and the signal value both come from an
- * absolute round index the host supplies, so successive launches continue the
- * sequence instead of restarting it.
+ * The reduction sums the partials in rank order, so the result is
+ * bit-reproducible — the trajectory gate needs that, and EP16 failed it
+ * precisely by changing a summation's association.
  */
 #include "tp_push_kernel.h"
 #include "kernel_operator.h"
@@ -19,18 +18,19 @@
 
 using namespace AscendC;
 
+// The window's head is the flag region and the payload follows, as in
+// examples/allgather. Slots are spaced 16 int32 apart so no two share a cache
+// line; cann/shmem PR 913 widened combine's for the same reason.
+constexpr int64_t SIGNAL_SLOT_INT32 = 16;
 constexpr int64_t ALIGN_BYTES = 32;
-constexpr int64_t SLOT_INT32 = ALIGN_BYTES / static_cast<int64_t>(sizeof(int32_t));
 constexpr int64_t PLANES = 2;
-// A3 has 192 KiB of UB in total, so the put's staging area and the
-// reduction's two buffers have to be carved out of that one budget rather
-// than stacked: placing the reduction at a 192 KiB offset put it out of
-// bounds entirely and its stores silently did nothing.
-constexpr int64_t UB_TOTAL_BYTES = 192 * 1024;
+
+// A3 has 192 KiB of UB in total, shared by every consumer in the kernel.
+constexpr int64_t FLAG_UB_BASE = 32;
+constexpr int64_t STAGE_UB_BASE = 1024;
+constexpr int64_t STAGE_UB_BYTES = 96 * 1024;
+constexpr int64_t REDUCE_UB_BASE = 112 * 1024;
 constexpr int64_t REDUCE_UB_SPAN = 32 * 1024;
-constexpr int64_t REDUCE_UB_BASE = 1024;
-constexpr int64_t UB_STAGE_BASE = REDUCE_UB_BASE + PLANES * REDUCE_UB_SPAN;
-constexpr int64_t UB_STAGE_BYTES = UB_TOTAL_BYTES - UB_STAGE_BASE - 1024;
 
 ACLSHMEM_DEVICE int64_t AlignUp(int64_t value, int64_t alignment)
 {
@@ -38,8 +38,8 @@ ACLSHMEM_DEVICE int64_t AlignUp(int64_t value, int64_t alignment)
 }
 
 struct TpPushLayout {
+    __gm__ int32_t* flags;
     __gm__ float* data;
-    __gm__ int32_t* status;
     int64_t stride;
     int64_t elements;
 };
@@ -49,32 +49,48 @@ ACLSHMEM_DEVICE TpPushLayout TpPushPlane(__gm__ uint8_t* window, int rows, int h
     TpPushLayout layout;
     layout.elements = static_cast<int64_t>(rows) * hidden;
     layout.stride = AlignUp(layout.elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    const int64_t data_floats = PLANES * pe_size * layout.stride;
-    layout.data = (__gm__ float*)window + plane * pe_size * layout.stride;
-    layout.status = (__gm__ int32_t*)((__gm__ float*)window + data_floats) + plane * pe_size * SLOT_INT32;
+    const int64_t flag_int32 = PLANES * pe_size * SIGNAL_SLOT_INT32;
+    layout.flags = (__gm__ int32_t*)window + plane * pe_size * SIGNAL_SLOT_INT32;
+    layout.data = (__gm__ float*)((__gm__ int32_t*)window + flag_int32) + plane * pe_size * layout.stride;
     return layout;
 }
 
-/** Publish our partial to every peer's slot for us, then announce it. */
-ACLSHMEM_DEVICE void TpPushPublish(const TpPushLayout& layout, __gm__ float* partial, int64_t core, int64_t my_pe,
-                                   int64_t pe_size, int32_t ticket)
+/** Write our partial into our own slot, then raise our own flag. */
+ACLSHMEM_DEVICE void TpPushPublish(const TpPushLayout& layout, __gm__ float* partial, int64_t my_pe, int32_t ticket)
 {
-    if (core >= pe_size) {
-        return;
-    }
-    // Rotating the start spreads the first writes over distinct links.
-    const int64_t peer = (my_pe + core) % pe_size;
-    __ubuf__ float* ub = (__ubuf__ float*)(UB_STAGE_BASE);
-    aclshmemx_mte_put_nbi(layout.data + my_pe * layout.stride, partial, ub, UB_STAGE_BYTES, layout.elements, peer,
+    __ubuf__ float* stage = (__ubuf__ float*)(STAGE_UB_BASE);
+    aclshmemx_mte_put_nbi(layout.data + my_pe * layout.stride, partial, stage, STAGE_UB_BYTES, layout.elements, my_pe,
                           EVENT_ID0);
-    aclshmemx_mte_quiet();
-    aclshmemx_signal_op(layout.status + my_pe * SLOT_INT32, ticket, ACLSHMEM_SIGNAL_SET, peer);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    aclshmemx_signal_op(layout.flags + my_pe * SIGNAL_SLOT_INT32, ticket, ACLSHMEM_SIGNAL_SET, my_pe);
 }
 
-/** Sum every rank's slot in rank order over this core's stripe. */
-ACLSHMEM_DEVICE void TpPushReduce(const TpPushLayout& layout, __gm__ float* out, int64_t core, int64_t cores,
-                                  int64_t pe_size)
+/**
+ * Poll every peer's flag without blocking on any one of them, then sum this
+ * core's stripe in rank order once all of them have been observed.
+ */
+ACLSHMEM_DEVICE void TpPushConsume(const TpPushLayout& layout, __gm__ float* out, int64_t core, int64_t cores,
+                                   int64_t pe_size, int32_t ticket)
 {
+    __ubuf__ int32_t* seen = (__ubuf__ int32_t*)(FLAG_UB_BASE);
+    for (int64_t pe = 0; pe < pe_size; ++pe) {
+        seen[pe * 8] = 0;
+    }
+    int64_t ready = 0;
+    while (ready < pe_size) {
+        for (int64_t pe = 0; pe < pe_size; ++pe) {
+            if (seen[pe * 8] == ticket) {
+                continue;
+            }
+            aclshmem_int32_get_nbi(seen + pe * 8, layout.flags + pe * SIGNAL_SLOT_INT32, 1, pe);
+            PipeBarrier<PIPE_ALL>();
+            if (seen[pe * 8] == ticket) {
+                ++ready;
+            }
+        }
+    }
+
     const int64_t stripe = (layout.elements + cores - 1) / cores;
     const int64_t begin = core * stripe;
     if (begin >= layout.elements) {
@@ -119,30 +135,21 @@ ACLSHMEM_DEVICE void TpPushReduce(const TpPushLayout& layout, __gm__ float* out,
 ACLSHMEM_DEVICE void tp_push_once(
     __gm__ float* partial, __gm__ float* out, __gm__ uint8_t* window, int rows, int hidden, int64_t round, int stage)
 {
-    // A MIX kernel body runs on both core types, and the vector side has
-    // GetSubBlockNum() blocks per cube block. Using GetBlockNum() alone made
-    // cube and vector duplicate stripes 0..3 while vector blocks 4..7 fell off
-    // the end, so the cube side -- which has no vector units -- overwrote the
-    // output with rubbish. The reduction belongs to the vector cores only.
     const int64_t core = GetBlockIdx();
     const int64_t cores = GetBlockNum() * GetSubBlockNum();
     const int64_t my_pe = aclshmem_my_pe();
     const int64_t pe_size = aclshmem_n_pes();
     const TpPushLayout layout = TpPushPlane(window, rows, hidden, pe_size, round % PLANES);
-    // One ticket per plane visit, so a stale signal from two rounds back can
-    // never satisfy this round's wait.
     const int32_t ticket = static_cast<int32_t>(round / PLANES) + 1;
 
-    if (stage != 2) {
-        TpPushPublish(layout, partial, core, my_pe, pe_size, ticket);
-        for (int64_t pe = 0; pe < pe_size; ++pe) {
-            aclshmem_signal_wait_until(layout.status + pe * SLOT_INT32, ACLSHMEM_CMP_EQ, ticket);
+    // Producer and consumer cores are disjoint, as in examples/allgather, so
+    // no core waits on work it owes itself.
+    if (core == 0) {
+        if (stage != 2) {
+            TpPushPublish(layout, partial, my_pe, ticket);
         }
-    }
-    if (stage != 1) {
-        if ASCEND_IS_AIV {
-            TpPushReduce(layout, out, core, cores, pe_size);
-        }
+    } else if (stage != 1) {
+        TpPushConsume(layout, out, core - 1, cores - 1, pe_size, ticket);
     }
 }
 
@@ -151,6 +158,11 @@ extern "C" __global__ __aicore__ void tp_push_kernel(
     int rounds, int round_base, int stage)
 {
     util_set_ffts_config(fftsAddr);
+    // A MIX body runs on both core types and the cube side has no vector
+    // units, so its stores would corrupt the output.
+    if ASCEND_IS_AIC {
+        return;
+    }
     for (int round = 0; round < rounds; ++round) {
         tp_push_once(partial, out, window, rows, hidden, static_cast<int64_t>(round_base) + round, stage);
     }

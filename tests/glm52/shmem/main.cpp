@@ -19,9 +19,11 @@
 
 namespace {
 
-constexpr int64_t ALIGN_BYTES = 32;
-constexpr int64_t SLOT_INT32 = ALIGN_BYTES / static_cast<int64_t>(sizeof(int32_t));
 constexpr uint64_t HEAP_BYTES = 1024UL * 1024UL * 1024UL;
+constexpr int64_t ALIGN_BYTES = 32;
+// Must match the kernel: flags occupy the window's head, 16 int32 apart so no
+// two ranks share a cache line, and the payload follows them.
+constexpr int64_t SIGNAL_SLOT_INT32 = 16;
 constexpr int64_t PLANES = 2;
 
 int64_t AlignUp(int64_t value, int64_t alignment)
@@ -58,10 +60,8 @@ int main(int argc, char* argv[])
 
     const int64_t elements = static_cast<int64_t>(rows) * hidden;
     const int64_t stride = AlignUp(elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    // Two planes of data and two of status, alternating by round. The kernel
-    // derives both from the absolute round index the host passes.
-    const size_t window_bytes =
-        PLANES * pe_size * stride * sizeof(float) + PLANES * pe_size * SLOT_INT32 * sizeof(int32_t);
+    const size_t flag_bytes = PLANES * pe_size * SIGNAL_SLOT_INT32 * sizeof(int32_t);
+    const size_t window_bytes = flag_bytes + PLANES * pe_size * stride * sizeof(float);
     void* window = aclshmem_malloc(window_bytes);
     if (window == nullptr) {
         std::printf("pe %d: aclshmem_malloc failed\n", pe_id);
@@ -90,6 +90,12 @@ int main(int argc, char* argv[])
     // get, so the launch is sized for the reduction and the push uses the
     // first pe_size cores of it.
     const uint32_t blocks = (argc > 9) ? static_cast<uint32_t>(std::atoi(argv[9])) : 48U;
+
+    // Every rank's window must be zeroed and visible before any rank makes a
+    // remotely visible write, or a receiver can spin on a slot whose peer has
+    // not finished initialising it -- which is how an untimed device spin
+    // earns aicore 507015 under contention.
+    aclshmem_barrier_all();
 
     // Signal values continue across both launches, so neither needs a reset.
     tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, rows, hidden, warmup, 0, stage);
