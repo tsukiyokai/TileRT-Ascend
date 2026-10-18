@@ -315,3 +315,10 @@
   cases run 307 and 298 rounds at different acceptance over different expert
   sets. Compare kernels with kernels.
   [Retraction](evidence/ascend-decode/five-flag-profile-20261018/README.md#gather_fia-works-and-an-earlier-objection-to-it-was-wrong)
+- A negative result expires when the configuration around it changes. AIV
+  reduction measured 5.05% worse than AI_CPU under the default configuration
+  and was set aside; under the composed set it is 0.463 ms better, 15.978
+  against 16.441 ms, with identical trajectories. The difference is one
+  environment variable. Re-test rejected settings after the surrounding
+  configuration moves.
+  [Expansion mode](evidence/ascend-decode/expansion-20261018/README.md)
