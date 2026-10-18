@@ -73,7 +73,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ---
 --- a/vllm_ascend/quantization/methods/w4a8/w4a8.py
 +++ b/vllm_ascend/quantization/methods/w4a8/w4a8.py
-@@ -115,6 +115,56 @@
+@@ -115,6 +115,59 @@
      )
  
  
@@ -82,6 +82,9 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 +# declares, not for the ones the group list activates. Setting this False
 +# restores the previous behaviour; see _compact_expert_declaration.
 +_COMPACT_EXPERT_DECLARATION = True
++# ACL's ND format code. vllm_ascend names only ACL_FORMAT_FRACTAL_NZ, so this
++# one is spelled out rather than imported.
++_ACL_FORMAT_ND = 2
 +
 +
 +def _compact_expert_declaration(layer, weight, scale, bias, group_list, active):
@@ -107,7 +110,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 +    """
 +    if not _COMPACT_EXPERT_DECLARATION or active >= group_list.shape[0]:
 +        return weight, scale, bias, group_list
-+    if any(torch_npu.get_npu_format(tensor) != ACL_FORMAT_ND
++    if any(torch_npu.get_npu_format(tensor) != _ACL_FORMAT_ND
 +           for tensor in weight):
 +        return weight, scale, bias, group_list
 +    index = torch.sort(torch.topk(group_list, active).indices).values
@@ -130,7 +133,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  @register_scheme("W4A8_DYNAMIC", "moe")
  class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
      """FusedMoE method for Ascend W4A8_DYNAMIC.
-@@ -376,7 +426,11 @@
+@@ -376,7 +429,11 @@
          else:
              self.process_weights_after_loading_modelslim(layer)
          layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
@@ -143,7 +146,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
          tensor_names = (
              "w13_weight",
              "w2_weight",
-@@ -637,9 +691,14 @@
+@@ -637,9 +694,14 @@
          return torch_npu.npu_dynamic_quant(hidden_states, dst_type=torch.int8)
  
      def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):

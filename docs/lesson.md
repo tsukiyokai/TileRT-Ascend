@@ -866,3 +866,13 @@
   sixteen-rank measurement failed on free-memory checks because an agent's job
   started inside the window between my settle check and init_device. The
   machine has no lock; the discipline has to be mine.
+- `ast.parse` passing excludes syntax errors and nothing else. A patch
+  referenced a name that does not exist anywhere in the target tree, and
+  "applies cleanly and parses" read as evidence it would run; the branch that
+  would have raised was the guard taken on the production configuration's
+  first decode. Resolve every Name against its bindings before handing a patch
+  over.
+- A test that supplies what the code under test forgot to import is worse than
+  no test. The harness locally defined the missing constant, so it validated
+  the logic and converted a crash into a pass. When a check runs the code in a
+  namespace it will not have in production, it is checking something else.

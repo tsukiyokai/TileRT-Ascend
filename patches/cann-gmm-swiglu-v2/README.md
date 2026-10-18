@@ -152,6 +152,24 @@ in a graph: 16.439 µs allocating against 16.477 resident, a difference inside
 the noise, because graph allocation is decided at capture and replay never
 reaches the allocator. It still matters on the eager path.
 
+### A NameError that `ast.parse` could not see, and a test that hid it
+
+The first version of this patch referenced `ACL_FORMAT_ND`, a name that does
+not exist anywhere in `vllm_ascend` — the tree defines only
+`ACL_FORMAT_FRACTAL_NZ`. `ast.parse` passing says nothing about unbound names,
+so "applies cleanly and parses" was not evidence the patch could run, and the
+branch that would have raised is the guard returning the weight unchanged when
+it is not ND: the first decode under the NZ production configuration.
+
+It survived its own test because `helper_check.py` locally defined
+`ACL_FORMAT_ND = 2`. The harness supplied the binding the patch was missing,
+validating the logic while masking the error. **A test that provides what the
+code under test forgot to import converts a crash into a pass.**
+
+Fixed by spelling it out as a module constant with the reason, and the check
+upgraded from "it parses" to resolving every `Name` node against local
+bindings, module-level definitions, imports and builtins.
+
 ### Open before landing
 
 `maybe_trans_nz` on `w2` may be the right choice at prefill shapes; ND was
