@@ -54,18 +54,36 @@ A3 gives 24 cube and 48 vector cores per die. The partition is static for the
 kernel's life, because a flag protocol between roles that change is a protocol
 nobody can reason about.
 
-The decisive measurement for batch one: a four-row projection is 12.58 M
-weight elements, and one `Axpy` covers 128 of them for one row, so four rows
-cost 8,192 instructions per core across 48 cores — about 4.6 µs — against
-15.6 µs to read 24 MiB at the die's marginal 1540 GB/s. **The vector unit is
-not the constraint at decode's row count, and the cube is not what this shape
-needs.** That is also why the vendor's W4A8 pipeline wastes 5.6×: it splits
-the activation into two int4 halves and passes them through global memory so
-the cube has operands it can accept, for rows that never needed the cube.
+**The cube is mandatory, and an earlier version of this document said
+otherwise on a bad count.** `dav-c220-vec` has no int4 and no int8 multiply —
+`Intrinsic_vmul` takes float16, float32, int32 and int16 — so every quantised
+weight must be widened and sign-restored before it can be multiplied, which
+costs 8.13 vector element-ops per W4 weight against a budget of 3.69 at
+1540 GB/s. I had counted four instructions per 128 weights by silently
+assuming fp16 weights, and fp16 weights cost two to four times the bytes that
+are the whole point.
 
-So: vector cores stream weights and accumulate; a reserved subset owns remote
-writes; the cube is unused at batch one and available for the attention
-block's genuinely cube-shaped work.
+This is settled by measurement rather than estimate. The repository's TileLang
+W4A8 GEMV, now verified bit-exact against a CPU reference on device over 18
+cases, runs `(256, 6144)` at 31.398 µs — 25.05 GB/s, 1.63% of what the die
+delivers. One layer's batch-one expert work is 453.05 µs against the vendor
+operator's 116.2, **3.90× slower**, and every identified headroom together
+(waking all 48 cores rather than 16, a wider `block_k`, fewer output pairs)
+lands at parity, not a win. Per core the kernel reaches 16.3% of nominal
+throughput because each vector instruction takes about 23 cycles where its ALU
+work is 4.3 ns, and the weight load is capped by DMA granularity — 256-byte
+segments at stride 6144 — at 71 GB/s, which is 4.6% of the die and not a
+bandwidth limit at all.
+
+The premise behind the bad count was also wrong in a way worth keeping:
+routed decode has a reuse factor of exactly 1 at batch one, since top-8 over
+256 experts gives each active expert a single row. There is no MAC
+amplification to exploit and no reuse to cache.
+
+So: the cube does the products, the vector cores do normalisation,
+quantisation, the SwiGLU epilogue and the ordered reduction, and a reserved
+subset of them owns remote writes. The MIX structure stands.
+[decomposition](evidence/ascend-decode/gmm-fastpath-20261019/README.md)
 
 ### 2. On-chip budget, decided once
 
@@ -125,6 +143,12 @@ what makes the fusion boundary a layer rather than an operator — a tile read
 once must feed the projection, its push, and its reduction before it is
 evicted.
 
+One caution against over-reading this. **At batch one the expert GMM is not
+weight-bound**: crossing L2 costs it 3.36 µs of a 98 µs call, while 40% goes
+to scanning 248 empty `group_list` slots and 23% to the kernel launch floor.
+The weight stream is the floor for a *perfect* kernel, not the cost of the
+present one, and the two must not be confused when ranking work.
+
 ### 5. Then the arithmetic
 
 Normalisation, quantisation, projection, push, ordered reduction, residual,
@@ -134,16 +158,20 @@ anything above.
 ## The first measurable brick
 
 `tests/glm52/shmem/fused_proj_reduce_kernel.cpp` compiles with a NZ-weight
-`Matmul<>` and a per-tile `aclshmemx_mte_put_nbi` in one
-`KERNEL_TYPE_MIX_AIC_1_2` body, which established that the two can share a
-kernel. By the analysis above it is the wrong design — it uses the cube for a
-shape that does not need one — and
-`tests/glm52/shmem/vector_proj_kernel.cpp` replaces it with an `Axpy`-based
-vector-only projection whose weight load is one strided `DataCopy` per tile.
+`Matmul<>` and a per-tile push in one `KERNEL_TYPE_MIX_AIC_1_2` body, which
+established that the two can share a kernel. After the correction above it is
+the right shape: the cube does the product because nothing else can.
+`tests/glm52/shmem/vector_proj_kernel.cpp` is kept as the record of the
+refuted alternative.
 
-Neither has a number yet. The gate for either is ≥1.3× against the operators
-it replaces, at the real shapes, with bank rotation to defeat L2, and with a
-payload that varies per round so the check can see a stale buffer.
+It has no number yet. The gate is ≥1.3× against the operators it replaces, at
+the real shapes, with bank rotation to defeat L2, and with a payload that
+varies per round so the check can see a stale buffer.
+
+And one discipline the GMM work made non-negotiable: **measure inside a
+captured graph, never eager**. That operator is host-bound in eager mode and
+an event pair around it reads the host — 109.90 µs of enqueue against a
+113.04 µs reading — which silently inverted one conclusion already.
 
 ## What this document must not become
 

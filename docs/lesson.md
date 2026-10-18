@@ -737,3 +737,16 @@
   same plane on consecutive rounds with one sync between -- a race the constant
   payload could never show.
   [Audit](evidence/ascend-decode/onesided-audit-20261018/README.md)
+- An instruction count is only as good as the data type it assumed. I argued
+  the cube was unnecessary at batch one from four Axpy instructions per 128
+  weights, having silently assumed fp16 weights -- and fp16 weights cost two
+  to four times the bytes that are the entire point. The vector unit has no
+  int4 and no int8 multiply, so every quantised weight must be widened and
+  sign-restored first: 8.13 element-ops against a 3.69 budget, measured at
+  3.90 times slower than the vendor operator.
+- The floor for a perfect kernel is not the cost of the present one. At batch
+  one the expert GMM spends 3.4 microseconds of a hundred on crossing L2,
+  while 40% goes to scanning empty routing slots and 23% to the launch floor.
+  Ranking work by the perfect kernel's bottleneck put weight bandwidth first
+  when the real item was a dense table nobody needed to read.
+  [GMM decomposition](evidence/ascend-decode/gmm-fastpath-20261019/README.md)

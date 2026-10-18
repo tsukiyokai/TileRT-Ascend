@@ -1,0 +1,119 @@
+# What the expert GMM actually spends its microseconds on
+
+Measured on a3-84, device 7, one binary per arm selected by an input bit that
+is arithmetically inert, paired arms interleaved A,B,B,A in one process, in a
+captured graph rather than eager, with six weight banks rotated so each batch
+of 32 calls touches 202.1 MB of distinct addresses against the die's 192 MiB
+L2. Shape is the TP16 `gate_up`: K=6144, N=256, M=8 — batch one's top-8 gives
+each active expert exactly one row.
+
+## The measurement had to move into a graph first
+
+In eager mode **this operator is host-bound and an event pair measures the
+host**. The host enqueue floor is 109.90 µs per call against an event-pair
+reading of 113.04; inside a replayed graph the host drops to 0.66–1.48 µs and
+the device time appears at 98.47. One of this investigation's own earlier
+conclusions — that the cost is independent of table length — was an artefact
+of that and is withdrawn; re-measured in a graph the slope is 0.182 µs/slot
+rather than 0.037.
+
+## The call, decomposed
+
+| item | µs | share |
+|---|---|---|
+| **scanning 248 empty `group_list` slots** | **39.9** | **40%** |
+| kernel launch floor | ~23 | 23% |
+| cube matmul | ~12 | 12% |
+| mandatory mixed barriers | 4.6 | 5% |
+| removable barrier pair | 3.5 | 4% |
+| vector tail | 5.9 | 6% |
+| weight stream's HBM increment | 3.4 | 3% |
+| MSD activation split | 0.1 | 0.1% |
+
+Two independent routes agree: ablation puts the floor of launch plus table
+scan plus the two kept barriers at 67.05–69.88 µs over six runs, which after
+subtracting 4.6 leaves 64.2, while the table-length difference gives
+256 × 0.161 = 41.2 and leaves 23.0 for launch.
+
+**The operator is not weight-bound at batch one.** Thirty-two windows crossing
+L2 against one window inside it is 98.665 versus 95.301 µs, a 3.36 µs
+difference against the 4.09 µs that 6.29 MB at 1540 GB/s predicts. The weight
+stream is three microseconds of a hundred.
+
+## The empty-slot scan is the largest device-side item in the round
+
+Same binary, same process, same weights, same activation; the two graphs
+differ only in whether the `group_list` tensor is 256 long or 8. Both arms
+read only experts 0–7, 37.9 MB and fully L2-resident, and the first call's
+output codes are bit-identical. Long table 95.301 µs, short table 55.387,
+paired difference **39.870 µs**, σ 0.195, 30 positive of 30, host 0.72 µs.
+That is 0.1608 µs per empty slot.
+
+Three consumers walk the dense table: `mid.h:191-223` takes one
+global-memory scalar read per slot and only reaches its `continue` at 209-211;
+`InitWorkSpaceSplitConfig` (pipeline.h:148-152) sums the whole table on every
+core when `groupListType == 1`; `UpdateWorkSpaceSplitConfig` walks it again.
+With mLimit 4681 against 8 total rows, `rightMatrixExpertEndIndex` always
+reaches `groupListLen - 1`, so where the active experts sit does not matter —
+only the table's length does.
+
+**78 layers × 39.9 µs = 3.11 ms per round, 21.8% of the current 14.247 ms** —
+larger than the weight stream, the MSD round trip, the barriers and the vector
+tail combined.
+
+## The straight-line path at one split: 0.50 ms per round, ready to land
+
+`loopCount = Ceil(M, mLimit)` with mLimit 4681 is 1 for every decode call
+(M=8 at batch one, M=32 at batch four; it reaches 2 only at M=4682). Confirmed
+at runtime, not just in arithmetic: a binary with 14 extra `SyncAll<false>`
+inside the `loopCount == 1` branch measures +32.490 µs, which would have to be
+zero if the branch were not taken.
+
+Both guards return early — `pre.h:125-130` on `idx >= loopCount`,
+`post.h:361-366` on `idx >= loopCount || idx < 0` — so the loop's
+`preProcess(idx+1)` and `postProcess(idx-1)` are pure cost, as is the barrier
+pair around them. `tempWorkspaceSplitConfig` is zero rather than
+indeterminate, since `WorkSpaceSplitConfig` carries NSDMI on every field; what
+saves it is the `< 0` clause, not the loopCount comparison.
+
+Replacing the loop with pre(0), sync, mid(0), sync, post(0) when
+`loopCount == 1`, leaving the general path untouched, measures **−6.43 µs per
+call** (three runs: −6.426, −9.171, −4.865; σ 0.442/0.194/0.274; 0 positive of
+40 in all three; p = 1.8e-12), with codes and scales bit-identical. Batch four
+gives −8.729 and −10.35.
+
+That is more than the 3.54 µs the two barriers cost, because the two no-op
+stage calls, a whole-struct assignment, an extra `pipe->Reset()` and the loop
+control also disappear; the 2.9 µs difference is measured but not attributed
+further.
+
+Barriers were priced separately and additively: mixed `SyncAll<false>` 2.30 µs
+and AIV-only `SyncAll<true>` 1.25, summing to 3.55 against 3.54 measured for
+the pair.
+
+**`down` is out of reach**: `w4a8.py:621,643` call
+`torch_npu.npu_grouped_matmul`, a CANN built-in outside this vendor package,
+and rebuilding it would mean touching /opt/ascend.
+
+## The shipped binary is non-deterministic at this shape
+
+The factory object — sha256 `2444c7e7…`, byte-identical to a no-patch rebuild —
+given bit-identical inputs four times produces calls 0 and 1 agreeing while 2
+and 3 each differ, codes by up to 114 and scales by 0.83 and 1.02. All five
+inputs were checked for drift before and after every call: 0.0.
+
+Adding the repository's one-line `PipeBarrier<PIPE_V>()` at `post.h:207`,
+after the SwiGLU merge copies `workspaceLocal` into `_inMMLocal`, makes four
+consecutive calls agree. So `tests/glm52/patches/gmm1-swiglu-barrier.patch`
+fixes a live epilogue race that ships in the vendor package, in the exact
+shape production runs — which matters because the trajectory gate compares
+tokens bit for bit.
+
+## Provenance
+
+A rebuild with no patches gives sha256 `2444c7e7…`, byte-identical to the
+shipped object. The control with only the SwiGLU barrier gives `2eb81546…`,
+matching `gmm1-tiling-20261018/single-chunk-audit.json`'s recorded control.
+The straight-line candidate is `a63d5899…`. The second proof that our binary
+ran is the barrier slope above: 14 barriers exist only inside the
+`loopCount == 1` branch, so an unselected overlay could not produce 32.5 µs.
