@@ -37,15 +37,20 @@ def _load():
 class OneSidedReduce:
     """Own the symmetric domain for one rank and reduce FP32 tensors in it."""
 
-    def __init__(self, rank, world_size, endpoint):
+    def __init__(self, rank, device, world_size, endpoint):
         import torch
 
         _load()
-        self.manager = torch.classes.ShmemOps.Manager()
-        status = self.manager.attr_init(rank, world_size, HEAP_BYTES, endpoint)
-        if status != 0:
-            raise RuntimeError(f"aclshmem init returned {status}")
-        self.reducer = torch.classes.ShmemOps.AllReduce()
+        # attr_init reads the calling thread's ACL device, and inside a vLLM
+        # worker that thread may have none: it then tries device -1 and
+        # setup_heap fails with ACLSHMEM_INNER_ERROR.
+        with torch.npu.device(device):
+            self.manager = torch.classes.ShmemOps.Manager()
+            status = self.manager.attr_init(rank, world_size, HEAP_BYTES,
+                                            endpoint)
+            if status != 0:
+                raise RuntimeError(f"aclshmem init returned {status}")
+            self.reducer = torch.classes.ShmemOps.AllReduce()
 
     def sum(self, value):
         """Return the TP sum of `value`, which the caller keeps in FP32."""
@@ -70,7 +75,7 @@ def install(engine, endpoint):
     """
     import torch
 
-    reduce = OneSidedReduce(engine.rank, 16, endpoint)
+    reduce = OneSidedReduce(engine.rank, engine.device, 16, endpoint)
 
     def one_sided(value):
         if value.dtype == torch.bfloat16:

@@ -65,6 +65,27 @@ endpoint argument, installs it right after `_install_tp_sum`, and finalises
 the domain in `shutdown`. `bench_cann_mtp.py` exposes
 `--onesided-reduce tcp://127.0.0.1:9421`.
 
+## The first production attempt failed on a device context
+
+`aclshmem init returned -4` — `ACLSHMEM_INNER_ERROR`, not the `-8`
+`ACLSHMEM_MALLOC_FAILED` a loaded model's HBM would suggest. The SDK's own
+log named it in one line:
+
+```
+[mem_entity_default.cpp:85] Set device id to be -1 failed: 107001
+[shmem_init_backend.cpp:588] hybm import failed, result: -4
+[shmem_init.cpp:748] exchange slice failed, result: -4
+[shmem_init.cpp:1234] init_manager->setup_heap() failed.
+```
+
+`attr_init` reads the **calling thread's** ACL device, and inside a vLLM
+worker that thread may not have one — so it tried device −1. The standalone
+check passed because its process sets the device itself. Wrapping the
+bring-up in `torch.npu.device(engine.device)` is the fix, and
+`/root/shmem/log/aclshmem_<pid>_*.log` is where this class of failure is
+legible: the Python-level return code says only that something internal went
+wrong.
+
 ## Three build facts worth keeping
 
 `torch_binding` is gated behind `PYEXPAND_EXAMPLE`, not `USE_EXAMPLES`, so it

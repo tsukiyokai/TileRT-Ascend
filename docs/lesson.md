@@ -632,3 +632,12 @@
   24576 elements; the second check is what licenses swapping it into a path
   whose trajectory gate compares tokens bit for bit.
   [Torch operator](evidence/ascend-decode/torch-allreduce-20261018/README.md)
+- A library that initialises fine in a standalone script can fail inside a
+  framework worker because the calling thread has no device. `attr_init`
+  reads the current ACL device and tried −1 inside a vLLM worker, returning
+  ACLSHMEM_INNER_ERROR, while the same call returned 0 in a plain process that
+  had set its own device. The Python return code said only "internal error";
+  /root/shmem/log named it in one line. Read the dependency's own log before
+  reasoning about its return value, and set the device context explicitly when
+  bringing a device library up from inside someone else's worker.
+  [Torch operator](evidence/ascend-decode/torch-allreduce-20261018/README.md)
