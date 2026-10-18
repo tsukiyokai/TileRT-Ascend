@@ -36,14 +36,44 @@ shortens both paths. The ablation figures are therefore lower bounds.
 | weight stream's HBM increment | 3.4 | measured directly |
 | MSD activation split | 0.1 | measured directly |
 
-Ablation puts the floor of launch plus table scan plus the two kept barriers
-at 67.05–69.88 µs over six runs. **That figure contradicts the ~8 µs in-graph
-per-call floor measured in `fixed-cost-20261018` by eightfold, and which is
-right decides the size of the prize for the whole programme**: a verify
-forward is 2,416 calls, which is 19.3 ms of floor at 8 µs and 162 ms at 67 —
-the latter exceeding the entire round. The likely resolution is that the 67 is
-not a dispatch floor but this operator's own prologue, and settling it is now
-the board's most important open question.
+## There is no universal floor: dispatch is 1.2 µs and prologues are per operator
+
+Measured in one process, one set of captured graphs, 32 calls per graph, 30
+rounds taking the minimum then the median, host 0.44–1.17 µs per call:
+
+| operator | µs per call in a graph |
+|---|---|
+| `torch.add`, 8 float32 | 1.127–1.310, floor 1.192 |
+| `npu_dynamic_quant`, 4×32 bf16 | 2.797–3.590 |
+| `npu_quant_matmul`, 4×32 by 32×32 | 8.183–8.808, floor 8.303 |
+
+So `fixed-cost-20261018`'s 8 µs reproduces exactly and **is that operator's own
+per-call cost, not a dispatch floor**. The dispatch floor is 1.2 µs.
+
+This GMM's own prologue — enter, read the one base tiling member it needs to
+branch, leave — is **16.4 µs** (16.424 and 16.428 over two runs). Sliced by
+moving the cut later, paired graph replays within one binary, σ ≤ 0.26, 30 of
+30, 256 slots:
+
+| segment | µs, 256 slots | µs, 8 slots |
+|---|---|---|
+| enter + base tiling | 16.43 | 16.42 |
+| + two tiling copies (one `TCubeTiling`) + `mm.Init` | 4.54 | 5.18 |
+| + `op.Init` (global buffers, sum the table) | **38.55** | ~0 |
+| `op.Process` (two barriers, three stages) | 30.67 | 21.48 |
+
+The 67–70 µs was never a floor. It is 16.4 of launch, 4.5 of `TCubeTiling` and
+`mm.Init`, 38.6 of the table's first traversal, and 4.6 of barriers. Of the
+three things I had guessed, the tiling copy is 4.54 and the barriers 4.60
+while `preProcess` is 0.1; the large one was the table, which I had not
+listed.
+
+**The round's arithmetic**: 2,416 calls at the real 1.2 µs floor is 2.9 ms,
+20% of the current 14.247. The 8.3 µs figure cannot be multiplied uniformly —
+2,416 × 8.3 = 20.1 ms already exceeds the round — so most calls must be
+cheaper than `npu_quant_matmul`. The megakernel's prize is the dispatch floor
+plus the sum of per-operator prologues, and this GMM's share of the latter is
+78 × 16.4 = 1.28 ms.
 
 **The operator is not weight-bound at batch one.** Thirty-two windows crossing
 L2 against one window inside it is 98.665 versus 95.301 µs, a 3.36 µs
@@ -91,10 +121,33 @@ already cached — while the per-slot length term is 0.16 µs, about 296 cycles.
 Thirty times apart. And `midProcess` has no `TPipe` at all (`mid.h:88-113`),
 so giving it UB staging is not a local change.
 
-Localising the remaining 33–46 µs needs per-stage device timestamps at two
-table lengths, which has not been run. An op-prototype change for index-based
-routing would mean a full package build rather than the 21.3 s single-operator
-rebuild these patches use, so it is not worth paying blind.
+## The table cost belongs to whoever touches it first
+
+Eliminating both pipeline-level traversals moved the cut-point cost from 59.52
+to 23.1 µs while `op.Process` rose from 30.67 to 69.6 — and **the total did not
+move, 88–93 µs** (σ 0.108 and 0.100, 30 of 30). The bill changed hands rather
+than being cancelled, which is exactly why the three elimination patches
+measured only 0.9, 1.6–3.6 and 4.16 µs.
+
+The mechanism: a 2 KB table pulled by 24 cube and 48 vector cores, each doing
+blocking scalar global reads of one int64 at a time — 72 unshared request
+streams against the same 32 cache lines, serialising. 38.55 µs over 248 extra
+slots is 0.155 µs per slot, matching the 0.1556 measured directly.
+
+**So the earlier conclusion that UB batching cannot help is withdrawn**; it
+rested on the moving-house illusion, inferring from "deleting one consumer is
+worth 4 µs" that each read costs 5.4 ns and is already cached, when the cold
+cost simply passed to the next consumer. One `DataCopy` of 2 KB is a single
+MTE2 bulk transfer of 32 lines against 256 serial scalar round trips. It is a
+kernel-internal change: no operator prototype, no index tensor, no full
+package build. Not yet built — the four consumers span three classes and
+`midProcess` has no `TPipe` — so 38.55 µs is a measured size with an
+identified but unmeasured fix.
+
+Localisation used three cuts at the kernel entry crossed with two table
+lengths, each cut a paired graph replay within one binary — the same
+discipline as everything else here, and neither msprof nor `CrossCoreSetFlag`
+was needed.
 
 ## The straight-line path at one split: 0.50 ms per round, ready to land
 
