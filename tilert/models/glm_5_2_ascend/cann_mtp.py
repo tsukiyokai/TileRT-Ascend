@@ -117,6 +117,7 @@ class CannMtp:
         self.capacity = target.capacity
         self.layout = target.layout
         self.position = 0
+        self.graph = None
         self.attention_kernel = target.attention_kernel
         self.checkpoint = target.checkpoint
         self.weight_files = weight_sources(self.checkpoint)
@@ -238,6 +239,21 @@ class CannMtp:
         self.position = length
         self.model.model.set_skip_topk(False)
 
+    def enable_graph(self):
+        """Capture shared-index M1 chains after uncaptured TP warmup."""
+        import torch
+        from .cann_mtp_graph import CannMtpGraph
+
+        if self.graph is None:
+            with torch.npu.device(self.device):
+                self.graph = CannMtpGraph(self)
+
+    def close(self):
+        """Release the draft graph before shutting down the target worker."""
+        if self.graph is not None:
+            self.graph.close()
+            self.graph = None
+
     def forward(self, tokens, parent, *, external_indices=None,
                 full_logits=True):
         import torch
@@ -279,18 +295,27 @@ class CannMtp:
             self.model.model.set_skip_topk(external_indices is not None)
             if external_indices is not None:
                 self.indices_buffer[:width].copy_(external_indices)
-            with set_ascend_forward_context(
-                metadata, self.config, num_tokens=width,
-                num_actual_tokens=width, model_instance=self.model,
-                is_draft_model=True,
-            ):
-                pre_norm, recycle = self.model(
-                    input_ids=self.input_ids, positions=self.positions,
-                    hidden_states=parent, spec_step_idx=0,
+            use_graph = (self.graph is not None and width == 1
+                         and external_indices is not None)
+            if use_graph:
+                pre_norm, recycle, logits, token_ids, indices = (
+                    self.graph.forward(metadata, parent)
                 )
-                logits = self.model.compute_logits(pre_norm, spec_step_idx=0)
-                token_ids = logits.argmax(dim=-1)
-            indices = self.indices_buffer[:width].clone()
+            else:
+                with set_ascend_forward_context(
+                    metadata, self.config, num_tokens=width,
+                    num_actual_tokens=width, model_instance=self.model,
+                    is_draft_model=True,
+                ):
+                    pre_norm, recycle = self.model(
+                        input_ids=self.input_ids, positions=self.positions,
+                        hidden_states=parent, spec_step_idx=0,
+                    )
+                    logits = self.model.compute_logits(
+                        pre_norm, spec_step_idx=0,
+                    )
+                    token_ids = logits.argmax(dim=-1)
+                indices = self.indices_buffer[:width].clone()
         self.position += width
         return CannMtpStep(
             logits if full_logits else None, token_ids, pre_norm, recycle,

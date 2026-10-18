@@ -56,8 +56,10 @@ def parse_arguments(argv=None):
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--target-graph", action="store_true",
                         help="Compare graph after uncaptured execution")
+    parser.add_argument("--draft-graph", action="store_true",
+                        help="Graph shared-index M1 draft chains")
     parser.add_argument("--compile-target", action="store_true",
-                        help="Compile the target; keep MTP eager")
+                        help="Compile the target backbone")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
@@ -72,8 +74,10 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     if args.max_tokens < 1 or args.capacity < 128:
         parser.error("Positive output budget and capacity >= 128 required")
-    if args.target_graph and args.max_tokens < 2:
+    if (args.target_graph or args.draft_graph) and args.max_tokens < 2:
         parser.error("Graph comparison requires a decode round")
+    if args.draft_graph and args.width != 4:
+        parser.error("--draft-graph requires --width 4")
     if args.compile_target and (not args.target_graph or args.width != 4):
         parser.error("--compile-target requires --target-graph --width 4")
     if args.super_kernel and not args.compile_target:
@@ -300,6 +304,7 @@ def source_hashes(target, draft):
         paths.add(Path(inspect.getfile(inspect.unwrap(value))).resolve())
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py")
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_graph.py")
+    paths.add(ROOT / "tilert/models/glm_5_2_ascend/cann_mtp_graph.py")
     paths.update(ROOT / f"tilert/pd_vllm/{name}.py" for name in
                  ("ascend_layout", "ascend_cache", "prefix_capture"))
     return {**target.source_metadata(),
@@ -337,7 +342,7 @@ def execute(args):
     )
     draft = CannMtp(target)
     if not draft.model.do_not_compile:
-        raise ValueError("MTP must remain eager in both target variants")
+        raise ValueError("MTP backbone compilation must be disabled")
     source = source_hashes(target, draft)
     group = get_world_group().cpu_group
 
@@ -361,7 +366,7 @@ def execute(args):
     directory.mkdir(parents=True, exist_ok=False)
     expected_cache = None
     phases = ["serial", "speculative"]
-    if args.target_graph:
+    if args.target_graph or args.draft_graph:
         phases.append("graph")
     phases.append("reset")
     with torch.inference_mode():
@@ -377,7 +382,10 @@ def execute(args):
                             tail = value[begin:initial + args.max_tokens + 4]
                             tail.fill_(float("nan")
                                        if value.is_floating_point() else -128)
-                target.enable_graph(width=args.width)
+                if args.target_graph:
+                    target.enable_graph(width=args.width)
+                if args.draft_graph:
+                    draft.enable_graph()
             parent = saved_parent.to(target.device)
             predicted = token_ids(target.predict(parent))[0]
             agree((predicted, target.position, draft.position))
@@ -448,6 +456,15 @@ def execute(args):
                  target.input_ids.data_ptr(), target.positions.data_ptr(),
              ]},
         ])
+    if args.draft_graph:
+        checks.extend([
+            {"name": "draft_graph.single_capture",
+             "passed": draft.graph.capture_count == 1},
+            {"name": "draft_graph.two_chains_per_round",
+             "passed": draft.graph.replay_count == 2 * sum(
+                 len(runs[label]["rounds"]) for label in ("graph", "reset")
+             )},
+        ])
     checks.append({"name": "source_stable",
                    "passed": source_hashes(target, draft) == source})
     passed = all(item["passed"] for item in checks)
@@ -460,6 +477,7 @@ def execute(args):
         "checkpoint_sha256": checkpoint, "inputs": inputs,
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
+        "draft_graph": args.draft_graph,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
@@ -473,6 +491,11 @@ def execute(args):
                          "input_addresses": entry.input_addresses}
                         for key, entry in target.graph.wrapper
                         .concrete_aclgraph_entries.items()],
+        },
+        "draft_graph_state": None if draft.graph is None else {
+            "captures": draft.graph.capture_count,
+            "replays": draft.graph.replay_count,
+            "scope": "M1 shared-index chain, including own head",
         },
         "capacity": args.capacity, "eos_tokens": stops,
         "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -529,6 +552,7 @@ def execute(args):
             ),
             "capture_manifest_sha256": inputs["capture_manifest_sha256"],
         })
+    draft.close()
     target.shutdown()
     return 0 if success else 1
 

@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 def rejects(call):
@@ -216,6 +216,25 @@ def run(checkpoint, report):
         assert torch.equal(seed.indices, saved_indices)
         add_check(report, "explicit_chain_indices_and_cloned_output")
 
+        graph = SimpleNamespace(forward=Mock(return_value=(
+            seed.pre_norm_hidden, seed.recycle_hidden, seed.logits,
+            seed.token_ids, seed.indices,
+        )), close=Mock())
+        draft.graph = graph
+        result = draft.forward((6,), seed.recycle_hidden,
+                               external_indices=seed.indices)
+        graph.forward.assert_called_once()
+        assert graph.forward.call_args.args[1] is seed.recycle_hidden
+        assert result.recycle_hidden is seed.recycle_hidden
+        draft.forward((7,), seed.recycle_hidden)
+        draft.forward((1, 2, 3, 4), torch.zeros((4, 6144),
+                                             dtype=torch.bfloat16))
+        assert graph.forward.call_count == 1
+        draft.close()
+        graph.close.assert_called_once()
+        assert draft.graph is None
+        add_check(report, "chain_graph_dispatch_and_eager_seed_conditioned")
+
         for length in (-1, draft.position + 1, True, 1.5):
             rejects(lambda: draft.truncate(length))
         draft.truncate(2)
@@ -340,6 +359,7 @@ def main():
                          "NPU initialization", "NPU kernels", "HCCL",
                          "model precision", "timing"],
         "fixtures": ["CPU model rows and postprocess boundary stub",
+                     "graph dispatch stub; no graph capture",
                      "CPU projection modules and TP constructor query=1",
                      "TP/DP forward context queries=16/1",
                      "NPU device context replaced with nullcontext"],

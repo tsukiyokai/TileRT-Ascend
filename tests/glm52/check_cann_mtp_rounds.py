@@ -233,31 +233,47 @@ def check_cache(torch):
         wrong["main"][0][field][0] = 0
         checks = []
         runner.compare_cache("mutation", wrong, cache, checks)
-        require(any(not item["passed"] for item in checks), field)
+        if field == "latent":
+            changed = next(item for item in checks
+                           if item["name"] == "mutation.main.0.latent.row.0")
+            require(changed["diagnostic_only"] and not changed["bit_exact"]
+                    and changed["passed"], "finite cross-width diagnostic")
+        else:
+            require(any(not item["passed"] for item in checks), field)
+    wrong = copy.deepcopy(cache)
+    for value in (float("nan"), float("inf")):
+        wrong["main"][0]["latent"][0] = value
+        checks = []
+        runner.compare_cache("nonfinite", wrong, cache, checks)
+        require(any(not item["passed"] for item in checks), "nonfinite cache")
+    wrong["main"][0]["latent"][0] = 0
+    checks = []
+    runner.compare_cache("reset", wrong, cache, checks, exact=True)
+    require(any(not item["passed"] for item in checks), "exact reset mutation")
     checks = []
     runner.compare_cache("reset", cache, cache, checks, exact=True)
     require(all(item["exact"] for item in checks if "exact" in item),
             "reset compares every value exactly")
 
 
-def check_row_dilution(torch):
+def check_row_diagnostics(torch):
     reference = torch.ones((15, 512), dtype=torch.bfloat16)
     wrong = reference.clone()
     wrong[14] = 1.03125
     whole = []
     runner.compare_tensor("whole_matrix", wrong, reference, whole)
-    require(whole[0]["passed"], "counterexample must pass the old gate")
     entry = {"latent": reference, "rope": reference[:, :64]}
     expected = {"main": [entry] * 78, "mtp": [entry]}
     actual = {"main": [{**entry, "latent": wrong}, *([entry] * 77)],
               "mtp": [entry]}
     checks = []
-    runner.compare_cache("row_gate", actual, expected, checks)
-    rejected = [item for item in checks if not item["passed"]]
-    require(len(rejected) == 1
-            and rejected[0]["name"] == "row_gate.main.0.latent.row.14"
-            and rejected[0]["nrmse"] == 0.03125,
-            "one bad row must fail independently of other rows")
+    runner.compare_cache("row_metric", actual, expected, checks)
+    row = next(item for item in checks
+               if item["name"] == "row_metric.main.0.latent.row.14")
+    require(row["diagnostic_only"] and not row["bit_exact"]
+            and row["nrmse"] == 0.03125 and row["passed"],
+            "per-row error remains visible without a cross-width gate")
+    require(row["nrmse"] > whole[0]["nrmse"], "row error is not diluted")
 
 
 def check_phase_preparation():
@@ -328,8 +344,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cann-mtp-host-") as temporary:
         check_capture(Path(temporary), torch, record)
     record("cache.compare_and_mutations", lambda: check_cache(torch))
-    record("cache.reject_single_row_dilution",
-           lambda: check_row_dilution(torch))
+    record("cache.per_row_diagnostics",
+           lambda: check_row_diagnostics(torch))
     record("cache.phase_preparation", check_phase_preparation)
     path = Path(runner.__file__)
     record("runner.ast", lambda: ast.parse(path.read_text()))

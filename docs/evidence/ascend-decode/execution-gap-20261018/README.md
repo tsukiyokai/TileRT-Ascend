@@ -139,8 +139,33 @@ Both precision and timing runners expose
 `create_config(super_kernel=True)` and reuses the approved static package.
 On sixteen ranks, all five saved phases match the frozen static and plain
 controls bit for bit. CPU checks cover the three configuration modes, six
-CLI cases and eager MTP isolation. The device scope is one resident dense
-layer; MoE, complete teachers and long timing follow separately.
+CLI cases and eager MTP isolation. The device scope is one resident dense layer.
+
+The [MoE activation audit](static-super-moe-audit.json) extends the actual
+product configuration to resident layer3, M4 and TP16. Input A uses frozen
+hidden/residual/shared indices; B applies documented synthetic row/index
+reorders. Ten phases include eager, compiled, Graph and dirty resets.
+The [plain/static comparison](static-super-moe-comparison.json) finds all
+5,611,520 compared elements bit identical; each configuration also passes
+its own replay/reset checks. Peak allocation is 999,919,104 bytes/die.
+
+The static process privately installs its 37-operator package and records
+158 installed-file hashes; sixteen processes reselect it. Every rank's
+actual ELF-open trace retains the patched GMM1. The process-local static
+blacklist preserves that implementation.
+
+The [MoE short trace](static-super-moe-profile-audit.json) closes three
+actual replays on ranks 0/14. Plain compilation executes 27 compute tasks
+per replay. Static execution has six SK tasks and eight standalone compute
+tasks, totaling 14; both paths retain two separate AllReduce tasks. Three
+SK groups have distinct first/last endpoints; three are single-operator
+wrappers. Patched GMM1 remains standalone. Endpoints bind to the exact
+private package and binaries, including rank-specific Unpermute names.
+Final outputs from all sixteen participants match their graph references.
+Complete teachers and matched model timing follow separately. Raw artifacts
+stay in `/home/shanshan/trt-asc/offline/cann-resident-moe-static-super-20261018-01/`.
+Trace artifacts stay in
+`/home/shanshan/trt-asc/offline/cann-resident-moe-profile-20261018-01/`.
 
 ## Symmetric-buffer reduction
 

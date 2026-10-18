@@ -99,6 +99,8 @@ def arguments():
     parser.add_argument("--capacity", type=int, default=9344)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--target-graph", action="store_true")
+    parser.add_argument("--draft-graph", action="store_true",
+                        help="Graph shared-index M1 draft chains")
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
@@ -109,7 +111,7 @@ def arguments():
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
-    if args.target_graph and args.warmup < 1:
+    if (args.target_graph or args.draft_graph) and args.warmup < 1:
         parser.error("Graph capture requires an unmeasured warmup request")
     if args.compile_target and not args.target_graph:
         parser.error("--compile-target requires --target-graph")
@@ -218,6 +220,11 @@ def validate_local(report, args):
                 or len(graph["entries"]) != 1
                 or not graph["entries"][0]["has_aclgraph"]):
             raise ValueError("M4 graph capture/replay counts differ")
+    if args.draft_graph:
+        graph = report["draft_graph_state"]
+        if (graph["captures"] != 1 or graph["replays"] != 2 * sum(
+                len(history["rounds"]) for history in histories)):
+            raise ValueError("M1 draft graph capture/replay counts differ")
     if report["rank"] == 0:
         validate_delivery(report["requests"], histories, args)
     return histories
@@ -303,17 +310,18 @@ def run(args, report):
                        super_kernel=args.super_kernel,
                        attention_kernel=args.attention_kernel,
                        fp32_head=args.fp32_head)
+    draft = None
     try:
         draft = CannMtp(target)
         if not draft.model.do_not_compile:
-            raise ValueError("MTP must remain eager in both target variants")
+            raise ValueError("MTP backbone compilation must be disabled")
         if target.tp_reduction != "float32":
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
         engine = MeasuredRank(target, draft, channel.group)
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():
-            if args.target_graph:
+            if args.target_graph or args.draft_graph:
                 counters_before = asdict(compilation_counter)
                 engine.inject(prefix)
                 engine.start_mtp(first, args.max_tokens, WIDTH, ())
@@ -369,7 +377,10 @@ def run(args, report):
                             .static_forward_context is not
                             config.static_forward_context),
                     }
-                target.enable_graph(width=WIDTH)
+                if args.target_graph:
+                    target.enable_graph(width=WIDTH)
+                if args.draft_graph:
+                    draft.enable_graph()
             sources = source_hashes(target, draft)
             for name in ("mtp_session.py", "tp_runtime.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
@@ -408,6 +419,11 @@ def run(args, report):
             status="completed", rank_requests=engine.requests,
             command_serial=executor.serial, closed=executor.closed,
             final_positions=[target.position, draft.position],
+            draft_graph_state=None if draft.graph is None else {
+                "captures": draft.graph.capture_count,
+                "replays": draft.graph.replay_count,
+                "scope": "M1 shared-index chain, including own head",
+            },
             graph=None if graph is None else {
                 "width": graph.width, "captures": graph.capture_count,
                 "replays": graph.replay_count,
@@ -457,6 +473,7 @@ def run(args, report):
                 "warmup": args.warmup, "requests": args.requests,
                 "output_tokens_per_request": args.max_tokens,
                 "target_graph": args.target_graph,
+                "draft_graph": args.draft_graph,
                 "compile_target": args.compile_target,
                 "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
@@ -468,6 +485,8 @@ def run(args, report):
             atomic_json(args.output / "summary.json", summary)
         return passed
     finally:
+        if draft is not None:
+            draft.close()
         target.shutdown()
 
 
@@ -482,6 +501,7 @@ def main():
         "width": WIDTH, "max_tokens": args.max_tokens,
         "capacity": args.capacity, "warmup": args.warmup,
         "measured_requests": args.requests, "target_graph": args.target_graph,
+        "draft_graph": args.draft_graph,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
@@ -491,7 +511,8 @@ def main():
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",
         "prefix_readiness": "Local synchronize then Gloo barrier before g0",
         "round_scope": "Gloo, draft chain, verify, MTP recompute, commit",
-        "phase_device_timing": False, "draft_execution": "eager",
+        "phase_device_timing": False,
+        "draft_execution": "chain_graph" if args.draft_graph else "eager",
         "ignore_eos": True, "precision_verified": False,
         "formal_1024_token_run": False, "profiled": False,
     }

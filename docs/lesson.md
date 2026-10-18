@@ -1,5 +1,18 @@
 # Lessons
 
+- Captured workspaces outlive a forward. Three MTP graphs exhausted the
+  2 GiB probe quota; each bucket independently passes with serial graph
+  lifetime. Track live graph pools separately from model-weight memory.
+  [MTP forward graphs](evidence/ascend-decode/layer-major-20261018/README.md#complete-mtp-forward-graph)
+- A chained graph can consume its own previous output. Stage the live
+  recycle parent before replay reuses that output; retain the independent
+  seed indices across both chain calls. Real alias calls and dirty rollback
+  verify this lifetime contract beyond frozen-input replay.
+  [Product chain check](evidence/ascend-decode/layer-major-20261018/mtp-chain-graph-audit.json)
+- Static selection must preserve numerical fixes. The MoE private package
+  keeps GMM1 out of regeneration, and actual ELF-open traces on every rank
+  confirm the installed SwiGLU-barrier implementation is still selected.
+  [MoE activation](evidence/ascend-decode/execution-gap-20261018/static-super-moe-audit.json)
 - A completed prefix capture proves transport, not decode. A live PD check
   binds one request ID across sixteen WRITE acknowledgements, prefill's
   first token, real decode steps, callback tokens and the HTTP response.

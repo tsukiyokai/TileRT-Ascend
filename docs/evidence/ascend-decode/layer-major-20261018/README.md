@@ -105,16 +105,63 @@ The [MTP head audit](head-mtp-audit.json) loads the actual layer-78 model,
 its separate BF16 head and norm, then shares the target embedding. One real
 M4 forward produces four pre-norm inputs. Its 9,912,320 initial logits and
 118,947,840 M1/M4 head outputs across sixteen ranks match the independent
-raw-shard references bit for bit. Norm runs once per row. Sixty-four head
-captures supply 320 changing-input/reset replays; peak reserved memory is
+raw-shard references bit for bit. Each head call normalizes once.
+Sixty-four head captures supply 320 changing-input/reset replays; peak reserved memory is
 1,868,562,432 bytes/die. M1/M4 differences remain diagnostic.
 
 The [first probe](head-mtp-load-failure.json) omitted the target constructor's
 packed quantization mapping and failed during loading. The corrected probe
 uses the actual constructor with empty decoder slots; product loading is unchanged.
-Graphs here cover norm, projection, gather and crop. Complete MTP-forward
-graphs and the new-head session trajectory are the next checks. Artifacts
+Graphs here cover norm, projection, gather and crop. Artifacts
 remain in `/home/shanshan/trt-asc/offline/cann-mtp-own-head-20261018-02/`.
+
+## Complete MTP forward Graph
+
+The [full-forward audit](mtp-forward-graph-audit.json) checks seed M1,
+shared-index chain M1 and target-conditioned M4 with the real layer-78
+loader, FP32 output head and frozen 8K prefix. Six changing-input cases
+have eager, Graph and reverse-order recapture results on all sixteen ranks.
+The 64,979,328 compared output elements and all saved new KV match bit for
+bit. Every case also gives identical logits when the head processor uses
+the already-normalized recycle hidden directly.
+
+Each rank performs six captures and twelve replays with one graph resident
+at a time. Peak allocated/reserved memory is 1,605,115,904/2,134,900,736
+bytes/die under the 2 GiB Torch quota. The first three-graph residency
+attempt exhausted that quota before saving numerical results; its failure
+did not identify the bucket. Serial bucket lifetime supplies the results
+above. These tests use frozen parents; the product check below exercises
+live device-output chaining. Joint bucket residency is a separate check.
+
+Artifacts stay in
+`/home/shanshan/trt-asc/offline/cann-mtp-forward-graph-20261018-{01,02}/`.
+
+## Product chain graph
+
+`--draft-graph` in the precision/timing runners captures shared-index M1
+chains through the actual
+[CannMtp](../../../../tilert/models/glm_5_2_ascend/cann_mtp.py) interface.
+The graph includes the MTP layer, its own head, gather, argmax and index
+snapshot. Seed and target-conditioned M4 calls execute eagerly. Returned
+graph storage is reused; the next call stages its parent in a separate
+persistent buffer before replay overwrites the previous recycle output.
+
+The [product audit](mtp-chain-graph-audit.json) runs an eager seed, two live
+chain calls, then truncates to P and repeats the first chain with dirty
+tail bytes retained. Graph, dirty request reset and recapture all match
+the eager sequence: 64,979,328 output elements and 405,504 new KV elements
+are bit exact. Sixty-four pointer records confirm direct recycle-output
+aliasing and a distinct staged parent. Each rank performs two captures and
+nine replays, closes both graphs and retains eager seed/M4 dispatch.
+Peak allocated/reserved memory is 1,606,456,832/2,061,500,416 bytes/die.
+
+CPU contracts pass 15/15 and 163/163 checks plus six CLI cases. Two old
+cache-checker assertions now follow the established cross-width diagnostic
+policy; production comparisons are unchanged. Nonfinite cache values and
+same-configuration reset mutations still fail. The next measurement is
+the matched two-chain stage, followed by complete target/session validation.
+Artifacts stay in
+`/home/shanshan/trt-asc/offline/cann-mtp-chain-product-20261018-01/`.
 
 ## Reference scope
 
