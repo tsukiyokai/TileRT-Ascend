@@ -104,5 +104,43 @@ vendor's own demonstration of symmetric memory inside an ACL graph, not our
 code, so capture compatibility is now a named open risk rather than a
 hypothesis — and the production decode path is entirely graph-captured.
 
-`notifywait` remains to be read: it is the local flag spin that replaces a
-barrier.
+## Sub-microsecond, and the topology appears
+
+Small messages, 200 loops, `-t put`:
+
+| path | small-message put | HCCL pairwise `all_reduce` |
+|---|---|---|
+| die 0 → 1, same module | **0.31–0.33 µs** | 94.38 µs |
+| die 0 → 8, across modules | **0.84–0.90 µs** | 74.52 µs |
+
+Every transfer verified. Two things follow. The wire is sub-microsecond, so
+HCCL's per-operation cost is 100 to 300 times the thing it carries. And the
+topology is real and visible — crossing a module costs 2.7× an intra-module
+hop — whereas HCCL's pairwise latencies showed no such structure
+([localising](../rendezvous-locate-20261018/README.md)) and in fact made the
+cheapest hop look like the slowest. Its overhead buried a difference that
+exists.
+
+## The one-shot push, run at sixteen ranks and verified
+
+`examples/combine/combine_classic` is the finished article, and its kernel is
+the AMD description line by line: `aclshmemx_mte_put_nbi` to publish,
+`aclshmemx_mte_quiet` to drain, `aclshmemx_signal_op(..., SET, ...)` to
+announce; the receiver `aclshmem_signal_wait_until(slot, CMP_EQ, READY)` spins
+on **its own** slot and then reduces locally with weights. No barrier anywhere
+(`combine_kernel.cpp:84-109`).
+
+At our decode shape it passes:
+
+```
+bash scripts/run.sh -pes 16 -bs 4 -h 6144
+  [SUCCESS] combine demo run success in pe 0 … pe 15
+  [Combine] check passed
+```
+
+Sixteen ranks, four tokens, hidden 6144 — push plus ordered local reduction,
+numerically correct. Its `--perf` path then fails at `main.cpp:558` with
+`aclError:-3` because it wants profiling enabled, so the timing came from
+`ascendc_perftest` instead.
+
+`notifywait` remains to be read for the flag-spin idiom in isolation.

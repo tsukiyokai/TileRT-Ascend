@@ -517,3 +517,9 @@
   binary settled it in a minute, and it had been sitting in an uninstalled
   SDK.
   [One-sided put](evidence/ascend-decode/shmem-install-20261018/README.md#the-wire-measured-at-last)
+- An overhead large enough hides the structure underneath it. HCCL's pairwise
+  latencies spanned only 68.90 to 95.93 us and made rank 0's own module-mate
+  look like its slowest peer, which read as "topology does not matter". A
+  one-sided put shows 0.31 us within a module against 0.86 us across one, a
+  real 2.7-fold. The topology was there all along, under 70 us of scheduling.
+  [Wire](evidence/ascend-decode/shmem-install-20261018/README.md#sub-microsecond-and-the-topology-appears)
