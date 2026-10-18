@@ -974,3 +974,17 @@
   one width and not another" rather than a list of suspects. Each refutation
   cost one run; guessing from the code would have cost the same and settled
   nothing.
+- Read the operator table for the boring operators. Cast is 554 calls and
+  1.54 milliseconds a round, 22% of the budget and four times the next
+  elementwise item, and nobody had looked at it in a week of profiling because
+  it is not an operator anyone optimises. 314 of those calls exist because
+  this project forces an FP32 reduction with a bfloat16 round trip around every
+  one of the round's 157 reductions -- a choice made for precision that can be
+  kept while folding the conversion into loads the kernel already does.
+  [Cast census](evidence/ascend-decode/cast-census-20261019/README.md)
+- Check whether the vendor already fuses what you were about to fuse, and then
+  check whether its pass actually fires. The norm-quant fusion is enabled by
+  default and supported on this part, yet it matches 3.3 times a round against
+  16.6 unfused norms -- so the opportunity is in the pass's pattern matching,
+  not in a new kernel, and a kernel would have re-implemented work that is
+  already running.
