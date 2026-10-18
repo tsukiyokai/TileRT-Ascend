@@ -441,3 +441,16 @@
   package missing when the real benchmark, launched without `-I`, could import
   it. The hygiene habit for untrusted downloads manufactured a false negative
   about our own environment.
+- My ND-artefact retraction was itself wrong, and the way to tell was to
+  measure the layout instead of reasoning about it. FRACTAL_NZ buys 5% on
+  o_proj, not the two-fold the amplification story predicted, so the int8
+  matmul's deficit is real. Its cause is per-call fixed cost: half the bytes
+  take the same time as bfloat16, and a smaller weight (`q_a_proj`, 9.44 MiB)
+  costs more time than a larger one (`o_proj`, 12.58 MiB). A retraction needs
+  its own evidence, exactly like the claim it replaces.
+  [NZ rates](evidence/ascend-decode/quant-nz-20261018/README.md)
+- Pick the instrument per subject. A single-operator ACL graph is ~6 us slower
+  than eager back-to-back calls, because the replay floor is exposed while
+  eager dispatch is already hidden behind the previous kernel. Graphs are the
+  right instrument for a round, eager back-to-back for one operator; using
+  either everywhere produces a wrong number in one of the two places.
