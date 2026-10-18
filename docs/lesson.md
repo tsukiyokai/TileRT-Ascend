@@ -454,3 +454,17 @@
   eager dispatch is already hidden behind the previous kernel. Graphs are the
   right instrument for a round, eager back-to-back for one operator; using
   either everywhere produces a wrong number in one of the two places.
+- Measure the same quantity with both instruments before believing either.
+  Eagerly a projection looks 95% prologue; in a graph the marginal is 8 us of
+  floor plus streaming at 96% of the die's ceiling, so the prologue is 42% and
+  the bandwidth is already spent. The fusion saving halves too, from 46.9% to
+  nothing for two-into-one, while four-into-one still pays 37%. Both numbers
+  were right about their own regime and only one describes production.
+  [Per-call cost](evidence/ascend-decode/fixed-cost-20261018/README.md)
+- The budget, not the profile, decides whether a programme can reach the
+  target. A round delivering 3.433 tokens may cost 6.87 ms at 2 ms/token, and
+  reading each rank's weights once costs 5.7-6.0 ms, so 84% is unavoidable and
+  clearing every structural tax leaves 1.1 ms. That makes tokens-per-round a
+  first-class lever rather than a tuning knob -- and a projection costs the
+  same at 1, 4, 16 and 64 rows, so widening MTP is nearly free where it
+  matters most.
