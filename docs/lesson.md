@@ -805,3 +805,21 @@
   device, so an eager event pair reads the device and the earlier L2 results
   stand; the custom fused operator's host floor is 98.97 to 109.90, which is
   why the same method read the host there. One perf_counter decides which.
+- Ask whether a span is uncapturable or merely uncaptured. The conditioned
+  draft ran entirely eager and the reason was a gate written for width one and
+  buffers hard-coded to it, not a data-dependent shape or a host round trip --
+  and the same trace already contained a captured collective, which should have
+  been the clue. Parameterising the graph was worth 1.1155 milliseconds per
+  token.
+- An assertion that always fails stops being an assertion. The benchmark
+  compared against an operation name the session never emits, so rank 0 raised
+  on every run and every summary said fail, including the run whose number the
+  project had been quoting for a day. Two investigations tripped over it
+  separately before anyone read it.
+- Separate a call's intercept from its slope before deciding what to fuse. The
+  941 elementwise calls carry 1.5 to 2.9 milliseconds of intercept against 0.4
+  to 0.9 of element work, which makes them a better target for a resident
+  kernel than the expensive operator everyone was looking at. And the two mixed
+  barriers inside that operator are intrinsic rather than overhead, because
+  fused work doing the same three stages still has to meet twice.
+  [Census](evidence/ascend-decode/prologue-census-20261019/README.md)
