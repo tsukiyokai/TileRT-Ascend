@@ -28,11 +28,20 @@ The eager back-to-back floor for the same operation is 10.09 µs
 removes about nine microseconds per kernel, a factor of 9.5. That is the
 mechanism behind the measured M1 graph result of 256.84→44.68 ms.
 
-This bounds the kernel count rather than condemning it. The named operator
-families in one M4 target verify are 561 calls (75 GMM-SwiGLU, 75 GMM,
-78 SFA, 255 QuantBatchMatmul, 78 MlaProlog), which is 0.59 ms at this rate;
-even a thousand kernels per round costs 1.08 ms against the 6.752 ms round
-budget. Launch volume is therefore not what keeps the round at 71.6 ms.
-In-graph SFA costs 90.3 µs per call, 84 times this floor, so the round cost
-sits inside the kernels. Fusion has to be justified by locality and traffic,
-not by dispatch.
+This prices the kernel count rather than condemning it. One M4 target
+verify issues 2,416 calls, not the 561 the five largest operator types
+suggest: the profile's family table sums 150 grouped GMM, 234 MLA prolog
+and attention, 255 quantized projections, 941 cast/quant/norm, 225 MoE
+routing and combine, 548 other traced compute, 21 index selections and 42
+RoPE calls to exactly the 40.698 ms compute union
+([family table](../cann-mtp-profile-20261017/summary.json)). At 1.079 µs
+that floor is 2.61 ms, which is 38% of the 6.866 ms round budget at the
+observed acceptance.
+
+So launch volume does not explain today's round of 57.12 ms — in-graph SFA
+costs 90.3 µs per call, 84 times this floor, and the round cost sits inside
+the kernels. But the call count is a first-order claim on the 2 ms budget
+and has to fall as well. The clearest case is cast/quant/norm: 941 calls for
+3.032 ms, 3.2 µs each, of which 1.02 ms is the floor alone. Together with
+the 548 other traced compute calls that is 1,489 calls and 9.32 ms at 6.3 µs
+each, almost all of it small vector work whose cost the floor dominates.

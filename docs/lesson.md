@@ -252,3 +252,9 @@
   Read the constraint table before planning a patch: the EP whitelist is one
   line, the intermediate rule is the real wall.
   [MegaMoE availability](evidence/ascend-decode/mega-moe-20261018/README.md)
+- Count the calls from the family table, not from the largest operator types.
+  One M4 target verify issues 2,416 calls; the five biggest types are 561 of
+  them. At the in-graph floor of 1.079 µs the true count costs 2.61 ms, 38%
+  of the round budget, where the five types suggest 0.59 ms. Cast/quant/norm
+  alone is 941 calls for 3.032 ms, a third of which is the floor.
+  [Family table](evidence/ascend-decode/cann-mtp-profile-20261017/summary.json)
