@@ -40,8 +40,16 @@ observed acceptance.
 
 So launch volume does not explain today's round of 57.12 ms — in-graph SFA
 costs 90.3 µs per call, 84 times this floor, and the round cost sits inside
-the kernels. But the call count is a first-order claim on the 2 ms budget
-and has to fall as well. The clearest case is cast/quant/norm: 941 calls for
-3.032 ms, 3.2 µs each, of which 1.02 ms is the floor alone. Together with
-the 548 other traced compute calls that is 1,489 calls and 9.32 ms at 6.3 µs
-each, almost all of it small vector work whose cost the floor dominates.
+the kernels. The call count is still a claim on the 2 ms budget, but a
+smaller one than it first appears, and the count and the budget come from
+different trajectories: 2,416 is from a capture delivering 2.0 tokens per
+round, while 6.866 ms is 2 ms times the composed set's acceptance of 3.433.
+
+Where the floor really bites is narrower than first stated. Cast/quant/norm
+is 941 calls for 3.032 ms at 3.2 µs each, so 1.015 ms, a third of it, is
+floor. Other traced compute is not: its 548 calls cost 6.288 ms, and 198 of
+them — `Slice` at 45.7 µs, `ForeachAddList` at 18.0 µs, `MatMulV3` at
+14.5 µs — carry 73.7% of the family at 23.4 µs each, twenty-two times the
+floor, with 129 of the family's calls on AI_CORE. Over both families the
+floor is 1.607 ms of 9.320 ms, 17.2%, not the third an earlier revision of
+this file claimed.

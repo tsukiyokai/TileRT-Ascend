@@ -11,9 +11,14 @@ for the driver to reclaim HBM.
 | no-compile | `--draft-graph --draft-projection-tp --attention-kernel gather_fia --fp32-head` | 19.496 | 51.3 | 319 | 3.207 | 62.52 |
 | composed | the above plus `--compile-target --super-kernel` | 16.640 | 60.1 | 298 | 3.433 | 57.12 |
 
-Medians of the three measured requests; the spread within each case is small
-(composed: 16.637, 16.640, 16.704). The three requests of a case agree on
-round count, so each trajectory is deterministic.
+Medians of the three measured requests. The three requests of a case agree
+on round count, so each trajectory is deterministic, but the spread is not
+uniformly small: composed is tight at 16.637, 16.640, 16.704 and no-compile
+at 19.484, 19.496, 19.575, while the default case runs 20.491, 21.210,
+22.461 — rising monotonically over a 1.970 ms range, 9.3% of its median and
+the same order as the 2.856 ms attributed to the compiled pair. The default
+case also carries a `created_at` 79 minutes before the other two, so "back
+to back" describes only the latter pair.
 [default](idle-default-rank0.json), [no-compile](idle-no-compile-rank0.json),
 [composed](idle-composed-all-rank0.json); token dumps and per-round records
 were dropped from the archived reports.
@@ -24,7 +29,16 @@ The composed set is 21.5% below the default and the round falls 20.2%, from
 latency gain for SuperKernel: the earlier screen could only report a task
 count falling from 44 to 34 and stated that it did not establish a latency
 gain. Against the vLLM-Ascend baseline p50 of 16.390 ms this is a ratio of
-1.015, where `--target-graph` alone was 1.247.
+1.015, where `--target-graph` alone was 1.247 — but these are different
+scopes and parity is not established: 16.390 ms is a client p50 over 32
+requests, while 16.640 ms is this bench's internal delivery with HTTP and
+HIXL excluded. Note also that the `a3-gs` 20.441 ms reference set
+`HCCL_OP_EXPANSION_MODE=AI_CPU` explicitly while these runs record it as
+`null`, and 21.210 ms sits 1.2% from the `a3-gs` AIV comparison of
+21.473 ms, so machine identity and expansion mode are not separated here.
+The round column is TPOT × A, a derived quantity; of the 4.570 ms between
+default and composed, 0.278 ms comes from acceptance rising 3.376 → 3.433
+and 4.292 ms from the round.
 
 Distance to the target is now 8.32×, from 10.61× at the default.
 

@@ -9,6 +9,7 @@ filled with arbitrary bits. One shape per process. One device, one rank.
 
 import argparse
 from datetime import datetime, timezone
+import itertools
 import json
 import os
 from pathlib import Path
@@ -27,8 +28,15 @@ PROJECTIONS = {"gate_up": (HIDDEN, 2 * LOCAL_INTERMEDIATE),
                "down": (LOCAL_INTERMEDIATE, HIDDEN)}
 
 
-def build_bank(inputs, outputs, device):
-    return {
+def build_banks(inputs, outputs, device, count):
+    """Allocate `count` independent banks so a rotation defeats L2 reuse.
+
+    One bank of 256 groups is exactly the die's 192 MiB L2, so reading a
+    single bank repeatedly measures cache reread rather than HBM. Rotating
+    over several banks makes every call read memory the previous call did
+    not touch.
+    """
+    return [{
         "weight": torch.randint(-2 ** 31, 2 ** 31 - 1,
                                 (EXPERTS, inputs, outputs // PACK),
                                 dtype=torch.int32, device=device),
@@ -36,7 +44,7 @@ def build_bank(inputs, outputs, device):
                             device=device),
         "scale_bias": torch.zeros(EXPERTS, outputs, dtype=torch.float32,
                                   device=device),
-    }
+    } for _ in range(count)]
 
 
 def build_routing(experts, rows, device):
@@ -59,10 +67,13 @@ def build_activation(rows, inputs, device):
     }
 
 
-def grouped_matmul_call(bank, activation, counts, routing):
+def grouped_matmul_call(banks, activation, counts, routing):
     import torch_npu
 
+    rotation = itertools.cycle(banks)
+
     def call():
+        bank = next(rotation)
         return torch_npu.npu_grouped_matmul(
             x=[activation["x"]], weight=[bank["weight"]],
             scale=[bank["scale"]], bias=[bank["scale_bias"]],
@@ -74,11 +85,11 @@ def grouped_matmul_call(bank, activation, counts, routing):
     return call
 
 
-def unpermuted_call(bank, activation, counts, routing):
+def unpermuted_call(banks, activation, counts, routing):
     """Time the production pair: grouped matmul, then the routing combine."""
     import torch_npu
 
-    matmul = grouped_matmul_call(bank, activation, counts, routing)
+    matmul = grouped_matmul_call(banks, activation, counts, routing)
 
     def call():
         return torch_npu.npu_moe_token_unpermute(
@@ -88,11 +99,14 @@ def unpermuted_call(bank, activation, counts, routing):
     return call
 
 
-def finalize_routing_call(bank, activation, counts, routing):
+def finalize_routing_call(banks, activation, counts, routing):
     """Time the fused alternative: grouped matmul with the combine inside."""
     import torch_npu
 
+    rotation = itertools.cycle(banks)
+
     def call():
+        bank = next(rotation)
         return torch_npu.npu_grouped_matmul_finalize_routing(
             activation["x"], bank["weight"], counts,
             scale=bank["scale"].view(-1).to(torch.float32),
@@ -125,12 +139,12 @@ def measure(args, report):
     torch_npu.npu.set_device(args.device)
     device = torch.device("npu", args.device)
     inputs, outputs = PROJECTIONS[args.projection]
-    bank = build_bank(inputs, outputs, device)
+    banks = build_banks(inputs, outputs, device, args.banks)
     activation = build_activation(args.experts * args.rows, inputs, device)
     counts = torch.zeros(EXPERTS, dtype=torch.int64, device=device)
     counts[:args.experts] = args.rows
     routing = build_routing(args.experts, args.rows, device)
-    call = PATHS[args.path](bank, activation, counts, routing)
+    call = PATHS[args.path](banks, activation, counts, routing)
 
     for _ in range(args.warmup):
         call()
@@ -154,6 +168,8 @@ def arguments():
     parser.add_argument("--projection", choices=tuple(PROJECTIONS),
                         default="gate_up")
     parser.add_argument("--path", choices=tuple(PATHS), default="grouped")
+    parser.add_argument("--banks", type=int, default=5,
+                        help="rotate this many banks so a call misses L2")
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)
@@ -169,13 +185,13 @@ def main():
         "status": "error", "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv], "hostname": platform.node(),
         "path": args.path, "projection": args.projection,
-        "experts": args.experts,
+        "experts": args.experts, "banks": args.banks,
         "rows": args.rows, "device": args.device, "calls": args.calls,
         "warmup": args.warmup, "batches": args.batches,
         "scope": "one die, one rank, shared with another tenant",
         "value_note": "arbitrary bits; timing does not depend on values",
-        "bank_note": "the full 256-group bank is resident; counts select the "
-                     "active groups",
+        "bank_note": "counts select the active groups; banks rotate so that "
+                     "one call does not reread the previous call's weights",
     }
     try:
         passed = measure(args, report)

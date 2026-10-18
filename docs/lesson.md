@@ -258,3 +258,25 @@
   of the round budget, where the five types suggest 0.59 ms. Cast/quant/norm
   alone is 941 calls for 3.032 ms, a third of which is the floor.
   [Family table](evidence/ascend-decode/cann-mtp-profile-20261017/summary.json)
+- A resident bank the size of L2 measures L2. The first expert-GMM sweep held
+  one 256-group bank, which is exactly 201,326,592 bytes and exactly the die's
+  L2, and reported a 64→128 marginal rate of 1261.2 GB/s — above the
+  1190.77 GB/s the HBM probe measured on one die. A rate above the measured
+  ceiling is the tell. Rotating five banks moved the fixed cost from
+  35.8–39.5 µs to 60–63 µs.
+  [Re-measurement](evidence/ascend-decode/gmm-l2-20261018/README.md)
+- Separate speed from acceptance before crediting a flag. Three of the five
+  composed flags make the round shorter when removed and TPOT worse, because
+  their whole return is speculative acceptance: `--fp32-head` 1.317 ms,
+  `gather_fia` 0.216, `--draft-projection-tp` 0.100. Only `--super-kernel`
+  and `--draft-graph` leave A untouched and are genuinely faster. A leave-one-out
+  that does not report A cannot tell these apart.
+  [Attribution](evidence/ascend-decode/ablate-20261018/README.md)
+- A quantity named union may be a sum. In the archived profile the family
+  durations add to `compute_union_ms` to the last digit, and the stage
+  `compute_union_ms` add to the round's. Either the export sums rather than
+  unions, in which case 40.698 ms is not a union, or the tasks never overlap,
+  in which case the file's own "duration sums are not additive critical path"
+  does not apply to it. Do not build an overlap argument on it until a line
+  sweep settles which.
+  [Profile](evidence/ascend-decode/cann-mtp-profile-20261017/summary.json)

@@ -1,5 +1,13 @@
 # W4A8 grouped matmul: fixed cost against streaming slope
 
+**Superseded.** This sweep kept one resident bank, and one bank of
+256 groups is exactly the die's 192 MiB L2, so its slope measures
+cache reread. Its 64→128 marginal rate of 1261.2 GB/s also exceeds
+the 1190.77 GB/s single-die maximum. Read
+[the re-measurement](../gmm-l2-20261018/README.md) instead: with five
+banks rotated the fixed cost is 60–63 µs, not the 35.8–39.5 µs below,
+and `gate_up` converges to 1138 GB/s.
+
 A3 `a3-84` die 0, shared with another tenant's idle `vllm serve`, one rank,
 no model. [The sweep](../../../../tests/glm52/bench_gmm_shape_scaling.py)
 keeps the full 256-group bank resident and uses `group_list` to select the
