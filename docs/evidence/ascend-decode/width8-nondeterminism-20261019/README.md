@@ -1,5 +1,128 @@
 # Width 8 is not a valid result yet: the trajectory diverges run to run
 
+## Located: the W4A8 routed-expert MoE段 under TP, and a race that re-ignites every forward
+
+**The narrowest bracket.** Two separate processes, identical input: the first
+divergence is in **round 0**, in the target's `predictions` alone. Candidates
+match (`[6500, 382, 262, 9897, 721, 3467, 284, 656]`), accepted tokens match
+(`[382, 262, 576]`), and predictions split from the fourth position. Identical
+up to it: prefix injection, the eager width-1 seed draft
+(`mtp_round.py:95-99`), six M1 captured-graph replays (`mtp_round.py:106-110`),
+and the eight host token ids handed to `verify` (`mtp_round.py:111`). So the
+first divergence is the width-8 verify's output, `cann_model.py:492-529`.
+
+**It is not setup.** Six consecutive `target.verify` calls on identical input
+in one process give six different row-wise digests, all eight rows differing,
+with |Δ|max 0.297–0.605 against |ref|max 3.45–4.19 — 7.1% to 17.5% relative.
+That is corrupted data, not reduction noise, and the same magnitude class as
+the int8 code difference of 114 seen in the vendor epilogue race. Captured-graph
+replay diverges identically, so the graph is not a necessary condition.
+
+**Bisected.** Per-layer, 795 module hooks, four repeats with identical module
+order: layers 0, 1 and 2 are bit-identical including their six TP all-reduces,
+as are layer 3's norms, attention and gate, and the first difference is
+`model.layers.3.mlp.experts`. Per-operator, 644 instrumented calls:
+`apply_gmm1_act_quant`, `npu_grouped_matmul`, `apply_gmm2` and
+`npu_moe_token_unpermute` are clean and the first difference is a following
+`npu_dynamic_quant`.
+
+**But the ignition point is random.** Three independent bisections put it in
+three different places. What is stable across all three is that the dense
+layers plus the first one or two MoE layers are bit-identical and everything
+after differs — 73 of 75 MoE layers. So this is a race that re-ignites
+somewhere in the MoE段 on every forward, not a fixed line and not
+accumulation.
+
+**The confirming differential.** `--expert-parallel` is the only change that
+restores reproducibility: one stream of three, 249/249/249 rounds, TPOT range
+0.110 ms, round-0 predictions unmoved across five samples. It replaces the
+whole dispatch, GMM, SwiGLU and combine path and removes the MoE TP reduction
+(`cann_model.py:144-147`). Five independent width-8 baselines give three
+streams each.
+
+It is a control and not a workaround: w8-ep's median TPOT is 15.612 ms against
+width 4's 15.609, so EP16 eats the whole of width 8's gain — consistent with
+the earlier finding that EP16 costs more per round than TP16.
+
+**Two candidates remain, both with a file:line.** The shared expert's
+`npu_dequant_swiglu_quant` (`shared_experts.py:546`), where
+`dequant_swiglu_quant.h:793` and `:797` have only a non-ordering
+`SetDeqScale` between two `Cast` calls while the two pairs that follow both
+carry `PipeBarrier<PIPE_V>`. Or `apply_gmm2`'s built-in `GroupedMatmul` A8W4
+split-K with `SetAtomicAdd<half>`, whose split dimension is chosen by host
+tiling from M — and M is 32 at width 4 against 64 at width 8.
+
+## The threshold is between 4 and 6, not at 8
+
+Width 4 is deterministic **across processes**, not only across requests: seven
+independent processes each give one token stream and 319 rounds, and a
+same-session control gives 307/307/307 with a 0.286 ms range and round-0
+predictions unmoved.
+
+But width 6 gives three streams of three, 232/230/241 rounds, first divergence
+in round 1. Its round-0 predictions hold only because that round's top-2
+margins are wide, not because width 6 is clean. So the asymmetry is real and
+its boundary is 4 to 6.
+
+## Eliminated by measurement, so that nobody re-tests them
+
+The down-stepping width hypothesis I had put first: refuted by counting. All
+879 width-8 rounds ran at width 8, `room` never fell below 129, and
+`mtp_state.py:166-169`'s down-step branch was never taken — which also clears
+the `torch.empty` input buffers, since one run uses one width and
+`positions`, `slots` and `input_ids` are fully written every round.
+
+SFA attention and the indexer: two independent differentials. Layer 3's
+attention is bit-identical before the first difference, and swapping the whole
+attention kernel for `gather_fia` at width 6 still gives three streams. **A
+hypothesis that fit perfectly and is nonetheless wrong** is worth recording:
+`sparse_flash_attention_kernel_mla.h:645` sets
+`info.mSizeV = (info.mSize <= 16) ? …` and with `gSize = 64/16 = 4` the
+threshold lands exactly between width 4 and width 6, matching the observation —
+and at width 4 the odd AIV of each pair early-exits throughout because
+`vecDealM == 0`. Replacing that kernel does not fix the divergence, so the fit
+is coincidence.
+
+`_int64_kv_slots`: follows from the attention output being identical.
+
+ACL graph, static kernels and SuperKernel: not necessary conditions, since the
+divergence reproduces with `compile_target=False` and `super_kernel=False`.
+
+A second missing barrier in `grouped_matmul_swiglu_quant_v2`: built and tested.
+`post.h:126`'s `Cast` and `:133`'s `Muls` have only `mmOutQueue`'s MTE2→V event
+between them, which cannot order V→V, while the two pairs that follow carry
+explicit barriers. Patched, rebuilt and placed first: still six differing
+hidden states and three streams. Not it.
+
+HCCL reduction order, both directions: unset and set, with and without the
+barrier active, three streams each. And the dense layers' six all-reduces are
+bit-identical, which removes the collective directly.
+
+## My own barrier evidence was void
+
+**The barrier overlay never took effect in any of my width-8 runs.**
+`utils.py:84-86` takes `_CUSTOM_OP_BASE_DIR` from
+`dirname(vllm_ascend.__file__)`, and `bootstrap_custom_op_env`
+(`utils.py:454-458`) prepends the vendor path derived from it at index 0.
+Because `PYTHONPATH` put the hoist overlay first, what got prepended was that
+overlay's **own unpatched vendor copy** — byte-identical to in-tree — ahead of
+the barrier at index 4. Spelling the in-tree path second does not help,
+because the bootstrap does not prepend that string.
+
+With the barrier genuinely first, width 8 still gives three streams, so the
+elimination stands. But the evidence I published for it did not exist, and the
+lesson is the one already in this project's record in a different form: an
+override installed in the wrong position fails in silence.
+
+## A probe that cannot be used on a collective
+
+Wrapping the TP sum to call it twice on one input and compare gave 314 of 314
+unequal with |Δ|max 0.575 against |ref|max 0.038 — a difference fifteen times
+the value measured. That is not non-determinism: two calls on the same
+symmetric window without a barrier let the second overwrite what peers are
+still reading. "Call twice and compare" is unusable for HCCL.
+
+
 Three arms, one tree, one frozen prefix, 1024 output tokens, three warmups and
 three measured requests each, `--target-graph --draft-graph
 --draft-projection-tp --compile-target --super-kernel --attention-kernel sfa
