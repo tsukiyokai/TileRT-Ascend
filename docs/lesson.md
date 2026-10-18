@@ -962,3 +962,8 @@
   first, eight calls agree; with the pristine vendor first, two results differ
   by 99 at the fourth call. An override installed in the wrong order fails in
   silence, which is the standard way a fix gets credited for nothing.
+- Installing the fix is also how an attribution gets refuted. The vendor
+  epilogue barrier clears its operator's race over 384 calls, and width 8 still
+  produced three token streams with it installed, so the cause of that
+  divergence was never the barrier. A withdrawal can be right about the
+  withdrawal and wrong about the reason, and only the fix distinguishes them.

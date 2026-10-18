@@ -105,6 +105,39 @@ the patch had failed to import, turning a crash into a pass. Both are the same
 failure: **the test supplied something the thing under test was missing** —
 there a name, here a static environment it had no right to depend on.
 
+## With the barrier installed, width 8 still diverges
+
+Three arms re-run with the overlay prepended, same tree and prefix:
+
+| arm | median | range | rounds | distinct token streams |
+|---|---|---|---|---|
+| width 4 | 14.533 ms | 0.141 | 307, 307, 307 | **1** |
+| width 8 | 12.688 ms | 2.267 | 218, 255, 221 | **3** |
+| width 8 + hoist | 13.030 ms | 0.610 | 247, 238, 243 | **3** |
+
+**The barrier is not the cause.** Width 4 stays deterministic and width 8
+stays at three streams, so this withdrawal's attribution was wrong and the
+caution against accepting it was right. There is a second source at width 8.
+
+The barrier should still be installed — 384 calls with zero disagreements
+against the factory object's 10 — but it buys correctness on that operator
+rather than reproducibility on the round.
+
+## The next candidate is in my own script
+
+`HCCL_DETERMINISTIC` is unset on this machine, and the benchmark only records
+it into the report rather than setting it. With HCCL free to vary its
+reduction order, a TP all_reduce's float sum differs run to run, which flips a
+marginal `argmax` occasionally — and width 8 has more draft positions for one
+to flip in, which is exactly the asymmetry observed. That is one variable and
+it is being measured now.
+
+If that is not it either, the remaining named candidate is the
+`_int64_kv_slots` identity caching: it invalidates by tensor identity only
+(`sfa_v1.py:459-474`), so a reused metadata object makes the check always hit
+and `cache_index` keeps the first round's int64 copy. Three independent
+safeties prevent it today and none of them is an assertion.
+
 ## Why both measurements of width 8 can be right
 
 An earlier investigation reported five runs at width 8 emitting bit-identical
