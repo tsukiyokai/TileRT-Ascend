@@ -294,3 +294,10 @@
   nothing to keep sixteen ranks in step. Forty-six times, for 0.6% transit.
   Optimise the schedule that feeds a collective before the collective.
   [Draft collectives](evidence/ascend-decode/draft-collectives-20261018/README.md)
+- Instrumentation that cannot wrap the production path yields no attribution.
+  A capture requested with `--draft-graph` records `draft_execution: eager`,
+  and adding `--compile-target` fails in `sfa_v1.py:1779` on a width-bound
+  output buffer. Every stage-level figure therefore describes a superseded
+  configuration, which is why the composed set's 57.12 ms round has no
+  decomposition. Check that the profiler records the flags you passed.
+  [Capture receipt](evidence/ascend-decode/draft-collectives-20261018/README.md)

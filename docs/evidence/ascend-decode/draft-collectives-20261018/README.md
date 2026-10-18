@@ -57,12 +57,29 @@ host launches between those reductions.
 ## A candidate that this measurement makes worth costing
 
 The three reductions exist because the single MTP layer is TP-sharded like
-the other 78. Replicating that one layer instead would remove all three from
-every draft stage. The cost is that each rank then reads the whole layer:
-eight selected experts at the full intermediate of 2048 in W4 is about
-151 MB, plus the layer's attention, which at 1138 GB/s
-([GMM re-measurement](../gmm-l2-20261018/README.md)) is a few hundred
-microseconds per draft step and one to two ms per round. Against roughly
-11 ms of rendezvous this looks strongly favourable, but the attention share
-and the extra resident bytes per die are not yet derived, and the proposal
-is a hypothesis until they are.
+the other 78. Replicating only the parts whose shard needs a reduction
+removes all three from every draft stage, and the cost is now derived rather
+than sketched. From the draft weight components in
+[runtime-traffic.json](../runtime-traffic.json), the sharded parts are the
+attention shards (`q_b_proj` 2,101,248 + `W_UK` 786,432 + `W_UV` 1,048,576 +
+`o_proj` 6,303,744 = 10,240,000 B; `q_a_proj`, `kv_a_proj` and the norms are
+already replicated), the routed experts at 10,051,584 B and `shared_ffn` at
+2,372,096 B. Replicating those three multiplies them by sixteen, adding
+339,955,200 B — 324.2 MiB — per rank per draft step, which at 1138 GB/s
+([GMM re-measurement](../gmm-l2-20261018/README.md)) is 299 µs per step and
+0.90 ms per round. The LM head stays vocab-sharded: its AllGather is the
+cheap collective at 0.234 ms, and replicating it would mean reading the whole
+154,880 × 6144 BF16 table.
+
+Against that, the upper bound on the saving is the three stages' collective
+envelopes less their AllGathers, 10.20 ms per round, so the net upper bound
+is 9.30 ms. Taken in full that would move the round from 57.12 to 47.82 ms
+and TPOT to 13.93 ms. The extra 324.2 MiB per die is resident, not per step,
+and fits the plan's 48 GiB per-die decode budget.
+
+Two reasons the bound is an upper bound. It comes from a capture taken before
+`--draft-graph`, and that flag already earns 5.78 ms per round
+([attribution](../ablate-20261018/README.md)) most plausibly by shrinking
+these same envelopes. And replication changes the arithmetic — a single-rank
+accumulate replaces a sixteen-way FP32 reduction — so the trajectory and
+acceptance would move and need their own validation.
