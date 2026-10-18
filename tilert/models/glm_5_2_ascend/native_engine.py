@@ -7,6 +7,7 @@ import torch
 import torch.distributed as distributed
 import torch.nn.functional as functional
 
+from .cann_model import device_tokens
 from .config import DecodeConfig
 from .engine import StepResult
 from .moe_plan import build_plan
@@ -433,9 +434,21 @@ class NativeDecodeEngine:
         return StepResult(result.logits, result.hidden_states, selections,
                           routes, result.last_hidden, result.token_ids)
 
+    def host_tokens(self, *groups):
+        """Read several token groups to the host in one transfer."""
+        tensors = [device_tokens(group, self.device) for group in groups]
+        read = torch.cat(tensors).tolist()
+        result, start = [], 0
+        for tensor in tensors:
+            width = tensor.shape[0]
+            result.append(tuple(int(value) for value in
+                                read[start:start + width]))
+            start += width
+        return tuple(result)
+
     def embed(self, tokens):
         """Look up replicated token rows from the sixteen vocabulary shards."""
-        values = torch.tensor(tokens, dtype=torch.int64, device=self.device)
+        values = device_tokens(tokens, self.device)
         local = values - self.vocab_start
         owns = (local >= 0) & (local < self.vocab_width)
         valid_local = local.clamp(0, self.vocab_width - 1)
@@ -449,13 +462,10 @@ class NativeDecodeEngine:
         ``last_hidden`` is the final RMSNorm output used to condition MTP.
         ``full_logits=False`` uses distributed top1 without vocabulary gather.
         """
-        tokens = tuple(tokens)
-        if len(tokens) not in (1, 2, 4):
+        tokens = device_tokens(tokens, self.device)
+        if tokens.shape[0] not in (1, 2, 4):
             raise ValueError("Verification width must be 1, 2 or 4")
-        if any(isinstance(token, bool) or not isinstance(token, int)
-               or not 0 <= token < self.config.vocab_size for token in tokens):
-            raise ValueError("Token is outside the vocabulary")
-        if self.position + len(tokens) > self.capacity:
+        if self.position + tokens.shape[0] > self.capacity:
             raise ValueError("Decode cache capacity exceeded")
         x = self.embed(tokens)
         hidden = [x] if trace else []

@@ -146,6 +146,14 @@ class _Rank(_Proxy):
         finally:
             self.state.mode = None
 
+    def advance_mtp_n(self, count):
+        results = []
+        for _ in range(count):
+            results.append(self.advance_mtp())
+            if results[-1].commit.finish_reason is not None:
+                break
+        return results
+
     def finish_mtp(self, retained_position):
         with self.state.markers.span("finish", retained=retained_position):
             return self.wrapped.finish_mtp(retained_position)

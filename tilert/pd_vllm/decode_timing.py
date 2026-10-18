@@ -88,6 +88,16 @@ class TimedBackend:
                 natural_accepted=commit.natural_accepted,
                 accepted_tokens=list(commit.accepted_tokens),
             )
+        elif operation == "advance_mtp_n":
+            commits = [item.commit for item in result]
+            entry.update(
+                rounds=len(commits),
+                accepted=sum(commit.committed for commit in commits),
+                matched_drafts=sum(commit.matched_drafts
+                                   for commit in commits),
+                accepted_tokens=[token for commit in commits
+                                 for token in commit.accepted_tokens],
+            )
         return result
 
     def inject(self, request):
@@ -103,6 +113,9 @@ class TimedBackend:
 
     def advance_mtp(self):
         return self._call("advance_mtp")
+
+    def advance_mtp_n(self, count):
+        return self._call("advance_mtp_n", count)
 
     def finish_mtp(self, retained_position):
         return self._call("finish_mtp", retained_position)

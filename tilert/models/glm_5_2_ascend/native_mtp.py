@@ -8,6 +8,8 @@ from pathlib import Path
 import struct
 from typing import TYPE_CHECKING
 
+from .cann_model import device_tokens
+
 if TYPE_CHECKING:
     import torch
 
@@ -156,18 +158,10 @@ class NativeMtp:
     def _validate(self, tokens, parent, external_indices):
         import torch
 
-        if isinstance(tokens, bool):
-            raise ValueError("Invalid MTP input token")
-        if isinstance(tokens, int) and not isinstance(tokens, bool):
-            tokens = (tokens,)
-        else:
-            tokens = tuple(tokens)
-        if len(tokens) not in (1, 2, 4):
+        tokens = device_tokens(tokens, self.device)
+        if tokens.shape[0] not in (1, 2, 4):
             raise ValueError("MTP width must be 1, 2 or 4")
-        if any(isinstance(token, bool) or not isinstance(token, int)
-               or not 0 <= token < VOCAB for token in tokens):
-            raise ValueError("Invalid MTP input token")
-        if (parent.shape != (len(tokens), HIDDEN)
+        if (parent.shape != (tokens.shape[0], HIDDEN)
                 or parent.dtype != torch.bfloat16
                 or parent.device != self.device):
             raise ValueError("MTP parent must be device BF16 [M,6144]")

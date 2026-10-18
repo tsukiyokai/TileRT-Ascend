@@ -48,12 +48,17 @@ class AscendMtpPDEngine(AscendPDEngine):
     returned token IDs or callbacks that completed successfully.
     """
 
-    def __init__(self, backend, width=4, stop_ids=()):
+    def __init__(self, backend, width=4, stop_ids=(), rounds_per_command=1):
         if (isinstance(width, bool) or not isinstance(width, int)
                 or width not in (2, 4)):
             raise ValueError("MTP serving requires width 2 or 4")
+        if (isinstance(rounds_per_command, bool)
+                or not isinstance(rounds_per_command, int)
+                or rounds_per_command < 1):
+            raise ValueError("rounds_per_command must be a positive integer")
         super().__init__(backend, stop_ids)
         self.width = width
+        self.rounds_per_command = rounds_per_command
 
     def inject(self, request):
         if request.seq_len < 1:
@@ -95,34 +100,49 @@ class AscendMtpPDEngine(AscendPDEngine):
                 started = True
             while started and not output.check_cancelled():
                 position = self.backend.position
-                calls += 1
-                result = self.backend.advance_mtp()
-                commit = result.commit
-                if (not commit.accepted_tokens
-                        or commit.main.before != position
-                        or commit.main.retained != position + commit.committed
-                        or self.backend.position != commit.main.retained):
-                    raise RuntimeError("MTP accepted span and cache differ")
-                span = {
-                    "width": commit.width,
-                    "matched_drafts": commit.matched_drafts,
-                    "natural_accepted": commit.natural_accepted,
-                    "accepted": commit.committed,
-                    "output_tokens": 0,
-                    "main_start": position,
-                    "main_retained": commit.main.retained,
-                }
-                spans.append(span)
-                before = len(output.tokens)
                 try:
-                    for token in commit.accepted_tokens:
-                        output.deliver(token)
-                        if output.reason is not None:
-                            break
-                finally:
-                    span["output_tokens"] = len(output.tokens) - before
-                if output.reason is None and commit.finish_reason is not None:
-                    raise RuntimeError("MTP stopped before a delivery limit")
+                    results = self.backend.advance_mtp_n(
+                        self.rounds_per_command
+                    )
+                except BaseException:
+                    calls += 1
+                    raise
+                calls += len(results)
+                if not results:
+                    raise RuntimeError("MTP command completed no round")
+                for result in results:
+                    commit = result.commit
+                    if (not commit.accepted_tokens
+                            or commit.main.before != position
+                            or commit.main.retained
+                            != position + commit.committed):
+                        raise RuntimeError("MTP accepted span and cache differ")
+                    position = commit.main.retained
+                    span = {
+                        "width": commit.width,
+                        "matched_drafts": commit.matched_drafts,
+                        "natural_accepted": commit.natural_accepted,
+                        "accepted": commit.committed,
+                        "output_tokens": 0,
+                        "main_start": commit.main.before,
+                        "main_retained": commit.main.retained,
+                    }
+                    spans.append(span)
+                    before = len(output.tokens)
+                    try:
+                        for token in commit.accepted_tokens:
+                            output.deliver(token)
+                            if output.reason is not None:
+                                break
+                    finally:
+                        span["output_tokens"] = len(output.tokens) - before
+                    if (output.reason is None
+                            and commit.finish_reason is not None):
+                        raise RuntimeError(
+                            "MTP stopped before a delivery limit"
+                        )
+                if self.backend.position != position:
+                    raise RuntimeError("MTP accepted span and cache differ")
         except BaseException as error:
             failure = error
             output.reason = "error"

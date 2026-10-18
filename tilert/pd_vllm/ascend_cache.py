@@ -259,6 +259,20 @@ class AscendRankEngine:
             raise RuntimeError("Start MTP before advancing a round")
         return self._mtp.advance()
 
+    def advance_mtp_n(self, count):
+        """Run up to ``count`` rounds on one command.
+
+        Every rank computes the same tokens, acceptance and stop decision
+        from its own device results, so rounds between commands need no
+        coordination beyond the collectives the model already performs.
+        """
+        results = []
+        for _ in range(count):
+            results.append(self.advance_mtp())
+            if results[-1].commit.finish_reason is not None:
+                break
+        return results
+
     def finish_mtp(self, retained_position):
         """Retain delivered-token state after a complete distributed round."""
         if self._mtp is None:

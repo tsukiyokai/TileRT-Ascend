@@ -1,20 +1,20 @@
-"""Greedy MTP rounds over the main-model and MTP CANN interfaces."""
+"""Greedy MTP rounds over the main-model and MTP CANN interfaces.
+
+A round issues every device call before the host reads anything. Proposal
+tokens travel as whatever the engines produce — device scalars for the real
+engines — so the chain, the verification and the conditioned MTP pass need
+no synchronisation between them. One call to the target's ``host_tokens``
+then delivers the proposals and predictions that committing requires.
+"""
 
 from dataclasses import dataclass
 
 from .mtp_state import MtpState
 
 
-def token_ids(result):
-    values = result.token_ids
-    if hasattr(values, "tolist"):
-        values = values.tolist()
-    return tuple(int(value) for value in values)
-
-
 @dataclass(frozen=True)
 class DraftSeed:
-    token: int
+    token: object
     recycle_hidden: object
     indices: object
 
@@ -67,7 +67,7 @@ class MtpRoundExecutor:
     @staticmethod
     def _seed(result, row):
         return DraftSeed(
-            token_ids(result)[row], result.recycle_hidden[row:row + 1],
+            result.token_ids[row], result.recycle_hidden[row:row + 1],
             result.indices[row:row + 1],
         )
 
@@ -101,22 +101,24 @@ class MtpRoundExecutor:
                 candidates.append(seed.token)
                 if len(candidates) < plan.width:
                     chained = self.draft.forward(
-                        (seed.token,), seed.recycle_hidden,
+                        [seed.token], seed.recycle_hidden,
                         full_logits=False, external_indices=shared_indices,
                     )
                     seed = self._seed(chained, 0)
             verified = self.target.verify(candidates, full_logits=False)
-            predictions = token_ids(verified)
             self.draft.truncate(plan.main_start)
             conditioned = self.draft.forward(
-                predictions, verified.last_hidden, full_logits=False,
+                verified.token_ids, verified.last_hidden, full_logits=False,
             )
-            commit = self.state.resolve(plan, candidates, predictions)
+            proposals, predictions = self.target.host_tokens(
+                candidates, verified.token_ids,
+            )
+            commit = self.state.resolve(plan, proposals, predictions)
             self.target.truncate(commit.main.retained)
             self.draft.truncate(commit.draft.retained)
             self.seed = self._seed(conditioned, commit.committed - 1)
             self.seed_parent_hidden = None
-            return ExecutedRound(tuple(candidates), predictions, commit)
+            return ExecutedRound(proposals, predictions, commit)
         except Exception:
             self.failed = True
             raise

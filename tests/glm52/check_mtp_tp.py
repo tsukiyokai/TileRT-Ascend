@@ -89,6 +89,9 @@ class ScalarTarget(ScalarCache):
             predictions.append(Token(predict(previous, self.position)))
         return SimpleNamespace(token_ids=predictions, last_hidden=hidden)
 
+    def host_tokens(self, *groups):
+        return tuple(tuple(int(token) for token in group) for group in groups)
+
 
 class ScalarDraft(ScalarCache):
     def __init__(self, capacity, mode):

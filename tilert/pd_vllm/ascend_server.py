@@ -55,7 +55,7 @@ class AscendServingEngine(AscendDeviceContext):
         return super().decode(first_token_id, **kwargs)
 
 
-def create_session(backend, mtp_width, stop_ids):
+def create_session(backend, mtp_width, stop_ids, rounds_per_command=1):
     from tilert.models.glm_5_2_ascend.mtp_session import AscendMtpPDEngine
     from tilert.models.glm_5_2_ascend.session import AscendPDEngine
 
@@ -64,7 +64,8 @@ def create_session(backend, mtp_width, stop_ids):
             backend, stop_ids=stop_ids,
             select_token=lambda result: int(result.token_ids[0].item()),
         )
-    return AscendMtpPDEngine(backend, width=mtp_width, stop_ids=stop_ids)
+    return AscendMtpPDEngine(backend, width=mtp_width, stop_ids=stop_ids,
+                             rounds_per_command=rounds_per_command)
 
 
 def create_serving_engine(backend, rank_engine, device, *, mtp_width,

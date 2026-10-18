@@ -58,6 +58,9 @@ class ScalarTarget:
             predictions.append(next_token(previous, self.position))
         return SimpleNamespace(token_ids=predictions, last_hidden=hidden)
 
+    def host_tokens(self, *groups):
+        return tuple(tuple(int(token) for token in group) for group in groups)
+
     def truncate(self, length):
         if not 0 <= length <= self.position:
             raise ValueError("Target truncate exceeds written rows")

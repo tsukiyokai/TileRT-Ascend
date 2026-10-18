@@ -110,9 +110,13 @@ def arguments():
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
     parser.add_argument("--cpu-affinity", action="store_true")
+    parser.add_argument("--rounds-per-command", type=int, default=1,
+                        help="Rounds each broadcast command batches")
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
+    if args.rounds_per_command < 1:
+        parser.error("--rounds-per-command must be positive")
     if (args.target_graph or args.draft_graph) and args.warmup < 1:
         parser.error("Graph capture requires an unmeasured warmup request")
     if args.compile_target and not args.target_graph:
@@ -130,7 +134,8 @@ def drive(backend, first, args):
     from tilert.pd_vllm.ascend_server import create_session
 
     timed = TimedBackend(backend)
-    session = create_session(timed, WIDTH, ())
+    session = create_session(timed, WIDTH, (),
+                             rounds_per_command=args.rounds_per_command)
     records = []
     try:
         for number in range(args.warmup + args.requests):

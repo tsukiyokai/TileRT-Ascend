@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tilert.models.glm_5_2_ascend.mtp_round import (  # noqa: E402
-    MtpRoundExecutor, token_ids,
+    MtpRoundExecutor,
 )
 from tilert.pd_vllm.ascend_layout import (  # noqa: E402
     PARENT_HIDDEN_REGION, validate_layout, validate_parent_hidden_metadata,
@@ -42,6 +42,14 @@ from tilert.pd_vllm.decode_timing import atomic_json  # noqa: E402
 from tilert.pd_vllm.prefix_capture import (  # noqa: E402
     copy_to_cpu, digest, save_bundle,
 )
+
+
+def token_ids(result):
+    """Read a step's ids to the host; serial teacher forcing needs each one."""
+    values = result.token_ids
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return tuple(int(value) for value in values)
 
 
 def parse_arguments(argv=None):

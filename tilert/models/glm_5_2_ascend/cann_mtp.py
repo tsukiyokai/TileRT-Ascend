@@ -5,12 +5,11 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .cann_model import CannModel
+from .cann_model import CannModel, device_tokens
 
 
 LAYER = 78
 HIDDEN = 6144
-VOCAB = 154880
 TOPK = 2048
 MAIN_CACHE = "model.layers.78.self_attn.attn"
 INDEX_CACHE = "model.layers.78.self_attn.indexer.k_cache"
@@ -268,13 +267,9 @@ class CannMtp:
         )
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
-        if isinstance(tokens, bool):
-            raise ValueError("Invalid MTP input token")
-        tokens = (tokens,) if type(tokens) is int else tuple(tokens)
-        width = len(tokens)
-        if (width not in (1, 2, 4)
-                or any(type(token) is not int or not 0 <= token < VOCAB
-                       for token in tokens)):
+        tokens = device_tokens(tokens, self.device)
+        width = tokens.shape[0]
+        if width not in (1, 2, 4):
             raise ValueError("MTP requires 1, 2 or 4 vocabulary tokens")
         if (parent.shape != (width, HIDDEN)
                 or parent.dtype != torch.bfloat16
@@ -296,7 +291,7 @@ class CannMtp:
         ):
             metadata = CannModel._metadata(self, width)
             metadata[MAIN_CACHE].attn_state = AscendAttentionState.SpecDecoding
-            self.input_ids.copy_(torch.tensor(tokens, dtype=torch.long))
+            self.input_ids.copy_(tokens)
             self.model.model.set_skip_topk(external_indices is not None)
             if external_indices is not None:
                 self.indices_buffer[:width].copy_(external_indices)

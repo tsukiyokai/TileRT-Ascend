@@ -69,7 +69,8 @@ class RankExecutor:
         if command.get("request_id") != self.request_id:
             raise ValueError("Rank command belongs to another request")
         operation = command["operation"]
-        if operation in ("step", "start_mtp", "advance_mtp", "finish_mtp"):
+        if operation in ("step", "start_mtp", "advance_mtp",
+                         "advance_mtp_n", "finish_mtp"):
             if self.request_id is None:
                 raise RuntimeError("Rank has no injected request")
         result = None
@@ -92,6 +93,8 @@ class RankExecutor:
             )
         elif operation == "advance_mtp":
             result = self.engine.advance_mtp()
+        elif operation == "advance_mtp_n":
+            result = self.engine.advance_mtp_n(command["count"])
         elif operation == "finish_mtp":
             self.engine.finish_mtp(command["retained_position"])
         elif operation == "reset":
@@ -158,6 +161,9 @@ class CoordinatedBackend:
 
     def advance_mtp(self):
         return self._execute("advance_mtp")
+
+    def advance_mtp_n(self, count):
+        return self._execute("advance_mtp_n", count=int(count))
 
     def finish_mtp(self, retained_position):
         self._execute("finish_mtp", retained_position=retained_position)

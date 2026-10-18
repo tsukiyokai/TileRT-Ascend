@@ -11,6 +11,33 @@ from tilert.pd_vllm.ascend_layout import (
 )
 
 
+VOCAB_SIZE = 154880
+
+
+def device_tokens(tokens, device):
+    """Normalise decode tokens to one device integer tensor.
+
+    An element may be a host integer, which a caller supplies and we check,
+    or a device scalar from ``logits.argmax``, which is a vocabulary index
+    by construction. Accepting both lets a round propose entirely on the
+    device while still naming its pending token on the host.
+    """
+    import torch
+
+    if torch.is_tensor(tokens):
+        return tokens.reshape(-1).to(torch.int64)
+    values = tuple(tokens) if isinstance(tokens, (list, tuple)) else (tokens,)
+    for value in values:
+        if torch.is_tensor(value):
+            continue
+        if type(value) is not int or not 0 <= value < VOCAB_SIZE:
+            raise ValueError("Decode requires GLM-5.2 vocabulary tokens")
+    return torch.stack([
+        torch.as_tensor(value, dtype=torch.int64, device=device).reshape(())
+        for value in values
+    ])
+
+
 @dataclass
 class CannStep:
     logits: object
@@ -357,10 +384,9 @@ class CannModel:
             set_ascend_forward_context,
         )
 
-        width = len(tokens)
-        if (width not in (1, 2, 4)
-                or any(type(token) is not int or not 0 <= token < 154880
-                       for token in tokens)):
+        tokens = device_tokens(tokens, self.device)
+        width = tokens.shape[0]
+        if width not in (1, 2, 4):
             raise ValueError("Verify requires 1, 2 or 4 vocabulary tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
@@ -371,10 +397,7 @@ class CannModel:
             set_current_vllm_config(self.config)
         ):
             metadata = self._metadata(width)
-            if width == 1:
-                self.input_ids.fill_(tokens[0])
-            else:
-                self.input_ids.copy_(torch.tensor(tokens, dtype=torch.int32))
+            self.input_ids.copy_(tokens)
             with set_ascend_forward_context(
                 metadata, self.config, num_tokens=width,
                 num_actual_tokens=width,
@@ -389,6 +412,25 @@ class CannModel:
             return CannStep(
                 logits if full_logits else None, hidden, token_ids,
             )
+
+    def host_tokens(self, *groups):
+        """Read several token groups to the host in one transfer.
+
+        A round issues every kernel before calling this, so this is its only
+        synchronisation. The host needs these values to commit cache lengths
+        and to deliver text.
+        """
+        import torch
+
+        tensors = [device_tokens(group, self.device) for group in groups]
+        read = torch.cat(tensors).tolist()
+        result, start = [], 0
+        for tensor in tensors:
+            width = tensor.shape[0]
+            result.append(tuple(int(value) for value in
+                                read[start:start + width]))
+            start += width
+        return tuple(result)
 
     def step(self, token):
         return self.verify((token,), full_logits=False)

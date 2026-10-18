@@ -80,9 +80,11 @@ def serial_oracle(prompt, count, capacity, stops=(), cancel_after=None):
     return output, rows, reason
 
 
-def make_session(prefix=128, width=4, mode="accept", room=32, stops=()):
+def make_session(prefix=128, width=4, mode="accept", room=32, stops=(),
+                 rounds_per_command=1):
     backend, ranks, channel = make_backend(mode, prefix + room)
-    session = create_session(backend, width, stops)
+    session = create_session(backend, width, stops,
+                             rounds_per_command=rounds_per_command)
     prompt = tuple((row * 7 + 3) % 251 for row in range(prefix))
     session.inject(PrefixRequest("request", prefix, {"prompt": prompt}))
     first = ranks[0].engine.first_token_id
@@ -141,7 +143,11 @@ class MtpSessionChecks(unittest.TestCase):
         self.assertNotIn("step", commands)
         self.assertEqual(commands.count("start_mtp"),
                          commands.count("finish_mtp"))
-        self.assertEqual(commands.count("advance_mtp"), stats["round_calls"])
+        batch_commands = (commands.count("advance_mtp")
+                          + commands.count("advance_mtp_n"))
+        chunk = getattr(session, "rounds_per_command", 1)
+        self.assertLessEqual(batch_commands, stats["round_calls"])
+        self.assertLessEqual(stats["round_calls"], batch_commands * chunk)
         self.coverage["fixtures"] += 1
         for name in ("round_calls", "verified_positions", "output_tokens"):
             self.coverage[name] += stats[name]
@@ -174,6 +180,25 @@ class MtpSessionChecks(unittest.TestCase):
                 expected = serial_oracle(prompt, budget, prefix + 32)
                 self.assertEqual(delivered, actual)
                 self.check_result(session, ranks, channel, actual, expected)
+
+    def test_batched_rounds_deliver_the_single_round_stream(self):
+        for chunk, mode, budget in product(
+            (2, 3, 5), ("accept", "reject", "mixed"), (5, 9),
+        ):
+            with self.subTest(chunk=chunk, mode=mode, budget=budget):
+                session, ranks, channel, prompt, first = make_session(
+                    mode=mode, rounds_per_command=chunk,
+                )
+                delivered = []
+                actual = session.decode(first, budget,
+                                        on_token=delivered.append)
+                expected = serial_oracle(prompt, budget, 160)
+                self.assertEqual(delivered, actual)
+                self.check_result(session, ranks, channel, actual, expected)
+                commands = operations(channel)
+                self.assertEqual(commands.count("advance_mtp"), 0)
+                self.assertLess(commands.count("advance_mtp_n"),
+                                session.last_stats["round_calls"] + 1)
 
     def test_zero_and_one_output_do_not_start_or_finish_mtp(self):
         for budget in (0, 1):
@@ -308,7 +333,7 @@ class MtpSessionChecks(unittest.TestCase):
                               (expected, rows, "cancelled"))
             self.assertEqual(delivered, [first])
             self.assertEqual(operations(channel),
-                             ["inject", "start_mtp", "advance_mtp",
+                             ["inject", "start_mtp", "advance_mtp_n",
                               "finish_mtp"])
             self.assertEqual(session.last_stats["completed_rounds"], 1)
             self.assertGreater(session.last_stats["accepted"], 0)
@@ -383,7 +408,7 @@ class MtpSessionChecks(unittest.TestCase):
             session.decode(first, 9)
         self.assertTrue(session.backend.failed)
         self.assertEqual(operations(channel),
-                         ["inject", "start_mtp", "advance_mtp"])
+                         ["inject", "start_mtp", "advance_mtp_n"])
         self.assertIn("TP command stream failed",
                       session.last_stats["finish_error"])
         self.assertEqual(session.last_stats["finish_reason"], "error")
@@ -406,7 +431,7 @@ class MtpSessionChecks(unittest.TestCase):
             session.decode(first, 5, on_token=delivered.append)
         self.assertTrue(session.backend.failed)
         self.assertEqual(operations(channel),
-                         ["inject", "start_mtp", "advance_mtp",
+                         ["inject", "start_mtp", "advance_mtp_n",
                           "finish_mtp"])
         self.assertEqual(session.last_stats["output_tokens"], len(delivered))
         self.assertEqual(session.last_stats["finish_reason"], "error")
