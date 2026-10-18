@@ -36,6 +36,11 @@ def predict(digest, length):
 
 
 class Token(int):
+    """Model a device scalar: the executor must snapshot it before reuse."""
+
+    def clone(self):
+        return self
+
     def item(self):
         return int(self)
 
@@ -115,7 +120,8 @@ class ScalarDraft(ScalarCache):
             wrong = self.mode == "reject" or (
                 self.mode == "mixed" and self.position % 4 == 1
             )
-            predictions.append((predicted % 251) + 1 if wrong else predicted)
+            predictions.append(Token((predicted % 251) + 1 if wrong
+                                   else predicted))
             recycled.append(Hidden("draft", digest, length))
             indices.append((self.position - 1,) if external_indices is None
                            else external_indices[row])

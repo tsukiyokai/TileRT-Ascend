@@ -112,6 +112,8 @@ def arguments():
     parser.add_argument("--cpu-affinity", action="store_true")
     parser.add_argument("--rounds-per-command", type=int, default=1,
                         help="Rounds each broadcast command batches")
+    parser.add_argument("--expert-parallel", action="store_true",
+                        help="EP16 experts and the fused MC2 MoE operator")
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
@@ -316,7 +318,8 @@ def run(args, report):
                        compile_target=args.compile_target,
                        super_kernel=args.super_kernel,
                        attention_kernel=args.attention_kernel,
-                       fp32_head=args.fp32_head)
+                       fp32_head=args.fp32_head,
+                       expert_parallel=args.expert_parallel)
     draft = None
     try:
         draft = CannMtp(target, shard_projections=args.draft_projection_tp)

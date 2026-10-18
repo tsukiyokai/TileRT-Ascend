@@ -46,8 +46,15 @@ class CannStep:
 
 
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
-                  *, compile_target=False, super_kernel=False):
-    """Construct TP16 config, optionally compiling the M4 target backbone."""
+                  *, compile_target=False, super_kernel=False,
+                  expert_parallel=False):
+    """Construct TP16 config, optionally compiling the M4 target backbone.
+
+    ``expert_parallel`` reshards the 256 routed experts over the sixteen
+    ranks (EP16, sixteen full experts each, intermediate stays 2048) and
+    selects the fused MC2 MoE: dispatch, both GMMs, SwiGLU and combine in
+    one vendor operator per layer, removing the MoE's TP reduction.
+    """
     if super_kernel and not compile_target:
         raise ValueError("SuperKernel requires the compiled M4 target")
 
@@ -69,6 +76,7 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         max_model_len=capacity,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=False, enable_chunked_prefill=True,
+        enable_expert_parallel=expert_parallel,
         enforce_eager=not compile_target, async_scheduling=False,
         compilation_config={
             "mode": CompilationMode.VLLM_COMPILE,
@@ -80,7 +88,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         speculative_config=None, kv_transfer_config=None,
         additional_config={
             "enable_flashcomm1": False, "enable_dsa_cp": False,
-            "enable_shared_expert_dp": False, "enable_fused_mc2": 0,
+            "enable_shared_expert_dp": False,
+            "enable_fused_mc2": int(expert_parallel),
             "ascend_compilation_config": {
                 "enable_static_kernel": super_kernel,
                 "enable_super_kernel": super_kernel,
@@ -102,6 +111,7 @@ class CannModel:
         self, checkpoint, device, rank, init_method="env://", capacity=9344,
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
+        expert_parallel=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -131,6 +141,7 @@ class CannModel:
         self.config = create_config(
             self.checkpoint, capacity, gpu_memory_utilization,
             compile_target=compile_target, super_kernel=super_kernel,
+            expert_parallel=expert_parallel,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(

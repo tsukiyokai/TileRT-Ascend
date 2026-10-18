@@ -388,3 +388,16 @@
   failed one-shot push. Search for the error code in shipped source before
   black-box bisection.
   [HyperMPMD](evidence/ascend-decode/hyper-mpmd-20261018/README.md)
+- A synchronisation can be load-bearing for a reason that is not
+  synchronisation. `.tolist()` on a draft result was removed to stop a device
+  stall, and it silently took a snapshot with it: the graphed draft returns
+  reused buffers, so the chain's candidates became aliases that the next
+  replay overwrote. Output stayed bit-exact and the round's wall time did not
+  move — only acceptance fell, 3.433 to 2.079, and TPOT went from 14.540 to
+  24.504. When removing a copy, ask what else the copy was doing, and keep a
+  gate on acceptance, not only on tokens.
+  [Aliasing](evidence/ascend-decode/devtok-aliasing-20261018/README.md)
+- A passing test is not evidence of coverage. All three scalar doubles handed
+  back fresh lists of immutable ints, so no host test could have caught the
+  aliasing above. Model the awkward part of the real contract — reused storage
+  — and verify the new case fails on the unfixed binary before trusting it.

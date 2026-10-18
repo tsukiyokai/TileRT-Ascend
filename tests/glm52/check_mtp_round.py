@@ -29,6 +29,16 @@ def next_token(context_hash, length):
     return (context_hash * 19 + length * 7) % 251 + 1
 
 
+class Token(int):
+    """Model a device scalar: the executor must snapshot it before reuse."""
+
+    def clone(self):
+        return self
+
+    def item(self):
+        return int(self)
+
+
 @dataclass(frozen=True)
 class Hidden:
     kind: str
@@ -55,7 +65,7 @@ class ScalarTarget:
                 self.rows.append(entry)
             self.position += 1
             hidden.append(Hidden("target", previous, self.position))
-            predictions.append(next_token(previous, self.position))
+            predictions.append(Token(next_token(previous, self.position)))
         return SimpleNamespace(token_ids=predictions, last_hidden=hidden)
 
     def host_tokens(self, *groups):
@@ -107,7 +117,7 @@ class ScalarDraft:
             wrong = self.mode == "reject" or (
                 self.mode == "mixed" and (self.position % 4 == 1)
             )
-            predictions.append(predicted + int(wrong))
+            predictions.append(Token(predicted + int(wrong)))
             recycled.append(Hidden("draft", digest, length))
             indices.append(
                 tuple(range(min(self.position, 2048)))
@@ -115,6 +125,61 @@ class ScalarDraft:
             )
         return SimpleNamespace(token_ids=predictions,
                                recycle_hidden=recycled, indices=indices)
+
+
+class Cell:
+    """A mutable token slot, as a graphed draft returns reused storage.
+
+    ``clone`` is the only way to detach a value, so an executor that keeps
+    the slot itself among its candidates sees the next chain step rewrite a
+    proposal it already made.
+    """
+
+    def __init__(self, value):
+        self.value = value
+
+    def clone(self):
+        return Cell(self.value)
+
+    def item(self):
+        return int(self.value)
+
+    def __int__(self):
+        return int(self.value)
+
+    def __index__(self):
+        return int(self.value)
+
+    def __eq__(self, other):
+        return int(self.value) == int(other)
+
+    def __hash__(self):
+        return hash(int(self.value))
+
+    def __add__(self, other):
+        return int(self.value) + int(other)
+
+    __radd__ = __add__
+
+    def __mod__(self, other):
+        return int(self.value) % int(other)
+
+
+class RecycledDraft(ScalarDraft):
+    """Hand every forward the same cells, refilled in place."""
+
+    def __init__(self, target, prefix_length, first_token, mode):
+        super().__init__(target, prefix_length, first_token, mode)
+        self.cells = []
+
+    def forward(self, tokens, parent_hidden, **kwargs):
+        result = super().forward(tokens, parent_hidden, **kwargs)
+        while len(self.cells) < len(result.token_ids):
+            self.cells.append(Cell(0))
+        for cell, token in zip(self.cells, result.token_ids):
+            cell.value = int(token)
+        result.token_ids = self.cells[:len(result.token_ids)]
+        return result
 
 
 def autoregressive(prompt, first, count, capacity, eos=()):
@@ -132,12 +197,13 @@ def autoregressive(prompt, first, count, capacity, eos=()):
     return output, rows
 
 
-def make_executor(width, prefix, missing_seed, mode, budget=64, room=100):
+def make_executor(width, prefix, missing_seed, mode, budget=64, room=100,
+                  draft_class=ScalarDraft):
     prompt = tuple((row * 7 + 3) % 251 for row in range(prefix))
     target = ScalarTarget(prompt, prefix + room)
     parent = Hidden("target", target.rows[-1][1], prefix)
     first = next_token(parent.context_hash, prefix)
-    draft = ScalarDraft(target, prefix - int(missing_seed), first, mode)
+    draft = draft_class(target, prefix - int(missing_seed), first, mode)
     executor = MtpRoundExecutor(target, draft, width, budget)
     executor.start(first, [parent])
     return executor, prompt, first
@@ -173,6 +239,27 @@ class MtpRoundChecks(unittest.TestCase):
                                 :executor.target.position
                             ]
                             self.assertEqual([row[0] for row in valid], rows)
+
+    def test_a_recycled_draft_buffer_does_not_cost_acceptance(self):
+        """A reused output slot must not rewrite an already-made proposal."""
+        for width in (2, 4):
+            with self.subTest(width=width):
+                plain, prompt, first = make_executor(width, 128, False,
+                                                     "accept")
+                recycled = make_executor(width, 128, False, "accept",
+                                         draft_class=RecycledDraft)[0]
+                expected, rounds = [first], 0
+                while plain.state.finish_reason is None:
+                    expected.extend(plain.advance().commit.accepted_tokens)
+                    rounds += 1
+                actual, recycled_rounds = [first], 0
+                while recycled.state.finish_reason is None:
+                    actual.extend(
+                        recycled.advance().commit.accepted_tokens
+                    )
+                    recycled_rounds += 1
+                self.assertEqual(actual, expected)
+                self.assertEqual(recycled_rounds, rounds)
 
     def check_committed_cache(self, executor, prompt, output):
         target, draft, state = executor.target, executor.draft, executor.state

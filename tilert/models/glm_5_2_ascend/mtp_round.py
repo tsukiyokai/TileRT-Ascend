@@ -66,9 +66,12 @@ class MtpRoundExecutor:
 
     @staticmethod
     def _seed(result, row):
+        # A graphed draft returns its persistent output buffers, so the next
+        # replay would rewrite a proposal already placed among the candidates.
+        # Snapshot the token on the device; the host still reads nothing.
         return DraftSeed(
-            result.token_ids[row], result.recycle_hidden[row:row + 1],
-            result.indices[row:row + 1],
+            result.token_ids[row].clone(),
+            result.recycle_hidden[row:row + 1], result.indices[row:row + 1],
         )
 
     def advance(self):
