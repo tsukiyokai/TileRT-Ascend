@@ -322,3 +322,18 @@
   environment variable. Re-test rejected settings after the surrounding
   configuration moves.
   [Expansion mode](evidence/ascend-decode/expansion-20261018/README.md)
+- An advanced index on a non-contiguous view materialises the whole view.
+  `chunk` left the derived rope caches with a row stride of 128 instead of 64,
+  so `_cos_cache[positions]` moved 384 MiB on every metadata build — 7.4 GB
+  per round, more than the model's weights — at full streaming bandwidth, so
+  it looked like an efficient kernel rather than a mistake. Two
+  `.contiguous()` calls took TPOT from 15.978 to 14.540 ms with the trajectory
+  unchanged. Check the stride of anything you index by tensor.
+  [Rope cache](evidence/ascend-decode/rope-contiguous-20261018/README.md)
+- A compiled model is traced at the width of its first forward. The runner's
+  serial M1 validation phase ran before the M4 phase, so the compiled target
+  was fixed at one row and the M4 phase fed four rows into a one-row buffer.
+  That single crash had hidden the compiled configuration from the profiler
+  all day, and with it the 9% above. Warm a compiled module at the width you
+  intend to use.
+  [How it was found](evidence/ascend-decode/rope-contiguous-20261018/README.md#how-it-was-found)

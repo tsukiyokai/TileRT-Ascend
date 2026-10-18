@@ -117,13 +117,13 @@ def profiler_identity(torch_npu):
                 msprof_hash == PROFILER_CONTRACT["msprof_sha256"]}
 
 
-def make_profiler(directory, rank):
+def make_profiler(directory, rank, *, with_stack=False):
     from torch_npu import profiler
 
     return profiler.profile(
         activities=[profiler.ProfilerActivity.CPU,
                     profiler.ProfilerActivity.NPU],
-        record_shapes=False, profile_memory=False, with_stack=False,
+        record_shapes=False, profile_memory=False, with_stack=with_stack,
         on_trace_ready=profiler.tensorboard_trace_handler(
             str(directory), worker_name=f"rank-{rank}", analyse_flag=False,
         ),

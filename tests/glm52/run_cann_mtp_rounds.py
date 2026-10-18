@@ -67,6 +67,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
+    parser.add_argument("--profile-stacks", action="store_true",
+                        help="record Python stacks so eager kernels name their caller")
     parser.add_argument("--profile-output", type=Path,
                         help="Capture M4 stages after device checks pass")
     parser.add_argument("--device-offset", type=int, choices=range(16),
@@ -368,7 +370,11 @@ def execute(args):
     directory = args.output / f"rank-{rank}"
     directory.mkdir(parents=True, exist_ok=False)
     expected_cache = None
-    phases = ["serial", "speculative"]
+    # The compiled target is traced at the width of its first forward, so a
+    # serial M1 pass would fix it at one row and the M4 phase would then feed
+    # four rows into a one-row buffer.
+    phases = ["speculative"] if args.compile_target else ["serial",
+                                                          "speculative"]
     if args.target_graph or args.draft_graph:
         phases.append("graph")
     phases.append("reset")
@@ -423,7 +429,7 @@ def execute(args):
             path = directory / f"{label}.pt"
             save_bundle({**result, "new_cache": cache}, path)
             paths[label] = {"path": str(path), "sha256": digest(path)}
-            if label == "serial":
+            if label == phases[0]:
                 expected_cache = cache
             else:
                 reference = runs[phases[phases.index(label) - 1]]
@@ -547,7 +553,8 @@ def execute(args):
         prefix = FullRankPrefix(main_prefix, mtp_prefix,
                                 saved_parent.to(target.device), initial)
         capture_validated_mtp(target, draft, prefix, first, rank,
-                              args.profile_output)
+                              args.profile_output,
+                              with_stack=args.profile_stacks)
         atomic_json(args.output / f"profile-binding-rank-{rank}.json", {
             "validation_summary_sha256": digest(args.output / "summary.json"),
             "validation_report_sha256": digest(path),

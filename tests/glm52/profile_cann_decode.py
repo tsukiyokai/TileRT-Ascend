@@ -40,7 +40,8 @@ class _MarkedModel:
             return self.model.reset()
 
 
-def capture_validated_model(engine, prefixes, first_token, rank, directory):
+def capture_validated_model(engine, prefixes, first_token, rank,
+                            directory, *, with_stack=False):
     """Profile the caller's accepted model without reloading or prompt replay.
 
     All sixteen ranks must call this after their numerical checks pass.
@@ -79,7 +80,7 @@ def capture_validated_model(engine, prefixes, first_token, rank, directory):
         markers.phase = "capture"
         markers.range_factory = npu_range
         captured = capture_phase(
-            make_profiler(raw, rank), markers, barrier,
+            make_profiler(raw, rank, with_stack=with_stack), markers, barrier,
             lambda: run_phase(*phase_args, ignore_eos=True),
         )
     consistent = [True]
@@ -104,6 +105,7 @@ def capture_validated_model(engine, prefixes, first_token, rank, directory):
         "initial_position": 8192, "first_token_id": first_token,
         "max_tokens": 3, "ignore_eos": True,
         "profiler_api": identity, "warmup": warmup, "capture": captured,
+        "with_stack": with_stack,
         "markers": markers.events, "trace_directory": str(raw),
         "source_sha256": {**engine.source_metadata(), **sources},
         "trace_files": trace_inventory(raw),
@@ -116,7 +118,8 @@ def capture_validated_model(engine, prefixes, first_token, rank, directory):
     return report
 
 
-def capture_validated_mtp(target, draft, prefix, first_token, rank, directory):
+def capture_validated_mtp(target, draft, prefix, first_token, rank,
+                          directory, *, with_stack=False):
     """Profile the accepted M4 objects and their existing target graph.
 
     Six outputs require at most five rounds. The frozen 8K input uses
@@ -152,7 +155,7 @@ def capture_validated_mtp(target, draft, prefix, first_token, rank, directory):
         torch.npu.synchronize(target.device)
         markers.phase, markers.range_factory = "capture", npu_range
         captured = capture_phase(
-            make_profiler(raw, rank), markers, barrier,
+            make_profiler(raw, rank, with_stack=with_stack), markers, barrier,
             lambda: run_phase(*phase_args, ignore_eos=True),
         )
     counts = Counter(event["name"] for event in markers.events
@@ -199,6 +202,7 @@ def capture_validated_mtp(target, draft, prefix, first_token, rank, directory):
         "draft_execution": "eager" if draft.graph is None else "chain_graph",
         "actual_rounds": rounds, "rank_stages": ranks,
         "profiler_api": identity, "warmup": warmup, "capture": captured,
+        "with_stack": with_stack,
         "markers": markers.events, "trace_directory": str(raw),
         "source_sha256": {**target.source_metadata(), **sources},
         "trace_files": trace_inventory(raw),
