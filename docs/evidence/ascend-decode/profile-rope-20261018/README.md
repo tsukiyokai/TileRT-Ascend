@@ -53,16 +53,44 @@ and all three fall inside the decode window at offsets of 78.48, 214.19 and
 345.57 ms across a 410.46 ms window, so one occurs per round and none is a
 teardown barrier.
 
-They do not match any named collective: the nearest entry in
-`communication.json` is 9.9 to 24.0 ms away and 0.03 ms long. Under AIV
-expansion with SuperKernel the collectives vanish from the operator table
-altogether — `allreduceAicpuKernel` and `allGather` are both absent — so the
-usual attribution path is gone and what these three calls contain is
-unconfirmed. `Block Num` 16 matches the AIV collective signature recorded in
-[the earlier mode comparison](../cann-mtp-profile-20261017/aiv-comparison.json),
-which makes an embedded collective the leading candidate, but stacks do not
-help because SuperKernel runs inside the graph.
+They match no named collective — the nearest `communication.json` entry is
+9.9 to 24.0 ms away and 0.03 ms long — because under AIV expansion with
+SuperKernel the collectives leave the operator table altogether, with both
+`allreduceAicpuKernel` and `allGather` absent. `trace_view.json` names them:
 
-The query that would settle it: read `trace_view.json` around those three
-timestamps for the sub-tasks inside the group, or export the task-level view
-with `msprof --export` and list the SuperKernel's members.
+```
+sk_1277_full_model_start_aiv_all_reduce_float_end_aiv_all_reduce_float
+Model Id 48, Task Type MIX_AIV, Physic Stream Id 80
+```
+
+So it is a collective after all, embedded in a SuperKernel group whose first
+and last operators are both an AIV FP32 all-reduce.
+
+## One grouping boundary costs 4.36 ms per round
+
+Grouping the trace's `sk_*` events by name gives 637 distinct groups totalling
+103.587 ms over three rounds, so 34.53 ms per round. Of those, 157 name an
+`all_reduce` and total 29.921 ms, which is 28.9% of all SuperKernel time or
+9.97 ms per round. The count matches the 157 reductions a round performs, so
+each reduction sits in its own group.
+
+The distribution inside that set is the finding. `sk_1277` alone takes
+13.068 ms of the 29.921, which is 4.36 ms per round, while the other 156
+groups share 16.853 ms and average about 36 µs each. One group costs 121
+times what its siblings cost, and the names say why: `sk_1277` begins and
+ends with an all-reduce, while the others begin with a compute kernel, for
+example
+`sk_667_full_model_start_static_kernel_AddRmsNormBias_...`.
+
+A group that begins with a collective cannot start until all sixteen ranks
+arrive, and it holds no preceding compute to cover the skew. A group that
+begins with compute hides its reduction behind that compute. This is the same
+mechanism the draft stages showed, where three reductions after a host
+broadcast waited about 1.2 ms each
+([draft collectives](../draft-collectives-20261018/README.md)), expressed here
+as a single grouping boundary worth 8.7% of the round.
+
+The next experiment is to move that boundary: `cann_mtp.py` already sets
+`compilation_config.static_all_moe_layers`, so the grouping is configurable
+from this project, and the test is whether forcing a compute kernel ahead of
+that reduction collapses the 4.36 ms.

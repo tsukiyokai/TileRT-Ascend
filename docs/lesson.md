@@ -344,3 +344,11 @@
   the usual route. Gaining speed can cost observability; check that the thing
   you optimised is still visible.
   [Round composition](evidence/ascend-decode/profile-rope-20261018/README.md)
+- Where a fusion boundary falls decides whether a collective is free. Of 157
+  SuperKernel groups that contain an all-reduce, 156 begin with a compute
+  kernel and average 36 µs; the one that begins and ends with an all-reduce
+  averages 4356 µs, 121 times more, because it has no preceding compute inside
+  the group to cover sixteen ranks arriving apart. Group names carry this:
+  `start_aiv_all_reduce_float` against `start_static_kernel_AddRmsNormBias`.
+  Read the boundary, not just the contents.
+  [Grouping boundary](evidence/ascend-decode/profile-rope-20261018/README.md#one-grouping-boundary-costs-436-ms-per-round)
