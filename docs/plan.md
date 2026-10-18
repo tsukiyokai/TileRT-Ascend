@@ -32,6 +32,22 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，归约 dtype、custom OPP 与调度也不同。[仅切 AIV 的长测](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control)保持全部 token、提议与接受一致，TPOT 中位数升至 21.47 ms；但[纯通信对照](evidence/ascend-decode/tp-mode-20261017/README.md)的 FP32 96 KiB、156 次图归约链由 AI_CPU 10.93 ms 降至 AIV 5.04 ms。[新 M4 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md#aiv-decode-comparison)确认 AIV 实际生效，并在一次归约观察到 rank 14 晚到约 4.21 ms；尚未证明资源竞争。保留 AIV 路线，编译主干先作独立单变量对照。共有 GMM 成本不能当作双方增量差距；长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
+## decode 接管与融合的分层账（2026-10-18 定）
+
+参照物是本项目 AMD 侧的 `libtilert_glm52_rocm.so`：459 个 kernel、29 个基名，形态是层粒度融合加「归约做成生产者收尾」加形状特化，而非单个大 kernel。注意它也不是「一层一个算子」——`pure_mla_moe_layer_kernel` 是 MLA 加 MoE 合体（48 变体），但 `sparse_index`（63+57 变体，全库最大）与 `topk_select` 自成一族，真实形态是每层两到三个 kernel、层间无裸露。[kernel 清单](evidence/tilert-ascend/libtilert_glm52_rocm-elf.txt)
+
+按额分四级，逐级独立可验：
+
+一、轮间主机税。每轮原有 4 次设备同步加 1 次 Gloo 广播；token 已改为驻留设备、命令可按块下发。隔离测得每轮主机命令值约 1.9 ms（32 轮一命令比 1 轮一命令快 0.88 ms/token）。[别名缺陷与测量](evidence/ascend-decode/devtok-aliasing-20261018/README.md)
+
+二、MoE 块。TP16 下每层约 200 µs：两次 GMM 共 160 µs（其中 124 µs 是固定开销，且 k=128 的切片打烂 cube 效率）、permute/unpermute、36 µs 裸归约。EP16 加 `enable_fused_mc2=1` 把整串换成一个 mega_moe 融合算子，intermediate 回到 2048 同时解开 `finalize_routing` 的 k>128 封印。实验已就绪未测。注意终局反向约束：batch=1 无统计平滑，27.1 个激活专家撒 16 个桶，最忙桶期望 4.5–5 个完整专家，combine 是每层栅栏，临界路径为 TP16 的约 2.8 倍，每轮多约 3.7 ms。故终局候选是 EP4×TP4（尾部约 1.5 倍，intermediate/rank=512 恰踩 mega_moe 下限）或 batch=1 专属的热专家复制加两选一路由（HBM 余量约 44 GB/卡，复制一份 +22.6 GB/卡）。
+
+三、注意力块的裸露部分。厂商已做块内融合（`MlaPrologV3`、`FusedInferAttentionScore`、`lightning_indexer`），裸露的是三样：每轮约 637 次经 L2／GM 的 cube/vector 交接、o_proj 之后 78 次没有厂商算子肯融的归约（`MatmulAllReduce` 无 ascend910_93 二进制，实测钉死）、以及缝隙里 556 次 `Cast`。这是手写 MIX kernel 的地盘：o_proj 矩阵乘加归约收尾加残差归一化，一个 kernel。归约收尾的配方已从 HyperMPMD 读出（UB 乒乓、MTE3 排空、fence、远端 signal-add，发送端零 DCCI，等待只自旋本地 flag）。[解剖](evidence/ascend-decode/hyper-mpmd-20261018/README.md)
+
+四、层缝合。把注意力块与 MoE 块并成 ROCm 那种每层两三个 kernel。
+
+四级全部兑现只清掉结构税；2 ms 终局还要压权重流式的下限，那是量化与驻留的另一仗。
+
 ## 开发主线与停止条件
 
 主线固定 M4，M1 保留为精度与性能对照。将设备执行看作串行 greedy decode 的精化。设 prompt 长度为 P，正常轮次提交边界的逻辑输出数为 N，主干有效长度为 L；最后一个输出是尚未被主干消费的 pending token。优化保持以下四个不变量。
