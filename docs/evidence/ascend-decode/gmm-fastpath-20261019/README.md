@@ -197,6 +197,70 @@ fixes a live epilogue race that ships in the vendor package, in the exact
 shape production runs — which matters because the trajectory gate compares
 tokens bit for bit.
 
+## Warming the table on chip: refuted as a cheap fix
+
+Three variants, each one binary with two arms selected by the inert input bit,
+graph replay, paired:
+
+| where the bulk read happens | result |
+|---|---|
+| both core types | **hangs** — 4m53s at 100% AICore, killed |
+| vector cores only | runs, bit-identical, **5.512 µs slower** (σ 0.271, 25 of 25) |
+| cube cores only | **hangs**, killed by a 150 s watchdog |
+
+Cube cores cannot do `TBuf<TPosition::VECCALC>` plus a GM→UB `DataCopy` plus
+an `MTE2_S` flag, which matches `cube_vector_combine=split` in
+`Ascend910_9391.ini`: UB and the vector unit sit on the side separate from
+cube. So "each core does its own `DataCopy`, nothing needs sharing" does not
+work here — the 24 cube cores have no UB to copy into.
+
+And the vector side alone is not where the time is. Warming only AIV should
+have made the call much faster if the 38.55 µs lived there; it made it slower
+by exactly the batching machinery's own cost. **Both sides pay for the first
+traversal**, and removing one leaves the other holding the first barrier.
+
+The shape that could work, not built: the side with UB compresses the table
+into a short list of expert id and cumulative count in workspace, publishes it
+through the pre→mid barrier that already exists, and `midProcess` walks that
+list instead of 256 slots. Still kernel-internal with no package build and no
+host index tensor, but it needs a workspace allocation and `midProcess`'s
+weight addressing to change from `UpdateMnConfig`'s accumulation
+(`mid.h:141-153`) to offsets computed from the list. That is a real refactor,
+and now it is clear why it cannot be reduced to one copy per core.
+
+After the two hangs the straight-line control was re-run to confirm the die
+was unharmed: 97.888 against 92.079 µs, saving 5.838 (σ 0.156, 0 of 20),
+bit-identical, within the 4.865–9.171 range measured before.
+
+## Eager measurement is safe for `npu_grouped_matmul`, and why
+
+Its eager host enqueue floor is 28.128 µs with a median of 28.613, against an
+eager event pair at 59.589/60.104 and graph replay at 58.876/59.097 with a
+host cost of 0.576–0.602. The host is under half the device and the two
+readings differ by 1.7%, so `gmm-l2-20261018`'s 60–63 µs fixed cost and
+1138 GB/s convergence stand without re-measurement. An independent check: 8
+active experts measure 59.1 µs on device here against gmm-l2's 65.9 and 65.2
+at 1 and 4 groups.
+
+The custom fused operator differs because its host floor is 98.97–109.90 µs
+through `torch.ops._C_ascend`, 3.5× higher, which is what pushed it past its
+own device time. The discipline that follows: before measuring any operator,
+print its eager host cost beside the event pair; if they are close, the event
+pair is reading the host.
+
+## The prologue list so far
+
+| operator | in-graph per call | prologue |
+|---|---|---|
+| `torch.add`, 8 float32 | 1.127–1.310 µs | — (this is the dispatch floor) |
+| `npu_dynamic_quant` | 2.797–3.590 µs | not separated |
+| `npu_quant_matmul` | 8.183–8.808 µs | not separated |
+| `npu_grouped_matmul` | 59.097 µs | not separated, no source |
+| this W4A8 GMM | 88–93 µs | **16.4 µs**, sliced |
+
+Six-fold spread across operators, which is why no single figure can be
+multiplied by the round's 2,416 calls.
+
 ## Provenance
 
 A rebuild with no patches gives sha256 `2444c7e7…`, byte-identical to the

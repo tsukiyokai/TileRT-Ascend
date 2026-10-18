@@ -793,3 +793,15 @@
   nothing at eight. The sweep had been measuring a compiler that had stopped
   applying.
   [Width](evidence/ascend-decode/width-20261019/README.md)
+- Check which engine can execute the fix before designing around it. I
+  proposed that each of 72 cores bulk-copy a shared table into its own UB,
+  reasoning that nothing needed sharing; two of the three variants hang,
+  because the 24 cube cores have no UB to copy into -- the platform's own
+  cube_vector_combine is split. And warming only the vector side made the call
+  slower by the batching machinery's cost, which says both engines were paying
+  for the first traversal rather than one of them.
+- Before measuring an operator, print its eager host cost beside the event
+  pair. npu_grouped_matmul's host enqueue is 28.6 microseconds against 60 on
+  device, so an eager event pair reads the device and the earlier L2 results
+  stand; the custom fused operator's host floor is 98.97 to 109.90, which is
+  why the same method read the host there. One perf_counter decides which.
