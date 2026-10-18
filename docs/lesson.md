@@ -876,3 +876,19 @@
   no test. The harness locally defined the missing constant, so it validated
   the logic and converted a crash into a pass. When a check runs the code in a
   namespace it will not have in production, it is checking something else.
+- Bind the device before anything allocates, not when the model is built. The
+  benchmark loaded its inputs before constructing the engine and never called
+  set_device, so every rank's first allocation landed on device 0 and rank 0
+  then saw sixteen contexts on its own die -- 33.12 of 61.27 GiB free against
+  52.08 wanted. A single process sees 59.92 free on the same device, which is
+  what proved the device was not the problem. The failure is a race on
+  start-up order, which is why it appeared intermittently and why one early
+  run succeeded.
+- 4256 zombie processes are a real problem and not a memory one. A night of
+  killed sixteen-rank runs left them unreaped, and they looked like the
+  explanation for held HBM until the obvious was recalled: a zombie has
+  already released its memory and holds only an exit status.
+- A killed torchrun leaves its rendezvous port bound. Three arms sharing one
+  --master-port then die on EADDRINUSE in seven seconds, which reads like a
+  code error rather than residue from the run you stopped. Give each arm its
+  own port.
