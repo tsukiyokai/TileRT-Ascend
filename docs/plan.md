@@ -2,6 +2,8 @@
 
 目标：A3 单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms。实验机 `a3-84:trt-asc`，共享机——整机计时只在空闲时做，被占时推进单 die 与编译类工作。vLLM-Ascend 做 prefill，TileRT-Ascend 做 decode。
 
+工作方法与今晚的教训见 [workflow.md](workflow.md) 与 [lesson.md](lesson.md)。
+
 ## 状态（2026-10-19 05:40）
 
 确定测得的最好点是 **14.533 ms**（width 4，装屏障 overlay，三请求同一轨迹、轮数同为 307、跨度 0.141）。此前记录的 14.247 ms 口径不同（用 `gather_fia`），且产出它那次运行的 `summary.status` 因一条过期时钟断言恒为 fail，该断言已修。
