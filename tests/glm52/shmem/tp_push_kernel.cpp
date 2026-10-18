@@ -42,8 +42,13 @@ ACLSHMEM_DEVICE void tp_push_once(
     const int64_t elements = static_cast<int64_t>(rows) * hidden;
     const int64_t stride = AlignUp(elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
 
-    __gm__ float* data = (__gm__ float*)window;
-    __gm__ int32_t* status = (__gm__ int32_t*)(window + pe_size * stride * sizeof(float));
+    // Alternate between two planes so a round's push cannot overwrite the
+    // data the previous round is still reducing. Without this the last round
+    // reads a mixture and the check fails only at high round counts.
+    const int64_t plane = round & 1;
+    __gm__ float* data = (__gm__ float*)window + plane * pe_size * stride;
+    __gm__ int32_t* status =
+        (__gm__ int32_t*)(window + 2 * pe_size * stride * sizeof(float)) + plane * pe_size * SLOT_INT32;
     __ubuf__ float* ub = (__ubuf__ float*)(64);
 
     // One core per peer publishes our partial into that peer's slot for us.
@@ -64,39 +69,50 @@ ACLSHMEM_DEVICE void tp_push_once(
     }
 
     if (stage != 1) {
-        // Scalar accumulation costs 557 us here, because each element pays
-        // sixteen separate global reads. Stage the stripe through UB and add
-        // with vector instructions instead.
+        // Chunk the stripe so both UB buffers stay inside their region, copy
+        // each peer's slice once, and keep the barriers outside the add loop:
+        // a PipeBarrier per add drains the whole pipeline sixteen times.
         const int64_t stripe = (elements + cores - 1) / cores;
         const int64_t begin = core * stripe;
         const int64_t span = (begin + stripe <= elements) ? stripe : elements - begin;
-        if (span > 0) {
-            LocalTensor<float> acc;
-            LocalTensor<float> term;
-            acc.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
-            acc.address_.bufferAddr = REDUCE_UB_BASE;
-            acc.address_.dataLen = span * sizeof(float);
-            term.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
-            term.address_.bufferAddr = REDUCE_UB_BASE + REDUCE_UB_SPAN;
-            term.address_.dataLen = span * sizeof(float);
+        LocalTensor<float> acc;
+        LocalTensor<float> term;
+        acc.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
+        acc.address_.bufferAddr = REDUCE_UB_BASE;
+        acc.address_.dataLen = REDUCE_UB_SPAN;
+        term.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
+        term.address_.bufferAddr = REDUCE_UB_BASE + REDUCE_UB_SPAN;
+        term.address_.dataLen = REDUCE_UB_SPAN;
+        const int64_t chunk = REDUCE_UB_SPAN / static_cast<int64_t>(sizeof(float));
+        for (int64_t offset = 0; offset < span; offset += chunk) {
+            const int64_t count = (span - offset < chunk) ? span - offset : chunk;
             GlobalTensor<float> source;
-            GlobalTensor<float> sink;
-            source.SetGlobalBuffer(data + begin, span);
-            DataCopy(acc, source, span);
-            PipeBarrier<PIPE_ALL>();
+            source.SetGlobalBuffer(data + begin + offset, count);
+            DataCopy(acc, source, count);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
             for (int64_t pe = 1; pe < pe_size; ++pe) {
-                source.SetGlobalBuffer(data + pe * stride + begin, span);
-                DataCopy(term, source, span);
-                PipeBarrier<PIPE_ALL>();
-                Add(acc, acc, term, span);
-                PipeBarrier<PIPE_ALL>();
+                source.SetGlobalBuffer(data + pe * stride + begin + offset, count);
+                DataCopy(term, source, count);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID2);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID2);
+                Add(acc, acc, term, count);
             }
-            sink.SetGlobalBuffer(out + begin, span);
-            DataCopy(sink, acc, span);
-            PipeBarrier<PIPE_ALL>();
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID1);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID1);
+            GlobalTensor<float> sink;
+            sink.SetGlobalBuffer(out + begin + offset, count);
+            DataCopy(sink, acc, count);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
         }
     }
-    aclshmemi_sync_core_soft();
+    // Cost scaled linearly with core count, which means the per-round cost is
+    // a sum over cores rather than their maximum: this soft sync serialises
+    // them. Stage 3 drops it to attribute the time.
+    if (stage != 3) {
+        aclshmemi_sync_core_soft();
+    }
 }
 
 extern "C" __global__ __aicore__ void tp_push_kernel(

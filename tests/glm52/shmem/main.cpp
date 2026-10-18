@@ -33,7 +33,7 @@ int64_t AlignUp(int64_t value, int64_t alignment)
 int main(int argc, char* argv[])
 {
     if (argc < 8) {
-        std::printf("usage: %s <pe_size> <pe_id> <ip_port> <rows> <hidden> <warmup> <rounds> [stage]\n", argv[0]);
+        std::printf("usage: %s <pe_size> <pe_id> <ip_port> <rows> <hidden> <warmup> <rounds> [stage] [blocks]\n", argv[0]);
         return 1;
     }
     const int pe_size = std::atoi(argv[1]);
@@ -57,7 +57,9 @@ int main(int argc, char* argv[])
 
     const int64_t elements = static_cast<int64_t>(rows) * hidden;
     const int64_t stride = AlignUp(elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    const size_t window_bytes = pe_size * stride * sizeof(float) + pe_size * SLOT_INT32 * sizeof(int32_t);
+    // Two planes of data and status, alternating by round parity.
+    const size_t window_bytes =
+        2 * pe_size * stride * sizeof(float) + 2 * pe_size * SLOT_INT32 * sizeof(int32_t);
     void* window = aclshmem_malloc(window_bytes);
     if (window == nullptr) {
         std::printf("pe %d: aclshmem_malloc failed\n", pe_id);
@@ -76,7 +78,10 @@ int main(int argc, char* argv[])
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
     const uint64_t ffts = util_get_ffts_config();
-    const uint32_t blocks = static_cast<uint32_t>(pe_size);
+    // The push needs one core per peer; the reduction wants every core it can
+    // get, so the launch is sized for the reduction and the push uses the
+    // first pe_size cores of it.
+    const uint32_t blocks = (argc > 9) ? static_cast<uint32_t>(std::atoi(argv[9])) : 48U;
 
     // Signal values continue across both launches, so neither needs a reset.
     tp_push_demo(blocks, stream, ffts, (float*)partial, (float*)out, (uint8_t*)window, rows, hidden, warmup, 0, stage);
@@ -95,16 +100,20 @@ int main(int argc, char* argv[])
     std::vector<float> result(elements, 0.0F);
     ACL_CHECK(aclrtMemcpy(result.data(), elements * sizeof(float), out, elements * sizeof(float),
                           ACL_MEMCPY_DEVICE_TO_HOST));
+    // Only stage 0 produces a sum; the push-free stages leave `out` untouched,
+    // so checking them against the sum would always report every element wrong.
     const float expected = static_cast<float>(pe_size * (pe_size - 1) / 2);
     int64_t wrong = 0;
-    for (int64_t i = 0; i < elements; ++i) {
-        if (result[i] != expected) {
-            ++wrong;
+    if (stage == 0) {
+        for (int64_t i = 0; i < elements; ++i) {
+            if (result[i] != expected) {
+                ++wrong;
+            }
         }
     }
     if (pe_id == 0) {
-        std::printf("pe_size %d rows %d hidden %d bytes %ld rounds %d\n", pe_size, rows, hidden,
-                    (long)(elements * sizeof(float)), rounds);
+        std::printf("pe_size %d rows %d hidden %d bytes %ld rounds %d blocks %u\n", pe_size, rows,
+                    hidden, (long)(elements * sizeof(float)), rounds, blocks);
         std::printf("RESULT stage %d per_reduction_us %.3f wrong %ld of %ld expected %.1f got %.1f\n",
                     stage, total_us / rounds, (long)wrong, (long)elements, expected, result[0]);
     }

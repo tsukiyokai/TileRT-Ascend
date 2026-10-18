@@ -51,6 +51,52 @@ GM-to-GM form that stages through a UB scratch, which is the one to use when
 the source is in global memory — the five-argument form requires the source
 already in UB.
 
+## The launch cost was masquerading as the reduction
+
+Every number above divided one kernel launch by the round count. A round
+sweep at fixed shape exposed it:
+
+| rounds | reported per reduction | implied total |
+|---|---|---|
+| 1 | 26454.8 µs | 26.5 ms |
+| 5 | 5363.1 | 26.8 |
+| 50 | 573.7 | 28.7 |
+| 400 | 70.8 | 28.3 |
+
+The product is constant at about 26–28 ms, so the whole figure was a single
+launch amortised, and the per-round work was invisible underneath it. The
+earlier "557 µs reduce-only" and "543 µs full" were both that same launch.
+
+With the launch amortised over 4000 rounds the per-reduction cost appears:
+
+| configuration | cores | per reduction |
+|---|---|---|
+| reduce only | 8 | 7.118 µs |
+| reduce only | 48 | 23.184 |
+| **push and reduce** | **4** | **5.215** |
+| push and reduce | 8 | 6.435 |
+| push and reduce | 16 | 9.936 |
+
+**About 5 µs for a complete two-rank push plus ordered local reduction of
+96 KiB**, against HCCL's 126 µs eager at the same shape. More cores is
+strictly worse — 48 costs 3.8× what 8 does — so the reduction is bound by
+inter-core coordination, not by arithmetic, and a batch-one reduction wants
+few cores.
+
+These timings are provisional: the numerical check does not pass at high
+round counts, so they measure a kernel that is not yet correct.
+
+## Where the kernel stands, unfinished
+
+Correct at 50 rounds with a single data plane; after adding round-parity
+double buffering — so a push cannot overwrite data a previous round is still
+reducing — `out` comes back as zero at every round count. The parity is
+computed from `round & 1` inside the kernel while the host issues two
+launches with `round_base` of 0 and then `warmup`, so the plane the last round
+writes is not the plane the host reads. That is a plain indexing error in my
+code and needs a rewrite rather than another single-line guess; stopping here
+rather than iterating blind.
+
 ## Where this leaves the argument
 
 Nothing here contradicts the case for the one-sided route, and one thing

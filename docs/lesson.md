@@ -543,3 +543,15 @@
   for a full [4, 6144] sum that is sixteen global reads per element. The
   example was right for its own shape and wrong for mine, and the resemblance
   hid the difference.
+- Sweep the repeat count before trusting any per-iteration number. Four
+  successive attempts to explain a 543 us reduction -- scalar accumulation,
+  barrier placement, core count, a soft sync -- were all explaining one kernel
+  launch divided by fifty. At 1 round the figure is 26454 us and at 400 it is
+  70.8, a constant product. The real cost is 5.2 us. A repeat sweep is two
+  minutes and it would have replaced every one of those guesses.
+  [TP push](evidence/ascend-decode/tp-push-20261018/README.md)
+- More cores made the reduction strictly slower: 48 cost 3.8 times what 8 did,
+  monotonically. At batch one a 96 KiB reduction is bound by inter-core
+  coordination rather than arithmetic, so the parallelism that helps a large
+  kernel is a tax on a small one. Sweep the core count rather than assuming
+  the die's width is the target.
