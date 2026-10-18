@@ -120,8 +120,31 @@ plus sync is 78% of the cost. Reduce-scatter plus all-gather would move
 2 × 15 × 6 KiB ≈ 180 KiB, **eight times less**, at the price of two cross-PE
 syncs per round instead of one.
 
-Whether that wins depends on the sync floor, which nobody has measured. One
-experiment settles it: add a stage that only does `aclshmem_quiet()` and
-`aclshmemx_sync_vec_all()` and moves nothing, at 16 cores and 400 rounds. If
-the floor is well under 17.5 µs, RS+AG is worth writing; if not, 22.3 µs is
-already against the sync wall and saving bytes buys nothing.
+A stage that only does `aclshmem_quiet()` and `aclshmemx_sync_vec_all()` and
+moves nothing settles it. At TP16, 16 cores, 400 rounds:
+
+| stage | per reduction |
+|---|---|
+| **sync only** | **5.078 µs** |
+| push plus sync | 17.655 |
+| local sum only | 3.368 |
+| full | 22.403 |
+
+**The sync floor is 5.078 µs, well under 17.5**, so the push half carries
+12.58 µs of actual data movement. Reduce-scatter plus all-gather divides those
+bytes by eight and pays a second sync:
+
+```
+12.58 / 8 + 2 × 5.078 = 11.73 µs      against today's 17.655
+```
+
+That is about 5.9 µs off the communication half and takes the whole reduction
+from 22.4 to roughly 16.5 µs — a further 26%, and 3.85× HCCL's 63.5 µs. The
+experiment returns a go.
+
+Two caveats on the arithmetic. It assumes the 12.58 µs scales linearly with
+bytes, which the earlier size sweep suggests is optimistic at these sizes
+([rendezvous](../reduce-floor-20261018/README.md) found the vendor collective
+entirely size-independent, though that was rendezvous rather than transfer).
+And it assumes the two syncs cannot overlap with their own transfers, which a
+careful implementation might partly defeat.
