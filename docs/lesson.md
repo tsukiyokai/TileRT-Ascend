@@ -9,6 +9,24 @@
   seed indices across both chain calls. Real alias calls and dirty rollback
   verify this lifetime contract beyond frozen-input replay.
   [Product chain check](evidence/ascend-decode/layer-major-20261018/mtp-chain-graph-audit.json)
+- Removing a host round trip need not shorten the measured chain. Merging
+  two correct draft replays into one graph saves a paired median 0.089 ms
+  and wins 15/30 under shared load, while capture context roughly doubles.
+  Retain the prototype as evidence; pursue the observed device execution
+  tails before adding it to the default session.
+  [Two-chain timing](evidence/ascend-decode/layer-major-20261018/mtp-two-chain-timing-audit.json)
+- Matching raw PMU counters to a task does not establish that they count
+  only its execution. A 10.52 µs rotation carries 4.81 ms of converted
+  AICORE time, while a 115.34 µs instance carries 4.78 µs. Preserve the
+  raw occurrence and counter semantics before assigning execution tails
+  to arithmetic or preemption.
+  [PMU audit](evidence/ascend-decode/layer-major-20261018/mtp-chain-pmu-summary.json)
+- ELF provenance must separate verification reads from runtime loading.
+  The complete-MoE driver hashes four control/candidate files before one
+  runtime control open; treating all successful opens as selection rejects
+  a correct baseline. Preserve the ordered verifier prefix and audit the
+  subsequent loader access.
+  [Complete-MoE control](evidence/ascend-decode/gmm1-tiling-20261018/moe-baseline-audit.json)
 - Static selection must preserve numerical fixes. The MoE private package
   keeps GMM1 out of regeneration, and actual ELF-open traces on every rank
   confirm the installed SwiGLU-barrier implementation is still selected.
@@ -170,3 +188,32 @@
   rebuild costs 10.609 µs more. Retain installed controls before attributing
   a fusion gain; stop this branch without identifying a speculative cause.
   [Installed control](evidence/ascend-decode/execution-gap-20261018/README.md#o-publication-and-complete-reduction)
+- A shared machine is not the explanation until it is measured. The same
+  configuration on an idle machine gives 21.210 ms against 20.441 ms on the
+  contended one. Contention costs less than the measurement spread here;
+  reach for it only after an idle control.
+  [Idle control](evidence/ascend-decode/compose-20261018/README.md)
+- Separate a kernel's fixed cost from its slope before optimising either.
+  SFA fits `29.4 µs + 27.9 ns/row` across sixteen times the selected rows,
+  and sixteen times the query heads costs 8%. Head count and traffic are
+  therefore not the lever; the intercept and the in-flight load count are.
+  [Shape scaling](evidence/ascend-decode/sfa-shape-20261018/README.md)
+- A slow gather inside a kernel does not prove the hardware gathers slowly.
+  The rows SFA charges 27.9 ns for cost nothing marginal through
+  `index_select`, which stays flat to 4096 rows and reaches 196 GB/s
+  unsaturated. Time the bare memory operation before writing a new kernel.
+  [Gather control](evidence/ascend-decode/sfa-shape-20261018/README.md#top-k-at-heads-4)
+- The MSD workspace stages the activation, not the weight. Its preprocess
+  reads int8 `x` and writes two int4 halves to GM, so at M≤32 the staged
+  bytes are ~196 KiB and the roofline is not missing a dequantised-weight
+  round trip. Read the kernel before adding a traffic term.
+  [Kernel source](https://github.com/vllm-project/vllm-ascend) `csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_pre.h`
+- Per-round host coordination is one broadcast, not one per operation.
+  `command_serial` 1843 over 1818 rounds rules out Gloo command volume as a
+  round cost. Count the control messages before optimising the control path.
+  [Round control](evidence/ascend-decode/compose-20261018/idle-default-rank0.json)
+- A device tensor the operator reads must live on the device. Leaving
+  `actual_seq_lengths_*` on the host faults the sparse kernel with aicore
+  exception 507015 rather than a shape error; the existing screens move every
+  case entry to the device.
+  [Screen convention](../tests/glm52/bench_cann_sparse_attention.py)

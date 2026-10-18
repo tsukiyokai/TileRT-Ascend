@@ -1,8 +1,10 @@
 # TileRT Ascend：A3 单用户 2 ms decode
 
-目标：`a3-gs:trt-asc`，单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms，即 ≥500 tok/s。vLLM-Ascend 执行 prefill，HIXL 交接 KV，TileRT-Ascend 执行 decode；单机两阶段依次占用设备，decode 计时期间 prefill 静默。
+目标：A3 单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms，即 ≥500 tok/s。当前实验机是 `a3-84:trt-asc`（镜像 `trt-asc:a3-84-unified-20261018`），`a3-gs` 已被外部作业占满。两台都是共享机：整机计时只在空闲时做，被占时推进单 die 与编译类工作。vLLM-Ascend 执行 prefill，HIXL 交接 KV，TileRT-Ascend 执行 decode；单机两阶段依次占用设备，decode 计时期间 prefill 静默。
 
 vLLM-Ascend P+D 基线已完成：同一 checkpoint 与 8K token IDs，TP16／DP1、MTP3／graph4，逐请求串行生成 1024 tokens；3 次预热、32 次测量，TPOT p50=16.39 ms、p95=18.29 ms，均值 16.51 ms，即 60.55 tok/s。16.39／2=8.20 是该基线到目标的压缩比，不能当作 TileRT 实测收益。同一服务在 temperature=0、seed=0 下仍产生 32 条不同轨迹，使用冻结 teacher-32 作为确定的输入与后继标签，不能把重新请求服务后的分叉归因于 TileRT。[原始结果与口径](evidence/ascend-decode/vllm-baseline-20261017/README.md)、[基线启动](../tests/glm52/serve_vllm_baseline.sh)与[测量入口](../tests/glm52/bench_vllm_decode.py)。
+
+同配置在空闲 `a3-84` 的复测给出 TPOT 中位 21.210 ms（三次 20.491／21.210／22.461），对 `a3-gs` 的 20.441 ms 慢 3.8%，轨迹与接受数不变；20 ms 这一量级不是被他人占用造成的。[空闲复测](evidence/ascend-decode/compose-20261018/README.md)
 
 本次 P+D 基线在 `a3-gs:trt-asc` 空闲时复用已有镜像与统一 Python 环境。此前 TP16 短序列验证使用 `a3-187:trt-asc`。[环境快照](evidence/ascend-decode/a3-187-environment-20261016.json)、[运行时检查](evidence/ascend-decode/a3-187-runtime-20261016.json)
 
@@ -51,7 +53,7 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [MTP 投影分片](evidence/ascend-decode/layer-major-20261018/README.md#mtp-output-projection-sharding)的 M1／M4 微测为 2.989／2.955→0.562／0.583 ms；完整两轮链配对仅省中位 0.522 ms、19/30 胜。跨配置 C2 recycle NRMSE 达 0.080302；固定 C1 和精确点积已确认起点是 eh 四个正确舍入的 1-ULP 变化。[30 个 teacher 窗口](evidence/ascend-decode/layer-major-20261018/mtp-teacher-proposal-audit.json)中，五个提议槽位变化，但每个窗口的连续覆盖长度均保持不变；实际会话接受数另验。
 
-[完整链短 trace](evidence/ascend-decode/layer-major-20261018/mtp-chain-profile-summary.json)已审计 TP16 的 128 个窗口、640 次 collective：head／router／MLA 存在毫秒级设备任务长尾，head 跨 rank 入口偏斜的保守下界仍超过 2.9 ms；尚未确定长尾原因。通信入口紧随本地 producer，跨卡时钟包络不足以将结束偏差解释为纯传输时延。[两轮合图原型](evidence/ascend-decode/layer-major-20261018/README.md#two-chain-calls-in-one-graph)已通过设备候选回喂、独立动态 metadata 及 TP16 A/B/reset；下一项对照测两次 replay／候选回读改为一次的完整链净收益，整机空闲后测同源长轨迹。完整验收保持第 4 节口径。
+[完整链短 trace](evidence/ascend-decode/layer-major-20261018/mtp-chain-profile-summary.json)已审计 TP16 的 128 个窗口、640 次 collective：head／router／MLA 存在毫秒级设备任务长尾，head 跨 rank 入口偏斜的保守下界仍超过 2.9 ms；尚未确定长尾原因。通信入口紧随本地 producer，跨卡时钟包络不足以将结束偏差解释为纯传输时延。[两轮合图原型](evidence/ascend-decode/layer-major-20261018/README.md#two-chain-calls-in-one-graph)已通过设备候选回喂、独立动态 metadata 及 TP16 A/B/reset；[合图配对计时](evidence/ascend-decode/layer-major-20261018/mtp-two-chain-timing-audit.json)仅省中位 0.089 ms、15/30 胜，停止默认集成；[PMU 复核](evidence/ascend-decode/layer-major-20261018/mtp-chain-pmu-summary.json)已匹配全部 7,936 个计算任务，但 10.52 µs 任务携带 4.81 ms 换算计数的反例使长尾归因仍未闭合。当前验证 GMM1 单分块同步补丁的完整 MoE M1／M4，再于整机空闲时测同源长轨迹。完整验收保持第 4 节口径。
 
 | 顺序 | 本阶段交付 | 转入下一步的条件 |
 |---|---|---|
@@ -83,6 +85,8 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 | AllReduce | 主干每层 attention、FFN 各一次，共 156 次，目标单 token 为 `6144×2=12 KiB` BF16；当前 FP32 精度基线为 24 KiB。同源 TP16 依赖链的图重放 rank-MAX event p50：24／96 KiB FP32 的 AI_CPU 为 10.925／10.931 ms，AIV 为 4.976／5.044 ms。该链包括重放、rank 偏差与依赖调度。[实测与复现](evidence/ascend-decode/tp-sum.md#matched-ai_cpu-and-aiv) |
 
 流式读取模型给出 `T_HBM=3.818 GB/(1.6 TB/s×η)`：峰值带宽下为 2.39 ms，约 419 tok/s；取 70% 带宽为 3.41 ms，约 293 tok/s。加上匹配 AIV 的 M1 FP32 图归约链 4.976 ms，串行场景为 7.36／8.39 ms，即约 136／119 tok/s；理想重叠场景为 `max(T_HBM,4.976 ms)`，约 201 tok/s。这些是场景预算，图链包含重放提交、rank 偏差和依赖调度，不能当作裸 HCCL α 或模型增量耗时。[die 0 流式读取](evidence/a3-hbm-20261017.json)现测得中位 1.155 TB/s：四个 513 MiB 输入轮换，预热 100 次、测量 1000 次，15 组 checksum 通过；代入 3.818 GB 场景约需 3.31 ms。16 die 并行最低带宽及 W4 模型有效带宽另测。
+
+单 die 的[形状扫描](evidence/ascend-decode/sfa-shape-20261018/README.md)把 attention 的成本拆成两项：SFA 在 top-k 256–4096 上拟合 `29.4 µs + 27.9 ns/行`，并且对 query head 不敏感（4→64 head、16 倍计算量只多 8%），所以它既非 compute-bound，也不因 TP16 的 4 head 而缺活。斜率折合 41.3 GB/s，仅为 1.155 TB/s 的 3.6%；同样的行用 `index_select` 读是平的（256→4096 行 23.4→24.0 µs，4096 行达 196 GB/s 未饱和），所以瓶颈是融合 kernel 内部的取数循环，不是散读本身。按 27.9 ns/行与约 600 ns 访存延迟估算，在飞请求只有约 20 个。另测 eager 连发的[每算子地板](evidence/ascend-decode/sfa-shape-20261018/README.md#per-kernel-floor)：`add` 从 1 元素到 49 KiB 恒为 10.09–10.25 µs，纯分配 4.90 µs，单行 `npu_rms_norm` 24.86 µs；图内 SFA 的 90.3 µs 与此处 88 µs 吻合，故其截距属设备侧，约 19 µs/次、78 层合 1.5 ms/轮。图内的每算子地板尚未单独量，不能据此断言 kernel 数量就是约束。
 
 因此，只消除 Python 提交开销仍不足以达到 2 ms。关键是复制的低秩投影、router、indexer、156 次归约，以及小 M 下的解包和计算效率。2 ms 路线从 MTP 共享权重读取、减少复制读取、tile 流水和生产端融合归约展开。
 
@@ -138,6 +142,6 @@ MTP 实现验证宽度 `M=2/4`：`T_round=T_verify(M)+ΣT_draft+T_accept`，稳�
 | logits | 已测最终 BF16 间隔 0.125，大于旧 0.1 界；撤销该绝对判据，报告最大差／参考 logits 极差及 top-1 余量。两步最终相对差为 0.031716／0.025571，最终 top-1 相同。中间层 final norm＋LM head 是探针，其绝对差没有跨层不变的含义。 |
 | hidden | 保留 NRMSE、cosine 曲线和相邻层增量用于定位；旧 1e−2／0.999 不作放行闸门，也不按当前 17–21% 的轨迹峰值拟合新阈值。先区分突跃与局部舍入底板，端到端按冻结标签验收。 |
 
-参考修正、78 层曲线、在线 HIXL→M1→HTTP、M4 Graph／长测及短 trace 已完成。静态／SuperKernel、FP32 head、MTP 图与投影分片已逐项验证；新组合仍需完整冻结轨迹与同源长测。当前优先测两轮 draft 合图的净收益，并定位设备任务长尾；GMM1 baseN=128 与 O 发布融合无净收益，停止对应分支；双槽归约保留作空闲定标与模型对照。端到端八输入／32 步及 32 个长请求均按上表验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
+参考修正、78 层曲线、在线 HIXL→M1→HTTP、M4 Graph／长测及短 trace 已完成。静态／SuperKernel、FP32 head、MTP 图与投影分片已逐项验证；新组合仍需完整冻结轨迹与同源长测。两轮 draft 合图未见稳定净收益，停止默认集成；PMU 已完整采集，计数不能独立归因长尾；当前验证 GMM1 单分块同步补丁的完整 MoE，随后依据无 profiler 对照选择下一项；GMM1 baseN=128 与 O 发布融合无净收益，停止对应分支；双槽归约保留作空闲定标与模型对照。端到端八输入／32 步及 32 个长请求均按上表验收。AgentX 提交使用其正式 workload 与统计规则；这里的 8K TPOT 是开发指标。[AgentX methodology](https://inferencex.semianalysis.com/agentx/methodology)
 
 [实验日志](probe.md)记录最新测量与下一项实验；[经验](lesson.md)保留可复用的执行与数值结论。

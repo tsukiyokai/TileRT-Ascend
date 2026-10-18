@@ -292,6 +292,29 @@ remote payload visibility. HCCL child waits cross operation boundaries in
 Raw profiles, exports, join keys, causal bounds and auditors stay under
 `/home/shanshan/trt-asc/offline/cann-mtp-projection-chain-profile-20261018-01/`.
 
+### PMU capture
+
+The [PMU audit](mtp-chain-pmu-summary.json) matches all 7,936 compute tasks
+in 128 chain windows to exported PMU data and original context records.
+The 640 AICPU collective wrappers are outside this counter coverage.
+Raw integer counters reproduce all 896 AICORE time/Cube/MTE conversions.
+
+| Same-shape instance | TASK elapsed (µs) | Counter-derived AICORE time (µs) |
+|---|---|---|
+| Original head, fastest / slowest | 128.02 / 3579.44 | 103.09 / 3466.16 |
+| Sharded rotation, fastest / slowest | 10.52 / 115.34 | 4811.09 / 4.78 |
+
+The rotation reverses the apparent relation between counters and elapsed
+time. These values survive raw stream/task/occurrence and timestamp
+checks; they cannot establish exclusive counter ownership or attribute
+the head tail to arithmetic, memory stalls or preemption. Context counters
+are aggregated across blocks. All eighty sparse frequency samples report
+1850 MHz; they do not measure frequency continuously. This capture runs
+under the recorded external NPU load and a concurrent own CPU build.
+Retain the unresolved attribution and use profiler-off matched execution
+to select optimizations. Raw data and CPU reproducers stay under
+`/home/shanshan/trt-asc/offline/cann-mtp-chain-pmu-20261018-01/`.
+
 ## Two chain calls in one Graph
 
 The [unrolled Graph prototype](mtp-two-chain-graph-audit.json) keeps the
@@ -302,9 +325,37 @@ to 8193/8194, then dirty reset restores A. On TP16, 16,244,832 output and
 191,488 valid KV elements match the corresponding eager runs bit for bit.
 Saved device-bridge tensors also match C1 recycle/token and seed indices.
 Each rank captures once and replays three times, with peak reserved memory
-1,835,008,000 bytes/die. This prototype has no latency measurement or
-product-session integration yet. Artifacts stay in
+1,835,008,000 bytes/die. Artifacts stay in
 `/home/shanshan/trt-asc/offline/cann-mtp-two-chain-20261018-01/`.
+
+The [sharded-model paired measurement](mtp-two-chain-timing-audit.json)
+compares two single-chain replays/two token reads against one two-chain
+graph/one candidate read. Both wall windows include dynamic metadata and
+device feedback. Each sample follows three full-chain warmups; capture,
+seed, restore and tensor snapshots stay outside the window. One graph is
+resident at a time.
+
+| Two dependent draft calls, rank-MAX wall | p50 (ms) | p95 (ms) |
+|---|---|---|
+| Two replays | 27.20328 | 30.23225 |
+| One two-chain Graph | 27.16949 | 28.97017 |
+
+Thirty AB/BA pairs save a median 0.089471 ms; p10/p90 are
+−1.696436/+3.369580 ms, with 15/30 wins. AB and BA medians have opposite
+signs, −0.164832/+0.280664 ms. This shared-load screen does not establish a
+stable gain; stop default integration and investigate device execution
+tails. Capture-context rank-MAX median rises from 552.18 to 1051.22 ms.
+Full target verification, conditioned M4, acceptance and delivery are
+excluded, so this is not TPOT.
+
+An independent CPU audit compares A/B/dirty/reset/recapture, metadata,
+device bridge snapshots and all 960 timed C2 outputs/valid KV: 405,199,504
+element comparisons are bit exact. Sixteen ranks each close 64 captures
+after 375 replays; reported peak reservation is 1,788,870,656 bytes/die.
+Memory peaks, graph counters and full-prefix preservation are driver
+records; saved tensors and paired clocks are independently reconstructed.
+Reproducers and raw outputs stay in
+`/home/shanshan/trt-asc/offline/cann-mtp-two-chain-paired-20261018-01/`.
 
 ## Reference scope
 
