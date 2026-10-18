@@ -967,3 +967,10 @@
   produced three token streams with it installed, so the cause of that
   divergence was never the barrier. A withdrawal can be right about the
   withdrawal and wrong about the reason, and only the fix distinguishes them.
+- Eliminate hypotheses with differentials, and say which ones died. Width 8's
+  divergence survived the vendor barrier, survived HCCL determinism, and
+  survived process isolation -- three named causes, three experiments, three
+  refutations, and the search space is now "what differs across processes at
+  one width and not another" rather than a list of suspects. Each refutation
+  cost one run; guessing from the code would have cost the same and settled
+  nothing.

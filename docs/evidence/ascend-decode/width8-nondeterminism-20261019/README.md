@@ -123,7 +123,35 @@ The barrier should still be installed — 384 calls with zero disagreements
 against the factory object's 10 — but it buys correctness on that operator
 rather than reproducibility on the round.
 
-## The next candidate is in my own script
+## Three hypotheses eliminated, and the divergence is process-level
+
+| hypothesis | test | verdict |
+|---|---|---|
+| the vendor epilogue race | barrier overlay installed, 384 calls clean | **not it** — width 8 still gives three streams |
+| HCCL reduction order | `HCCL_DETERMINISTIC=true` | **not it** — rounds 231/227/223, three streams |
+| state leaking across requests in one process | three separate processes, one request each | **not it** — two completed runs gave 228 and 280 rounds, two streams |
+
+So it is process-level non-determinism with identical inputs, and the question
+narrows to what differs across processes at width 8 and not at width 4.
+
+What remains, as leads rather than conclusions. Something read before it is
+written whose content depends on allocation history: `cann_model.py:372-384`
+allocates `_input_buffers` per width with `torch.empty`, and a width-8 run also
+executes widths 6, 4, 2 and 1 because `mtp_state.begin()` steps down through
+`WIDTHS` as the token budget shrinks, while only width 8 has a captured graph.
+A buffer sized or filled for one width and read at another would produce
+exactly this signature. And `_int64_kv_slots` (`sfa_v1.py:459-474`)
+invalidates by tensor identity alone, with three safeties and no assertion
+among them.
+
+One control still missing: width 4 has been shown reproducible across requests
+within a process but not across processes. If it diverges across processes too,
+the asymmetry this page is built on does not exist and the real question
+becomes why the round count is so much more sensitive at width 8.
+
+## The candidate that was in my own script
+
+
 
 `HCCL_DETERMINISTIC` is unset on this machine, and the benchmark only records
 it into the report rather than setting it. With HCCL free to vary its
