@@ -1,4 +1,4 @@
-"""Time the W4A8 grouped matmul at one active-expert count and row count.
+"""Time one W4A8 expert-GMM path at a given active-expert and row count.
 
 Each active group reads its own weight shard, so sweeping the number of
 non-zero groups scales HBM traffic at a fixed kernel shape and separates the
@@ -39,6 +39,18 @@ def build_bank(inputs, outputs, device):
     }
 
 
+def build_routing(experts, rows, device):
+    """One destination row per expert row, as the permuted layout implies."""
+    total = experts * rows
+    return {
+        "tokens": total,
+        "sorted_indices": torch.arange(total, dtype=torch.int32,
+                                       device=device),
+        "row_index": torch.arange(total, dtype=torch.int64, device=device),
+        "probs": torch.ones(total, dtype=torch.bfloat16, device=device),
+    }
+
+
 def build_activation(rows, inputs, device):
     return {
         "x": torch.ones(rows, inputs, dtype=torch.int8, device=device),
@@ -47,7 +59,7 @@ def build_activation(rows, inputs, device):
     }
 
 
-def grouped_matmul_call(bank, activation, counts):
+def grouped_matmul_call(bank, activation, counts, routing):
     import torch_npu
 
     def call():
@@ -60,6 +72,42 @@ def grouped_matmul_call(bank, activation, counts):
         )[0]
 
     return call
+
+
+def unpermuted_call(bank, activation, counts, routing):
+    """Time the production pair: grouped matmul, then the routing combine."""
+    import torch_npu
+
+    matmul = grouped_matmul_call(bank, activation, counts, routing)
+
+    def call():
+        return torch_npu.npu_moe_token_unpermute(
+            matmul(), routing["sorted_indices"], routing["probs"],
+        )
+
+    return call
+
+
+def finalize_routing_call(bank, activation, counts, routing):
+    """Time the fused alternative: grouped matmul with the combine inside."""
+    import torch_npu
+
+    def call():
+        return torch_npu.npu_grouped_matmul_finalize_routing(
+            activation["x"], bank["weight"], counts,
+            scale=bank["scale"].view(-1).to(torch.float32),
+            pertoken_scale=activation["per_token_scale"],
+            logit=routing["probs"].to(torch.float32),
+            row_index=routing["row_index"],
+            dtype=torch.bfloat16, output_bs=routing["tokens"],
+            group_list_type=1,
+        )
+
+    return call
+
+
+PATHS = {"grouped": grouped_matmul_call, "unpermuted": unpermuted_call,
+         "finalize_routing": finalize_routing_call}
 
 
 def batch_mean_us(call, calls):
@@ -81,7 +129,8 @@ def measure(args, report):
     activation = build_activation(args.experts * args.rows, inputs, device)
     counts = torch.zeros(EXPERTS, dtype=torch.int64, device=device)
     counts[:args.experts] = args.rows
-    call = grouped_matmul_call(bank, activation, counts)
+    routing = build_routing(args.experts, args.rows, device)
+    call = PATHS[args.path](bank, activation, counts, routing)
 
     for _ in range(args.warmup):
         call()
@@ -104,6 +153,7 @@ def arguments():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--projection", choices=tuple(PROJECTIONS),
                         default="gate_up")
+    parser.add_argument("--path", choices=tuple(PATHS), default="grouped")
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)
@@ -118,7 +168,8 @@ def main():
     report = {
         "status": "error", "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv], "hostname": platform.node(),
-        "projection": args.projection, "experts": args.experts,
+        "path": args.path, "projection": args.projection,
+        "experts": args.experts,
         "rows": args.rows, "device": args.device, "calls": args.calls,
         "warmup": args.warmup, "batches": args.batches,
         "scope": "one die, one rank, shared with another tenant",
@@ -133,7 +184,8 @@ def main():
         passed = False
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"projection": args.projection, "experts": args.experts,
+    print(json.dumps({"path": args.path, "projection": args.projection,
+                      "experts": args.experts,
                       "rows": args.rows, "passed": passed,
                       "median_us": report.get("median_us"),
                       "gb_per_s": report.get("gb_per_s")}))
