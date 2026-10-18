@@ -24,12 +24,20 @@ using namespace AscendC;
 constexpr int64_t SIGNAL_SLOT_INT32 = 16;
 constexpr int64_t ALIGN_BYTES = 32;
 constexpr int64_t PLANES = 2;
+// Upper bound on producer cores, so the flag region has a fixed size the
+// host can allocate without knowing the launch width.
+constexpr int64_t MAX_SLICES = 32;
 
-// A3 has 192 KiB of UB in total, shared by every consumer in the kernel.
-constexpr int64_t FLAG_UB_BASE = 32;
-constexpr int64_t STAGE_UB_BASE = 1024;
-constexpr int64_t STAGE_UB_BYTES = 96 * 1024;
-constexpr int64_t REDUCE_UB_BASE = 112 * 1024;
+// A3 has 192 KiB of UB. ACLSHMEM reserves [0, 16384) for its own mte_config
+// window (src/host/init/shmem_init.cpp:42,78), so everything here starts
+// above it. The reduction's buffers come from a TPipe rather than by filling
+// LocalTensor::address_ by hand: a hand-made tensor paired with explicit
+// SetFlag/WaitFlag stalls forever on an event nobody set, with no error code.
+constexpr int64_t SHMEM_RESERVED_UB = 16 * 1024;
+constexpr int64_t FLAG_UB_BASE = SHMEM_RESERVED_UB;
+constexpr int64_t FLAG_UB_BYTES = 16 * 1024;
+constexpr int64_t STAGE_UB_BASE = FLAG_UB_BASE + FLAG_UB_BYTES;
+constexpr int64_t STAGE_UB_BYTES = 64 * 1024;
 constexpr int64_t REDUCE_UB_SPAN = 32 * 1024;
 
 ACLSHMEM_DEVICE int64_t AlignUp(int64_t value, int64_t alignment)
@@ -49,21 +57,35 @@ ACLSHMEM_DEVICE TpPushLayout TpPushPlane(__gm__ uint8_t* window, int rows, int h
     TpPushLayout layout;
     layout.elements = static_cast<int64_t>(rows) * hidden;
     layout.stride = AlignUp(layout.elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    const int64_t flag_int32 = PLANES * pe_size * SIGNAL_SLOT_INT32;
-    layout.flags = (__gm__ int32_t*)window + plane * pe_size * SIGNAL_SLOT_INT32;
+    // Flags are indexed per producer core, like allgather's
+    // aivNum * SYNC_FLAG_INTERVAL, so the region is sized for the largest
+    // producer half the host is willing to launch.
+    const int64_t flag_int32 = PLANES * MAX_SLICES * SIGNAL_SLOT_INT32;
+    layout.flags = (__gm__ int32_t*)window + plane * MAX_SLICES * SIGNAL_SLOT_INT32;
     layout.data = (__gm__ float*)((__gm__ int32_t*)window + flag_int32) + plane * pe_size * layout.stride;
     return layout;
 }
 
-/** Write our partial into our own slot, then raise our own flag. */
-ACLSHMEM_DEVICE void TpPushPublish(const TpPushLayout& layout, __gm__ float* partial, int64_t my_pe, int32_t ticket)
+/**
+ * Each producer core stages its own slice of our partial into our own window
+ * and raises its own flag, as examples/allgather does: the flag region is
+ * indexed per core, so a consumer learns about a slice as soon as that slice
+ * lands rather than waiting for the whole partial.
+ */
+ACLSHMEM_DEVICE void TpPushPublish(const TpPushLayout& layout, __gm__ float* partial, int64_t slice, int64_t slices,
+                                   int64_t my_pe, int32_t ticket)
 {
-    __ubuf__ float* stage = (__ubuf__ float*)(STAGE_UB_BASE);
-    aclshmemx_mte_put_nbi(layout.data + my_pe * layout.stride, partial, stage, STAGE_UB_BYTES, layout.elements, my_pe,
-                          EVENT_ID0);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    aclshmemx_signal_op(layout.flags + my_pe * SIGNAL_SLOT_INT32, ticket, ACLSHMEM_SIGNAL_SET, my_pe);
+    const int64_t span = (layout.elements + slices - 1) / slices;
+    const int64_t begin = slice * span;
+    if (begin < layout.elements) {
+        const int64_t count = (begin + span <= layout.elements) ? span : layout.elements - begin;
+        __ubuf__ float* stage = (__ubuf__ float*)(STAGE_UB_BASE);
+        aclshmemx_mte_put_nbi(layout.data + my_pe * layout.stride + begin, partial + begin, stage, STAGE_UB_BYTES,
+                              count, my_pe, EVENT_ID0);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    aclshmemx_signal_op(layout.flags + slice * SIGNAL_SLOT_INT32, ticket, ACLSHMEM_SIGNAL_SET, my_pe);
 }
 
 /**
@@ -71,21 +93,27 @@ ACLSHMEM_DEVICE void TpPushPublish(const TpPushLayout& layout, __gm__ float* par
  * core's stripe in rank order once all of them have been observed.
  */
 ACLSHMEM_DEVICE void TpPushConsume(const TpPushLayout& layout, __gm__ float* out, int64_t core, int64_t cores,
-                                   int64_t pe_size, int32_t ticket)
+                                   int64_t pe_size, int64_t slices, int32_t ticket, LocalTensor<float>& acc,
+                                   LocalTensor<float>& term)
 {
+    // Wait for every (peer, slice) flag, polling and moving on rather than
+    // blocking on any one of them.
     __ubuf__ int32_t* seen = (__ubuf__ int32_t*)(FLAG_UB_BASE);
-    for (int64_t pe = 0; pe < pe_size; ++pe) {
-        seen[pe * 8] = 0;
+    const int64_t total = pe_size * slices;
+    for (int64_t index = 0; index < total; ++index) {
+        seen[index * 8] = 0;
     }
     int64_t ready = 0;
-    while (ready < pe_size) {
-        for (int64_t pe = 0; pe < pe_size; ++pe) {
-            if (seen[pe * 8] == ticket) {
+    while (ready < total) {
+        for (int64_t index = 0; index < total; ++index) {
+            if (seen[index * 8] == ticket) {
                 continue;
             }
-            aclshmem_int32_get_nbi(seen + pe * 8, layout.flags + pe * SIGNAL_SLOT_INT32, 1, pe);
+            const int64_t pe = index / slices;
+            const int64_t slice = index % slices;
+            aclshmem_int32_get_nbi(seen + index * 8, layout.flags + slice * SIGNAL_SLOT_INT32, 1, pe);
             PipeBarrier<PIPE_ALL>();
-            if (seen[pe * 8] == ticket) {
+            if (seen[index * 8] == ticket) {
                 ++ready;
             }
         }
@@ -98,58 +126,51 @@ ACLSHMEM_DEVICE void TpPushConsume(const TpPushLayout& layout, __gm__ float* out
     }
     const int64_t span = (begin + stripe <= layout.elements) ? stripe : layout.elements - begin;
 
-    LocalTensor<float> acc;
-    LocalTensor<float> term;
-    acc.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
-    acc.address_.bufferAddr = REDUCE_UB_BASE;
-    acc.address_.dataLen = REDUCE_UB_SPAN;
-    term.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
-    term.address_.bufferAddr = REDUCE_UB_BASE + REDUCE_UB_SPAN;
-    term.address_.dataLen = REDUCE_UB_SPAN;
-
     const int64_t chunk = REDUCE_UB_SPAN / static_cast<int64_t>(sizeof(float));
     for (int64_t offset = 0; offset < span; offset += chunk) {
         const int64_t count = (span - offset < chunk) ? span - offset : chunk;
         GlobalTensor<float> source;
         source.SetGlobalBuffer(layout.data + begin + offset, count);
         DataCopy(acc, source, count);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
+        PipeBarrier<PIPE_ALL>();
         for (int64_t pe = 1; pe < pe_size; ++pe) {
             source.SetGlobalBuffer(layout.data + pe * layout.stride + begin + offset, count);
             DataCopy(term, source, count);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID2);
-            WaitFlag<HardEvent::MTE2_V>(EVENT_ID2);
+            PipeBarrier<PIPE_ALL>();
             Add(acc, acc, term, count);
+            PipeBarrier<PIPE_ALL>();
         }
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID1);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID1);
         GlobalTensor<float> sink;
         sink.SetGlobalBuffer(out + begin + offset, count);
         DataCopy(sink, acc, count);
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+        PipeBarrier<PIPE_ALL>();
     }
 }
 
 ACLSHMEM_DEVICE void tp_push_once(
-    __gm__ float* partial, __gm__ float* out, __gm__ uint8_t* window, int rows, int hidden, int64_t round, int stage)
+    __gm__ float* partial, __gm__ float* out, __gm__ uint8_t* window, int rows, int hidden, int64_t round, int stage,
+    LocalTensor<float>& acc, LocalTensor<float>& term)
 {
-    const int64_t core = GetBlockIdx();
+    // GetBlockIdx() is the cube block index in a MIX kernel, so two vector
+    // sub-blocks would share one core id: half the stripes would go uncomputed
+    // and two sub-blocks would publish the same slice.
+    const int64_t core = GetBlockIdx() * GetSubBlockNum() + GetSubBlockIdx();
     const int64_t cores = GetBlockNum() * GetSubBlockNum();
     const int64_t my_pe = aclshmem_my_pe();
     const int64_t pe_size = aclshmem_n_pes();
     const TpPushLayout layout = TpPushPlane(window, rows, hidden, pe_size, round % PLANES);
     const int32_t ticket = static_cast<int32_t>(round / PLANES) + 1;
 
-    // Producer and consumer cores are disjoint, as in examples/allgather, so
-    // no core waits on work it owes itself.
-    if (core == 0) {
+    // Cores split into two disjoint halves exactly as examples/allgather does:
+    // the first stages our partial into our own window, the second reads the
+    // peers. No core waits on work it owes itself.
+    const int64_t half = cores / 2;
+    if (core < half) {
         if (stage != 2) {
-            TpPushPublish(layout, partial, my_pe, ticket);
+            TpPushPublish(layout, partial, core, half, my_pe, ticket);
         }
     } else if (stage != 1) {
-        TpPushConsume(layout, out, core - 1, cores - 1, pe_size, ticket);
+        TpPushConsume(layout, out, core - half, cores - half, pe_size, half, ticket, acc, term);
     }
 }
 
@@ -163,8 +184,17 @@ extern "C" __global__ __aicore__ void tp_push_kernel(
     if ASCEND_IS_AIC {
         return;
     }
+    // One allocation for the whole launch: a TPipe inside the round loop would
+    // re-carve UB every round.
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> accumulator;
+    TBuf<TPosition::VECCALC> addend;
+    pipe.InitBuffer(accumulator, REDUCE_UB_SPAN);
+    pipe.InitBuffer(addend, REDUCE_UB_SPAN);
+    LocalTensor<float> acc = accumulator.Get<float>();
+    LocalTensor<float> term = addend.Get<float>();
     for (int round = 0; round < rounds; ++round) {
-        tp_push_once(partial, out, window, rows, hidden, static_cast<int64_t>(round_base) + round, stage);
+        tp_push_once(partial, out, window, rows, hidden, static_cast<int64_t>(round_base) + round, stage, acc, term);
     }
 }
 

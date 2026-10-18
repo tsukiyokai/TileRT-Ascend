@@ -168,6 +168,44 @@ inter-core sync before the receive wait, and puts a timeout on the wait; PR 897
 checks `aclshmemx_set_qp_num`'s return and the SDMA QP count against the
 device's vector-core count before launching.
 
+## On the fixed library: publish is 0.874 µs
+
+The library's barrier defect
+([ABI](../shmem-abi-20261018/README.md)) had to be rebuilt and reinstalled
+before any of this measured anything — device-side builds do not track header
+dependencies, so the `.cpp` must be touched first and the `.run` reinstalled.
+
+With that in place, at two PEs, blocks 8, `[4, 6144]` float32:
+
+| stage | result |
+|---|---|
+| publish and wait, no reduce | **0.874 µs**, `wrong 0` |
+| reduce only | hangs, no plog |
+| full | hangs, no plog |
+
+The publish half more than halved from 1.814 µs once the barrier stopped
+being a silent no-op. The stall is in the reduction, which an independent
+investigation reproduced on the same code — my earlier attribution of the cost
+to the reduce half was right about the location and wrong about everything
+measured through the broken barrier.
+
+Four diagnosed faults are now fixed and it still hangs, so at least one is not
+the cause: the reduction's buffers come from a `TPipe` with
+`TBuf<TPosition::VECCALC>` allocated once at launch scope rather than
+hand-filled `LocalTensor::address_`; every explicit `SetFlag`/`WaitFlag` pair
+in the reduction is a `PipeBarrier<PIPE_ALL>`; UB regions sit above
+ACLSHMEM's reserved `[0, 16384)`; and the core index is
+`GetBlockIdx() * GetSubBlockNum() + GetSubBlockIdx()`, since `GetBlockIdx()`
+alone is the cube block index in a MIX kernel and two sub-blocks would share
+one id.
+
+Handed to the investigation that found the ABI defect, which has the working
+environment and far more of this SDK read than I do. One structural question
+goes with it: `allgather` needs two disjoint core groups because its consumers
+read peers' *payloads*, while a reduction only needs peers' *flags* — every
+rank's data is already local once published — so the two-group split may be
+the wrong shape here.
+
 ## Still open: producer and consumer in one kernel
 
 The full path still hangs while the halves pass separately — push 1.814 µs,

@@ -25,6 +25,7 @@ constexpr int64_t ALIGN_BYTES = 32;
 // two ranks share a cache line, and the payload follows them.
 constexpr int64_t SIGNAL_SLOT_INT32 = 16;
 constexpr int64_t PLANES = 2;
+constexpr int64_t MAX_SLICES = 32;
 
 int64_t AlignUp(int64_t value, int64_t alignment)
 {
@@ -60,7 +61,7 @@ int main(int argc, char* argv[])
 
     const int64_t elements = static_cast<int64_t>(rows) * hidden;
     const int64_t stride = AlignUp(elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    const size_t flag_bytes = PLANES * pe_size * SIGNAL_SLOT_INT32 * sizeof(int32_t);
+    const size_t flag_bytes = PLANES * MAX_SLICES * SIGNAL_SLOT_INT32 * sizeof(int32_t);
     const size_t window_bytes = flag_bytes + PLANES * pe_size * stride * sizeof(float);
     void* window = aclshmem_malloc(window_bytes);
     if (window == nullptr) {
