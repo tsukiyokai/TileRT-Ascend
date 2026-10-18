@@ -1075,3 +1075,16 @@ against what its control would have cost.
   flips an argmax at that width: the release gate passes on the distance
   between the top two logits, not on the arithmetic. A gate that compares
   tokens cannot see an error the margins absorb.
+- Inheriting an environment variable can be safer than setting it. activate.sh
+  already ships ASCEND_CUSTOM_OPP_PATH with a patched vendor overlay ahead of
+  the in-tree one, and the bootstrap's guard then declines to prepend anything
+  because the in-tree path is already present. Exporting the variable from
+  scratch drops that overlay and re-arms the prepend, which with a Python
+  overlay first on PYTHONPATH hands index 0 to that overlay's own unpatched
+  copy. I did exactly that in five runs and read the consequence back out of
+  their records afterwards.
+- The best evidence for an inference is often a run you already have. "Width 4
+  passes its gate on margin rather than correctness" was an argument assembled
+  from two separate measurements; reading one run's own vendor resolution
+  showed it had executed the unpatched object and still produced a single token
+  stream over three requests, which is the claim directly.

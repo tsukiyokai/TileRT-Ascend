@@ -125,6 +125,53 @@ HCCL reduction order, both directions: unset and set, with and without the
 barrier active, three streams each. And the dense layers' six all-reduces are
 bit-identical, which removes the collective directly.
 
+## The vendor-path trap, read out of my own runs
+
+Every one of my width-8 records resolves the same way, from each run's own
+`runtime_env`:
+
+| index | path | provides the operator |
+|---|---|---|
+| 0, 2, 3 | `fla_npu` vendors | no |
+| **1** | the hoist overlay's own `_cann_ops_custom/vendors/custom_transformer` | **yes, unpatched — wins** |
+| 4 | my barrier overlay | yes |
+| 5 | the in-tree vendor | yes |
+
+So the factory object ran in `barrier/w8`, `barrier/w8-hoist`, `det/w8`,
+`det/w8-hoist` and `isolate/run1`.
+
+The trap's shape is more specific than either half of the story suggested.
+`activate.sh` already ships `ASCEND_CUSTOM_OPP_PATH` containing a
+barrier-patched owner overlay
+(`/workspace/offline/cann-workspace-owner-20261017/kernel-overlay/…`, holding
+`2eb81546…`) at index 3, ahead of the in-tree vendor at 4 — and
+`_prepend_env_path`'s guard (`utils.py:449`) finds the in-tree path already
+present and therefore never moves it to index 0. **Inheriting the variable is
+safe.** Setting it from scratch is what breaks: it drops the owner overlay,
+and the bootstrap then prepends the path derived from
+`dirname(vllm_ascend.__file__)` — which, with a Python overlay first on
+`PYTHONPATH`, is that overlay's own unpatched copy.
+
+Five completed width-4 records from 09:03–09:28 show the inherited order with
+the barrier at index 3, so those runs executed the patched object.
+`onesided-20261018` records no `ASCEND_CUSTOM_OPP_PATH` at all, which is the
+other dangerous case: with the variable unset the guard does not fire and the
+bootstrap hands index 0 to the unpatched in-tree vendor.
+
+## Margin absorption, now on direct evidence
+
+This settles the earlier inference without an inference. `barrier/w4` resolved
+to the unpatched object at index 1 — **it ran the factory object** — and it
+produced 307 rounds in all three measured requests, a single token stream and
+a 0.141 ms range.
+
+So in one run, an operator measured as non-deterministic at exactly that
+configuration's verify shape (M = 32: four distinct results over 64 calls,
+int8 codes differing by 115) produced bit-reproducible tokens end to end. The
+corrupted values never flipped an argmax. The release gate passes on the
+distance between the top two logits, and a gate comparing tokens cannot see
+it.
+
 ## My own barrier evidence was void
 
 **The barrier overlay never took effect in any of my width-8 runs.**
