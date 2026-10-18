@@ -280,3 +280,17 @@
   does not apply to it. Do not build an overlap argument on it until a line
   sweep settles which.
   [Profile](evidence/ascend-decode/cann-mtp-profile-20261017/summary.json)
+- Subtracting compute from a span merges three different things. The raw
+  per-rank analysis carries `activity_union_ms` next to compute and
+  collective, and defines its gap as no traced kernel, HCCL or AICPU
+  interval, so verify's genuinely idle device time is 1.014 ms where
+  span minus compute gives 7.855 ms. Read the exporter's own fields before
+  deriving one.
+  [Four-way split](evidence/ascend-decode/draft-collectives-20261018/README.md)
+- The same collective costs what the schedule around it allows. A reduction
+  inside verify waits 26 µs because 157 of them are pipelined behind 0.26 ms
+  of per-layer compute; a reduction inside a single-token draft stage waits
+  about 1234 µs because only three of them follow a host broadcast with
+  nothing to keep sixteen ranks in step. Forty-six times, for 0.6% transit.
+  Optimise the schedule that feeds a collective before the collective.
+  [Draft collectives](evidence/ascend-decode/draft-collectives-20261018/README.md)
