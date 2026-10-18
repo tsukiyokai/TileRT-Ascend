@@ -523,3 +523,12 @@
   one-sided put shows 0.31 us within a module against 0.86 us across one, a
   real 2.7-fold. The topology was there all along, under 70 us of scheduling.
   [Wire](evidence/ascend-decode/shmem-install-20261018/README.md#sub-microsecond-and-the-topology-appears)
+- Read the whole source before building a programme on an excerpt. Working
+  from a quoted paragraph about the one-shot push, I inferred the architecture
+  from a symbol table and got it backwards: the design is the entire model
+  statically unfolded into one persistent kernel with no launch sequence, and
+  the 459 exported kernels are building blocks compiled into it. Two of its
+  three mechanisms -- the streaming handshake that replaces global barriers,
+  and prefetch scheduled across the whole forward pass -- were absent from my
+  plan entirely, and both are the reason the third one works.
+  [Reread](evidence/tilert-ascend/amd-article-reread-20261018.md)
