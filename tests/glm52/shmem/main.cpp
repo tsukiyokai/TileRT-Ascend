@@ -22,6 +22,7 @@ namespace {
 constexpr int64_t ALIGN_BYTES = 32;
 constexpr int64_t SLOT_INT32 = ALIGN_BYTES / static_cast<int64_t>(sizeof(int32_t));
 constexpr uint64_t HEAP_BYTES = 1024UL * 1024UL * 1024UL;
+constexpr int64_t PLANES = 2;
 
 int64_t AlignUp(int64_t value, int64_t alignment)
 {
@@ -57,9 +58,10 @@ int main(int argc, char* argv[])
 
     const int64_t elements = static_cast<int64_t>(rows) * hidden;
     const int64_t stride = AlignUp(elements * sizeof(float), ALIGN_BYTES) / sizeof(float);
-    // Two planes of data and status, alternating by round parity.
+    // Two planes of data and two of status, alternating by round. The kernel
+    // derives both from the absolute round index the host passes.
     const size_t window_bytes =
-        2 * pe_size * stride * sizeof(float) + 2 * pe_size * SLOT_INT32 * sizeof(int32_t);
+        PLANES * pe_size * stride * sizeof(float) + PLANES * pe_size * SLOT_INT32 * sizeof(int32_t);
     void* window = aclshmem_malloc(window_bytes);
     if (window == nullptr) {
         std::printf("pe %d: aclshmem_malloc failed\n", pe_id);
@@ -75,6 +77,12 @@ int main(int argc, char* argv[])
     ACL_CHECK(aclrtMalloc(&partial, elements * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMalloc(&out, elements * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMemcpy(partial, elements * sizeof(float), host.data(), elements * sizeof(float),
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+    // A sentinel distinguishes "the kernel wrote a wrong sum" from "the kernel
+    // never wrote the output at all", which a zero cannot.
+    const float SENTINEL = -12345.0F;
+    std::vector<float> sentinel(elements, SENTINEL);
+    ACL_CHECK(aclrtMemcpy(out, elements * sizeof(float), sentinel.data(), elements * sizeof(float),
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
     const uint64_t ffts = util_get_ffts_config();
@@ -111,11 +119,17 @@ int main(int argc, char* argv[])
             }
         }
     }
+    int64_t untouched = 0;
+    for (int64_t i = 0; i < elements; ++i) {
+        if (result[i] == SENTINEL) {
+            ++untouched;
+        }
+    }
     if (pe_id == 0) {
         std::printf("pe_size %d rows %d hidden %d bytes %ld rounds %d blocks %u\n", pe_size, rows,
                     hidden, (long)(elements * sizeof(float)), rounds, blocks);
-        std::printf("RESULT stage %d per_reduction_us %.3f wrong %ld of %ld expected %.1f got %.1f\n",
-                    stage, total_us / rounds, (long)wrong, (long)elements, expected, result[0]);
+        std::printf("RESULT stage %d per_reduction_us %.3f wrong %ld untouched %ld of %ld expected %.1f got %.1f\n",
+                    stage, total_us / rounds, (long)wrong, (long)untouched, (long)elements, expected, result[0]);
     }
 
     aclshmem_free(window);

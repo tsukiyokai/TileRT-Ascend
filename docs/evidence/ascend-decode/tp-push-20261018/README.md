@@ -86,6 +86,44 @@ few cores.
 These timings are provisional: the numerical check does not pass at high
 round counts, so they measure a kernel that is not yet correct.
 
+## Two real defects found, and 507015 earned honestly
+
+Rewriting rather than patching surfaced two concrete faults, both mine.
+
+**A MIX kernel body runs on both core types.** A device print of the stripe
+computation showed it directly:
+
+```
+[AIC Block 0/4] reduce core=0 cores=4 elements=24576 stripe=6144 begin=0
+[AIV Block 0/8] reduce core=0 cores=4 elements=24576 stripe=6144 begin=0
+[AIV Block 4/8] reduce core=4 cores=4 elements=24576 stripe=6144 begin=24576
+```
+
+`GetBlockNum()` returns the launch's 4, but the vector side has
+`GetSubBlockNum()` blocks per cube block, so there are 8. Cube and vector were
+duplicating stripes 0–3 onto the same output while vector blocks 4–7 fell off
+the end — and the cube side, which has no vector units, wrote rubbish. The fix
+is `cores = GetBlockNum() * GetSubBlockNum()` with the reduction inside
+`if ASCEND_IS_AIV`.
+
+**The UB budget is 192 KiB in total, not per consumer.** I had the put's
+staging area at 190 KiB and then placed the reduction's buffers at a 192 KiB
+offset, entirely out of bounds. Its stores silently did nothing, which a
+sentinel exposed: pre-filling the output with −12345 and counting survivors
+reported `untouched 24576 of 24576`, distinguishing "wrote a wrong sum" from
+"never wrote at all" in one run where a zero could not. Both regions now come
+out of the one budget: reduction 2×32 KiB from 1 KiB, staging 126 KiB from
+65 KiB.
+
+With the layout corrected the reduction executes, and the run now deadlocks
+with **507015** in the plog. That is the error HyperMPMD's own bindings name
+as what an untimed device spin does under interconnect contention, and it is
+now ours legitimately rather than by accident — the earlier retraction stands,
+since sixteen PEs do form a domain, but a hand-written spin can still earn it.
+One item of their recipe is missing here: the host must converge before the
+first remotely visible write, and my `aclshmem_barrier_all()` runs after the
+warmup launch rather than before it.
+
 ## Where the kernel stands, unfinished
 
 Correct at 50 rounds with a single data plane; after adding round-parity

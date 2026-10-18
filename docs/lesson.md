@@ -555,3 +555,20 @@
   coordination rather than arithmetic, so the parallelism that helps a large
   kernel is a tax on a small one. Sweep the core count rather than assuming
   the die's width is the target.
+- A sentinel separates "computed wrongly" from "never ran". My reduction
+  reported every element wrong with the value 0.0, which reads as a bad sum;
+  pre-filling the output with -12345 and counting survivors reported
+  `untouched 24576 of 24576` and moved the search from the arithmetic to the
+  store in one run. Zero is the worst possible sentinel because it is also a
+  plausible answer.
+  [TP push](evidence/ascend-decode/tp-push-20261018/README.md)
+- A MIX kernel body executes on both core types, and the vector side has
+  GetSubBlockNum() blocks per cube block. Using GetBlockNum() as the core
+  count had cube and vector writing the same stripes while the surplus vector
+  blocks addressed past the end -- and the cube side has no vector units, so
+  its stores were rubbish. Gate the vector work with ASCEND_IS_AIV and count
+  cores as GetBlockNum() * GetSubBlockNum().
+- UB is one 192 KiB budget shared by every consumer in the kernel, not a
+  per-consumer allowance. Stacking a 190 KiB staging area and then addressing
+  a reduction buffer at a 192 KiB offset put it out of bounds, and the stores
+  failed silently rather than faulting.
