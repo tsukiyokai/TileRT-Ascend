@@ -78,14 +78,59 @@ the eight used are declared — paired difference **20.424 µs** (σ 0.167, 25 o
 25, host 0.75 µs), or 0.0824 µs per empty slot. Half the custom operator's
 0.155 but the same disease.
 
-Two limits are stated rather than hidden. The arms hold different allocations,
-4×201 MB against 4×25 MB, so the short arm's working set fits L2 and the long
-one's does not; the same effect measured 3.36 µs on the custom operator, which
-leaves about 17 µs attributable to slot traversal. And the built-in rejects a
-group list shorter than the weight's expert dimension —
+### The footprint control, and the measured net
+
+Repeated with identical allocations on both arms — each four banks of the full
+256 experts' weight, scale and bias — reading the same eight experts' share
+with the same rotation and reuse distance, in three arms that separate the
+declaration from read locality:
+
+| shape | declared 256, active contiguous | declared 256, active scattered | declared 8, gathered | declaration | locality |
+|---|---|---|---|---|---|
+| K=6144 N=256 | 59.836 | 69.014 | 33.695 | 26.141 | 9.178 |
+| K=128 N=6144 | 60.073 | 65.654 | 30.401 | 29.672 | 5.581 |
+
+A third run on a different bank count gave 30.400 and 0.835. So the
+declaration effect is **28.7 ± 2.2 µs** and survives the control; the earlier
+17 µs attribution was conservative rather than an L2 artefact. The locality
+arm swings from 0.835 to 9.178 and is deliberately excluded from the figure
+that lands.
+
+**The gather costs 15.3 ± 0.4 µs, not the 4.1 that bytes over bandwidth
+predicts.** `index_select` of weight, scale and bias moves 12.6 MB read plus
+written at 824 GB/s, 54% of the die's marginal rate, on the matmul's own
+stream — and at batch one there is no other work at that point to overlap it
+with. Dividing bytes by a peak figure was off by 3.7×, the third time tonight.
+
+Net **13.4 µs per layer, 1.01 ms per round** across the round's ~75 built-in
+grouped calls, host-side only, bit-identical.
+
+### Half of it can avoid the copy entirely
+
+A narrow view `w[32:40]` with a length-8 group list **is accepted**, stays in
+npu format 29, and returns output bit-identical to the full-bank call reading
+the same experts (max absolute difference 0.0). So when the active window is
+contiguous the copy disappears and the whole 26–30 µs is saved. The scattered
+gather is bit-exact too, so the compression is semantically sound rather than
+merely fast.
+
+The production tensor permits it: `w2` is (256, 128, 768) int32 in format 29 at
+100,663,296 B, and narrow view, view plus contiguous, `index_select` and
+`clone` all succeed on it. An earlier refusal under format 29 belonged to the
+(256, 6144, 32) `w13` tensor specifically, not to NZ.
+
+Landing point is `AscendW4A8DynamicFusedMoEMethod.apply_gmm2`
+(`w4a8.py:637-645`): compress the group list to the active experts and replace
+weight, scale and bias with an `index_select` on those indices, or a view when
+the window is contiguous. Both must change together, since the built-in
+rejects a group list shorter than the weight's expert dimension —
 `size of groupList(tensor) 8 should be equal to weight dim 0 256 with
-groupType 0` — so collecting the win needs the host to gather the eight active
-experts' weights into a tensor declaring eight, a 6.29 MB device copy per
-layer. Net over 75 calls is about **0.97 ms per round, host-side only**,
-pending a footprint-controlled repeat and a measured rather than
-bandwidth-divided gather cost.
+groupType 0`.
+
+Limits to carry: per-call figures come from a single die with neighbours
+present, multiplied by a family count from a 16-rank profile; the gather
+allocates per call, and an `out=` buffer plus the 46% of peak it leaves on the
+table are untested headroom of roughly 7 µs; `apply_gmm1` has a built-in path
+not currently in use, worth 10.5 µs per layer if it is ever enabled. Still
+outstanding before landing: a bit-exact comparison on the real checkpoint
+rather than on synthesised weights.

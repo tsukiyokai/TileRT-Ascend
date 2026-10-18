@@ -823,3 +823,15 @@
   barriers inside that operator are intrinsic rather than overhead, because
   fused work doing the same three stages still has to meet twice.
   [Census](evidence/ascend-decode/prologue-census-20261019/README.md)
+- Dividing bytes by a peak bandwidth figure has been wrong by several times
+  every time tonight. A gather of eight experts out of 256 moves 12.6 MB and
+  predicts 4.1 microseconds at the die's marginal rate; measured it is 15.3,
+  running at 54% of peak because strided block copies are not a stream. Price
+  a transfer by measuring it, especially when it sits on the critical path with
+  nothing to overlap it.
+- Ask whether the expensive step can be skipped rather than made cheaper. The
+  built-in grouped matmul rejects a short group list, which looked like it
+  forced a per-layer copy -- but a narrow view over the resident bank is
+  accepted, keeps its NZ format and is bit-identical, so a contiguous active
+  window costs nothing at all. One check turned a mandatory 15 microseconds
+  into a conditional one.
