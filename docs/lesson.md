@@ -482,3 +482,11 @@
   bandwidth limit, so the figure describes rounds and rendezvous and falls by
   an order of magnitude under a one-shot push. Before dividing a budget by a
   measured cost, ask what that cost is made of.
+- Sweep the size before calling a collective's rate a bandwidth. A TP16
+  float32 all_reduce costs 157 us for four bytes and 110 us for six
+  mebibytes, so the 0.76 GB/s at our shape is not a transfer rate but a
+  message divided by a rendezvous. That single sweep converts "the collective
+  is expensive" into "the collective is one synchronisation, and the payload
+  rides free", which is what makes a one-shot push attack all of it rather
+  than part.
+  [Reduction floor](evidence/ascend-decode/reduce-floor-20261018/README.md)
