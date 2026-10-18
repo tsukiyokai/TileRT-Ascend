@@ -32,7 +32,18 @@ HF 独立差分保持首要诊断地位：SwiGLU 屏障和 Div 1-ULP 缺陷均�
 
 [三轮分阶段 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md)的后两轮 target 验证窗口约 49 ms，专家两类 GMM 合计约 13.3 ms；这些是 profiling 数字。原 vLLM 1024-output 基线为 16.39 ms，当前观测中位比为 1.247；其主干经过 torch.compile，我们只录制 eager 模型，归约 dtype、custom OPP 与调度也不同。[仅切 AIV 的长测](evidence/ascend-decode/cann-graph-20261017/README.md#ai_cpu-versus-aiv-control)保持全部 token、提议与接受一致，TPOT 中位数升至 21.47 ms；但[纯通信对照](evidence/ascend-decode/tp-mode-20261017/README.md)的 FP32 96 KiB、156 次图归约链由 AI_CPU 10.93 ms 降至 AIV 5.04 ms。[新 M4 trace](evidence/ascend-decode/cann-mtp-profile-20261017/README.md#aiv-decode-comparison)确认 AIV 实际生效，并在一次归约观察到 rank 14 晚到约 4.21 ms；尚未证明资源竞争。保留 AIV 路线，编译主干先作独立单变量对照。共有 GMM 成本不能当作双方增量差距；长诊断尚未完成 teacher 精度与正式 32 请求验收。
 
-## 当前：13.338 ms（width 8）
+## 当前：13.338 ms（width 8），加两项已配对测得但尚未合测
+
+| 改动 | 配对收益 | 口径 |
+|---|---|---|
+| width 8（`max_num_seqs` 一个字面量） | 14.485 → 13.338 ms（复测 12.894） | 16 卡、1024 token、五跑逐位相同 |
+| metadata 与 mc2 掩码提升 | −0.7967 ms/token（−5.001%） | 下发 313→91，191712 项检查零失败 |
+| 专家声明压缩（w4a8） | 2.39 ms/轮（保守 1.97） | 真 checkpoint 逐位门过，prefill 五形状 ND 全不劣 |
+| GMM 三份 kernel 补丁 | 8.5 µs/次 × 78 ≈ 0.66 ms/轮 | p=1.8e-12，输出逐位相同 |
+
+四项各自在自己的配置上配对测得，**合测尚未拿到**：width 8 与 hoist 的组合在 8 token smoke 上撞 aicore 异常，正在二分（二者各自单独都跑得通）。所以不把它们相加当成 TPOT。
+
+## width 8 的细节
 
 M=8 实测 13.338 ms（复测 12.894），对 M=4 的 14.485 与记录最好值 14.247 分别是 7.9–11.0% 与 6.4–9.5%；A(8)=4.5066，M=16 反而回到 14.037 故最优在 8。使能它的是 `cann_model.py:80` 一个字面量（`max_num_seqs` 从 4 改成 `max(4, graph_width)`，因为 AscendCompiler 按它筛静态 token 桶，`--super-kernel` 在 4 行值 8.9 ms/轮、在 8 行一分不值）。宽度在硬件上几乎免费——attention 16 倍行只贵 7.0%、dense 投影全平——贵的是每多一个宽度多跑一次串行链式 draft（2.19 ms/单位 M，由 replay 数 =(M−2)×轮数×请求数 佐证）。同时修了 `gather_fia` 在宽度 >6 时丢失因果性（941 个逐位 KV 检查失败，它完全不加 mask 而依赖 docstring 断言）。[宽度](evidence/ascend-decode/width-20261019/README.md)
 
