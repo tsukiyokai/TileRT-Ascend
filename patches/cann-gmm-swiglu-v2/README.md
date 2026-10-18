@@ -43,20 +43,41 @@ global scalar reads per core: 2.118, 2.414 and 1.611 µs over three runs
 Measured on a toggle binary one arm of which executes exactly the submitted
 code, so the figure is for the shipped form rather than an approximation.
 
+## `gmm1-tiling-rowcount.patch` — a further 2 to 4 µs
+
+`InitWorkSpaceSplitConfig` sums the whole table when it needs only the row
+total, which tiling already holds (`base_tiling.cpp:201,434`) and
+`postProcess` already reads (`post.h:106`). Gated on one chunk; other loop
+counts keep summing. Measured 3.882, 0.663 and 2.127 µs (σ 0.207, 1.530,
+0.264; the middle run had a neighbour on the die), bit-identical — read it as
+2 to 4 µs rather than as a mean.
+
+The invariant is not newly assumed: feeding a `group_list` whose sum differs
+from tiling's M is silently accepted today and gives a wrong answer, because
+the activation indexing and the output scale buffer already size themselves
+from M while the chunking is derived from the table. The change picks which of
+two quantities that must already agree gets read.
+
 ## What these do not fix
 
 78 layers of `gate_up` at 8.5 µs is 0.66 ms per round against a 6.866 ms
 budget. `down` is out of reach: `w4a8.py:621,643` call
 `torch_npu.npu_grouped_matmul`, a CANN built-in outside this package.
 
-And the large item is untouched. A call's cost is linear in `group_list`'s
-length at 0.1556–0.1825 µs per slot, worth 37–50 µs for a 256-slot table, but
-only the 4.157 µs above is attributed to code. `midProcess` genuinely needs
-per-slot counts because its weight addressing accumulates `wBaseOffset` rather
-than indexing by `groupIdx`, and `postProcess` walks the table twice more.
-Batching the table into UB will not help: the 769 reads these patches remove
-cost 5.4 ns each, about ten cycles, so they already hit cache, while the
-per-slot length term is about 296 cycles — thirty times apart.
+And the large item is untouched, though it is now understood. A call's cost is
+linear in `group_list`'s length at 0.1556–0.1825 µs per slot, worth 37–50 µs
+for a 256-slot table, and **the cost belongs to whichever consumer touches the
+table first**: eliminating both pipeline-level traversals moved 38 µs from the
+prologue into `op.Process` while the total stayed at 88–93 µs. These three
+patches move the bill; they do not cancel it, which is why each is worth only a
+few microseconds.
+
+The mechanism is 24 cube and 48 vector cores each pulling a 2 KB table by
+blocking scalar global reads, one int64 at a time — 72 unshared streams against
+32 cache lines. The fix is one bulk `DataCopy` per consumer instead of 256
+serial round trips, which is kernel-internal and needs no prototype change. It
+is measured in size, 38.55 µs per call or about 3.0 ms per round, and
+unmeasured as a fix.
 
 ## A third patch this repository already carries
 

@@ -762,3 +762,21 @@
   so the mechanism is not the reads. Localise before paying for an interface
   change.
   [Correction](evidence/ascend-decode/gmm-fastpath-20261019/README.md)
+- Before believing a cost was removed, check the total. Deleting two of four
+  consumers of a routing table moved 38 microseconds out of the prologue and
+  into the stage that ran next, with the call's total unchanged to within a
+  microsecond. Each elimination measured a real few-microsecond saving and
+  their sum was nearly nothing, because the cold cost belongs to whoever
+  touches the data first. A per-part measurement that does not reconcile with
+  the whole is a bill changing hands.
+- There is no universal per-call floor to multiply by. Graph dispatch is
+  1.2 microseconds, one operator's own prologue is 16.4, another's per-call
+  cost is 8.3 -- and multiplying the largest by the round's 2,416 calls gives a
+  number larger than the round. The useful quantity is a per-operator
+  prologue, which is a finite enumeration rather than a constant.
+- A build script that installs some of its inputs manufactures false
+  negatives. build_gmm1_barrier.sh copies two headers into the overlay while
+  the compiler reads the overlay's installed .cpp, so a patch to that file is
+  discarded in silence: the build succeeds, the binary's hash is unchanged, the
+  measurement shows nothing, and no error appears anywhere.
+  [Floor](evidence/ascend-decode/gmm-fastpath-20261019/README.md)
