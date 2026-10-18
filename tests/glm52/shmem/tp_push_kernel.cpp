@@ -341,6 +341,96 @@ ACLSHMEM_DEVICE void TpPushProbe(__gm__ float* out, __gm__ int32_t* errors, int6
     }
 }
 
+/**
+ * Publish a bf16 partial, pipelined, straight into the peer's window.
+ *
+ * Half the bytes of the float32 path for the same values, since the sum is
+ * accumulated in float inside the reduction rather than on the wire.
+ */
+ACLSHMEM_DEVICE void TpPushPublishBf16(const TpPushLayout& layout, __gm__ bfloat16_t* partial, int64_t core,
+                                       int64_t my_pe, int64_t pe_size, const LocalTensor<bfloat16_t>& first,
+                                       const LocalTensor<bfloat16_t>& second)
+{
+    if (core >= pe_size) {
+        return;
+    }
+    const int64_t peer = (my_pe + core) % pe_size;
+    __gm__ bfloat16_t* remote = (__gm__ bfloat16_t*)aclshmem_ptr((__gm__ void*)layout.data, peer);
+    __gm__ bfloat16_t* slot = remote + my_pe * layout.stride * 2;
+    const int64_t chunk = STAGE_UB_BYTES / static_cast<int64_t>(sizeof(bfloat16_t));
+    const event_t events[2] = {EVENT_ID0, EVENT_ID1};
+
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(events[0]);
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(events[1]);
+    int64_t index = 0;
+    for (int64_t offset = 0; offset < layout.elements; offset += chunk) {
+        const int64_t count = (layout.elements - offset < chunk) ? layout.elements - offset : chunk;
+        const LocalTensor<bfloat16_t>& buffer = (index % 2 == 0) ? first : second;
+        const event_t event = events[index % 2];
+        ++index;
+
+        WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+        GlobalTensor<bfloat16_t> source;
+        source.SetGlobalBuffer(partial + offset, count);
+        DataCopy(buffer, source, count);
+        SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+
+        WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+        GlobalTensor<bfloat16_t> sink;
+        sink.SetGlobalBuffer(slot + offset, count);
+        DataCopy(sink, buffer, count);
+        SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+    }
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(events[0]);
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(events[1]);
+}
+
+/**
+ * Sum every rank's bf16 slot in float, in rank order, and store bf16.
+ *
+ * The widening and narrowing happen in UB around work the reduction already
+ * does, so the host no longer needs a Cast on either side.
+ */
+ACLSHMEM_DEVICE void TpPushReduceBf16(const TpPushLayout& layout, __gm__ bfloat16_t* out, int64_t core, int64_t cores,
+                                      int64_t pe_size, const LocalTensor<float>& acc, const LocalTensor<float>& term,
+                                      const LocalTensor<bfloat16_t>& narrow)
+{
+    const int64_t stripe = AlignUp((layout.elements + cores - 1) / cores, ALIGN_BYTES / sizeof(bfloat16_t));
+    const int64_t begin = core * stripe;
+    if (begin >= layout.elements) {
+        return;
+    }
+    const int64_t span = (begin + stripe <= layout.elements) ? stripe : layout.elements - begin;
+    const int64_t chunk = REDUCE_UB_BYTES / static_cast<int64_t>(sizeof(float));
+
+    for (int64_t offset = 0; offset < span; offset += chunk) {
+        const int64_t count = (span - offset < chunk) ? span - offset : chunk;
+        for (int64_t pe = 0; pe < pe_size; ++pe) {
+            GlobalTensor<bfloat16_t> source;
+            source.SetGlobalBuffer((__gm__ bfloat16_t*)layout.data + pe * layout.stride * 2 + begin + offset, count);
+            DataCopy(narrow, source, count);
+            SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            if (pe == 0) {
+                Cast(acc, narrow, AscendC::RoundMode::CAST_NONE, count);
+            } else {
+                Cast(term, narrow, AscendC::RoundMode::CAST_NONE, count);
+                PipeBarrier<PIPE_V>();
+                Add(acc, acc, term, count);
+            }
+            PipeBarrier<PIPE_V>();
+        }
+        Cast(narrow, acc, AscendC::RoundMode::CAST_RINT, count);
+        SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        GlobalTensor<bfloat16_t> sink;
+        sink.SetGlobalBuffer(out + begin + offset, count);
+        DataCopy(sink, narrow, count);
+        SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+        WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+    }
+}
+
 ACLSHMEM_DEVICE void tp_push_once(__gm__ float* partial, __gm__ float* out, __gm__ uint8_t* window, int rows,
                                   int hidden, int64_t round, int stage, __ubuf__ float* stage_ub,
                                   __gm__ int32_t* errors, const LocalTensor<float>& stage_tensor,
@@ -380,6 +470,8 @@ ACLSHMEM_DEVICE void tp_push_once(__gm__ float* partial, __gm__ float* out, __gm
         // No peer may begin its next push until every peer has finished
         // reading, which is what makes a single plane safe.
         aclshmemx_sync_vec_all();
+    } else if (stage == 10) {
+        // Stage 10 orders and synchronises inside its own branch.
     } else if (stage == 8) {
             TpPushSignal(window, core, my_pe, pe_size, round % PLANES, (int32_t)round + 1);
         } else {
