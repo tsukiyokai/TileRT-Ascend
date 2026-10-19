@@ -131,49 +131,33 @@ rather than mine are the reason to keep the adversarial pass running.
 
 ## 2026-10-19 evening: the launch recipe belongs in code
 
-Ten launches failed in one evening and not one of them was a fault in the
-thing being measured. Every cause was already written down.
+Ten launches failed in one evening, none of them a fault in the thing
+measured, and three of the five causes were already in this repo's own list of
+environment facts "each of which cost a launch". They were kept as prose. The
+evening's three drivers — 38, 42 and 44 lines — each rebuilt the same recipe
+and each dropped a different piece: the autograd cache, the gate, the port
+range. Details in [lesson.md](lesson.md); what matters here is where they now
+live.
 
-| cause | launches | machine time |
-|---|---|---|
-| `set -u` with `set_env.sh`'s unguarded `$ZSH_VERSION` | 1 | ~1 min |
-| 0.85 utilisation wanting 52.08 GiB with 50.54 free | 3 | ~4 min |
-| `TORCHINDUCTOR_AUTOGRAD_CACHE` unset | 2 | ~24 min |
-| three passes fired into a full machine, ungated | 3 | ~4 min |
-| a port range per pass instead of per arm | 1 | ~5 min, and a pair |
-
-Three of the five are in this repo's own list of environment facts "each of
-which cost a launch". I paid for them again because they were kept as prose.
-
-The evening's three driver scripts — 38, 42 and 44 lines — each rebuilt the
-same recipe and each dropped a different piece of it: one the autograd cache,
-one the gate, one the port range. That is one abstraction's worth of
-duplication and it failed three different ways.
-
-**`tests/glm52/launch_arm.sh` is that abstraction.** It encodes the guarded
-source, the overlay prepend that `activate.sh` undoes, a cache root and a port
-range per arm, the autograd cache, the gate, and the md5 of the file under
-test. A driver passes `TAG`, `WIDTH`, `TREE`, `OUT`, `PORT_BASE` and whatever
-flags differ. Exit 2 means the gate refused, so a driver waits rather than
+**`launch_arm.sh`** is one arm: the guarded source, the overlay prepend
+`activate.sh` undoes, a cache root and a port range per arm rather than per
+pass, `TORCHINDUCTOR_AUTOGRAD_CACHE=0`, the gate, and the md5 of the file
+under test. Exit 2 means the gate refused, so a caller waits instead of
 consuming the arm.
 
-## Three smaller things the same evening
+**`chain.sh`** is a list of them: `chain.sh <out> <tree> <overlay>
+tag:width:flags...`, one port range per arm, `round_clock.py` after each. It
+replaces `chain_alternating.sh`, which hard-coded the directory it looked for
+records in — so every experiment but one checked the wrong place.
 
-**Run the tool that exists.** I computed arm floors and paired deltas by hand
-three times. `paired.py` does exactly that — lowest round p10 per arm, pass by
-pass, with the sign string and the spread — and has done since this morning.
+So an experiment is now a list of arms and a patched file, and the recipe is
+not part of it. Four habits the evening also argues for:
 
-**A container can be killed from outside.** `trt-asc` took a SIGKILL at
-21:16 and another tenant's container started a minute later, in the middle of
-a four-arm chain. A waiter that only greps a log would have waited five hours
-on a dead container, so it checks `docker inspect` too.
-
-**Read load against the core count.** A load average of 39 looked like
-contention worth moving machines for. The box has 320 cores. Measured
-properly, a3-84 was at 4% HBM and 12% load while every other A3 host was at
-89 to 94% HBM — the emptiest machine by a wide margin, and I nearly left it.
-
-**Keep a standby staged.** a3-187 now carries the same experiment tree, the
-lookup code and the fixed gate, verified by its own round checks, so a switch
-costs a launch rather than twenty minutes. Its dies are full today; that is
-exactly why the staging had to happen before they were needed.
+- Run the tool that exists. `paired.py` has done arm floors and paired deltas
+  since this morning; I did them by hand three times.
+- A container can take a SIGKILL from outside mid-chain. A waiter that only
+  greps a log waits hours on a dead one, so check `docker inspect` too.
+- Read load against the core count. 39 looked like contention; the box has 320
+  cores, and a3-84 was the only host at 4% HBM while the rest were at 89–94%.
+- Stage the standby before it is needed. a3-187 carries the same tree, code
+  and gate, verified by its own round checks, so a switch costs one launch.
