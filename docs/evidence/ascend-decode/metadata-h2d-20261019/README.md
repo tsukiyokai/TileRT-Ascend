@@ -48,11 +48,18 @@ whole forward and blocks for it — but the host was going to wait at
 `host_tokens` anyway, and the conditioned pass depends on the target's
 output, so nothing is lost there.
 
-## The fix, and why the hoist could not have found it
+## The change, narrowed to the chain's one copy
 
-`_metadata` now writes persistent pinned buffers in place, one per
-destination dtype, instead of allocating three host tensors a call. The
-device copies become `non_blocking=True`.
+A width-1 forward makes exactly one host-to-device copy — `seq_lens` — and
+fills `slots` and `positions` with a scalar. Six of a round's nine forwards
+are width 1, and they are the chain. So `seq_lens` is the whole target, and
+the width > 1 paths are left alone: no new device operation anywhere.
+
+`_metadata` takes its length from a pinned ring and copies `non_blocking`.
+The ring is not decoration. The host enqueues every forward of a round before
+it reads anything, so with one shared buffer the host would overwrite the
+next length before the engine had read this one — a silent wrong `seq_lens`,
+not a slowdown. One slot per forward a round can have in flight.
 
 This is also why `hoist-20261019` read null at 313 → 91 launches and −0.14%
 TPOT: the three allocations and copies sit **above** the `hoisted is not None`

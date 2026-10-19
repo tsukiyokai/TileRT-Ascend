@@ -12,6 +12,10 @@ from tilert.pd_vllm.ascend_layout import (
 
 
 VOCAB_SIZE = 154880
+# Pinned sequence-length slots, one per forward a round can have in flight:
+# the widest round is 32 draft steps plus the verify, the conditioned pass and
+# the commit, and the host reads nothing until all of them are enqueued.
+LENGTH_SLOTS = 64
 
 
 def device_tokens(tokens, device):
@@ -377,11 +381,6 @@ class CannModel:
         self.graph = None
         self._hoisted = {}
         self._input_buffers = {}
-        # A copy from pageable host memory drains the stream before it stages,
-        # and a round enqueues every kernel before it reads anything, so each
-        # forward's copy pays for all the work queued ahead of it: 627 us
-        # against 48 from pinned memory at a queue depth of 512.
-        self._host_buffers = {}
         for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
             tokens = torch.empty(width, dtype=torch.int32, device=self.device)
             positions = torch.empty(
@@ -392,17 +391,19 @@ class CannModel:
             self._input_buffers[width] = (
                 tokens, positions, slots, query_cpu, query_cpu.to(self.device),
             )
-            # One buffer per destination dtype: a non-blocking copy that also
-            # converts has to stage, which is the cost being removed.
-            self._host_buffers[width] = (
-                torch.zeros(1, dtype=torch.int32).pin_memory(),
-                torch.zeros(1, dtype=torch.int32).pin_memory(),
-                torch.zeros(width, dtype=torch.long).pin_memory(),
-                torch.zeros(width, dtype=torch.int32).pin_memory(),
-            )
         (self.input_ids, self.positions, self.slots,
          self.query_cpu, self.query) = self._input_buffers[1]
         self.seq_lens = torch.empty(1, dtype=torch.int32, device=self.device)
+        # A copy from pageable host memory drains the stream before it stages,
+        # and a round enqueues every forward before it reads anything, so each
+        # forward's copy pays for the work queued ahead of it: measured at 139
+        # microseconds behind one draft graph and 1141 behind the target graph,
+        # against 48 to 71 from pinned memory. A slot per enqueued forward,
+        # because the host writes the next one long before the engine reads
+        # this one.
+        self._lengths = torch.zeros(
+            LENGTH_SLOTS, dtype=torch.int32).pin_memory()
+        self._length_slot = 0
         self.block_table = torch.arange(
             self.layout["capacity_tokens"] // PAGE_SIZE,
             dtype=torch.int32, device=self.device,
@@ -440,20 +441,21 @@ class CannModel:
 
         (self.input_ids, self.positions, self.slots,
          self.query_cpu, self.query) = self._input_buffers[width]
-        (length_cpu, computed_cpu, positions_cpu,
-         slots_cpu) = self._host_buffers[width]
+        slot = self._length_slot % LENGTH_SLOTS
+        self._length_slot += 1
+        length_cpu = self._lengths[slot:slot + 1]
         length_cpu[0] = self.position + width
-        computed_cpu[0] = self.position
-        torch.arange(self.position, self.position + width,
-                     dtype=torch.long, out=positions_cpu)
+        computed_cpu = torch.tensor([self.position], dtype=torch.int32)
+        positions_cpu = torch.arange(
+            self.position, self.position + width, dtype=torch.long,
+        )
         self.seq_lens.copy_(length_cpu, non_blocking=True)
         if width == 1:
             self.slots.fill_(self.position)
             self.positions.fill_(self.position)
         else:
-            slots_cpu.copy_(positions_cpu)
-            self.slots.copy_(slots_cpu, non_blocking=True)
-            self.positions.copy_(positions_cpu, non_blocking=True)
+            self.slots.copy_(positions_cpu)
+            self.positions.copy_(positions_cpu)
         hoisted = self._hoisted.get(width) if graphed else None
         if hoisted is not None:
             metadata, values, _ = hoisted
