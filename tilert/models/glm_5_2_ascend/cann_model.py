@@ -163,7 +163,7 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
 
 
 class CannModel:
-    """One request, TP16, full-P injection and M=1/2/4 target forwards.
+    """One request, TP16, full-P injection and fixed-width target forwards.
 
     ``rank`` is the logical TP rank; ``device`` selects the process's NPU.
     The caller supplies all 16 visible devices without a visibility rotation.
@@ -187,8 +187,8 @@ class CannModel:
             raise ValueError("Launch exactly 16 ranks")
         if attention_kernel not in ("sfa", "gather_fia", "shared_fia"):
             raise ValueError("Unknown attention kernel")
-        if attention_kernel == "shared_fia" and graph_width != 8:
-            raise ValueError("shared_fia currently supports target width 8")
+        if attention_kernel == "shared_fia" and graph_width not in (8, 32):
+            raise ValueError("shared_fia supports target widths 8 and 32")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
         import torch
@@ -538,7 +538,7 @@ class CannModel:
         tokens = device_tokens(tokens, self.device)
         width = tokens.shape[0]
         if width not in (1, 2, 4, 6, 8, 12, 16, 24, 32):
-            raise ValueError("Verify requires 1, 2, 4, 8 or 16 tokens")
+            raise ValueError("Unsupported verification width")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
         uses_fia = self.attention_kernel == "gather_fia" or (

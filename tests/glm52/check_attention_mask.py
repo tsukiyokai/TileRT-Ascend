@@ -76,12 +76,17 @@ class AttentionMaskChecks(unittest.TestCase):
                             for a, b in zip(snapshots[0], snapshots[2])))
 
     def test_m1_preserves_original_attention(self):
+        for width in (8, 32):
+            with self.subTest(width=width):
+                self.check_m1_fallback(width)
+
+    def check_m1_fallback(self, width):
         original = Mock(return_value="original")
         impl = SimpleNamespace(
             skip_topk=False, scale=0.25,
             _execute_sparse_flash_attention_process=original,
         )
-        shared = attention.SharedKVAttention(8, 8, "cpu")
+        shared = attention.SharedKVAttention(width, 8, "cpu")
         shared.bind(impl)
         output = impl._execute_sparse_flash_attention_process(
             torch.empty(1, 4, 512), None, None, None, None, None, None,
