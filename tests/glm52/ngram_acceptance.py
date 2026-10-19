@@ -23,20 +23,33 @@ import pathlib
 import statistics
 
 
-def lookup(context, proposal_length, longest, shortest):
-    """Propose what followed the most recent repeat of the context's tail.
+def lookup(context, proposal_length, longest, shortest, branches=1):
+    """Propose what followed the context's tail, one branch per repeat.
 
     Longest match first, which is what makes a hit worth trusting: a 4-gram
     repeat predicts its continuation far better than a 1-gram repeat does.
+
+    A tail that repeats several times offers several continuations, and a
+    verify wide enough to hold them can take whichever survives. Standard
+    prompt lookup keeps only the most recent and discards the rest, which is
+    the whole of why it misses two rounds in three.
     """
+    found = []
     for size in range(longest, shortest - 1, -1):
         if len(context) <= size:
             continue
         tail = context[-size:]
         for start in range(len(context) - size - 1, -1, -1):
-            if context[start:start + size] == tail:
-                return context[start + size:start + size + proposal_length]
-    return []
+            if context[start:start + size] != tail:
+                continue
+            branch = context[start + size:start + size + proposal_length]
+            if branch and branch not in found:
+                found.append(branch)
+                if len(found) == branches:
+                    return found
+        if found:
+            return found
+    return found
 
 
 def matched_prefix(proposal, actual):
@@ -48,13 +61,14 @@ def matched_prefix(proposal, actual):
     return count
 
 
-def simulate(tokens, proposal_length, longest, shortest):
+def simulate(tokens, proposal_length, longest, shortest, branches=1):
     """Walk the stream as rounds, returning each round's matched draft count."""
     matched, position = [], 1
     while position < len(tokens):
-        proposal = lookup(tokens[:position], proposal_length,
-                          longest, shortest)
-        count = matched_prefix(proposal, tokens[position:])
+        counts = [matched_prefix(branch, tokens[position:])
+                  for branch in lookup(tokens[:position], proposal_length,
+                                       longest, shortest, branches)]
+        count = max(counts, default=0)
         matched.append(count)
         position += count + 1
     return matched
@@ -63,7 +77,7 @@ def simulate(tokens, proposal_length, longest, shortest):
 def report(name, matched, width):
     accepted = sum(matched) + len(matched)
     hits = sum(1 for count in matched if count)
-    print(f"  {name:<22} width {width:3d}  rounds {len(matched):4d}  "
+    print(f"  {name:<26} width {width:3d}  rounds {len(matched):4d}  "
           f"acceptance {accepted / len(matched):6.3f}  "
           f"hit {hits / len(matched):5.1%}  "
           f"max {max(matched):3d}")
@@ -74,6 +88,7 @@ def main():
     parser.add_argument("record", type=pathlib.Path)
     parser.add_argument("--proposal", type=int, nargs="+",
                         default=[7, 15, 23, 31])
+    parser.add_argument("--branches", type=int, nargs="+", default=[1])
     parser.add_argument("--longest", type=int, default=8)
     parser.add_argument("--shortest", type=int, default=2)
     args = parser.parse_args()
@@ -88,8 +103,11 @@ def main():
         print(f"request {index}: {len(tokens)} tokens")
         report("MTP chain, measured", drafts, spans[0]["width"])
         for length in args.proposal:
-            matched = simulate(tokens, length, args.longest, args.shortest)
-            report(f"context lookup k={length}", matched, length + 1)
+            for branches in args.branches:
+                matched = simulate(tokens, length, args.longest,
+                                   args.shortest, branches)
+                report(f"lookup k={length} b={branches}", matched,
+                       length * branches + 1)
         print(f"  {'':<22} lookup lengths {args.shortest}..{args.longest}, "
               f"generation only")
 

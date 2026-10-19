@@ -82,3 +82,37 @@ record kept only the accepted prefix. `mtp_session.py` now records
 costs nothing — and with them any tree topology's acceptance is computable
 offline from one run, along with the per-position acceptance rates that decide
 where a tree should branch.
+
+## Branches are worth nothing; depth is everything
+
+A tail that repeats several times offers several continuations, so the obvious
+move is to verify them all. Measured, with each branch costing k more rows:
+
+| branches | width | acceptance | hit |
+|---|---|---|---|
+| 1 | 8 | 3.657 | 46.4% |
+| 2 | 15 | 3.864 | 46.8% |
+| 4 | 29 | 3.894 | 47.1% |
+| 8 | 57 | 3.908 | 47.3% |
+
+Eight branches at eight times the width buy 0.9 points of hit rate. When the
+longest tail match exists, the most recent occurrence's continuation is
+almost always the right one; when no match exists, no number of branches
+creates one. **Lookup's misses are structural, not a ranking problem**, so its
+complement has to be a model and not more of itself.
+
+At k=15 the same holds: 4.531 / 4.741 / 4.785 / 4.830 for 1 / 2 / 4 / 8.
+
+## A merge estimate that does not hold
+
+Evaluating lookup at the chain's own 227 round boundaries gives acceptance
+10.489 and a merged 11.405, which would be 4.89 ms a token. It is wrong:
+10.489 × 227 is 2381 tokens out of a 1023-token stream. Sampling at another
+drafter's boundaries counts the predictable runs once per boundary that lands
+in them, and a drafter accepting ten a round would have reached the end in 93
+rounds rather than 227.
+
+Only a walk where the drafter drives its own boundaries is consistent, which
+is what the table at the top of this page is. The merge cannot be simulated
+that way without the chain's proposals at arbitrary positions — the reason
+`mtp_session.py` now records `candidates` and `predictions`.
