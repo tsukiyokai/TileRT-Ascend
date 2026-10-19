@@ -126,10 +126,8 @@ class AscendMtpPDEngine(AscendPDEngine):
                         "output_tokens": 0,
                         "main_start": commit.main.before,
                         "main_retained": commit.main.retained,
-                        # The round already produced both, and with them any
-                        # draft tree's acceptance is computable offline from a
-                        # finished run: proposals are what the chain offered,
-                        # predictions are what the target would have taken.
+                        # Predictions beyond the first mismatch belong to
+                        # the rejected branch, not the serial continuation.
                         "candidates": list(result.candidates),
                         "predictions": list(result.target_predictions),
                     }

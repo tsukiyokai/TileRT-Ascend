@@ -64,7 +64,9 @@ class MtpRoundExecutor:
         row supplies the first draft token, recycle state and index set.
         """
         self.state.reset(self.target.position, first_token,
-                         draft_prefix_length=self.draft.position)
+                         draft_prefix_length=(self.draft.position
+                                              if self.drafter is None
+                                              else None))
         self.seed_parent_hidden = normalized_parent_hidden
         self.seed = None
         self.failed = False

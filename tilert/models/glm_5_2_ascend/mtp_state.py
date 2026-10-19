@@ -99,7 +99,8 @@ class MtpState:
     """Own one request's greedy control state, independently of KV storage.
 
     reset() counts first_token as the first output when the budget is
-    nonzero. For MTP, draft_prefix_length must be P-1 or P. P-1 requires
+    nonzero. A host drafter leaves draft_prefix_length unset. For MTP it
+    must be P-1 or P. P-1 requires
     a seed from target hidden[P-1] and first_token at MTP position P-1;
     P asserts that this target-conditioned seed already exists.
 
@@ -111,7 +112,7 @@ class MtpState:
     def __init__(self, width, capacity, max_new_tokens, eos_tokens=()):
         _integer(width, "width", 1)
         if width not in WIDTHS:
-            raise ValueError("verification width must be a power of two up to 16")
+            raise ValueError(f"verification width must be one of {WIDTHS}")
         self.width = width
         self.capacity = _integer(capacity, "capacity", 1)
         self.max_new_tokens = _integer(max_new_tokens, "max_new_tokens")
@@ -133,7 +134,7 @@ class MtpState:
         if self.width == 1:
             if draft_prefix_length is not None:
                 raise ValueError("plain decode has no MTP cache")
-        else:
+        elif draft_prefix_length is not None:
             _integer(draft_prefix_length, "draft_prefix_length")
             if draft_prefix_length not in (prefix_length - 1, prefix_length):
                 raise ValueError("MTP prefix must have length P-1 or P")
@@ -164,7 +165,7 @@ class MtpState:
         if self._active is not None:
             raise ValueError("a verification round is already active")
         room = self.capacity - self.main_length
-        use_draft = self.width > 1
+        use_draft = self.draft_length is not None
         width = max(value for value in WIDTHS
                     if value <= min(self.width, room))
         draft_start = self.main_length if use_draft else None

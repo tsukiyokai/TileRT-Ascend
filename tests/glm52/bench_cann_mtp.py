@@ -73,7 +73,7 @@ class MeasuredRank(CannRankEngine):
             "matched_drafts": commit.matched_drafts,
             "before": commit.main.before, "written": commit.main.written,
             "retained": commit.main.retained,
-            "draft_retained": commit.draft.retained,
+            "draft_retained": self.draft.position,
         })
         return result
 
@@ -147,6 +147,8 @@ def arguments():
         parser.error("Graph capture requires an unmeasured warmup request")
     if args.conditioned_graph and not args.draft_graph:
         parser.error("--conditioned-graph requires --draft-graph")
+    if args.lookup and args.draft_graph:
+        parser.error("--lookup does not execute draft or conditioned graphs")
     if args.compile_target and not args.target_graph:
         parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
@@ -210,6 +212,7 @@ def validate_local(report, args):
         raise ValueError("The rank did not reset and close every request")
     for request in report["rank_requests"]:
         tokens, position, previous_end = [request["first_token"]], 8192, 0
+        draft_position = request["injected"][1]
         rounds = []
         for item in request["rounds"]:
             candidates, predictions = item["candidates"], item["predictions"]
@@ -220,6 +223,8 @@ def validate_local(report, args):
                 matched += 1
             accepted = predictions[:min(matched + 1,
                                         args.max_tokens - len(tokens))]
+            if not args.lookup:
+                draft_position = position + len(accepted)
             if (item["width"] != args.width
                     or not len(candidates) == len(predictions)
                     == args.width
@@ -230,7 +235,7 @@ def validate_local(report, args):
                     or item["before"] != position
                     or item["written"] != position + args.width
                     or item["retained"] != position + len(accepted)
-                    or item["draft_retained"] != item["retained"]
+                    or item["draft_retained"] != draft_position
                     or not previous_end <= item["start_ns"] <= item["end_ns"]
                     or item["elapsed_ns"]
                     != item["end_ns"] - item["start_ns"]):
@@ -240,7 +245,7 @@ def validate_local(report, args):
             rounds.append({key: value for key, value in item.items()
                            if not key.endswith("_ns")})
         if (request["injected"] != [8192, 8191]
-                or request["finished"] != [position, position]
+                or request["finished"] != [position, draft_position]
                 or request["reset"] != [0, 0]
                 or len(tokens) != args.max_tokens
                 or position != 8192 + args.max_tokens - 1):
@@ -313,6 +318,8 @@ def validate_delivery(requests, histories, args):
             if (op["accepted_tokens"] != row["accepted_tokens"]
                     or not op["accepted"] == span["accepted"] == count
                     or span["output_tokens"] != count
+                    or span["candidates"] != row["candidates"]
+                    or span["predictions"] != row["predictions"]
                     or op["natural_accepted"] != row["natural_accepted"]
                     or span["natural_accepted"] != row["natural_accepted"]
                     or span["main_retained"] != row["retained"]):
@@ -453,7 +460,7 @@ def run(args, report):
                         conditioned_width=(args.width
                                            if args.conditioned_graph else 0))
             sources = source_hashes(target, draft)
-            for name in ("mtp_session.py", "tp_runtime.py"):
+            for name in ("mtp_session.py", "tp_runtime.py", "lookup_draft.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
                 sources[str(path)] = digest(path)
             for path in (
@@ -556,6 +563,7 @@ def run(args, report):
                             "min": min(values), "max": max(values)},
                 "warmup": args.warmup, "requests": args.requests,
                 "output_tokens_per_request": args.max_tokens,
+                "drafter": "lookup" if args.lookup else "mtp",
                 "target_graph": args.target_graph,
                 "draft_graph": args.draft_graph,
                 "conditioned_graph": args.conditioned_graph,

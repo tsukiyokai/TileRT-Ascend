@@ -30,6 +30,9 @@ for arm in "$@"; do
     echo "=== $tag gated out, attempt $attempt $(date -Is)"
     sleep "${GATE_WAIT:-180}"
   done
+  if [ "$status" != 0 ]; then
+    exit "$status"
+  fi
   if [ -f "$out/$tag/rank-0.json" ]; then
     python3 -I "$tree/tests/glm52/round_clock.py" "$out/$tag"
   else
