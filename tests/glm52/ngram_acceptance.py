@@ -61,12 +61,18 @@ def matched_prefix(proposal, actual):
     return count
 
 
-def simulate(tokens, proposal_length, longest, shortest, branches=1):
-    """Walk the stream as rounds, returning each round's matched draft count."""
+def simulate(tokens, proposal_length, longest, shortest, branches=1,
+             prompt=()):
+    """Walk the stream as rounds, returning each round's matched draft count.
+
+    The prompt belongs in the context. On an agentic trajectory it is where
+    the copied material is, and leaving it out understates every figure.
+    """
     matched, position = [], 1
     while position < len(tokens):
         counts = [matched_prefix(branch, tokens[position:])
-                  for branch in lookup(tokens[:position], proposal_length,
+                  for branch in lookup(list(prompt) + tokens[:position],
+                                       proposal_length,
                                        longest, shortest, branches)]
         count = max(counts, default=0)
         matched.append(count)
@@ -89,11 +95,16 @@ def main():
     parser.add_argument("--proposal", type=int, nargs="+",
                         default=[7, 15, 23, 31])
     parser.add_argument("--branches", type=int, nargs="+", default=[1])
+    parser.add_argument("--manifest", type=pathlib.Path,
+                        help="capture manifest carrying prompt_token_ids")
     parser.add_argument("--longest", type=int, default=8)
     parser.add_argument("--shortest", type=int, default=2)
     args = parser.parse_args()
 
     record = json.loads(args.record.read_text())
+    prompt = ()
+    if args.manifest:
+        prompt = json.loads(args.manifest.read_text())["prompt_token_ids"]
     requests = [request for request in record["requests"]
                 if not request.get("warmup")]
     for index, request in enumerate(requests):
@@ -105,11 +116,12 @@ def main():
         for length in args.proposal:
             for branches in args.branches:
                 matched = simulate(tokens, length, args.longest,
-                                   args.shortest, branches)
+                                   args.shortest, branches, prompt)
                 report(f"lookup k={length} b={branches}", matched,
                        length * branches + 1)
-        print(f"  {'':<22} lookup lengths {args.shortest}..{args.longest}, "
-              f"generation only")
+        scope = f"{len(prompt)}-token prompt + generation" if prompt \
+            else "generation only"
+        print(f"  {'':<26} lookup {args.shortest}..{args.longest}, {scope}")
 
 
 if __name__ == "__main__":

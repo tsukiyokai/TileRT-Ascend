@@ -116,3 +116,56 @@ Only a walk where the drafter drives its own boundaries is consistent, which
 is what the table at the top of this page is. The merge cannot be simulated
 that way without the chain's proposals at arbitrary positions — the reason
 `mtp_session.py` now records `candidates` and `predictions`.
+
+## The prompt is where the copying is
+
+GLM-5.2 is an agentic coding model and its output repeats its input, so
+searching the generation alone understates everything. The capture carries the
+prompt as `prompt_token_ids` in `manifest.json`, 8192 tokens ending at 9249,
+which joins the generation's first token 6500 exactly.
+
+| k | width | generation only | + 8192-token prompt | hit |
+|---|---|---|---|---|
+| 7 | 8 | 3.657 | **4.047** | 46.4% → 54.5% |
+| 15 | 16 | 4.531 | **5.172** | 37.2% → 46.5% |
+| 31 | 32 | 5.069 | **5.885** | 30.2% → 39.7% |
+| 63 | 64 | — | 5.988 | 38.6% |
+
+At width 32 the prompt is worth 16% of acceptance. At k=63 it saturates —
+runs reach 60 tokens and acceptance moves 0.1 — so **depth is exhausted and
+the cap is coverage**: 39.7% of rounds find no repeat at all.
+
+## A copy cursor is already there
+
+The obvious next move for a copying workload is to carry a cursor: once a
+round has copied from source position j, propose from j + accepted without
+re-matching the tail. Measured, keeping the cursor only when the proposal was
+consumed whole, it is **identical to re-searching every round** — 5.172,
+5.785, 5.988 at k = 15, 31, 63.
+
+The reason is that after copying k tokens the tail *is* those k tokens, so
+the tail search lands on the same source. The n-gram lookup is a copy cursor
+already. A cursor kept across a partial match is worse, 4.830 against 5.885 at
+k=31, because a partial match means the copy diverged and the cursor then
+suppresses the search that would have found the new source.
+
+## Arithmetic
+
+Lookup needs no draft forward, so the chain's 10.27 ms and the conditioned
+pass's 2.08 both go. Extrapolating the measured row cost, a width-32 verify is
+39.68 + 0.112 × 24 = 42.37 ms:
+
+| | round | acceptance | TPOT |
+|---|---|---|---|
+| chain, width 8, today | 53.05 | 4.507 | 11.77 |
+| lookup, width 32 | 43.4 | 5.885 | **7.37** |
+
+The risk in that row is the expert union: 8 rows select 27 of 256 experts and
+32 rows will select more, and `gmm-sweep-20261019` puts a regime change
+between 32 and 64 active where the last doubling costs 4.6 times the previous.
+Pricing gmm1 and gmm2 at their 64-expert figures adds 4.5 ms a verify, which
+is the pessimistic bound: round 47.9, **TPOT 8.14**.
+
+So 7.4 to 8.1 ms a token, from 11.77, with no kernel work, no training and no
+device-side drafter. It still should not ship alone: 39.7% of rounds find no
+repeat, and there it accepts one token against a 43 ms round.
