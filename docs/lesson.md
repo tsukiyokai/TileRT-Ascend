@@ -1,6 +1,6 @@
 # The bitter lesson
 
-189 entries below, each with the measurement that produced it. They fall into
+194 entries below, each with the measurement that produced it. They fall into
 seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
@@ -1415,3 +1415,31 @@ against what its control would have cost.
   direction -- UB to L1, absent in the same column of the same table -- it
   forces a 4.72 MB round trip a row inside one operator, 51 percent of that
   operator's traffic and 2.86 milliseconds a verify.
+- On a host-fed device a profiler's cost appears as device idle, so every gap
+  in the trace is the instrument and only the compute union is a quantity.
+  Eager tasks carry 43.6 microseconds of device wait each against 0.9 to 1.3
+  in-graph -- 33.65 milliseconds, 75 percent of the capture's wait, 11.2 a
+  round against a 12.59 millisecond instrument. I priced the 975 microsecond
+  gaps between chain replays at over a millisecond of TPOT; an A/B had already
+  removed 71 percent of the launches in them and moved TPOT by 0.14 percent.
+  Dropping the synchronisation primitives and unioning each stream reproduces
+  the hooked round to one percent, and it is the per-phase disagreement inside
+  that total -- target 1.12, chain 0.65, glue 0.05 -- that is the finding.
+- A serial wait with zero overlap can still not exist. MEM_WAIT_VALUE on the
+  target's compute stream unions 5.93 milliseconds against that stream's
+  compute with no intersection at all, which reads as 15 percent of the phase
+  exposed. But the same stream's compute union is 39.24 against a hooked 39.68
+  and there is no room for it. Two measurements of one phase bound each other;
+  a decomposition that exceeds the whole is wrong wherever it looks tightest.
+- An early return that skips the expensive part can still pay for it. The
+  metadata hoist removes an attention-metadata builder and 222 of 313 launches,
+  and reads null, because `_metadata` creates its three CPU tensors and does
+  its three H2D copies above the `hoisted is not None` branch. Check what runs
+  before the fast path, not only what the fast path skips.
+- Four acceptance points cost four runs and were already in the first one. The
+  draft chain is autoregressive, so a narrower width drafts a prefix and
+  `1 + mean(min(matched_drafts, w-1))` over one record's own spans reproduces a
+  measured sweep to 1.1 percent. It also showed what the sweep could not: the
+  histogram is bimodal, 22 percent of rounds dying at the fourth draft and 19
+  percent matching all seven, so the marginal draft position is a truncated
+  mode and not the tail of a decay.
