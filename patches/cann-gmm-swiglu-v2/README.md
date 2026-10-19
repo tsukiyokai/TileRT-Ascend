@@ -1,5 +1,35 @@
 # Two patches for the W4A8 expert GMM at batch one
 
+## Verified in a round, 2026-10-19: −1.468 ms a round, −0.326 a token
+
+The three kernel patches below were priced per call, about 8.5 µs over 78
+calls, roughly 0.66 ms a round. In a round they are worth more than twice
+that, and the round is the quantity that matters.
+
+Width 8, one tree, `FIX_ARM=cache-off` so neither arm installs a stale
+static-kernel package, each arm's gmm1 object read back from its own recorded
+search path:
+
+| arm | gmm1 object | round p10 | TPOT |
+|---|---|---|---|
+| barrier only | `a9863296` | 57.110, 56.875, 56.839 | 13.1049, 12.9081, 12.8858 |
+| + these three | `0a20fe78` | 55.749, 55.343, 55.327 | 12.6554, 12.6037, 12.6427 |
+
+Both arms emit the same 1024 tokens, digest `68f2bc184553`. The effect is 7.3×
+the 0.201 ms between-run floor.
+[the measurement](../../docs/evidence/ascend-decode/kernelpatch-remeasured-20261019/README.md)
+
+An earlier reading of these same patches was +3.15 ms a token. That comparison
+shared a working directory, and so a static-kernel cache index whose key omits
+the vendor path, which means at the captured width both arms ran whichever
+compiled first. It measured nothing about the patches.
+
+`w4a8-compact.patch` is **not** part of this result and is not verified: its
+bit-exactness gate varied the declared expert count while holding the layout
+fixed, so it never compared leaving `w2` in ND against converting it to
+FRACTAL_NZ.
+
+
 Both apply with `patch -p1` at the root of the `vllm-ascend-unified` checkout,
 against `csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/`, in the order
 listed. They live here because this repository is where the measurements are;
