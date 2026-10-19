@@ -1,21 +1,7 @@
 /**
- * A projection whose communication is not a standalone kernel.
- *
- * The conventional decode layer issues a matmul, then a collective, then the
- * next compute kernel. The collective's cost on A3 is a rendezvous rather
- * than transfer — a four-byte all_reduce costs what a six-megabyte one does —
- * and a separate kernel cannot overlap the compute it follows: the round's
- * profile measures that overlap at exactly zero.
- *
- * Here the matmul and the push live in one kernel, and the push is issued per
- * tile: as soon as a tile of the partial sum lands in global memory, that tile
- * flies to all sixteen peers while the cube computes the next one. The local
- * reduction then sums the peers' slots in rank order, which keeps the result
- * bit-reproducible — the trajectory gate compares tokens bit for bit.
- *
- * Cube and vector both run this body, so each half is guarded: AIV quantises
- * and later reduces, AIC multiplies, and one-sided operations stay on the
- * vector side where the SDK's visibility guarantee holds.
+ * Prototype INT8 projection followed by peer push and FP32 reduction.
+ * IterateAll completes the projection before publishing PROJECT_READY;
+ * this implementation does not overlap projection with communication.
  */
 #include "fused_proj_reduce_kernel.h"
 #include "kernel_operator.h"
@@ -60,10 +46,7 @@ ACLSHMEM_DEVICE FusedLayout FusedPlane(__gm__ uint8_t* window, int rows, int col
     return layout;
 }
 
-/**
- * Push one tile of our partial to every peer. Called per tile rather than
- * once at the end, so a tile is in flight while the cube computes the next.
- */
+/** Push a chunk of the completed projection to each peer. */
 ACLSHMEM_DEVICE void PushTile(const FusedLayout& layout, __gm__ float* partial, int64_t begin, int64_t count,
                              int64_t core, int64_t my_pe, int64_t pe_size, __ubuf__ float* stage)
 {
@@ -160,9 +143,7 @@ extern "C" __global__ __aicore__ void fused_proj_reduce_kernel(
 
         if ASCEND_IS_AIV {
             CrossCoreWaitFlag(PROJECT_READY);
-            // Push in tiles so a tile flies while the next is still being
-            // written, which is the whole point of not using a separate
-            // collective kernel.
+            // The full projection is ready before this chunk loop.
             const int64_t chunk = STAGE_UB_BYTES / static_cast<int64_t>(sizeof(float));
             for (int64_t begin = 0; begin < layout.elements; begin += chunk) {
                 const int64_t count =

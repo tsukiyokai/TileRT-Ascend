@@ -1,13 +1,4 @@
-/**
- * Time a projection whose push lives inside the matmul kernel against the two
- * kernels it replaces.
- *
- * The round spends 11.29 ms on collectives and overlaps them with compute by
- * exactly zero, so a faster standalone collective is bounded by that 11.29
- * while one inside the compute pipeline is not. This harness measures whether
- * the fused form actually beats the separate pair, at the decode shape and
- * with the payload checked.
- */
+/** Prototype driver for INT8 projection and peer reduction. */
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -75,9 +66,8 @@ int main(int argc, char* argv[])
     }
     ACL_CHECK(aclrtMemset(window, window_bytes, 0, window_bytes));
 
-    // An all-ones activation against an all-ones weight makes every element of
-    // the partial equal `inner`, so the reduced sum must be pe_size * inner and
-    // no wrong summation or missing peer can produce it.
+    // All-ones inputs give pe_size * inner. Equal contributions cannot
+    // distinguish a duplicated peer from a missing peer.
     void* activation = nullptr;
     void* weight = nullptr;
     void* partial = nullptr;
