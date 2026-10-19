@@ -1,3 +1,57 @@
+# Width 8 is the optimum, bracketed on both sides, and rows are nearly free
+
+## The four arms, all `status=measured` with a zero exit
+
+| width | chain | verify | round floor | acceptance | TPOT |
+|---|---|---|---|---|---|
+| 6 | 1.746 × 4 | 39.496 | 48.76 | 4.125 | 12.342 |
+| 8 | 1.707 × 6 | 39.677 | 52.26 | 4.507 | **12.047** |
+| 12 | 1.684 × 10 | 41.460 | 60.74 | 4.871 | 12.995 |
+| 16 | 1.744 × 14 | 43.338 | 70.29 | 5.356 | 13.847 |
+
+The marginal token, from the measured floors and acceptances:
+
+| | cost | tokens | a token | against the average | |
+|---|---|---|---|---|---|
+| 6 → 8 | +3.50 | +0.382 | 9.17 | 12.05 | pays |
+| 8 → 12 | +8.48 | +0.365 | 23.25 | 12.99 | does not |
+| 12 → 16 | +9.54 | +0.485 | 19.69 | 13.85 | does not |
+
+So the optimum is exactly 8, and the earlier reading that put it there was
+right for a reason it could not have known: that reading came from the
+configuration whose captured width ran a stale static-kernel package.
+
+## Rows are nearly free up to 8 and cost 0.45 above it
+
+| | the verify, a row |
+|---|---|
+| 6 → 8 | +0.090 ms |
+| 8 → 12 | +0.446 ms |
+| 12 → 16 | +0.470 ms |
+
+**The verify costs the same at six rows and at eight.** So its 39.5 ms is not
+the work of eight rows — it is a fixed cost per forward, and the knee at 8 is
+where the rows start to matter. That is the sharpest statement yet of what the
+2 ms target has to remove: not arithmetic, not bandwidth, but whatever a
+forward pays once regardless of how much it carries.
+
+A chain step is 1.712 ms independent of width, so the same holds there: three
+arms with 4, 6, 10 and 14 steps give 1.746, 1.707, 1.684, 1.744.
+
+## The fit, and where it fails
+
+Fitted on 8, 12 and 16: `round(w) = 1.712(w − 2) + 0.458w + 41.753`. It
+predicts 52.26, 60.94 and 69.62 against 52.26, 60.74 and 70.29 — and 51.34 at
+width 6 against a measured 48.76, because the 0.458 a row it assumes does not
+hold below 8. The linear form is an interpolation between 8 and 16 and not a
+law.
+
+Acceptance carries across configurations: the token digest is `68f2bc184553`
+in every arm at every width, so the same tokens are accepted whatever the
+kernels underneath.
+
+---
+
 # The round is linear in width, and widening past 8 does not pay
 
 Four arms in one session, the last repeating the first as the chain's own
