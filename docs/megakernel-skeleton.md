@@ -46,6 +46,19 @@ double buffer with explicit prologue and steady phases. Not one
 `PipeBarrier<PIPE_ALL>` in a hot path. Naming the dependency instead of
 draining the pipeline took 14.4 → 12.5 µs.
 
+## Correction: engine-homogeneous slicing already exists
+
+An earlier version of this document proposed slicing a layer into
+engine-homogeneous kernels as though it were a design choice. The
+configuration already does it — 55 SuperKernel group shapes named
+`start_<operator>_end_<operator>`, the largest class being 471 groups that
+start and end on AIV. What SuperKernel does not do is keep a run's
+intermediates on chip: it merges dispatch, and the operator table shows 1669
+standalone `Cast` entries coexisting with the group rows. So the claim worth
+making is one kernel body rather than one dispatch, and it is narrower than
+what this document first said.
+[SuperKernel's shape](evidence/ascend-decode/superkernel-shape-20261019/README.md)
+
 ## The skeleton, in the order the constraints impose
 
 ### 1. Core partition, decided once

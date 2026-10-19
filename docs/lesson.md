@@ -1157,3 +1157,16 @@ against what its control would have cost.
   4579 of its checks and produced no trace, because the harness emits
   --profile-output only on success and 1114 checks had failed on a quantised
   cache differing by one step. Decouple the artefact from the verdict.
+- Check whether the mechanism you are proposing already runs. I wrote a
+  skeleton proposing that a layer be sliced into engine-homogeneous kernels,
+  and the configuration already does exactly that: 55 SuperKernel group shapes
+  named start-operator to end-operator, the largest being 471 groups that both
+  start and end on the vector engine. What it does not do is keep the
+  intermediates on chip, which is a different claim and the one worth making.
+- A dispatch-level merge and a kernel-body merge are not the same fusion. The
+  SuperKernel rows coexist in the operator table with 1669 standalone Cast
+  entries, which is direct evidence those operators are outside the groups; and
+  a group spanning two different operator types is a sequence of complete
+  kernels in one dispatch. With the in-graph dispatch floor at 1.2 microseconds
+  against a per-operator prologue of 8.3 to 16.4, the merge that exists removes
+  the small term.
