@@ -1232,3 +1232,17 @@ against what its control would have cost.
   And it must clear an arm's output directory before any check that can exit
   early, or a stale record from the previous attempt satisfies the "did this
   arm produce anything" test. Both bugs were in the same forty-line script.
+- Ranking idle by the operator that ends at each gap's start is adjacency, not
+  causation, and I built a 68 percent attribution on it. The one piece a
+  controlled experiment could reach -- the metadata copies, 18 of the 98
+  milliseconds -- came back negative: removing them made the round's floor
+  0.278 milliseconds worse. The operators precede the idle without producing
+  it, and the rest of that ranking inherits the same standing.
+- A copy_ from a CPU tensor into a device tensor does not synchronise the
+  device. I called four families host round trips because they sat next to
+  gaps, and then traded two asynchronous DMA copies and a host arange for
+  three device kernel launches on a path that runs nine times a round.
+- Judge a change on the statistic that is stable, not on the one the goal is
+  stated in. The round's tenth percentile holds to 0.6 percent across six
+  requests in two independent runs; the TPOT medians of these two arms overlap
+  and would have read as noise. Same data, opposite conclusions.
