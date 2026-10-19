@@ -1302,3 +1302,13 @@ against what its control would have cost.
   benchmark hung on exactly that, and shmem/fused_proj_reduce_kernel.cpp has
   carried the same pattern unrun since it was written -- it compiles, and
   compiling was all it was ever asked to do.
+- A width chosen once gets written as a literal in six places and left behind
+  when the choice moves. Today: the conditioned graph's construction
+  (`enable_graph(..., 4)`) and its selection (`_graph`'s `width == 4`), the
+  profile capture's precondition (`target.graph.width != 4`) and its width
+  argument, the rounds harness refusing `--profile-output` and
+  `--compile-target` at any other width, and a check asserting the draft graph
+  replays twice a round -- which is width minus two, so 2 at width 4 and 6 at
+  width 8. Each one was silent in a different way: a no-op flag, a captured
+  graph that never replayed, a parser error, and a failed gate. The repair in
+  every case was to make one place ask another rather than restate the number.
