@@ -187,8 +187,8 @@ class CannModel:
             raise ValueError("Launch exactly 16 ranks")
         if attention_kernel not in ("sfa", "gather_fia", "shared_fia"):
             raise ValueError("Unknown attention kernel")
-        if attention_kernel == "shared_fia" and graph_width not in (8, 32):
-            raise ValueError("shared_fia supports target widths 8 and 32")
+        if attention_kernel == "shared_fia" and graph_width not in (8, 16, 32):
+            raise ValueError("shared_fia supports target widths 8, 16 and 32")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
         import torch

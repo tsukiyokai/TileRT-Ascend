@@ -76,7 +76,7 @@ class AttentionMaskChecks(unittest.TestCase):
                             for a, b in zip(snapshots[0], snapshots[2])))
 
     def test_m1_preserves_original_attention(self):
-        for width in (8, 32):
+        for width in (8, 16, 32):
             with self.subTest(width=width):
                 self.check_m1_fallback(width)
 
