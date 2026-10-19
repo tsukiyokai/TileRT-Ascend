@@ -6,7 +6,7 @@
 
 ## 状态（2026-10-19 12:25）
 
-确定测得的最好点是 11.7715 ms（width 8 + 三份 gmm1 补丁 + 条件图，三请求同一轨迹、轮数同为 227，token 与 width 4 逐位相同 `68f2bc184553`）。每轮最低 p10 52.166 ms。
+确定测得的最好点是 **11.6198 ms**(pinned seq_lens 拷贝,配对交替、两对完整、六对九完全分离,效应为 run 间地板的 21–23 倍;在被共租户占到 0.78 利用率的机器上测的,同机 pageable 读 12.3–12.6)。此前记录的 11.7715 ms（width 8 + 三份 gmm1 补丁 + 条件图，三请求同一轨迹、轮数同为 227，token 与 width 4 逐位相同 `68f2bc184553`）。每轮最低 p10 52.166 ms。
 
 ★ 六臂全部 `status=measured`、`agreement=True`、零 rank 错误——这是本项目第一次有运行通过它自己的闸门。此前每次 exit 1 都是一个 rank 报 `KeyError: 'natural_accepted'`（`TimedBackend` 只在 `advance_mtp` 分支记这个字段而我们走 `advance_mtp_n`），而诊断一直写在 `summary.json` 里，这个项目从没读过它。
 

@@ -1,6 +1,6 @@
 # The bitter lesson
 
-198 entries below, each with the measurement that produced it. They fall into
+200 entries below, each with the measurement that produced it. They fall into
 seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
@@ -1436,6 +1436,18 @@ against what its control would have cost.
   and reads null, because `_metadata` creates its three CPU tensors and does
   its three H2D copies above the `hoisted is not None` branch. Check what runs
   before the fast path, not only what the fast path skips.
+- The worst case is not the estimate, and writing it down as one closes a
+  route that is open. Eight-token blocks over a four-aligned selection look
+  like double the attended positions, which exactly cancels the saving that
+  motivated them. But that assumes every block expands alone: at the measured
+  25% density random placement covers 75% more rather than 100%, which turns
+  +0.7 microseconds a call into -9.7, and clustered selection costs nothing at
+  all for -36.7. The same arithmetic says open or closed depending on one
+  unmeasured distribution, so measure it rather than bound it.
+- A port range per pass is not a port range per arm. Two arms of the third
+  pass shared 16920 to 16939 and the second could not bind behind the first's
+  TIME_WAIT, after two passes had survived on the same mistake because the
+  accumulation was not yet enough.
 - A shared machine's free memory is a reading with a shelf life, and a gate
   that runs once is a gate for the first arm only. Three hosts read 2.87 to
   3.14 GiB a die at 20:00 and 56 to 60 GiB at 20:12; a driver with no gate
