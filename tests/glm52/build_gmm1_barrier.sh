@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-    echo "Usage: $0 VLLM_ASCEND_SOURCE NEW_OUTPUT_DIRECTORY" >&2
+if [[ $# -lt 2 || $# -gt 3 || (${3:-} != "" && ${3:-} != --compact-experts) ]]; then
+    echo "Usage: $0 VLLM_ASCEND_SOURCE NEW_OUTPUT_DIRECTORY [--compact-experts]" >&2
     exit 2
 fi
 : "${ASCEND_HOME_PATH:?Source the CANN/Python activation before this script}"
@@ -24,6 +24,12 @@ patches=(
 op=grouped_matmul_swiglu_quant_v2
 kernel_header="gmm/$op/op_kernel/${op}_a8w4_msd_post.h"
 pipeline_header="gmm/$op/op_kernel/${op}_a8w4_msd_pipeline.h"
+headers=("$kernel_header" "$pipeline_header")
+if [[ ${3:-} == --compact-experts ]]; then
+    patches+=("$script_dir/../../patches/cann-gmm-swiglu-v2/gmm1-active-groups.patch")
+    headers+=("gmm/$op/op_kernel/${op}_a8w4_msd_mid.h"
+              "gmm/$op/op_kernel/${op}_utils.h")
+fi
 original_vendor="$source_dir/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
 binary_dir="op_impl/ai_core/tbe/kernel/ascend910_93/$op"
 variant=GroupedMatmulSwigluQuantV2_fa3d6d3de6e1f32e170e39d2ddd3a20e
@@ -55,19 +61,26 @@ sha256sum "$source_dir/csrc/$kernel_header" \
     "$script_dir/build_gmm1_barrier.sh" "$original_vendor/$wrapper" \
     "$original_vendor/$binary_dir/$variant.json" \
     "$build_source/common/include/cann_compat.h" > "$output_dir/inputs.sha256"
-for header in "$kernel_header" "$pipeline_header"; do
+for header in "${headers[@]}"; do
     cmp "$build_source/$header" "$original_vendor/$installed_headers/${header##*/}"
 done
 cmp "$build_source/gmm/$op/op_kernel/$op.cpp" \
     "$original_vendor/$installed_headers/$op.cpp"
 for patch_file in "${patches[@]}"; do
-    patch --batch --fuzz=0 -p1 -d "$build_source" < "$patch_file"
+    strip=1
+    if grep -q '^+++ b/csrc/' "$patch_file"; then
+        strip=2
+    fi
+    patch --batch --fuzz=0 -p"$strip" -d "$build_source" < "$patch_file"
 done
+if [[ ${3:-} == --compact-experts ]]; then
+    headers+=("gmm/$op/op_kernel/active_groups.h")
+fi
 
 overlay="$output_dir/overlay/vendors/custom_transformer"
 mkdir -p "$(dirname -- "$overlay")"
 cp -a --reflink=auto "$original_vendor" "$overlay"
-for header in "$kernel_header" "$pipeline_header"; do
+for header in "${headers[@]}"; do
     cp "$build_source/$header" "$overlay/$installed_headers/"
 done
 # opc compiles the entry from the installed copy, so a patch that touches it
@@ -137,4 +150,7 @@ sha256sum "$output_dir/input-param.json" "$kernel_output/$variant.o" \
     "$overlay/op_api/lib/libcust_opapi.so" \
     "$original_vendor/op_impl/ai_core/tbe/op_tiling/liboptiling.so" \
     "$overlay/op_impl/ai_core/tbe/op_tiling/liboptiling.so" > "$output_dir/artifacts.sha256"
+for header in "${headers[@]}"; do
+    sha256sum "$build_source/$header" "$overlay/$installed_headers/${header##*/}"
+done >> "$output_dir/artifacts.sha256"
 printf 'ASCEND_CUSTOM_OPP_PATH=%s:%s\n' "$overlay" "$original_vendor"
