@@ -486,11 +486,16 @@ def execute(args):
              ]},
         ])
     if args.draft_graph:
+        # A round proposes `width` candidates: it starts with the pending
+        # token, appends width-1 more, and chains between appends except after
+        # the last, so the chain replays width-2 times. The literal 2 that
+        # used to stand here was that count at width 4.
+        chains_per_round = args.width - 2
         checks.extend([
             {"name": "draft_graph.single_capture",
              "passed": draft.graph.capture_count == 1},
-            {"name": "draft_graph.two_chains_per_round",
-             "passed": draft.graph.replay_count == 2 * sum(
+            {"name": "draft_graph.chains_per_round",
+             "passed": draft.graph.replay_count == chains_per_round * sum(
                  len(runs[label]["rounds"]) for label in ("graph", "reset")
              )},
         ])
