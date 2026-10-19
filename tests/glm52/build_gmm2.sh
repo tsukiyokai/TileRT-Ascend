@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 || (${2:-} != "" && ${2:-} != --compact-experts) ]]; then
-    echo "Usage: $0 NEW_OUTPUT_DIRECTORY [--compact-experts]" >&2
+if [[ $# -lt 1 || $# -gt 2 || (${2:-} != "" && ${2:-} != --compact-experts && ${2:-} != --adaptive-tiles) ]]; then
+    echo "Usage: $0 NEW_OUTPUT_DIRECTORY [--compact-experts|--adaptive-tiles]" >&2
     exit 2
 fi
 : "${ASCEND_OPP_PATH:?Activate CANN first}"
@@ -13,6 +13,7 @@ if [[ -e "$output" ]]; then
 fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 patch_file="$script_dir/../../patches/cann-grouped-matmul/gmm2-active-groups.patch"
+tile_patch="$script_dir/../../patches/cann-grouped-matmul/gmm2-adaptive-tiles.patch"
 builtin="$ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe"
 variant=GroupedMatmul_a0be48d01b162435398ed52e1b6182d4
 original="$builtin/kernel/ascend910_93/ops_transformer/grouped_matmul/$variant.json"
@@ -51,10 +52,13 @@ cp "$builtin/impl/ops_transformer/dynamic/grouped_matmul.py" "$source_dir/dynami
 cp -a "$builtin/impl/ops_transformer/ascendc/grouped_matmul" "$source_dir/ascendc/"
 ln -s "$builtin/impl/ops_transformer/ascendc/common" "$source_dir/ascendc/common"
 ln -s "$builtin/impl/ops_transformer/ascendc/3rd" "$source_dir/ascendc/3rd"
-sha256sum "$original" "$patch_file" "$script_dir/build_gmm2.sh" \
+sha256sum "$original" "$patch_file" "$tile_patch" "$script_dir/build_gmm2.sh" \
     "$builtin/op_tiling/lib/linux/aarch64/"*.so > "$output/inputs.sha256"
-if [[ ${2:-} == --compact-experts ]]; then
+if [[ ${2:-} != "" ]]; then
     patch --batch --fuzz=0 -p1 -d "$source_dir/ascendc/grouped_matmul/op_kernel" < "$patch_file"
+fi
+if [[ ${2:-} == --adaptive-tiles ]]; then
+    patch --batch --fuzz=0 -p1 -d "$source_dir/ascendc/grouped_matmul/op_kernel" < "$tile_patch"
 fi
 python3 - "$original" "$builtin/kernel/config/ascend910_93/ops_transformer/grouped_matmul.json" \
     "$output" <<'PY'
