@@ -1381,3 +1381,17 @@ against what its control would have cost.
   Folding the Cast pairs went from a published 18.53 milliseconds to a
   measured 0.93. The right accounting was available the whole time, in the same
   file: each operator's own p10 against the floor of its kind.
+- Five wrong calls stood between the captured shape and a running operator,
+  and the vendor's own single-card test held the answer to the one I was
+  guessing at. The profiler's operator name was not the function production
+  calls; the namespace needed vllm_ascend imported; importing it left one op;
+  loading the kernel library by hand added none; and
+  `from vllm_ascend.utils import enable_custom_op` was what registered them,
+  which `tests/e2e/.../test_sparse_flash_attention_dcp_lse.py` says in its
+  fourth line. Look for the vendor's test of an operator before guessing how
+  to load it.
+- The two tiling rejections each named their own fix and both were already
+  visible in the capture: a qk head dim of 512 against the 576 I passed, where
+  the capture shows `8,4,512` beside `8,4,64`, and a block table of one
+  against a batch of eight, where TND makes the eight rows one request's
+  tokens. The shapes were in the file I had been reading all day.
