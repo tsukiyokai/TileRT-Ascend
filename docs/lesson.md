@@ -1321,3 +1321,17 @@ against what its control would have cost.
   this symptom appeared I treated it as a code defect and "fixed" it by
   binding the device in the reduction's installer, which introduced an aicore
   507015 and was reverted.
+- Moving between A3 hosts is nearly free and I assumed it was expensive. The
+  378 GiB of weights already sit on a filesystem both machines mount, the
+  target still held a CANN-matched image from three days earlier, and only 13
+  GiB -- mostly the 8K capture -- had to travel, over NFS rather than the
+  network. What is not free is the window between checking free HBM and the
+  worker initialising: a3-84 showed 48.6 GiB free at launch and 35.41 by the
+  time the worker asked, and a3-187 went from 3.0 to 60.5 GiB a die within
+  twenty minutes of a container being built on it.
+- A measurement taken on a shared machine carries the other tenant in it. The
+  all-gather tail I attributed to arrival spread in our own structure was
+  captured while another tenant's residency tripled and began computing, and
+  HBM contention produces the same signature -- balanced compute, unbalanced
+  waiting. The attribution needs an idle host before it is more than a
+  hypothesis, and the plan now says so where the finding is stated.

@@ -1,5 +1,21 @@
 # The all-gather tail is arrival spread, and `--draft-projection-tp` buys it
 
+## Scope limit, added the same afternoon
+
+This capture was taken on a shared machine while another tenant's residency
+rose from 12.7 to 40.4 GiB a die and began computing. HBM contention produces
+exactly the shape measured here — balanced compute, 8% spread, against waiting
+that differs by 107% — so the attribution to our own structure is not settled
+until the same capture is taken on an idle host.
+
+Two hosts were tried that afternoon and both filled: a3-84 left 21.8 GiB free
+against the 24.20 a rank needs for weights plus KV, and a3-187 went from 3.0
+to 60.5 GiB a die within twenty minutes of a container being built on it. The
+move itself turned out to be nearly free — the 378 GiB of weights already sit
+on `8.5.255.11:/mnt/sfs_turbo`, which both machines mount, and 187 still held
+the CANN 9.2.0 image from 2026-10-16, so only 13 GiB had to travel.
+
+
 From the width-8 capture, seven ranks analysed.
 
 ## Every collective is in the draft graph, none in the verify
