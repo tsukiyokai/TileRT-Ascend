@@ -1134,3 +1134,21 @@ against what its control would have cost.
   accept/reject path shifts. That is the same asymmetry behind width 8's
   irreproducibility, and it means a token-comparing gate must be paired with a
   round-count check.
+- A gate that holds fixed what production varies answers a narrower question
+  than the one that matters. Four per-call gates on one patch each held
+  something constant -- the layout, the declared slot count, the tie structure,
+  the call's neighbours -- and each was correct; the regression they missed was
+  found by one end-to-end run in an afternoon against a day of per-call work.
+  Ask what your gate is holding still.
+- The economical explanation for "correct everywhere I can construct, wrong in
+  situ" is a perturbation exposing an existing race, not a new error. A patch
+  whose arithmetic is bit-identical at every shape tested destabilised the
+  round count in production, and the reading that fits is that it shifted
+  timing in a section where a race had already been localised. That turns the
+  patch from a failed optimisation into a reproducer for the race, in a
+  configuration that is otherwise deterministic -- worth more than the
+  milliseconds it was meant to buy.
+- An effect smaller than your spread is not a result in either direction.
+  Three kernel patches measured +0.224 ms a token against a predicted -0.2,
+  with arm ranges of 0.35 and 0.59: unconfounded, harmless, and undemonstrated.
+  Say which of the three it is rather than reading the sign.
