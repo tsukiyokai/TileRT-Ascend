@@ -1187,3 +1187,22 @@ against what its control would have cost.
   percent. That rules out launch rate at this granularity and points at the
   sampler, which turns out to hold 68 percent of the idle behind four families
   that each pay a host round trip per call.
+- A cache key that omits what the compiler actually reads turns every
+  experiment downstream of it into a lie. The static-kernel package cache keyed
+  on dumped operator parameters, an option string and a determinism flag, and
+  left out the vendor path and the header contents -- so a run installed a
+  package another tree had built, and only at the capture size. Every arm I ran
+  for a day was confounded with "did this arm happen to recompile", and the
+  option arms that came out clean came out clean because they changed the key.
+  When an ablation's switch participates in a cache key, that ablation cannot
+  be run.
+- An intermittent fault that tracks one configuration dimension is not
+  therefore a race in that dimension's code. This one tracked width because
+  static kernels are compiled for the capture size alone, so the captured width
+  got a stale package and every other width went through dynamic dispatch to
+  the patched object. I spent the day eliminating candidates inside the kernel
+  while the carrier was the build system.
+- Reproducibility bought by changing the parallel layout is not correctness.
+  Expert parallelism gave a stable token stream for weeks and it was a
+  different stream from width 4's throughout; the arm that is both stable and
+  correct appeared only once the real defect was fixed.

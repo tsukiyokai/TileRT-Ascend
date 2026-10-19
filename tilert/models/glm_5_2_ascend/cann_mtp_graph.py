@@ -1,7 +1,7 @@
 """Fixed-width graph for GLM-5.2's MTP draft layer and its own head."""
 
 
-WIDTHS = (1, 4)
+WIDTHS = (1, 4, 8)
 
 
 class CannMtpGraph:
@@ -17,7 +17,7 @@ class CannMtpGraph:
         import torch
 
         if width not in WIDTHS:
-            raise ValueError("MTP graphs capture width 1 or 4")
+            raise ValueError(f"MTP graphs capture widths {WIDTHS}")
         self.draft = draft
         self.width = width
         self.tokens, self.positions, self.slots = (
