@@ -194,7 +194,8 @@ class AscendReceiveBuffer:
 class AscendRankEngine:
     """Bind the receive prefix to the main/MTP caches on one TP rank."""
 
-    def __init__(self, target, draft, lookup_prompt=None):
+    def __init__(self, target, draft, lookup_prompt=None, *,
+                 lookup_min_ngram=2):
         self.target = target
         self.draft = draft
         # The prompt's token ids, when the round is to draft by looking for
@@ -202,6 +203,7 @@ class AscendRankEngine:
         # Every rank reads them from its own capture, so they cost no
         # broadcast.
         self.lookup_prompt = lookup_prompt
+        self.lookup_min_ngram = lookup_min_ngram
         self._clear_request()
 
     def _clear_request(self):
@@ -256,7 +258,8 @@ class AscendRankEngine:
                 LookupDrafter,
             )
 
-            drafter = LookupDrafter(self.lookup_prompt)
+            drafter = LookupDrafter(self.lookup_prompt,
+                                   shortest=self.lookup_min_ngram)
             drafter.commit((first_token,))
         rounds = MtpRoundExecutor(
             self.target, self.draft, width, max_tokens, eos_tokens, drafter,

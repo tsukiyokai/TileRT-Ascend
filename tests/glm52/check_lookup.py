@@ -23,13 +23,14 @@ class Draft(ScalarDraft):
         self.position = 0
 
 
-def run_request(width, lookup):
+def run_request(width, lookup, shortest=2):
     prompt = tuple((index * 7 + 3) % 251 for index in range(8192))
     target = Target(prompt, 8256)
     parent = Hidden("target", target.rows[-1][1], len(prompt))
     first = next_token(parent.context_hash, len(prompt))
     draft = Draft(target, 8191, first, "mixed")
-    engine = MeasuredRank(target, draft, None, prompt if lookup else None)
+    engine = MeasuredRank(target, draft, None, prompt if lookup else None,
+                          lookup_min_ngram=shortest)
     engine.parent_hidden = [parent]
     engine.first_token_id = first
     engine._prompt_length = 8192
@@ -37,6 +38,8 @@ def run_request(width, lookup):
                       "rounds": []}
     engine.requests.append(engine.current)
     engine.start_mtp(first, 12, width, ())
+    if lookup:
+        assert engine._mtp.drafter.shortest == shortest
     tokens = [first]
     while engine._mtp.state.finish_reason is None:
         result = engine.advance_mtp()
@@ -78,6 +81,18 @@ class LookupChecks(unittest.TestCase):
         validate_local(report, args)
         self.assertEqual(report["rank_requests"][0]["finished"],
                          [8203, 8203])
+
+    def test_unigram_lookup_preserves_serial_tokens_and_cache_lengths(self):
+        report, args = run_request(32, lookup=True, shortest=1)
+        validate_local(report, args)
+        self.assertEqual(report["rank_requests"][0]["finished"],
+                         [8203, 8191])
+
+    def test_unigram_supplies_continuation_when_longer_suffix_is_absent(self):
+        prompt = [1, 9, 2, 1]
+        self.assertEqual(LookupDrafter(prompt).propose(3), [])
+        self.assertEqual(LookupDrafter(prompt, shortest=1).propose(3),
+                         [9, 2, 1])
 
     def test_validator_rejects_fictitious_lookup_cache_and_bad_target(self):
         report, args = run_request(8, lookup=True)

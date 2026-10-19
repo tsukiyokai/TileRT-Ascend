@@ -1,6 +1,7 @@
 """Time CPU lookup on a frozen trajectory, including index construction."""
 
 import argparse
+from functools import partial
 import hashlib
 import importlib.util
 import json
@@ -13,14 +14,15 @@ from ngram_acceptance import lookup, matched_prefix
 
 
 class ReverseScan:
-    def __init__(self, prompt):
+    def __init__(self, prompt, shortest=2):
         self.context = list(prompt)
+        self.shortest = shortest
 
     def commit(self, tokens):
         self.context.extend(tokens)
 
     def propose(self, count):
-        branches = lookup(self.context, count, 8, 2)
+        branches = lookup(self.context, count, 8, self.shortest)
         return branches[0] if branches else []
 
 
@@ -73,11 +75,15 @@ def main():
     parser.add_argument("--widths", type=int, nargs="+", default=[8, 16, 32])
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument("--shortest", type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location("candidate", args.candidate)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    factories = {"scan": ReverseScan, "indexed": module.LookupDrafter}
+    factories = {
+        "scan": partial(ReverseScan, shortest=args.shortest),
+        "indexed": partial(module.LookupDrafter, shortest=args.shortest),
+    }
     record = json.loads(args.record.read_text())
     prompt = json.loads(args.manifest.read_text())["prompt_token_ids"]
     requests = [r["tokens"] for r in record["requests"] if not r["warmup"]]
@@ -87,6 +93,7 @@ def main():
         "hostname": platform.node(), "python": platform.python_version(),
         "prompt_tokens": len(prompt), "unique_trajectories": len(trajectories),
         "warmup": args.warmup, "samples": args.samples,
+        "shortest_tail": args.shortest,
         "source_sha256": {str(path): hashlib.sha256(
                               path.read_bytes()).hexdigest()
                           for path in (args.record, args.manifest,

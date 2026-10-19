@@ -40,8 +40,10 @@ WIDTH = 4
 class MeasuredRank(CannRankEngine):
     """Retain local round states and finish prefix copies before delivery."""
 
-    def __init__(self, target, draft, group, lookup_prompt=None):
-        super().__init__(target, draft, lookup_prompt)
+    def __init__(self, target, draft, group, lookup_prompt=None, *,
+                 lookup_min_ngram=2):
+        super().__init__(target, draft, lookup_prompt,
+                         lookup_min_ngram=lookup_min_ngram)
         self.group = group
         self.requests = []
         self.current = None
@@ -126,6 +128,8 @@ def arguments():
                         help="draft by finding where the context repeats "
                              "instead of running the MTP engine; no chain "
                              "and no conditioned pass")
+    parser.add_argument("--lookup-unigram", action="store_true",
+                        help="Allow one-token suffix matches in lookup")
     parser.add_argument("--index-topk", type=int,
                         help="override the checkpoint's 2048 selected "
                              "positions; sparse attention costs 17.61 us "
@@ -149,6 +153,8 @@ def arguments():
         parser.error("--conditioned-graph requires --draft-graph")
     if args.lookup and args.draft_graph:
         parser.error("--lookup does not execute draft or conditioned graphs")
+    if args.lookup_unigram and not args.lookup:
+        parser.error("--lookup-unigram requires --lookup")
     if args.compile_target and not args.target_graph:
         parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
@@ -385,7 +391,10 @@ def run(args, report):
             lookup_prompt = manifest["prompt_token_ids"]
             report["drafter"] = "lookup"
             report["lookup_prompt_tokens"] = len(lookup_prompt)
-        engine = MeasuredRank(target, draft, channel.group, lookup_prompt)
+        engine = MeasuredRank(
+            target, draft, channel.group, lookup_prompt,
+            lookup_min_ngram=1 if args.lookup_unigram else 2,
+        )
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():
             if args.target_graph or args.draft_graph:
@@ -564,6 +573,9 @@ def run(args, report):
                 "warmup": args.warmup, "requests": args.requests,
                 "output_tokens_per_request": args.max_tokens,
                 "drafter": "lookup" if args.lookup else "mtp",
+                "lookup_min_ngram": (
+                    (1 if args.lookup_unigram else 2) if args.lookup else None
+                ),
                 "target_graph": args.target_graph,
                 "draft_graph": args.draft_graph,
                 "conditioned_graph": args.conditioned_graph,
