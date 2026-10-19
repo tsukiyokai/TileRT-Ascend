@@ -1,6 +1,6 @@
 # TileRT Ascend：A3 单用户 2 ms decode
 
-目标：A3 单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms。实验机 `a3-84:trt-asc` 与 `a3-187:trt-asc-187`，都是共享机——整机计时只在空闲时做，被占时推进单 die 与编译类工作。两台的 CANN 9.1.0、driver 25.5.5、vllm 与 vllm_ascend 逐项相同,所以数字可比;a3-162 与 a3-194 的 die 也空闲(约 3 GiB/die 是容器地板),但没有 trt-asc 容器。vLLM-Ascend 做 prefill，TileRT-Ascend 做 decode。
+目标：A3 单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT ≤2 ms。实验机 `a3-84:trt-asc` 与 `a3-187:trt-asc-187`，都是共享机——整机计时只在空闲时做，被占时推进单 die 与编译类工作。两台的 CANN 9.1.0、driver 25.5.5、vllm 与 vllm_ascend 逐项相同,所以数字可比;a3-162 与 a3-194 没有 trt-asc 容器。三台的占用在十分钟内可以从 3 GiB/die 涨到 56 GiB/die,所以每一臂发射前都要过 `precheck.sh`,不能只在链首过一次。vLLM-Ascend 做 prefill，TileRT-Ascend 做 decode。
 
 工作方法与今晚的教训见 [workflow.md](workflow.md) 与 [lesson.md](lesson.md)。
 

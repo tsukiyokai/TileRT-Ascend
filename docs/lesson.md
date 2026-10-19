@@ -1,6 +1,6 @@
 # The bitter lesson
 
-196 entries below, each with the measurement that produced it. They fall into
+198 entries below, each with the measurement that produced it. They fall into
 seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
@@ -1436,6 +1436,16 @@ against what its control would have cost.
   and reads null, because `_metadata` creates its three CPU tensors and does
   its three H2D copies above the `hoisted is not None` branch. Check what runs
   before the fast path, not only what the fast path skips.
+- A shared machine's free memory is a reading with a shelf life, and a gate
+  that runs once is a gate for the first arm only. Three hosts read 2.87 to
+  3.14 GiB a die at 20:00 and 56 to 60 GiB at 20:12; a driver with no gate
+  fired all three of its passes into the full one, died in 85 seconds each
+  with the reason buried in a rank record, and reported done. Gate every arm.
+- The gate itself could not fail. `precheck.sh` matched `[0-9]+/ 65536`, but
+  the column pads a short value to `3138 / 65536`, so on a machine where every
+  die holds under 10000 MiB it matches nothing, the variable is empty, awk
+  reads it as zero and it passes on "busiest die holds 0.0 GiB". A check whose
+  parse failure is indistinguishable from a pass is not a check.
 - The licensed command does not reproduce the licensed run, because the launch
   recipe lives in the wrapper and not in the record. Copying the command
   verbatim cost three launches in a row: `set -u` plus an unguarded
