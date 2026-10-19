@@ -74,6 +74,14 @@ gmm1 89.809 µs 对 32.68 地板(8 行只触及 256 个专家里的 64,活 48 Mi
 
 而 verify(Model ID 48)里一个集合通信都没有——它的 TP 归约融进了 MC2。所以单边归约按「每轮 157 次归约」定的价是数在了另一侧;它替换 `_all_reduce_out_place`,碰不到承载尾巴的 all-gather。它仍是板上唯一消除屏障而非加速屏障的机制,而到达参差只认这一种。
 
+## 队列:等整机的三件,按价排
+
+一,Cast 搬迁。480 对 bf16↔fp32 的转换,960 个 kernel,**18.5 ms 一次 verify**。不是删(删会撤掉 `b377291` 那个正确性修复),是把加宽并进上游 epilogue、收窄并进下游 prologue。两个入口都经过我们的覆盖(`parallel_state.py:740` 与 `:196` 都落到 `_all_reduce_out_place`),所以位置是我们能选的。验证只需 token 流不变。[Cast](evidence/ascend-decode/cast-sites-20261019/README.md)
+
+二,`--draft-projection-tp` 的开关 A/B。它每轮买约 14 次 16 卡 all-gather,而那条尾巴占 all-gather 总时间 96%。两次发射都死在显存上。[尾巴](evidence/ascend-decode/collective-tail-20261019/README.md)
+
+三,单边 all-gather。注意它只消掉握手(1.95 倍,约 1.7 ms)而不是数据依赖——all-gather 的完整输出在最后一片到达前不存在。所以它是小项,排在后面。
+
 ## 测量纪律:0.2 ms 是 run 间地板,所以两臂必须交替
 
 同一配置在相邻两条链里跑出的每轮 p10 均值差 0.201 ms。而 p10 在一次运行内六个请求上只跨 0.6%——run 内稳定不等于 run 间可复现,我用后者判过一次，判错了。

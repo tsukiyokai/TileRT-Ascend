@@ -45,6 +45,18 @@ precision, which `cann-tp-sum-20261017.json` measured and `b377291` fixed —
 and the narrowing is required because the result must return to bf16. Removing
 the pair would undo a correctness fix. I was one step from doing it.
 
+## The override is reached by both entry points
+
+`all_reduce` in `vllm/distributed/parallel_state.py:740` branches on
+`use_custom_op_call`: true goes to `torch.ops.vllm.all_reduce`, false to
+`_all_reduce_out_place` directly. The custom op's implementation at `:196`
+ends in `group._all_reduce_out_place(tensor)`, so both paths pass through the
+override `_install_tp_sum` puts there — which is consistent with the 480 pairs
+being visible at all, and means the conversion's placement is ours to choose.
+
+I checked this because a branch that bypassed the override would have made the
+pairs come from somewhere else and the relocation impossible.
+
 ## What is actually available
 
 Not deletion but relocation. The widening belongs in the producer's epilogue —
