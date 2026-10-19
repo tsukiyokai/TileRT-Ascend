@@ -1115,3 +1115,22 @@ against what its control would have cost.
   bf16 step is 32. Design the input against the specific claim, not against
   "being sensitive".
   [Corrected](evidence/ascend-decode/onesided-corrected-20261019/README.md)
+- A per-call measurement does not predict a round. Four patches whose per-call
+  benches promised three milliseconds a round saved made the round 7.7
+  milliseconds slower and added fifteen rounds -- a 21.7% regression against an
+  expected gain, with the overlay verified live. Both halves of the prediction
+  were wrong, not just its size, so the bench does not reach whatever the round
+  does. Every expectation on this project's board that came from a per-call
+  delta is suspect until measured inside a round.
+- A bundled patch needs a gate on each half. The compact-declaration change
+  compressed the declared expert count *and* left the weight in ND, and the
+  bit-exactness gate varied only the first with the layout held fixed -- the
+  layout change was justified on speed and never on numerical equivalence.
+  Different tiling accumulates in a different order, which moves low bits,
+  which moves draft acceptance, which moves the round count.
+- Round count detects a numerical change that token identity hides. The draft
+  head's argmax is the sensitive element and the target's is not, so a
+  low-bit change leaves the generated tokens bit-identical while the
+  accept/reject path shifts. That is the same asymmetry behind width 8's
+  irreproducibility, and it means a token-comparing gate must be paired with a
+  round-count check.

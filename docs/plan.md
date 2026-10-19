@@ -10,6 +10,8 @@
 
 width 8 不确定,所以它的 12.7–13.3 ms 不作为结果。已定位到 **TP 下 W4A8 routed-expert MoE 段里一个每次 forward 都重新点火的竞争**:同一进程对同一输入连做 6 次 verify 得 6 个不同 hidden(相对 7.1–17.5%),dense 层与其 all-reduce 逐位一致而 75 个 MoE 层里 73 个全差,而点火位置在三次独立二分里是随机的。`--expert-parallel` 是唯一恢复可复现的改动(249/249/249 轮)但吃掉 width 8 全部收益,只能当对照。阈值在 width 4 与 6 之间,不在 8。两个候选带 file:line:`shared_experts.py:546` 的 `npu_dequant_swiglu_quant`(`dequant_swiglu_quant.h:793`/`:797` 两个 Cast 之间只有不定序的 `SetDeqScale`,而紧随其后两对都有 `PipeBarrier<PIPE_V>`),以及 `apply_gmm2` 的内建 `GroupedMatmul` A8W4 split-K 配 `SetAtomicAdd<half>`(splitDim 由 host tiling 按 M 选,M=32 对 M=64)。[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
 
+★ 2026-10-19 06:40 警告：四份补丁合装进生产后 **+3.15 ms/token(21.7% 回归)**,而逐调用台子预测 −0.9。token 流与基线逐位相同,但轮数 311→326/335/326,每轮 47.6→55.3 ms。**所以下面这些由逐调用测量推出的预期全部可疑**,在轮内测过之前不计入。[回归](evidence/ascend-decode/patch-regression-20261019/README.md)
+
 已配对测得、各自在自己配置上成立、尚未合测：metadata 与 mc2 掩码提升 −0.7967 ms/token（下发 313→91，191712 项检查零失败）；专家声明压缩 2.39 ms/轮（真 checkpoint 逐位门过）；GMM 三份 kernel 补丁约 0.66 ms/轮（p=1.8e-12）。
 
 ## 当前：13.338 ms（width 8），加两项已配对测得但尚未合测
