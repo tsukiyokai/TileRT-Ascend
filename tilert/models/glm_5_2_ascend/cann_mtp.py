@@ -276,13 +276,16 @@ class CannMtp:
     def _graph(self, width, shared_indices):
         """Name the captured graph for this call, or None for eager.
 
-        An M1 chain replays only against a shared index set; the M4
-        target-conditioned pass replays only when it selects its own.
+        A chain replays only against a shared index set; the
+        target-conditioned pass replays only when it selects its own. Each
+        asks the graph it would use whether that graph was captured at this
+        width, rather than naming the width twice -- the literal 4 that used
+        to stand here kept the conditioned pass eager at every other verify
+        width even once it was captured at the right one.
         """
-        if width == 1 and shared_indices:
-            return self.graph
-        if width == 4 and not shared_indices:
-            return self.conditioned_graph
+        candidate = self.graph if shared_indices else self.conditioned_graph
+        if candidate is not None and candidate.width == width:
+            return candidate
         return None
 
     def forward(self, tokens, parent, *, external_indices=None,

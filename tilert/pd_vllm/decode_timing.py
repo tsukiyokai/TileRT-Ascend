@@ -95,6 +95,8 @@ class TimedBackend:
                 accepted=sum(commit.committed for commit in commits),
                 matched_drafts=sum(commit.matched_drafts
                                    for commit in commits),
+                natural_accepted=sum(commit.natural_accepted
+                                     for commit in commits),
                 accepted_tokens=[token for commit in commits
                                  for token in commit.accepted_tokens],
             )
