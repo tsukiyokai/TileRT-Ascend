@@ -158,19 +158,32 @@ the barrier at index 3, so those runs executed the patched object.
 other dangerous case: with the variable unset the guard does not fire and the
 bootstrap hands index 0 to the unpatched in-tree vendor.
 
-## Margin absorption, now on direct evidence
+## Margin absorption, demonstrated — and scoped to my runs, not to production
 
-This settles the earlier inference without an inference. `barrier/w4` resolved
-to the unpatched object at index 1 — **it ran the factory object** — and it
-produced 307 rounds in all three measured requests, a single token stream and
-a 0.141 ms range.
+`barrier/w4` resolved to the unpatched object at index 1 — **it ran the factory
+object** — and produced 307 rounds in all three measured requests, a single
+token stream and a 0.141 ms range. So in one run, an operator measured as
+non-deterministic at exactly that configuration's verify shape (M = 32: four
+distinct results over 64 calls, int8 codes differing by 115) produced
+bit-reproducible tokens end to end. The corrupted values never flipped an
+argmax.
 
-So in one run, an operator measured as non-deterministic at exactly that
-configuration's verify shape (M = 32: four distinct results over 64 calls,
-int8 codes differing by 115) produced bit-reproducible tokens end to end. The
-corrupted values never flipped an argmax. The release gate passes on the
-distance between the top two logits, and a gate comparing tokens cannot see
-it.
+**But this is not a statement about production, and an earlier version of this
+page made it one.** Read out of a production run's own record, the resolution
+is: indices 0–2 are `fla_npu` vendors that do not provide the operator, index
+3 is the owner overlay carrying `2eb81546…` — the barrier-patched object — and
+index 4 is the in-tree vendor carrying `2444c7e7…`. **The winner is index 3.**
+Production has been running the patched object all along; the factory object
+sits behind it unused.
+
+So the correct scope is narrower and more useful. The margin absorption is
+demonstrated for runs that export `ASCEND_CUSTOM_OPP_PATH` from scratch, which
+drops the owner overlay — mine did, and that is why they executed the factory
+object. Production inherits the variable and is unaffected. What survives as a
+general lesson is that an operator's non-determinism can be invisible
+end-to-end because the margins absorb it, which is a reason not to trust a
+token-comparing gate as evidence of arithmetic correctness; it is not a live
+defect in the deployed path.
 
 ## My own barrier evidence was void
 

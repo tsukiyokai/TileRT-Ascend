@@ -1068,13 +1068,15 @@ against what its control would have cost.
   agreeing that the dense layers are clean and 73 of 75 MoE layers differ. The
   stable statement is the region and the per-forward re-ignition, and looking
   for the one line would have been looking for something that does not exist.
-- Bit-reproducible output does not mean correct computation. The vendor expert
-  matmul is non-deterministic at exactly width 4's verify shape -- four distinct
-  results over 64 calls, int8 codes differing by 115 -- while width 4's tokens
-  are identical across seven processes. Both hold because the corruption never
-  flips an argmax at that width: the release gate passes on the distance
-  between the top two logits, not on the arithmetic. A gate that compares
-  tokens cannot see an error the margins absorb.
+- Bit-reproducible output does not mean correct computation. In a run that
+  demonstrably executed the unpatched expert matmul -- non-deterministic at
+  exactly that configuration's verify shape, four distinct results over 64
+  calls with int8 codes differing by 115 -- the tokens were identical across
+  three requests, because the corruption never flipped an argmax. A gate that
+  compares tokens cannot see an error the margins absorb. Scope it carefully
+  though: production inherits an environment that already puts a patched
+  overlay ahead of the factory object, so this was a property of my own runs,
+  and I first wrote it as a live defect in the deployed path.
 - Inheriting an environment variable can be safer than setting it. activate.sh
   already ships ASCEND_CUSTOM_OPP_PATH with a patched vendor overlay ahead of
   the in-tree one, and the bootstrap's guard then declines to prepend anything
