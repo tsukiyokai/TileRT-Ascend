@@ -10,9 +10,16 @@ fi
 source_dir=$(realpath "$1")
 output_dir=$(realpath -m "$2")
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The barrier is the correctness patch; the three after it are the speed
+# patches measured at 1.468 ms a round, and the overlay that produced that
+# figure is byte-identical to the barrier header plus exactly these three.
+# gmm1-single-chunk is superseded by gmm1-straight-line, which rewrites the
+# same branch, and the two cannot both apply.
 patches=(
     "$script_dir/patches/gmm1-swiglu-barrier.patch"
-    "$script_dir/patches/gmm1-single-chunk.patch"
+    "$script_dir/../../patches/cann-gmm-swiglu-v2/gmm1-straight-line.patch"
+    "$script_dir/../../patches/cann-gmm-swiglu-v2/gmm1-chunk-span.patch"
+    "$script_dir/../../patches/cann-gmm-swiglu-v2/gmm1-tiling-rowcount.patch"
 )
 op=grouped_matmul_swiglu_quant_v2
 kernel_header="gmm/$op/op_kernel/${op}_a8w4_msd_post.h"
