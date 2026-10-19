@@ -1258,3 +1258,9 @@ against what its control would have cost.
   within the hour is that the next experiment's control happened to repeat the
   previous experiment's baseline. Without it the wrong conclusion would have
   stood, and it was already written down.
+- Python imports the name `sitecustomize` once, so two directories on
+  PYTHONPATH each holding one means only the first ever runs. Placing a new
+  post-import hook ahead of the existing one would have silently dropped the
+  static-kernel cache fix, which changes what the measured binary is -- the
+  exact class of error the new hook was built to avoid. Chain the other one by
+  path instead of by position.

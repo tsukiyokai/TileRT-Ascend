@@ -114,6 +114,27 @@ def _install_when_ready():
     builtins.__import__ = patched
 
 
+def _chain_other_hooks():
+    """Run any other sitecustomize this run needs, by path.
+
+    Python imports the name `sitecustomize` once, so two directories on
+    PYTHONPATH each holding one means only the first is ever executed. The
+    static-kernel cache fix is installed by another one, and silently losing it
+    would change what the measured binary is -- which is exactly the class of
+    error this instrument exists to avoid.
+    """
+    import importlib.util
+
+    for path in os.environ.get("PHASE_HOOK_CHAIN", "").split(os.pathsep):
+        if not path or not os.path.exists(path):
+            continue
+        spec = importlib.util.spec_from_file_location("_chained_hook", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        print(f"[phase] chained {path}", flush=True)
+
+
 if os.environ.get("PHASE_HOOK", "on") != "off":
     atexit.register(_report)
     _install_when_ready()
+_chain_other_hooks()
