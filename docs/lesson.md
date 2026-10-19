@@ -1264,3 +1264,12 @@ against what its control would have cost.
   static-kernel cache fix, which changes what the measured binary is -- the
   exact class of error the new hook was built to avoid. Chain the other one by
   path instead of by position.
+- An arm's floor is its fastest observation, not its mean. Across 28 arms the
+  within-arm spread of a round's p10 is under 0.6 ms in twenty and between 1.9
+  and 2.9 in a few, and the slow request's position is not systematic: the
+  means by position are 54.766, 54.607, 54.625 and the first request is
+  slowest in 15 of 28. So the spread is occasional interference, which a mean
+  carries and a minimum discards. On the minimum, two identical
+  configurations differ by 0.163 ms, the change I withdrew comes out at 1.04
+  times that, and the three kernel patches at 9.3. On the mean the first read
+  1.39 and looked real.

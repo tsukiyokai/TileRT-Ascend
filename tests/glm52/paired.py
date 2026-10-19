@@ -11,7 +11,18 @@ import sys
 
 
 def p10(directory):
-    """The tenth percentile of a round, averaged over the measured requests."""
+    """An arm's floor: the lowest tenth percentile of its measured requests.
+
+    The minimum rather than the mean. Across 28 arms the spread within an arm
+    is under 0.6 ms in twenty of them and between 1.9 and 2.9 in a few, and
+    the position of the slow request is not systematic -- the means by
+    position are 54.766, 54.607, 54.625 and the first request is slowest in 15
+    of 28. So the spread is occasional interference rather than warming, and a
+    floor is best estimated by the fastest observation. On the minimum, two
+    identical configurations differ by 0.163 ms, the metadata patch comes out
+    at 1.04x that and the three kernel patches at 9.3x; on the mean the first
+    read as 1.39x and had to be withdrawn.
+    """
     path = pathlib.Path(directory) / "rank-0.json"
     if not path.exists():
         return None
@@ -25,7 +36,7 @@ def p10(directory):
                         if entry.get("operation") == "advance_mtp_n")
         if rounds:
             values.append(rounds[len(rounds) // 10])
-    return statistics.fmean(values) if values else None
+    return min(values) if values else None
 
 
 root = pathlib.Path(sys.argv[1])
