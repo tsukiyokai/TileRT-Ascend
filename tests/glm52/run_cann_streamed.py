@@ -6,7 +6,7 @@ or a performance measurement. No processed NZ weight is copied to CPU.
 """
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import gc
 from importlib.metadata import version
 import inspect
@@ -90,9 +90,8 @@ def load_scope(engine, checkpoint, prefixes):
                 if name.startswith(prefixes)}
     names = sorted(name for name in checkpoint.weight_map
                    if name.startswith(prefixes))
-    loaded = engine.model.load_weights(
-        (name, checkpoint.tensor(name)) for name in names
-    )
+    with closing(checkpoint.tensors(names)) as weights:
+        loaded = engine.model.load_weights(weights)
     synthesized = set()
     for name in expected - loaded:
         parent, _, field = name.rpartition(".")
