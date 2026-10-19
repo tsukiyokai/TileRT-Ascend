@@ -111,6 +111,12 @@ round down toward its weight-stream time.
 
 ## A correctness defect that had to be fixed first
 
+Correction after source audit: the serial/speculative failure below remains
+observed, but its cause is unresolved. The production lightning indexer uses
+`sparse_mode=3` with per-query causal lengths; no source boundary exists at
+width six. The saved failure counts do not prove that any early query selected
+a future token. The width gate remains while that cause is isolated.
+
 `--attention-kernel gather_fia` stops being equivalent to serial decoding past
 width 6. Three-phase serial/speculative/reset comparison with
 `run_cann_mtp_rounds.py`, 32 tokens, `--ignore-eos`, no graph, same prefix and
@@ -120,15 +126,15 @@ fail. Dropping `--fp32-head` does not save it, only moves the divergence to
 token 20. The same widths under `sfa` pass completely, and width 16 differs
 only in one INT8 index key row by a single quantisation step.
 
-The mechanism is in `cann_attention.py`: `gathered_fia` gathers
+`cann_attention.py`'s `gathered_fia` gathers
 `width × 2048` rows and calls `npu_fused_infer_attention_score_v2` with
 `sparse_mode=0`, `actual_seq_qlen=[1]*width` and
-`actual_seq_kvlen=[2048]*width` — **no mask at all** — resting on a docstring
-claim that selection already enforces causality. Past width 6 an early row
-sees rows written later in the same verify. The diagnostic chain fits: round
-0's rows 0/1/2 are correct because that round's tail was zeroed, and round 1's
-row 0 is already wrong because the tail then holds the previous round's
-discarded vectors.
+`actual_seq_kvlen=[2048]*width`, without an additional mask. Correctness
+depends on valid causal selected IDs and matching logical/physical cache
+rows. The production indexer's causal mode supports that contract; the saved
+failure counts alone do not locate a violation or distinguish it from
+numerical drift. The first failing query's selected IDs and operands are
+needed to identify the cause.
 
 `install_gather_fia` now takes the width and refuses past
 `GATHER_FIA_MAX_WIDTH = 6`, and the docstring records what was measured

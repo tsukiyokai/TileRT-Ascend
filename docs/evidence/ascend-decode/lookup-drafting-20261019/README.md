@@ -1,171 +1,74 @@
-# Two thirds of this trajectory lives past the chain's ceiling
+# Context-copy drafting
 
-A width-8 round offers seven draft slots, so the MTP chain cannot accept more
-than seven tokens however accurate it is. This asks how much of the output is
-out of its reach, and answers it from a finished run with no device work.
+A lookup drafter proposes a continuation already present in the prompt or
+committed output. The target verifies it causally and commits the matching
+prefix plus its correction or bonus token. Width M permits M−1 proposed
+tokens and up to M committed tokens; the output budget clips the final round.
 
-`tests/glm52/ngram_acceptance.py` replays the record's own token stream as a
-context-lookup drafter: take the last n tokens, find the most recent earlier
-occurrence, propose what followed it. The accepted prefix is the longest
-common prefix of that proposal and what the run actually emitted, so a drafter
-that never ran has an exactly computable acceptance.
+## Exact CPU replay, 2026-10-19
 
-## Measured, `conditioned-20261019/on-1`, 1024 tokens
+One frozen 8192-token prompt and 1024-token output, shared by three identical
+measured requests. Lookup searches the longest matching suffix first and the
+most recent earlier occurrence second. Only observed continuations are used;
+short proposals use the deployed pending-token padding.
 
-| drafter | width | rounds | acceptance | hit | max |
-|---|---|---|---|---|---|
-| MTP chain, measured | 8 | 227 | 4.511 | 91.2% | 7 |
-| context lookup k=7 | 8 | 280 | 3.657 | 46.4% | 7 |
-| context lookup k=15 | 16 | 226 | 4.531 | 37.2% | 15 |
-| context lookup k=23 | 24 | 214 | 4.785 | 33.2% | 23 |
-| context lookup k=31 | 32 | 202 | 5.069 | 30.2% | 31 |
+| Width | Minimum suffix 2: rounds / accepted per round | Minimum suffix 1: rounds / accepted per round |
+|---|---|---|
+| 8 | 253 / 4.0435 | 228 / 4.4868 |
+| 16 | 198 / 5.1667 | 171 / 5.9825 |
+| 32 | 174 / 5.8793 | 147 / 6.9592 |
 
-Lookup lengths 2 to 8, longest first. The three measured requests are
-bit-identical, so one of them is the trajectory.
+The maximum suffix remains eight tokens. At width 32, the one-token fallback
+reduces rounds by 15.5%. Of its 62 unigram rounds, 27 match at least one
+proposed token. A repeated suffix and a correct continuation are separate
+metrics: minimum-suffix 2 has 68 rounds without a repeat and 105 without a
+correct draft match; minimum-suffix1 has 6 and 60 respectively.
 
-At the same width the chain wins — 4.511 against 3.657 — because it hits on
-91.2% of rounds and lookup on 46.4%. The two are not competing at the same
-width, though. They have different shapes:
+Prompt-only / generation-only / combined width 32 acceptance is
+1.8634 / 5.0644 / 5.8793 for minimum-suffix 2 and
+2.1180 / 6.0176 / 6.9592 for minimum-suffix1. Including the prompt helps this
+input; it is not a lower-bound theorem, because a new longer match can displace
+a better shorter one.
 
-**At k=23, 17.8% of rounds match more than seven drafts, and those rounds
-carry 68.7% of every token accepted.** At k=31 it is 17.8% of rounds and
-71.9% of tokens. The chain cannot reach any of it, at any accuracy, because
-width 8 has seven slots.
+[Raw policy summary and input hashes](../lookup-contract-20261019/policy-summary.json)
+include all 18 comparisons. These parameters have not been evaluated on held-out
+inputs. The earlier 5.885 figure counted a bonus beyond the output budget.
 
-This agrees with what the chain's own histogram says. 18.94% of its rounds
-match all seven — the predictable stretches — and lookup finds runs of 20 to
-31 in the same places. Two independent measurements, one structure: this
-trajectory is long predictable runs separated by hard tokens.
+## Implementation and cost
 
-Scope: a record carries the generated tokens and not the 8192-token prompt, so
-this searches the generation only. A deployed drafter also searches the
-prompt, which on an agentic trajectory is where the copyable material is.
-Every number above is a lower bound.
+`LookupDrafter` maintains an append-only suffix index. Entries only refer to
+occurrences with a known next token, and each key keeps its most recent such
+occurrence. The query is independent of context length for the fixed eight-token
+maximum. On the server CPU, the indexed implementation preserves every proposal
+and acceptance boundary and reduces total lookup work from about 1.03s to
+20.6–20.9ms per request, including index construction.
+[Paired CPU measurement](../lookup-contract-20261019/README.md)
 
-## Why the width is nearly free
+The device path skips the MTP chain and conditioned pass. Its MTP cache remains
+at the injected P−1 rows; only target KV advances. `--lookup-unigram` selects
+the one-token fallback for an independent comparison; the default remains two.
 
-`kernel_mla.h:536-549` sets `usedCoreNum` to the query count and returns from
-cores 8 to 23, so a width-8 verify runs eight core groups with a one-row
-critical path and **two thirds of the cube idle**
-([sfa-explained](../sfa-explained-20261019/README.md)). The measured row cost
-agrees: +0.045 ms a row from width 6 to 8, +0.112 from 8 to 12, +0.117 from 12
-to 16 ([width sweep](../width-sweep-20261019/README.md)).
+The next device result must report actual target round cost, expert union,
+accepted count and request TPOT at widths8/16/32. Width 32 may touch up to256
+experts, so a 64-expert measurement is not a worst-case bound. Previous
+7–8ms TPOT extrapolations are withdrawn pending this measurement.
 
-So `splitKV` being dead code and the die being two-thirds idle is not a
-separate problem to solve — a wider verify fills those cores with rows, and
-the rows are what buy acceptance.
+## Hybrid scope
 
-## The arithmetic, projected
+A merged lookup/MTP policy must advance along its own accepted boundaries.
+Recorded MTP proposals at another policy's boundaries do not provide an oracle
+at the newly reached positions; predictions after a rejected draft belong to
+that rejected context. Two branches also need correct RoPE depths, indexer
+visibility, attention visibility and selected-path KV compaction. Returning to
+MTP after lookup requires filling the missing conditioned MTP rows from genuine
+target hidden states and successor tokens.
 
-Extrapolating the measured row cost, a width-32 verify is about
-39.68 + 0.112 × 24 = 42.4 ms. A lookup drafter needs no draft forward at all,
-so the chain's 10.27 ms and the conditioned pass's 2.08 both go:
+## Verified-copy cursor, CPU rejection
 
-| configuration | round | acceptance | TPOT |
-|---|---|---|---|
-| chain, width 8 (today) | 53.05 | 4.507 | 11.77 |
-| lookup only, width 32 | 43.4 | 5.069 | **8.56** |
-| chain + lookup, width 32 | 55.8 | ≥ 5.07 | ≤ 11.0 |
-
-Lookup only reaches the 9 ms milestone with no kernel work, no training and
-no device-side drafter. But it is the wrong configuration to ship: on a
-non-repetitive stretch it accepts one token a round, which at a 43.4 ms round
-is 43 ms a token. The chain's 91.2% hit rate is what protects those stretches,
-so the two belong in one tree — and the merged acceptance is the number that
-decides the width, which is not measured yet.
-
-## What gates it
-
-The merged acceptance needs the chain's proposals at each round, and the
-record kept only the accepted prefix. `mtp_session.py` now records
-`candidates` and `predictions` — both already produced by the round, so this
-costs nothing — and with them any tree topology's acceptance is computable
-offline from one run, along with the per-position acceptance rates that decide
-where a tree should branch.
-
-## Branches are worth nothing; depth is everything
-
-A tail that repeats several times offers several continuations, so the obvious
-move is to verify them all. Measured, with each branch costing k more rows:
-
-| branches | width | acceptance | hit |
-|---|---|---|---|
-| 1 | 8 | 3.657 | 46.4% |
-| 2 | 15 | 3.864 | 46.8% |
-| 4 | 29 | 3.894 | 47.1% |
-| 8 | 57 | 3.908 | 47.3% |
-
-Eight branches at eight times the width buy 0.9 points of hit rate. When the
-longest tail match exists, the most recent occurrence's continuation is
-almost always the right one; when no match exists, no number of branches
-creates one. **Lookup's misses are structural, not a ranking problem**, so its
-complement has to be a model and not more of itself.
-
-At k=15 the same holds: 4.531 / 4.741 / 4.785 / 4.830 for 1 / 2 / 4 / 8.
-
-## A merge estimate that does not hold
-
-Evaluating lookup at the chain's own 227 round boundaries gives acceptance
-10.489 and a merged 11.405, which would be 4.89 ms a token. It is wrong:
-10.489 × 227 is 2381 tokens out of a 1023-token stream. Sampling at another
-drafter's boundaries counts the predictable runs once per boundary that lands
-in them, and a drafter accepting ten a round would have reached the end in 93
-rounds rather than 227.
-
-Only a walk where the drafter drives its own boundaries is consistent, which
-is what the table at the top of this page is. The merge cannot be simulated
-that way without the chain's proposals at arbitrary positions — the reason
-`mtp_session.py` now records `candidates` and `predictions`.
-
-## The prompt is where the copying is
-
-GLM-5.2 is an agentic coding model and its output repeats its input, so
-searching the generation alone understates everything. The capture carries the
-prompt as `prompt_token_ids` in `manifest.json`, 8192 tokens ending at 9249,
-which joins the generation's first token 6500 exactly.
-
-| k | width | generation only | + 8192-token prompt | hit |
-|---|---|---|---|---|
-| 7 | 8 | 3.657 | **4.047** | 46.4% → 54.5% |
-| 15 | 16 | 4.531 | **5.172** | 37.2% → 46.5% |
-| 31 | 32 | 5.069 | **5.885** | 30.2% → 39.7% |
-| 63 | 64 | — | 5.988 | 38.6% |
-
-At width 32 the prompt is worth 16% of acceptance. At k=63 it saturates —
-runs reach 60 tokens and acceptance moves 0.1 — so **depth is exhausted and
-the cap is coverage**: 39.7% of rounds find no repeat at all.
-
-## A copy cursor is already there
-
-The obvious next move for a copying workload is to carry a cursor: once a
-round has copied from source position j, propose from j + accepted without
-re-matching the tail. Measured, keeping the cursor only when the proposal was
-consumed whole, it is **identical to re-searching every round** — 5.172,
-5.785, 5.988 at k = 15, 31, 63.
-
-The reason is that after copying k tokens the tail *is* those k tokens, so
-the tail search lands on the same source. The n-gram lookup is a copy cursor
-already. A cursor kept across a partial match is worse, 4.830 against 5.885 at
-k=31, because a partial match means the copy diverged and the cursor then
-suppresses the search that would have found the new source.
-
-## Arithmetic
-
-Lookup needs no draft forward, so the chain's 10.27 ms and the conditioned
-pass's 2.08 both go. Extrapolating the measured row cost, a width-32 verify is
-39.68 + 0.112 × 24 = 42.37 ms:
-
-| | round | acceptance | TPOT |
-|---|---|---|---|
-| chain, width 8, today | 53.05 | 4.507 | 11.77 |
-| lookup, width 32 | 43.4 | 5.885 | **7.37** |
-
-The risk in that row is the expert union: 8 rows select 27 of 256 experts and
-32 rows will select more, and `gmm-sweep-20261019` puts a regime change
-between 32 and 64 active where the last doubling costs 4.6 times the previous.
-Pricing gmm1 and gmm2 at their 64-expert figures adds 4.5 ms a verify, which
-is the pessimistic bound: round 47.9, **TPOT 8.14**.
-
-So 7.4 to 8.1 ms a token, from 11.77, with no kernel work, no training and no
-device-side drafter. It still should not ship alone: 39.7% of rounds find no
-repeat, and there it accepts one token against a 43 ms round.
+A cursor may continue an earlier source only after every real proposal matched
+and its observed bonus equals the new pending token. Padding and budget
+clipping cannot establish that state. This differs from choosing the most
+recent suffix occurrence, but it does not improve the frozen M32 replay:
+147 rounds and4704 rows with either policy. M8 stays228 rounds; M16 improves
+171→170 only. Keep the deployed policy unchanged.
+[CPU source, invariants and raw result](../lookup-contract-20261019/cursor/result.json).

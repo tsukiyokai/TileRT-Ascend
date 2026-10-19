@@ -161,3 +161,21 @@ not part of it. Four habits the evening also argues for:
   cores, and a3-84 was the only host at 4% HBM while the rest were at 89–94%.
 - Stage the standby before it is needed. a3-187 carries the same tree, code
   and gate, verified by its own round checks, so a switch costs one launch.
+
+Launch the driver detached, or the gate waits for nothing:
+
+```sh
+docker exec -d trt-asc setsid bash -c "exec bash /workspace/experiments/go.sh > /workspace/experiments/go.log 2>&1"
+```
+
+A driver started from an interactive `docker exec` dies with the ssh session
+that opened it. Two did; their `sleep 180` children reparented to PID 1 as
+zombies, and a waiter watching for records watched for two hours while nothing
+ran. The symptom is a log whose last gate line is hours old with no driver in
+`ps`. To stop one, read its PID and kill that: `pkill -f` inside
+`docker exec bash -c` matches the wrapper's own argv and kills itself first,
+leaving the driver running.
+
+Ship a file with `scp` then `docker cp <file>`, and compare md5 on both sides.
+`docker cp /dev/stdin` once truncated a driver to 15 bytes, and `bash -n`
+passed on the fragment.
