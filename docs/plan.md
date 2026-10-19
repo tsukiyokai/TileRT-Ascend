@@ -4,27 +4,41 @@
 
 工作方法与今晚的教训见 [workflow.md](workflow.md) 与 [lesson.md](lesson.md)。
 
-## 状态（2026-10-19 05:40）
+## 状态（2026-10-19 10:40）
 
-确定测得的最好点是 **14.533 ms**（width 4，装屏障 overlay，三请求同一轨迹、轮数同为 307、跨度 0.141）。此前记录的 14.247 ms 口径不同（用 `gather_fia`），且产出它那次运行的 `summary.status` 因一条过期时钟断言恒为 fail，该断言已修。
+确定测得的最好点是 **13.0657 ms**（width 8，三请求同一轨迹、轮数同为 227、跨度 0.818；换一个干净工作目录复现 13.0659、跨度 0.097）。它吐出的 1024 个 token 与 width 4 逐位相同，所以 trajectory gate 过。width 4 同场 14.5551 未动。
 
-width 8 不确定,所以它的 12.7–13.3 ms 不作为结果。已定位到 **TP 下 W4A8 routed-expert MoE 段里一个每次 forward 都重新点火的竞争**:同一进程对同一输入连做 6 次 verify 得 6 个不同 hidden(相对 7.1–17.5%),dense 层与其 all-reduce 逐位一致而 75 个 MoE 层里 73 个全差,而点火位置在三次独立二分里是随机的。`--expert-parallel` 是唯一恢复可复现的改动(249/249/249 轮)但吃掉 width 8 全部收益,只能当对照。阈值在 width 4 与 6 之间,不在 8。两个候选带 file:line:`shared_experts.py:546` 的 `npu_dequant_swiglu_quant`(`dequant_swiglu_quant.h:793`/`:797` 两个 Cast 之间只有不定序的 `SetDeqScale`,而紧随其后两对都有 `PipeBarrier<PIPE_V>`),以及 `apply_gmm2` 的内建 `GroupedMatmul` A8W4 split-K 配 `SetAtomicAdd<half>`(splitDim 由 host tiling 按 M 选,M=32 对 M=64)。[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md)
+width 8 的非确定性已闭环，而根因不在算子里：屏障补丁 `gmm1-swiglu-barrier.patch` 一直是对的，被 static kernel 的包缓存在被 capture 的那个宽度上整条绕过。缓存 key（`static_kernel.py:1071-1092`）只含算子参数、超核选项串、确定性开关，不含 `ASCEND_CUSTOM_OPP_PATH`、不含编译器真正读的 vendor 头内容，而索引落在进程工作目录下。补丁一行：`compiler_interface.py` 加 `disable_static_kernel_compile_cache`，代价是启动时重编而非 decode 时间。两个曾带 file:line 的候选都已排除。[已闭环](evidence/ascend-decode/w4a8-race-closed-20261019/README.md)
 
-★ 2026-10-19 06:40 警告：四份补丁合装进生产后 **+3.15 ms/token(21.7% 回归)**,而逐调用台子预测 −0.9。token 流与基线逐位相同,但轮数 311→326/335/326,每轮 47.6→55.3 ms。**所以下面这些由逐调用测量推出的预期全部可疑**,在轮内测过之前不计入。[回归](evidence/ascend-decode/patch-regression-20261019/README.md)
+★ 两条口径纪律，都是被自己的实验逼出来的：
 
-已配对测得、各自在自己配置上成立、尚未合测：metadata 与 mc2 掩码提升 −0.7967 ms/token（下发 313→91，191712 项检查零失败）；专家声明压缩 2.39 ms/轮（真 checkpoint 逐位门过）；GMM 三份 kernel 补丁约 0.66 ms/轮（p=1.8e-12）。
+一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以 `debug-dcci-all`、`debug-sync-all`、`early-start`、各种 blacklist 臂「干净」只因为它们都触发了新编译。它们不构成证据。此前那条「四份补丁合装 +3.15 ms/token」同样被「是否恰好新编」混淆，需要重测。
 
-## 当前：13.338 ms（width 8），加两项已配对测得但尚未合测
+二，**逐算子时间相加不是占用率**。那会把并发轨重复计数，早先 35 ms 开销就是这么来的。并集口径下设备在稳态里忙 60.7%、空 39.3%，而空闲全在 ≥100 µs 的坑里（172 个合 97.194 ms），<10 µs 的缝只有 0.479 ms——所以在这个粒度上 decode 不是下发速率受限。[空闲](evidence/ascend-decode/device-idle-20261019/README.md)
 
-| 改动 | 配对收益 | 口径 |
-|---|---|---|
-| width 8（`max_num_seqs` 一个字面量） | **撤回**：本树三请求三条不同轨迹（轮数 220/236/238），TPOT 与接受数混在一起 | 归因于未安装的 `gmm1-swiglu-barrier.patch`，见[非确定性](evidence/ascend-decode/width8-nondeterminism-20261019/README.md) |
-| metadata 与 mc2 掩码提升 | −0.7967 ms/token（−5.001%） | 下发 313→91，191712 项检查零失败 |
-| 单边归约（bf16） | 16.571 µs/次对 HCCL 图内 32.340（1.95 倍），每轮 157 次约 2.48 ms | 三种 payload 各 400 轮零错、16 rank 零非零退出；[更正](evidence/ascend-decode/onesided-corrected-20261019/README.md) |
-| 专家声明压缩（w4a8） | 2.39 ms/轮（保守 1.97） | 真 checkpoint 逐位门过，prefill 五形状 ND 全不劣 |
-| GMM 三份 kernel 补丁 | 8.5 µs/次 × 78 ≈ 0.66 ms/轮 | p=1.8e-12，输出逐位相同 |
+## 主要矛盾：采样与记账的主机往返
 
-四项各自在自己的配置上配对测得，**合测尚未拿到**：width 8 与 hoist 的组合在 8 token smoke 上撞 aicore 异常，正在二分（二者各自单独都跑得通）。所以不把它们相加当成 TPOT。
+稳态空闲 97.962 ms 里 66.714 ms（68%）坐在四族算子后面，两侧都是同一批，而同一算子连成串、每两个之间隔一毫秒，是每次调用一个主机往返的签名：`aclnnIndex` 36 坑共 34.938 ms、`aclnnArgMax` 4 坑共 13.706、`aclnnInplaceCopy` 31 坑共 9.870、`aclnnInplaceFillScalar` 26 坑共 8.200。
+
+这些全不是模型前向，是采样器与投机解码的记账。AMD 的库里 `top_p`、`top1_allreduce`、`broadcast_selected_token_ids` 是设备核，后两个还带 peer 指针——他们的采样器在设备上。
+
+口径的限：带 profile 跑会加主机侧负担，而这台设备由主机喂，所以 39.3% 与 66.714 ms 搬不到不带 profile 的跑法上。能搬的是排序与形状。
+
+已在测：把每次前向的三处主机往返改成设备侧推导（`seq_lens` 已载着 `position + width`，positions 与 slots 从它推出），A/B 两臂只差这一个补丁。
+
+## 清掉的两项
+
+`EVENT WAIT` 是设备时间线上最大的一项、404.290 ms、比所有 SuperKernel 组加起来还多，但 99.9% 被别的轨掩盖，599 次里只有 16 次是真空——不是杠杆。设备侧 `Cast` 每段 2.86 µs、整份 profile 共 4.551 ms，在它运行的地方很便宜；贵的是主机侧，已被 hoist 拿走。
+
+## cube 与 vector 之间没有绕开 GM 的路
+
+三个来源一致：wiki《Cube-Vector 直通》第一句限定「A5 上新增」；《昇腾系列芯片差异对比》核内位宽表的 `L0C (FIXPIPE) → UB` 一行在 1971 列是斜杠（而 1971 列的显存 64 GB、L2 192 MB、带宽 1.8 T/s 与本机三项对上）；本地 `vis/refs/davidv100-core-path-evidence.md` 从另一侧确认该通路存在于 David 世代。1971 列 `L1 (MTE1) → UB` 也是斜杠，所以 cube 结果出 L0C 只有 GM 与 L1 两个去处，而 L1 到 UB 这一跳不存在。
+
+这件事决定整层核的形状：他们的 `pure_mla_moe_layer` 靠 L0C2UB 把 MLA 与 MoE 放一个核，在 A3 上照抄会把他们避免掉的 GM 往返全额付回去。而 SuperKernel 已经按引擎同构切了（55 种组形状，最大一类 471 次 `start_aiv_…_end_aiv_…`），它合并的是下发而不是数据通路——组外仍有 1669 次独立 `Cast` 条目。所以能做的是让单引擎内部那一段的中间结果留在 UB，一个核体而不是一次下发。[通路](evidence/ascend-decode/cube-vector-path-20261019/README.md)｜[SuperKernel](evidence/ascend-decode/superkernel-shape-20261019/README.md)
+
+## TP16 保留
+
+切成 TP8 会让每卡每轮多读 3.3 GB、地板从 3.886 涨到 6.040 ms（占 6.866 预算从 57% 到 88%），换回来的同步节省只有 0.236 ms。九比一的亏，而 16 卡已是全部 die，所以 TP16 是每卡权重字节的下界。AMD 的 TP8 成立是因为 288 GB／8 TB/s 的单卡让每卡字节落在预算内，他们在这一项上比我们紧（约 86% 对 57%）。
 
 ## width 8 的细节
 
