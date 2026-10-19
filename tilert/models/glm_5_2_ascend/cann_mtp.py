@@ -120,7 +120,10 @@ class CannMtp:
         self.conditioned_graph = None
         self.shard_projections = shard_projections
         self.hoist_metadata = target.hoist_metadata
-        self.attention_kernel = target.attention_kernel
+        self.attention_kernel = (
+            "sfa" if target.attention_kernel == "shared_fia"
+            else target.attention_kernel
+        )
         self.checkpoint = target.checkpoint
         self.weight_files = weight_sources(self.checkpoint)
         self.config = draft_config(target.config)

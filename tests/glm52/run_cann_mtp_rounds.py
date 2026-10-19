@@ -80,7 +80,8 @@ def parse_arguments(argv=None):
                         help="Compile the target backbone")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
-    parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
+    parser.add_argument("--attention-kernel",
+                        choices=("sfa", "gather_fia", "shared_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
     parser.add_argument("--profile-stacks", action="store_true",
@@ -359,6 +360,7 @@ def execute(args):
         compile_target=args.compile_target,
         super_kernel=args.super_kernel,
         attention_kernel=args.attention_kernel,
+        graph_width=args.width,
         fp32_head=args.fp32_head,
         hoist_metadata=args.hoist_metadata,
         hoist_forward_context=args.hoist_forward_context,

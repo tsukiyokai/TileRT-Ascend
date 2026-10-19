@@ -185,8 +185,10 @@ class CannModel:
             raise ValueError("Capacity must be at least one 128-token page")
         if int(os.environ.get("WORLD_SIZE", "16")) != 16:
             raise ValueError("Launch exactly 16 ranks")
-        if attention_kernel not in ("sfa", "gather_fia"):
-            raise ValueError("attention_kernel must be sfa or gather_fia")
+        if attention_kernel not in ("sfa", "gather_fia", "shared_fia"):
+            raise ValueError("Unknown attention kernel")
+        if attention_kernel == "shared_fia" and graph_width != 8:
+            raise ValueError("shared_fia currently supports target width 8")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
         import torch
@@ -306,6 +308,9 @@ class CannModel:
         self.storage = torch.empty(
             self.layout["nbytes"], dtype=torch.uint8, device=self.device,
         )
+        if self.attention_kernel == "shared_fia":
+            # Dense FIA reads masked rows too; 0 * NaN would poison PV.
+            self.storage.zero_()
         self.views = {}
         for name, region in self.layout["regions"].items():
             start = region["offset"]
@@ -369,6 +374,15 @@ class CannModel:
             context = self.config.compilation_config.static_forward_context
             for name in attention_names:
                 install_gather_fia(context[name].impl, self.graph_width)
+        elif self.attention_kernel == "shared_fia":
+            from .cann_attention import SharedKVAttention
+
+            context = self.config.compilation_config.static_forward_context
+            self._shared_attention = SharedKVAttention(
+                self.graph_width, self.layout["capacity_tokens"], self.device,
+            )
+            for name in attention_names:
+                self._shared_attention.bind(context[name].impl)
         self.builders = [
             (names, kind(spec, names, self.config, self.device))
             for (kind, spec), names in groups.items()
@@ -527,8 +541,11 @@ class CannModel:
             raise ValueError("Verify requires 1, 2, 4, 8 or 16 tokens")
         if self.position + width > self.capacity:
             raise ValueError("Decode exceeds cache capacity")
-        if self.attention_kernel == "gather_fia" and self.position < 2047:
-            raise ValueError("Gather/FIA requires 2048 valid selected rows")
+        uses_fia = self.attention_kernel == "gather_fia" or (
+            self.attention_kernel == "shared_fia" and width == self.graph_width
+        )
+        if uses_fia and self.position < 2047:
+            raise ValueError("FIA requires 2048 valid selected rows")
         use_graph = self.graph is not None and self.graph.width == width
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
@@ -632,6 +649,10 @@ class CannModel:
             from .cann_attention import gathered_fia
 
             objects.append(gathered_fia)
+        elif self.attention_kernel == "shared_fia":
+            from .cann_attention import SharedKVAttention
+
+            objects.append(SharedKVAttention)
         if self.fp32_head:
             from .cann_head import fp32_projection
 

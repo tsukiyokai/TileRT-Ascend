@@ -118,7 +118,8 @@ def arguments():
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
-    parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
+    parser.add_argument("--attention-kernel",
+                        choices=("sfa", "gather_fia", "shared_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
     parser.add_argument("--dump-indices", type=Path,
