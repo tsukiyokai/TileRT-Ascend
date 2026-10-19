@@ -26,6 +26,19 @@ A check on the method: `AI_VECTOR_CORE` at one block has a median of 1.20 µs,
 which is the in-graph dispatch floor this project measured independently. Two
 routes, one number.
 
+## Reproduced by `tests/glm52/kernel_accounting.py`, with a small difference
+
+The script reads the same capture and gives slightly lower floors:
+`AI_VECTOR_CORE` 0.70 against 0.72, `AI_CORE` 2.30 against 2.34, `MIX_AIV`
+**12.04 against 13.56**, `MIX_AIC` 13.58 against 14.20. The first query
+grouped by `Block Num` and `Mix Block Num` as well as the core, so it took the
+cheapest call of each shape of each kind rather than the cheapest of the kind.
+
+That moves the structure's lower bound from 12.84 µs to **11.34**, and the
+MIX total from 7.64 ms to **6.75** — 19% of the fixed cost rather than 21%.
+The script's figure is the correct one for the claim as stated, since the
+bound is over the kind and not over a shape within it.
+
 ## The fixed cost splits three ways
 
 | | a verify | share |
