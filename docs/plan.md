@@ -80,6 +80,8 @@ gmm1 89.809 µs 对 32.68 地板(8 行只触及 256 个专家里的 64,活 48 Mi
 
 一轮的组成,全部实测:verify 39.68、chain 10.27(6 × 1.712)、conditioned 2.08、host_tokens 0.26、提交与残差 0.76。
 
+★ 这些是墙钟。按相位把逐流**计算并集**与之对照(并集复现整轮到 1%,52.56 对 53.05),分相并不相等:verify 44.26/39.68 = 1.12,而 chain 6.72/10.27 = 0.65、verify 胶水 0.10/2.08 = 0.05。所以 **5.53 ms 一轮不是设备在算**,它不在任何价签上。机制已测:一次 pageable H2D 要先排干流才能暂存,而一轮故意把九个 forward 全发完才读,于是每个 forward 替它前面排的活付账——队列深 73 时 139 µs、2489 时 1141,pinned 则 48 到 71 不动。注意这不是 `29ada2c` 回滚的那件事:那次两臂都保留 pageable 源,变的是两次拷贝换三个设备 kernel。[相位归属](evidence/ascend-decode/phase-attribution-20261019/README.md)、[pageable 暂存](evidence/ascend-decode/metadata-h2d-20261019/README.md)
+
 手上有价签的三项合 5.51 ms,做完 TPOT 10.55:
 
 | 每轮 | 做法 |
@@ -96,11 +98,15 @@ gmm1 89.809 µs 对 32.68 地板(8 行只触及 256 个专家里的 64,活 48 Mi
 
 ## 队列:等整机的三件,按价排
 
-一,Cast 搬迁。480 对 bf16↔fp32 的转换,960 个 kernel,**18.5 ms 一次 verify**。不是删(删会撤掉 `b377291` 那个正确性修复),是把加宽并进上游 epilogue、收窄并进下游 prologue。两个入口都经过我们的覆盖(`parallel_state.py:740` 与 `:196` 都落到 `_all_reduce_out_place`),所以位置是我们能选的。验证只需 token 流不变。[Cast](evidence/ascend-decode/cast-sites-20261019/README.md)
+一,Cast 搬迁。480 对 bf16↔fp32 的转换,960 个 kernel,**1.88 ms 一次 verify**(此处原写 18.5,那是上面已作废的 19.30 µs/kernel 表算的,差 10 倍)。不是删(删会撤掉 `b377291` 那个正确性修复),是把加宽并进上游 epilogue、收窄并进下游 prologue。两个入口都经过我们的覆盖(`parallel_state.py:740` 与 `:196` 都落到 `_all_reduce_out_place`),所以位置是我们能选的。验证只需 token 流不变。[Cast](evidence/ascend-decode/cast-sites-20261019/README.md)
 
 二,`--draft-projection-tp` 的开关 A/B。它每轮买约 14 次 16 卡 all-gather,而那条尾巴占 all-gather 总时间 96%。两次发射都死在显存上。[尾巴](evidence/ascend-decode/collective-tail-20261019/README.md)
 
 三,单边 all-gather。注意它只消掉握手(1.95 倍,约 1.7 ms)而不是数据依赖——all-gather 的完整输出在最后一片到达前不存在。所以它是小项,排在后面。
+
+★ 在跑:`pinned-seqlen-20261019`,把 `seq_lens` 那一次拷贝改成 pinned 环形槽位,两臂只差一个文件(md5 写进日志),预测 3.5–3.9 ms 一轮。宽度一侧不欠账——`accept_curve.py` 从任一条记录的 `accepted_spans` 解出整条 τ(w),复现四臂扫描到 1.1%,width 8 就是最优。
+
+★ `index_topk` 2048→1024 那 1.15 ms 目前**零证据**:`half` 臂确定性死在 `sfa_v1.py:1593`,`self [8, 1024]` 对 `src [8, 2048]`——override 改到了索引缓存(vLLM 在 `sparse_mla_attention.py:272` 读 `hf_text_config.index_topk`)而 `self.indexer(...)` 仍产 2048。同一个超参两处命名,只改了一处,与今早条件图那次同形。
 
 ## 测量纪律:0.2 ms 是 run 间地板,所以两臂必须交替
 
