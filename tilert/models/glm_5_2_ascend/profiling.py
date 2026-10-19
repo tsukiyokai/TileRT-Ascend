@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from time import perf_counter_ns
 import os
 import threading
 
@@ -63,12 +64,17 @@ class StageMarkers:
             "thread_id": threading.get_ident(),
             "native_thread_id": threading.get_native_id(), **fields,
         }
-        self.events.append({**event, "event": "begin"})
+        # The clock makes this stream readable without a profiler attached,
+        # which matters because a profiler adds host work to a device the host
+        # feeds and so changes the durations it reports.
+        self.events.append({**event, "event": "begin",
+                            "ts_ns": perf_counter_ns()})
         try:
             with self.range_factory("tilert." + name):
                 yield
         finally:
-            self.events.append({**event, "event": "end"})
+            self.events.append({**event, "event": "end",
+                                "ts_ns": perf_counter_ns()})
 
 
 class _Proxy:
