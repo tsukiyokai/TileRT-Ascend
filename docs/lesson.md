@@ -1170,3 +1170,20 @@ against what its control would have cost.
   kernels in one dispatch. With the in-graph dispatch floor at 1.2 microseconds
   against a per-operator prologue of 8.3 to 16.4, the merge that exists removes
   the small term.
+- Sum of per-operator time is not occupancy. The earlier overhead figure came
+  from adding up operator durations across concurrent tracks, which double
+  counts. A union of busy spans against the profile's own wall clock does not,
+  and it says the device is idle 39 percent of steady state -- a different
+  quantity from the one I had been reasoning about all day.
+- Before calling the timeline's largest item a lever, check whether anything
+  overlaps it. EVENT WAIT totals 404 milliseconds, more than every SuperKernel
+  group combined, and 99.9 percent of it is covered by work on another track.
+  Sixteen of 599 waits are real idle. I was one sentence from announcing a
+  nonexistent 404 millisecond win.
+- The shape of idle picks the lever. Many sub-10-microsecond gaps would mean
+  the host cannot feed the device; a few millisecond-scale gaps mean something
+  blocks. Measured, it is the second: 172 gaps of 100 microseconds and up hold
+  essentially all the idle, and the gaps under 10 microseconds hold 0.2
+  percent. That rules out launch rate at this granularity and points at the
+  sampler, which turns out to hold 68 percent of the idle behind four families
+  that each pay a host round trip per call.
