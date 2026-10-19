@@ -1395,3 +1395,23 @@ against what its control would have cost.
   the capture shows `8,4,512` beside `8,4,64`, and a block table of one
   against a batch of eight, where TND makes the eight rows one request's
   tokens. The shapes were in the file I had been reading all day.
+- Row-independence can mean perfect parallelism rather than
+  data-independence, and I read it the wrong way for a whole afternoon. Sparse
+  attention costs 85.31 microseconds at one row and 89.17 at eight because
+  eight core groups each take one row and the critical path is one row either
+  way -- kernel_mla.h:536-549 sets usedCoreNum to the query count and returns
+  from cores 8 to 23. The sweep could not have shown the cost, and on the
+  strength of it I excluded bytes as an explanation.
+- Price every pass, not the one you can see. I measured a scattered gather at
+  956.7 GB/s, concluded the bytes were free at 2.6 percent of the call, and
+  the kernel makes 3.89 passes over the same data on a third of the die -- 31
+  times the bytes I counted. Reading the source gave 73.4 MB a call, which at
+  the measured 990 GB/s accounts for the time to within three percent. The
+  operator was bandwidth bound from the start.
+- A missing hardware path costs what the traffic it forces costs, and that
+  varies by direction and volume. I measured cube-to-vector through global
+  memory at 1.364 microseconds a 32 KiB tile, put 637 handoffs a round at 0.87
+  milliseconds, and wrote that the absence was almost free. In the other
+  direction -- UB to L1, absent in the same column of the same table -- it
+  forces a 4.72 MB round trip a row inside one operator, 51 percent of that
+  operator's traffic and 2.86 milliseconds a verify.
