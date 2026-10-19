@@ -148,6 +148,13 @@ def load_inputs(args, rank, checkpoint):
     manifest = json.loads((case / "manifest.json").read_text())
     contract = validate_v3(manifest, checkpoint)
     main, teacher, inputs = load_capture(case, rank, checkpoint)
+    length = inputs["initial_position"]
+    required = length + args.max_tokens - 1
+    if args.max_tokens > 1:
+        required += args.width - 1
+    if required > args.capacity or length >= args.capacity:
+        raise ValueError("Prefix, output budget and final verification "
+                         "exceed cache capacity")
     receipt = next(item for item in manifest["ranks"]
                    if item["rank"] == rank)
     path = case / "mtp-prefix" / f"rank-{rank}.pt"
@@ -156,10 +163,6 @@ def load_inputs(args, rank, checkpoint):
         raise ValueError("MTP prefix differs from its rank receipt")
     saved = torch.load(path, map_location="cpu", weights_only=True)
     draft = mtp_prefix_layer(saved, checkpoint)
-    length = inputs["initial_position"]
-    if (length + args.max_tokens - 1 > args.capacity
-            or length >= args.capacity):
-        raise ValueError("Prefix and output budget exceed cache capacity")
     for name, width in (("latent", 512), ("rope", 64), ("index_keys", 128)):
         value = draft[name]
         if (value.shape != (length - 1, width)
@@ -404,6 +407,7 @@ def execute(args):
                 target, draft, main_prefix, mtp_prefix, label,
             )
             if label == "graph":
+                end = initial + args.max_tokens + args.width - 2
                 for layers, begin, dense_mla in (
                     (target.cache, initial,
                      target.attention_kernel == "shared_fia"),
@@ -411,7 +415,7 @@ def execute(args):
                 ):
                     for fields in layers:
                         for name, value in fields.items():
-                            tail = value[begin:initial + args.max_tokens + 4]
+                            tail = value[begin:end]
                             # Dense PV requires finite masked rows.
                             poison = (7.0 if dense_mla and name in
                                       ("latent", "rope") else float("nan"))

@@ -149,7 +149,8 @@ def synthetic_capture(directory, torch):
         },
     }
     runner.atomic_json(directory / "manifest.json", manifest)
-    args = SimpleNamespace(capture_case=directory, max_tokens=4, capacity=128)
+    args = SimpleNamespace(capture_case=directory, max_tokens=4, capacity=128,
+                           width=4)
     return args, checkpoint, manifest, draft
 
 
@@ -167,6 +168,22 @@ def check_capture(directory, torch, record):
             require(inputs["rank"] == rank
                     and parent.shape == (1, 6144), "rank/parent")
     record("capture.valid_all_16_ranks", valid)
+    for width in (8, 32):
+        boundary = SimpleNamespace(**vars(args))
+        boundary.width = width
+        boundary.capacity = 2 + boundary.max_tokens + width - 2
+        record(f"capture.full_width_{width}", lambda: runner.load_inputs(
+            boundary, 0, checkpoint,
+        ))
+        boundary.capacity -= 1
+        record(f"capture.reject_short_width_{width}", lambda: rejects(
+            lambda: runner.load_inputs(boundary, 0, checkpoint),
+        ))
+    terminal = SimpleNamespace(**vars(args))
+    terminal.max_tokens, terminal.capacity = 1, 3
+    record("capture.first_token_only", lambda: runner.load_inputs(
+        terminal, 0, checkpoint,
+    ))
     mutations = {
         "v2": lambda value: value["runtime"].update(layout=cache_layout(128)),
         "missing_parent": lambda value: value.pop(PARENT_HIDDEN_REGION),
