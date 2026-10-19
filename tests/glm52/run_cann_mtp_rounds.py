@@ -404,12 +404,18 @@ def execute(args):
                 target, draft, main_prefix, mtp_prefix, label,
             )
             if label == "graph":
-                for layers, begin in ((target.cache, initial),
-                                      ([draft.cache], initial - 1)):
+                for layers, begin, dense_mla in (
+                    (target.cache, initial,
+                     target.attention_kernel == "shared_fia"),
+                    ([draft.cache], initial - 1, False),
+                ):
                     for fields in layers:
-                        for value in fields.values():
+                        for name, value in fields.items():
                             tail = value[begin:initial + args.max_tokens + 4]
-                            tail.fill_(float("nan")
+                            # Dense PV requires finite masked rows.
+                            poison = (7.0 if dense_mla and name in
+                                      ("latent", "rope") else float("nan"))
+                            tail.fill_(poison
                                        if value.is_floating_point() else -128)
                 if args.target_graph:
                     target.enable_graph(width=args.width)
@@ -546,10 +552,11 @@ def execute(args):
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "packages": {name: version(name) for name in
                      ("torch", "torch-npu", "vllm", "vllm-ascend")},
-        "scope": "CANN serial/speculative consistency and exact reset",
+        "scope": "CANN continuation consistency across recorded phases",
+        "compared_phases": phases,
         "logical_outputs_include_eos": True,
         "final_output_is_pending": True, "prompt_replayed": False,
-        "serial_speculative_consistency": passed,
+        "serial_speculative_consistency": passed if "serial" in runs else None,
         "reset_exact": all(item["passed"] for item in checks
                            if item["name"].startswith("reset.")),
         "precision_verified": False, "hf_parity": False,
@@ -575,7 +582,10 @@ def execute(args):
         summary = {
             "status": "pass" if success else "fail", "ranks": receipts,
             "all_ranks_agree": same,
-            "serial_speculative_consistency": success,
+            "serial_speculative_consistency": (
+                success if "serial" in runs else None
+            ),
+            "compared_phases": phases,
             "precision_verified": False, "hf_parity": False,
             "performance_measured": False,
         }
