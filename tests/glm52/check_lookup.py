@@ -1,6 +1,7 @@
 """CPU checks for lookup proposals, cache ownership and measurement records."""
 
 import copy
+import random
 from types import SimpleNamespace
 import unittest
 
@@ -104,6 +105,20 @@ class LookupChecks(unittest.TestCase):
         context = [1, 2, 3, 9, 4, 1, 2]
         self.assertEqual(lookup(context, 1, 8, 2), [[3]])
         self.assertEqual(lookup([4, 1, 2, 8] + context, 1, 8, 2), [[8]])
+
+    def test_incremental_index_matches_reverse_scan_after_each_commit(self):
+        rng = random.Random(42)
+        for shortest, longest in ((1, 1), (1, 8), (2, 8), (4, 12)):
+            context = [rng.randrange(4) for _ in range(40)]
+            drafter = LookupDrafter(context, longest, shortest)
+            for _ in range(80):
+                for count in (0, 1, 7, 31):
+                    branches = lookup(context, count, longest, shortest)
+                    expected = branches[0] if branches else []
+                    self.assertEqual(drafter.propose(count), expected)
+                added = [rng.randrange(4) for _ in range(rng.randrange(9))]
+                context.extend(added)
+                drafter.commit(added)
 
 
 if __name__ == "__main__":
