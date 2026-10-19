@@ -22,8 +22,9 @@ class CannChoices:
     """
 
     def __init__(self, model, width=1):
-        if type(width) is not int or width not in (1, 2, 4):
-            raise ValueError("Choice capture width must be 1, 2 or 4")
+        widths = (1, 2, 4, 6, 8, 12, 16, 24, 32)
+        if type(width) is not int or width not in widths:
+            raise ValueError("Unsupported choice capture width")
         backbone = model.model
         if (backbone.start_layer != 0 or backbone.end_layer != 78
                 or len(backbone.layers) != 78):

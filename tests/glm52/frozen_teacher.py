@@ -1,5 +1,6 @@
 """Fixed-input target diagnostics, independent of free-running acceptance."""
 
+from contextlib import nullcontext
 import hashlib
 import json
 
@@ -28,16 +29,52 @@ def load_teacher(path, capture, width, capacity):
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def teacher_run(target, teacher, width, directory, observe):
+def save_routes(parts, collector, teacher, width, initial, directory):
+    """Save actual selections in teacher-input order, outside timed runs."""
+    import torch
+
+    routes = torch.cat(parts, dim=1).transpose(0, 1).contiguous()
+    counts = torch.stack([
+        torch.stack([torch.bincount(layer.flatten().long(), minlength=256)
+                     for layer in block.transpose(0, 1)])
+        for block in routes.split(width)
+    ])
+    path = directory / f"teacher-m{width}-routes.pt"
+    torch.save({
+        "routes": routes, "first_layer": 3, "initial_position": initial,
+        "input_ids": teacher["teacher_tokens"], "width": width,
+        "teacher_sha256": teacher["sha256"],
+        "source_sha256": collector.source_metadata(),
+    }, path)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "shape": list(routes.shape), "first_layer": 3,
+        "active_experts": (counts > 0).sum(-1).tolist(),
+        "max_rows_per_expert": counts.max(-1).values.tolist(),
+    }
+
+
+def teacher_run(target, teacher, width, directory, observe, *,
+                capture_routes=False):
     import torch
 
     tokens = teacher["teacher_tokens"]
     expected = teacher["expected_next_tokens"]
     initial = target.position
     rows, first_difference, first_artifact = [], None, None
+    route_parts, collector = [], None
+    if capture_routes:
+        from tilert.models.glm_5_2_ascend.cann_choices import CannChoices
+
+        collector = CannChoices(target.model, width)
     for begin in range(0, len(tokens), width):
         ids = tuple(tokens[begin:begin + width])
-        result = target.verify(ids, full_logits=True)
+        with collector if capture_routes else nullcontext():
+            result = target.verify(ids, full_logits=True)
+            if capture_routes:
+                _, selected = collector.finish()
+                route_parts.append(torch.stack(selected[3:]).cpu())
         predictions = result.token_ids.tolist()
         observe((begin, ids, predictions, target.position))
         logits = result.logits.detach().float().cpu()
@@ -80,6 +117,9 @@ def teacher_run(target, teacher, width, directory, observe):
     return {
         "width": width, "rows": rows, "first_difference": first_difference,
         "first_difference_file": first_artifact,
+        "routing": (save_routes(route_parts, collector, teacher, width,
+                                initial, directory)
+                    if capture_routes else None),
         "initial_position": initial, "final_position": target.position,
         "passed": first_difference is None and len(rows) == len(tokens)
         and target.position == initial + len(tokens),

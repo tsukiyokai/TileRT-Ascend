@@ -307,7 +307,7 @@ def main():
             result["error"] = f"{type(error).__name__}: {error}"
         checks.append(result)
 
-    for width in (1, 2, 4):
+    for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
         for dtype in (torch.int32, torch.int64):
             record(f"capture.{width}.{dtype}",
                    lambda: check_capture(torch, width, dtype))

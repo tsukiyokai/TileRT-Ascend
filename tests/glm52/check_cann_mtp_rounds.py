@@ -416,6 +416,47 @@ def check_teacher(directory, torch):
     rejects(lambda: runner.teacher_run(WrongLogitsTarget(False), loaded, 32,
                                        directory, lambda value: None))
 
+    from check_cann_choices import Model
+
+    class RoutedTarget(Target):
+        def __init__(self, width, shared):
+            super().__init__(True)
+            self.model = Model(width, torch.int32)
+            if shared:
+                ids = torch.arange(8).repeat(width, 1)
+                for expert in self.model.experts:
+                    expert.result = (object(), ids)
+
+        def verify(self, ids, full_logits):
+            self.model.forward()
+            return super().verify(ids, full_logits)
+
+    for width, shared in ((1, False), (8, False), (32, False), (32, True)):
+        target = RoutedTarget(width, shared)
+        report = runner.teacher_run(target, loaded, width, directory,
+                                    lambda value: None, capture_routes=True)
+        artifact = report["routing"]
+        saved = torch.load(artifact["path"], weights_only=True)
+        require(saved["routes"].shape == (32, 75, 8)
+                and saved["input_ids"] == loaded["teacher_tokens"]
+                and saved["teacher_sha256"] == loaded["sha256"],
+                "route rows bind actual teacher inputs and 75 MoE layers")
+        expected = torch.arange(8)[None, None, :].expand(32, 75, 8)
+        if not shared:
+            expected = (expected
+                        + (torch.arange(32) % width)[:, None, None] * 8
+                        + torch.arange(3, 78)[None, :, None]) % 256
+        require(torch.equal(saved["routes"], expected),
+                "route axes preserve input, layer and top-k order")
+        expected_active = [[8 if shared else width * 8] * 75] * (32 // width)
+        expected_max = [[width if shared else 1] * 75] * (32 // width)
+        require(artifact["sha256"] == runner.digest(Path(artifact["path"]))
+                and artifact["active_experts"] == expected_active
+                and artifact["max_rows_per_expert"] == expected_max,
+                "counts distinguish shared and dispersed experts")
+        require(not report["passed"] and report["first_difference"] == 1,
+                "route diagnostics do not change the teacher label gate")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -470,7 +511,9 @@ def main():
               *[Path(__file__).with_name(name) for name in (
                   "check_mtp_round.py", "run_cann_model.py",
                   "run_native_decode.py", "prefix_io.py", "frozen_teacher.py",
+                  "check_cann_choices.py",
               )],
+              ROOT / "tilert/models/glm_5_2_ascend/cann_choices.py",
               ROOT / "tilert/models/glm_5_2_ascend/mtp_round.py",
               ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py",
               ROOT / "tilert/pd_vllm/ascend_layout.py",

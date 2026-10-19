@@ -59,6 +59,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--capture-case", type=Path, required=True)
     parser.add_argument("--teacher", type=Path,
                         help="32 frozen teacher inputs and successor labels")
+    parser.add_argument("--teacher-routes", action="store_true",
+                        help="Save expert IDs during eager teacher checks")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--width", type=int,
@@ -110,6 +112,8 @@ def parse_arguments(argv=None):
         parser.error("--super-kernel requires --compile-target")
     if args.teacher and args.compile_target:
         parser.error("Teacher M1 comparison requires an uncompiled target")
+    if args.teacher_routes and not args.teacher:
+        parser.error("--teacher-routes requires --teacher")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0, 1]")
     return args
@@ -415,7 +419,10 @@ def execute(args):
             for width in (1, args.width):
                 prepare_phase(target, draft, main_prefix, mtp_prefix,
                               "teacher")
-                result = teacher_run(target, teacher, width, directory, agree)
+                result = teacher_run(
+                    target, teacher, width, directory, agree,
+                    capture_routes=args.teacher_routes,
+                )
                 prefix_checks = []
                 check_prefix(target, main_prefix, prefix_checks, "main")
                 check_prefix(SimpleNamespace(cache=[draft.cache]), [mtp_prefix],
