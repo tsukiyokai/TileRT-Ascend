@@ -1,7 +1,7 @@
 """Fixed-width graph for GLM-5.2's MTP draft layer and its own head."""
 
 
-WIDTHS = (1, 4, 8)
+WIDTHS = (1, 4, 8, 12, 16)
 
 
 class CannMtpGraph:
