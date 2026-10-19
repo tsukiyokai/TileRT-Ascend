@@ -109,7 +109,15 @@ per token (`service_cube_mla.h:681/940`), which at 1 would be 16384 single-row
 strided descriptors a row — which is why `tiling.cpp:282` routes `≤ 4` to V.
 Above 4 each descriptor carries that many contiguous slots.
 
-**Three quarters of the die is idle.** Eight of 24 cube cores and 16 of 48
+**Three quarters of the die is idle, and split-KV is dead code.**
+`sparse_flash_attention_tiling.cpp:349` declares `bool splitKVFlag_ = false;`
+and no line in the file ever sets it true — it is read at `:316`, `:385` and
+`:416` and written nowhere. So the mechanism that would spread 2048 KV
+positions across cores is not an unmet condition but an unfinished path in
+this fork, and `:316` additionally excludes TND even if the flag were set.
+Opening it means implementing it, not configuring it.
+
+Eight of 24 cube cores and 16 of 48
 vector cores do the whole call, and no compiled tiling key changes that for a
 shape with eight query tokens: splitting KV across cores needs `FLASH_DECODE`,
 which no key enables.
