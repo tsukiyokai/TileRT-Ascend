@@ -1373,3 +1373,11 @@ against what its control would have cost.
   Stop after three and say the number is still missing;
   shmem/fused_proj_reduce_kernel.cpp has carried the same unrun pattern since
   it was written.
+- A number derived by division cannot then explain its own numerator, and I
+  built a board on one. 19.30 microseconds a kernel was 36.02 milliseconds
+  divided by 1867 kernels; used as a unit price it made every fusion look four
+  to twenty times more valuable than it is. Compounding it, the table
+  multiplied capture-wide counts by that price instead of per-verify counts.
+  Folding the Cast pairs went from a published 18.53 milliseconds to a
+  measured 0.93. The right accounting was available the whole time, in the same
+  file: each operator's own p10 against the floor of its kind.

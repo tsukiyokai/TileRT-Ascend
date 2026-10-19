@@ -1,3 +1,40 @@
+# Withdrawn: the 19.30 µs figure was circular and the re-pricing it produced was wrong by up to 20×
+
+## The error
+
+19.30 µs a kernel is 36.02 ms divided by 1867 kernels, so it was derived from
+the quantity it was then used to explain. And the table below multiplied it by
+capture-wide counts rather than per-verify counts, compounding the error.
+
+What each operator actually costs is measured directly in
+`kernel_details.csv`, and `tests/glm52/kernel_accounting.py` reports it:
+
+| | the table below | measured |
+|---|---|---|
+| fold the Cast pairs | 18.53 ms | **0.93** |
+| fold every Cast | 9.32 | **1.88** |
+| MegaMoE's MoE block | 5.89 | **2.92** (routing + quant + add; the matmuls stay) |
+| attention's small operators | 3.71 | **0.70** |
+
+The Cast figure was 20× too large. It had been the second item on the queue and
+is now a small one.
+
+## What survives
+
+The launch measurement itself, which was independent: four bodies of one loop
+cost 0.014 to 0.699 µs an iteration and 17.45 to 31.06 for a single launch, so
+a bare launch is 20–30 µs regardless of what the kernel does. That bounds a
+kernel's cost from above when it is not replayed, and it is why a replayed
+kernel's cost sits below it.
+
+What does not survive is the inference from one number to a whole board. The
+correct accounting is per operator, from its own measured p10 against the floor
+of its kind.
+[the floors](../mix-structure-20261019/README.md)
+[the split](../verify-split-final-20261019/README.md)
+
+---
+
 # A replayed kernel costs 19.30 µs, so the fixed cost is the kernel count
 
 `tests/glm52/handoff/floor_kernel.cpp`, one die, vector only. Four bodies of
