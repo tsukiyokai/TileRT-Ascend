@@ -21,6 +21,48 @@ when there is one split. One cause, three symptoms.
 [round accounting](evidence/ascend-decode/round-accounting-20261018/README.md),
 [weight floor](evidence/ascend-decode/weight-floor-recount-20261018/README.md)
 
+## Correction: the budget is 9.01 ms, and one pair fits
+
+Width 8's acceptance is 4.507, measured over 681 rounds and reproducible from
+any one of them, so 2 ms a token is a 9.01 ms round and not the 6.866 above.
+Against 9.01 the sentence "any two exceed the budget" is false:
+
+| pair | ms | |
+|---|---|---|
+| weight stream (optimistic) + reductions | 7.59 | fits, 1.43 to spare |
+| weight stream (pessimistic) + reductions | 9.57 | does not |
+| reductions + host launch | 9.56 | does not |
+| weight stream (optimistic) + host launch | 9.75 | does not |
+
+Every pair containing the host launch path fails and the pair without it
+fits, which is a more directive claim than the one it replaces: that term is
+the one that has to reach zero, and the other two then fit if the weight
+stream lands at its optimistic end.
+[acceptance curve](evidence/ascend-decode/accept-curve-20261019/README.md)
+
+## Correction: the host path is not a consequence of the launch count
+
+"The host path exists because the round is 2,416 separately launched pieces"
+is the link that makes the three symptoms one cause, and it has been tested.
+`hoist-20261019` removed 222 of 313 launches a round — 71% — and moved TPOT
+by **−0.14%**. Launch count is not the variable.
+
+What the host path is instead: measured against the hooked phases, 5.53 ms a
+round of wall the device is not computing in, 3.55 of it in the chain and
+1.98 in the verify glue. A forward's copy of its own sequence length comes
+from pageable host memory, which has to stage, and the runtime drains the
+stream to stage it — so each forward pays for every kernel already enqueued,
+and a round enqueues all nine before it reads anything. Measured on one die:
+139 µs behind one draft graph, 1141 behind the target graph, against 48 to 71
+from pinned memory.
+
+That is reducible without touching the launch structure, which means the host
+term may not require this skeleton at all. The megakernel's case now rests on
+the weight stream and the reductions — where the pair above fits only at the
+optimistic end — and not on a host path it cannot fix anyway.
+[phase attribution](evidence/ascend-decode/phase-attribution-20261019/README.md),
+[pageable staging](evidence/ascend-decode/metadata-h2d-20261019/README.md)
+
 ## What the vendor's own megakernel does
 
 `examples/shmem_mega_moe` in the CANN SHMEM tree is 4,896 lines and fuses
