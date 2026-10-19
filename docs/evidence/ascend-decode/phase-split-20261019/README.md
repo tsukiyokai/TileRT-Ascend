@@ -1,3 +1,34 @@
+# Corrected: the hook measured dispatch, and the model forward is 43 ms
+
+## The arithmetic settles what the hook could not
+
+The verify's 2.196 ms is **below its own weight-read floor**. A round reads
+5.985 GB a rank, which is 3.886 ms at the die's measured marginal rate, and
+the verify reads nearly all of it — the six chain steps are one MTP layer
+each. A forward cannot complete in less time than it takes to read the weights
+it uses, so 2.196 is dispatch and nothing else, by a factor of 1.77.
+
+Which makes the conditioned pass's 42.877 ms the device work it blocks on, not
+its own cost. The round then decomposes as 42.9 model + 5.7 chain + about 4
+commit = 52.5 against a p10 of 55.33.
+
+**So the model forward runs at 11.0× its weight floor**, which is the same
+10.4× the budget arithmetic gives for non-weight work, reached independently.
+
+This reverses the conclusion below, written an hour earlier, that the verify
+is not the problem and that plans aimed at the model forward were aimed at 4%
+of the round. They were aimed at 78% of it. The megakernel argument stands.
+
+The A/B that would have shown this — capturing the conditioned pass so it
+cannot be eager — is running, and on this reading it will move the round
+barely at all. Its first attempt measured nothing: the graph was captured at
+the verify width and still never replayed, because `_graph` carried a second
+hardcoded 4.
+
+What follows was written before this correction.
+
+---
+
 # The full-model verify dispatches in 2.2 ms; one draft forward takes 42.9
 
 Measured with `tests/glm52/phasehook`, a post-import hook, on the
