@@ -370,7 +370,6 @@ class CannModel:
         self.graph = None
         self._hoisted = {}
         self._input_buffers = {}
-        self._offsets = {}
         for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
             tokens = torch.empty(width, dtype=torch.int32, device=self.device)
             positions = torch.empty(
@@ -380,9 +379,6 @@ class CannModel:
             query_cpu = torch.tensor([0, width], dtype=torch.int32)
             self._input_buffers[width] = (
                 tokens, positions, slots, query_cpu, query_cpu.to(self.device),
-            )
-            self._offsets[width] = torch.arange(
-                width, dtype=torch.int32, device=self.device,
             )
         (self.input_ids, self.positions, self.slots,
          self.query_cpu, self.query) = self._input_buffers[1]
@@ -425,9 +421,17 @@ class CannModel:
         (self.input_ids, self.positions, self.slots,
          self.query_cpu, self.query) = self._input_buffers[width]
         length_cpu = torch.tensor([self.position + width], dtype=torch.int32)
+        computed_cpu = torch.tensor([self.position], dtype=torch.int32)
+        positions_cpu = torch.arange(
+            self.position, self.position + width, dtype=torch.long,
+        )
         self.seq_lens.copy_(length_cpu)
-        torch.add(self.seq_lens - width, self._offsets[width], out=self.slots)
-        self.positions.copy_(self.slots)
+        if width == 1:
+            self.slots.fill_(self.position)
+            self.positions.fill_(self.position)
+        else:
+            self.slots.copy_(positions_cpu)
+            self.positions.copy_(positions_cpu)
         hoisted = self._hoisted.get(width) if graphed else None
         if hoisted is not None:
             metadata, values, _ = hoisted
@@ -435,10 +439,6 @@ class CannModel:
                 value.max_seq_len = self.position + width
                 value.seq_lens_cpu = length_cpu
             return metadata
-        computed_cpu = torch.tensor([self.position], dtype=torch.int32)
-        positions_cpu = torch.arange(
-            self.position, self.position + width, dtype=torch.long,
-        )
         state = (AscendAttentionState.DecodeOnly if width == 1
                  else AscendAttentionState.ChunkedPrefill)
         common = AscendCommonAttentionMetadata(
