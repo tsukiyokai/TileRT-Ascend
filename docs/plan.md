@@ -74,6 +74,26 @@ gmm1 89.809 µs 对 32.68 地板(8 行只触及 256 个专家里的 64,活 48 Mi
 
 而 verify(Model ID 48)里一个集合通信都没有——它的 TP 归约融进了 MC2。所以单边归约按「每轮 157 次归约」定的价是数在了另一侧;它替换 `_all_reduce_out_place`,碰不到承载尾巴的 all-gather。它仍是板上唯一消除屏障而非加速屏障的机制,而到达参差只认这一种。
 
+## 到 9 ms 需要什么(2026-10-19 算)
+
+每轮现在 53.05 ms、接受率 4.507、TPOT 11.7715。9 ms 要求每轮 40.56,即砍掉 12.49 ms。
+
+一轮的组成,全部实测:verify 39.68、chain 10.27(6 × 1.712)、conditioned 2.08、host_tokens 0.26、提交与残差 0.76。
+
+手上有价签的三项合 5.51 ms,做完 TPOT 10.55:
+
+| 每轮 | 做法 |
+|---|---|
+| 1.88 ms | 484 个 Cast 全部折进邻居 |
+| 2.92 | MegaMoE 消掉 MoE 块的 routing / quant / add(两个 grouped matmul 留着) |
+| 0.70 | attention 的小算子折进去(bmm、prolog 的 epilogue) |
+
+缺的 6.98 ms 只能从三个大项出,它们合 14.96:`SparseFlashAttention` 5.57(64 × 87.01 µs)、gmm1 5.37(62 × 86.95)、gmm2 4.02(62 × 65.15)。
+
+而三者里只有 SFA 有明确余量:它的 87 µs 里行数、字节、结构、算术四项已被逐个测量排除。gmm1/gmm2 扣掉结构后只有 2.20 与 3.51 倍字节,已近其应有价钱。[SFA 未解](evidence/ascend-decode/sfa-unexplained-20261019/README.md)
+
+★ 价签全部按各算子自己实测的 p10 对其形态地板算。此前用 19.30 µs/kernel 那张表作废——那个数是 36.02÷1867,循环,而且乘的是整次 capture 的计数而非每次 verify 的,最多错 20 倍。[作废](evidence/ascend-decode/kernel-floor-20261019/README.md)
+
 ## 队列:等整机的三件,按价排
 
 一,Cast 搬迁。480 对 bf16↔fp32 的转换,960 个 kernel,**18.5 ms 一次 verify**。不是删(删会撤掉 `b377291` 那个正确性修复),是把加宽并进上游 epilogue、收窄并进下游 prologue。两个入口都经过我们的覆盖(`parallel_state.py:740` 与 `:196` 都落到 `_all_reduce_out_place`),所以位置是我们能选的。验证只需 token 流不变。[Cast](evidence/ascend-decode/cast-sites-20261019/README.md)
