@@ -1,7 +1,7 @@
 # The bitter lesson
 
-167 entries below, each with the measurement that produced it. They fall into
-six shapes, and naming the shape is faster than remembering the instance.
+189 entries below, each with the measurement that produced it. They fall into
+seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
 read at a time is a launch latency. An eager event pair can read the host. A
@@ -31,6 +31,15 @@ yourself is not a code defect, and the fix for it can break what worked.
 **Correct-looking output from incorrect computation.** Bit-reproducible tokens
 can come from margins absorbing a corrupted operator rather than from right
 arithmetic. A release gate that compares tokens cannot see it.
+
+**The build and the environment as hidden variables.** A package cache keyed
+on operator parameters and an option string, omitting the vendor path and the
+header contents, installs a package another tree built — and only at the
+capture size, which reads as a width-dependent race in the kernel. When an
+ablation's own switch is in that key, the ablation cannot be run. The
+activation script unsets the variables you set before it, and leaves another
+checkout of this project ahead of yours on the import path. Read back what the
+arm actually loaded, from the arm's own record.
 
 The working rule, in one line: **where a control is available, do not reason.**
 [workflow.md](workflow.md) carries that as a table of what each error cost
