@@ -37,6 +37,7 @@ class MtpRoundExecutor:
 
     def __init__(
         self, target, draft, width=4, max_new_tokens=1024, eos_tokens=(),
+        drafter=None,
     ):
         if width not in (2, 4, 6, 8, 12, 16, 24, 32):
             raise ValueError("MTP rounds require width 2, 4, 8 or 16")
@@ -44,6 +45,10 @@ class MtpRoundExecutor:
             raise ValueError("Main and MTP cache capacities must match")
         self.target = target
         self.draft = draft
+        # A host drafter replaces the MTP engine outright: no chain, no
+        # conditioned pass, and the MTP cache is never written, so nothing may
+        # read it while one is installed.
+        self.drafter = drafter
         self.state = MtpState(
             width, target.capacity, max_new_tokens, eos_tokens
         )
@@ -83,8 +88,11 @@ class MtpRoundExecutor:
         """
         if self.failed:
             raise RuntimeError("Inject fresh prefixes after a failed round")
-        if (self.target.position != self.state.main_length
-                or self.draft.position != self.state.draft_length):
+        if self.target.position != self.state.main_length:
+            raise ValueError("Engine lengths differ from the MTP state")
+        if self.drafter is not None:
+            return self._advance_drafted(self.state.begin())
+        if self.draft.position != self.state.draft_length:
             raise ValueError("Engine lengths differ from the MTP state")
         plan = self.state.begin()
         try:
@@ -121,6 +129,30 @@ class MtpRoundExecutor:
             self.draft.truncate(commit.draft.retained)
             self.seed = self._seed(conditioned, commit.committed - 1)
             self.seed_parent_hidden = None
+            return ExecutedRound(proposals, predictions, commit)
+        except Exception:
+            self.failed = True
+            raise
+
+    def _advance_drafted(self, plan):
+        """One round whose candidates come from the host, not the MTP engine.
+
+        The round is a verify and a host read. A proposal shorter than the
+        width is padded with the pending token, which is safe rather than
+        lucky: whatever is proposed, what gets committed is the target's own
+        predictions, so a pad that happens to match earns a real token.
+        """
+        try:
+            proposal = self.drafter.propose(plan.width - 1)
+            candidates = [plan.pending_token, *proposal[:plan.width - 1]]
+            candidates += [plan.pending_token] * (plan.width - len(candidates))
+            verified = self.target.verify(candidates, full_logits=False)
+            proposals, predictions = self.target.host_tokens(
+                candidates, verified.token_ids,
+            )
+            commit = self.state.resolve(plan, proposals, predictions)
+            self.target.truncate(commit.main.retained)
+            self.drafter.commit(commit.accepted_tokens)
             return ExecutedRound(proposals, predictions, commit)
         except Exception:
             self.failed = True

@@ -194,9 +194,14 @@ class AscendReceiveBuffer:
 class AscendRankEngine:
     """Bind the receive prefix to the main/MTP caches on one TP rank."""
 
-    def __init__(self, target, draft):
+    def __init__(self, target, draft, lookup_prompt=None):
         self.target = target
         self.draft = draft
+        # The prompt's token ids, when the round is to draft by looking for
+        # where the context repeats rather than by running the MTP engine.
+        # Every rank reads them from its own capture, so they cost no
+        # broadcast.
+        self.lookup_prompt = lookup_prompt
         self._clear_request()
 
     def _clear_request(self):
@@ -245,8 +250,16 @@ class AscendRankEngine:
             raise RuntimeError("MTP must start before any decode operation")
         if type(first_token) is not int or first_token != self.first_token_id:
             raise ValueError("First token differs from the injected prefix")
+        drafter = None
+        if self.lookup_prompt is not None:
+            from tilert.models.glm_5_2_ascend.lookup_draft import (
+                LookupDrafter,
+            )
+
+            drafter = LookupDrafter(self.lookup_prompt)
+            drafter.commit((first_token,))
         rounds = MtpRoundExecutor(
-            self.target, self.draft, width, max_tokens, eos_tokens,
+            self.target, self.draft, width, max_tokens, eos_tokens, drafter,
         )
         rounds.start(first_token, self.parent_hidden)
         if rounds.state.finish_reason is not None:

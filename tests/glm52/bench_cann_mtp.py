@@ -40,8 +40,8 @@ WIDTH = 4
 class MeasuredRank(CannRankEngine):
     """Retain local round states and finish prefix copies before delivery."""
 
-    def __init__(self, target, draft, group):
-        super().__init__(target, draft)
+    def __init__(self, target, draft, group, lookup_prompt=None):
+        super().__init__(target, draft, lookup_prompt)
         self.group = group
         self.requests = []
         self.current = None
@@ -119,6 +119,10 @@ def arguments():
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
+    parser.add_argument("--lookup", action="store_true",
+                        help="draft by finding where the context repeats "
+                             "instead of running the MTP engine; no chain "
+                             "and no conditioned pass")
     parser.add_argument("--index-topk", type=int,
                         help="override the checkpoint's 2048 selected "
                              "positions; sparse attention costs 17.61 us "
@@ -363,7 +367,15 @@ def run(args, report):
         if "float32" not in target.tp_reduction:
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
-        engine = MeasuredRank(target, draft, channel.group)
+        lookup_prompt = None
+        if args.lookup:
+            manifest = json.loads(
+                (Path(args.capture_case) / "manifest.json").read_text()
+            )
+            lookup_prompt = manifest["prompt_token_ids"]
+            report["drafter"] = "lookup"
+            report["lookup_prompt_tokens"] = len(lookup_prompt)
+        engine = MeasuredRank(target, draft, channel.group, lookup_prompt)
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():
             if args.target_graph or args.draft_graph:
