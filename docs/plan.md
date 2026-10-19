@@ -4,24 +4,22 @@
 
 工作方法与今晚的教训见 [workflow.md](workflow.md) 与 [lesson.md](lesson.md)。
 
-## 状态（2026-10-19 11:20）
+## 状态（2026-10-19 12:25）
 
-确定测得的最好点是 **12.6037 ms**（width 8，中位 12.6427，三请求同一轨迹、轮数同为 227）。它吐出的 1024 个 token 与 width 4 逐位相同（`68f2bc184553`），trajectory gate 过。每轮 p10 55.33 ms。
+确定测得的最好点是 11.7715 ms（width 8 + 三份 gmm1 补丁 + 条件图，三请求同一轨迹、轮数同为 227，token 与 width 4 逐位相同 `68f2bc184553`）。每轮最低 p10 52.166 ms。
 
-今天两项落地，各自在轮内配对测得：
+★ 六臂全部 `status=measured`、`agreement=True`、零 rank 错误——这是本项目第一次有运行通过它自己的闸门。此前每次 exit 1 都是一个 rank 报 `KeyError: 'natural_accepted'`（`TimedBackend` 只在 `advance_mtp` 分支记这个字段而我们走 `advance_mtp_n`），而诊断一直写在 `summary.json` 里，这个项目从没读过它。
+
+今天的四项，每项都在轮内配对测过：
 
 | 改动 | 轮内收益 | 判据 |
 |---|---|---|
-| static kernel 缓存 key 修复 + 屏障补丁成对 | width 8 从三条流变一条、13.0657→(基线) | 227/227/227 轮，哈希等于 width 4 的流；[已闭环](evidence/ascend-decode/w4a8-race-closed-20261019/README.md) |
-| 三份 gmm1 kernel 补丁 | **每轮 −1.468 ms ＝ 每 token −0.326** | 同链两臂 p10 56.941→55.473，是 run 间地板 0.201 的 7.3 倍，两臂最近值仍差 1.090；token 流不变；[复测](evidence/ascend-decode/kernelpatch-remeasured-20261019/README.md) |
+| metadata 与 mc2 掩码 hoist（今天之前落） | −0.7967 ms/token | 下发 313→91，191712 项检查零失败 |
+| static kernel 缓存 key + 屏障补丁成对 ⇒ width 8 可用 | 14.5551 → 12.8348，约 −1.72 | 227/227/227 轮、单流、哈希等于 width 4 |
+| 三份 gmm1 kernel 补丁 | 每轮 −1.468 ＝ −0.326 ms/token | p10 56.941→55.473，9.3× 地板，流不变 |
+| 条件前向捕成图 | 每轮 −2.979 ＝ −0.661 ms/token | 三对同号、跨度 0.365、18× 地板，流不变 |
 
-width 8 的非确定性根因不在算子里：屏障补丁 `gmm1-swiglu-barrier.patch` 一直是对的，被 static kernel 的包缓存在被 capture 的那个宽度上整条绕过。缓存 key（`static_kernel.py:1071-1092`）只含算子参数、超核选项串、确定性开关，不含 `ASCEND_CUSTOM_OPP_PATH`、不含编译器真正读的 vendor 头内容，索引落在进程工作目录下。补丁一行加 `disable_static_kernel_compile_cache`，代价是启动时重编而非 decode 时间。两个曾带 file:line 的候选都已排除。
-
-★ 口径纪律两条，都是被自己的实验逼出来的：
-
-一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以那些「干净」的臂只因为都触发了新编译。
-
-二，**逐调用测量不预测整轮，两个方向都失败过**。四补丁那次预测 −0.9 实测 +3.15（而那个对照本身无效）；这三份预测每轮 −0.66 实测 −1.468。所以板上凡从逐调用推出的期望都只是待测项。
+最大的两项不是「优化」而是修两个让已有机制失效的缺陷：前者让一个配置从不可用变可用，后者让一个开关从空操作变生效。两处都是同一个字面量被写死在两个地方（`enable_graph` 捕在 4、`_graph` 选在 4），只改一处会得到「捕在对的宽度上却永不回放」。
 
 ## 主要矛盾：一轮 55 ms 里 84% 是一次 draft 前向
 
