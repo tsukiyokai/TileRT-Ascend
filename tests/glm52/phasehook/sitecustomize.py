@@ -27,14 +27,12 @@ import time
 DRAFT_MODULE = "tilert.models.glm_5_2_ascend.cann_mtp"
 TARGET_MODULE = "tilert.models.glm_5_2_ascend.cann_model"
 
-totals = collections.Counter()
-counts = collections.Counter()
+samples = collections.defaultdict(list)
 verified = [False]
 
 
 def _record(name, begin):
-    totals[name] += time.perf_counter_ns() - begin
-    counts[name] += 1
+    samples[name].append((time.perf_counter_ns() - begin) / 1e6)
 
 
 def _wrap_draft(draft_class):
@@ -73,18 +71,30 @@ def _wrap_target(model_class):
 
 
 def _report():
-    rounds = counts["verify"]
+    """Report each phase's distribution, not its mean.
+
+    A mean over every round mixes the three warmup requests -- which compile
+    and capture -- with the measured ones, and the first version of this hook
+    reported phases summing to 124 ms against a 57 ms round because of it. The
+    tenth percentile is the floor of a phase in steady state and is the
+    quantity the round's own p10 can be compared against.
+    """
+    rounds = len(samples["verify"])
     if not rounds or os.environ.get("RANK", "0") != "0":
         return
     print(f"[phase] {rounds} rounds", file=sys.stderr, flush=True)
-    accounted = 0
-    for name, total in totals.most_common():
-        accounted += total
-        print(f"[phase] {name:12} {total / 1e6 / rounds:8.3f} ms a round  "
-              f"{counts[name] / rounds:5.2f} calls  "
-              f"{total / 1e6 / counts[name]:8.3f} ms a call",
+    floor = 0.0
+    for name in sorted(samples, key=lambda key: -len(samples[key])):
+        values = sorted(samples[name])
+        per_round = len(values) / rounds
+        low = values[len(values) // 10]
+        floor += low * per_round
+        print(f"[phase] {name:12} p10 {low:8.3f}  median "
+              f"{values[len(values) // 2]:8.3f}  p90 "
+              f"{values[9 * len(values) // 10]:8.3f} ms a call  "
+              f"{per_round:5.2f} calls a round",
               file=sys.stderr, flush=True)
-    print(f"[phase] accounted  {accounted / 1e6 / rounds:8.3f} ms a round",
+    print(f"[phase] floor sums to {floor:8.3f} ms a round",
           file=sys.stderr, flush=True)
 
 
