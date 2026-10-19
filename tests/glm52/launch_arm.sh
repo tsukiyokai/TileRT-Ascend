@@ -8,7 +8,7 @@
 #
 #   TAG      names the arm; its own cache root and port range come from it
 #   WIDTH    verify width
-#   TREE     the checkout to run from, because the kernel cache lives under it
+#   TREE     the source checkout
 #   OUT      where the records go
 #   OVERLAY  prepended to ASCEND_CUSTOM_OPP_PATH, which activate.sh resets
 #   remaining arguments go to the bench
@@ -18,8 +18,9 @@
 set -uo pipefail
 tag=${TAG:?}
 width=${WIDTH:?}
-tree=${TREE:?}
-out=${OUT:?}/$tag
+tree=$(realpath "${TREE:?}")
+out_root=$(realpath -m "${OUT:?}")
+out=$out_root/$tag
 overlay=${OVERLAY:-}
 want_gib=${WANT_GIB:-47}
 utilisation=${UTILISATION:-0.78}
@@ -37,7 +38,7 @@ export PYTHONPATH="$tree${PYTHONPATH:+:$PYTHONPATH}"
 # it, the second fails to bind behind the first's TIME_WAIT. And the autograd
 # cache asserts on OutputCode against torch_npu's _CompiledFxGraph twelve
 # minutes in, after the weights have loaded.
-export VLLM_CACHE_ROOT=${OUT:?}/cache-$tag
+export VLLM_CACHE_ROOT=$out_root/cache-$tag
 export HCCL_NPU_SOCKET_PORT_RANGE="${PORT_BASE:?}-$((PORT_BASE + 19))"
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
 
@@ -50,10 +51,11 @@ mkdir -p "$out" "$VLLM_CACHE_ROOT"
 echo "=== $tag width=$width util=$utilisation opp[0]=${ASCEND_CUSTOM_OPP_PATH%%:*} hccl=$HCCL_NPU_SOCKET_PORT_RANGE $* $(date -Is)"
 md5sum "$tree/tilert/models/glm_5_2_ascend/cann_model.py"
 
-cd "$tree"
+# Static kernel packages are cached below cwd, outside VLLM_CACHE_ROOT.
+cd "$out"
 timeout "${ARM_TIMEOUT:-3000}" torchrun --nproc-per-node 16 \
   --master-port $((51000 + RANDOM % 2000)) \
-  tests/glm52/bench_cann_mtp.py \
+  "$tree/tests/glm52/bench_cann_mtp.py" \
   --checkpoint /workspace/models/GLM-5.2-w4a8c8 \
   --capture-case /workspace/offline/prefix8k-allocation-20261017/capture/case-00 \
   --source-commit "$tag" \
