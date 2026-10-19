@@ -1246,3 +1246,15 @@ against what its control would have cost.
   stated in. The round's tenth percentile holds to 0.6 percent across six
   requests in two independent runs; the TPOT medians of these two arms overlap
   and would have read as noise. Same data, opposite conclusions.
+- Stability within a run is not reproducibility between runs, and I spent a
+  conclusion on the difference. A round's tenth percentile holds to 0.6 percent
+  across six requests inside one run, which is why I trusted a three-against-
+  three separation; then the same configuration run later from another
+  directory read a floor 0.201 milliseconds higher, against a patch effect of
+  0.278. Measured against the comparable run the patch was worth 0.077 --
+  nothing. An effect near the between-run floor has to be measured with the
+  arms alternated inside one session, not one arm after the other.
+- Keep a same-configuration arm in every chain. The only reason this was caught
+  within the hour is that the next experiment's control happened to repeat the
+  previous experiment's baseline. Without it the wrong conclusion would have
+  stood, and it was already written down.

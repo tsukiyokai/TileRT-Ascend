@@ -1,3 +1,35 @@
+# Inconclusive: the arms differed by run as much as by patch
+
+## 2026-10-19, corrected the same hour
+
+A third arm in a later chain ran the **same configuration** as the baseline
+here — barrier-only overlay, cache off, width 8 — from a different working
+directory, and read a different floor:
+
+| | p10 of a round | mean |
+|---|---|---|
+| baseline, first chain | 56.757, 56.789, 56.676 | 56.741 |
+| the same configuration, later chain | 57.110, 56.875, 56.839 | 56.941 |
+| with the patch, first chain | 57.033, 56.846, 57.177 | 57.019 |
+
+Two identical configurations differ by **+0.201 ms**. The patch was credited
+with +0.278, so the effect is 1.39× the spread between runs of the same thing,
+and against the configuration that ran under comparable conditions the patch
+is **+0.077** — nothing.
+
+The error was mine and it was specific: a round's p10 holds to 0.6% *within* a
+run, and I treated that as reproducibility *between* runs. It is not. The
+between-run floor for a three-request arm's p10 mean is about 0.2 ms, so an
+effect that size needs the arms alternated within one session rather than run
+one after the other.
+
+So this page's conclusion does not hold. The patch is neither shown to hurt
+nor shown to help, and the revert stands only on the usual default — an
+unproven change earns no place. What follows below was written before that
+third arm existed.
+
+---
+
 # The metadata copies sit next to the idle without causing it
 
 A controlled test of the one piece of the idle attribution that could be
@@ -49,6 +81,11 @@ A `copy_` from a CPU tensor into a device tensor does not synchronise the
 device. It was never a host round trip. The premise assumed it was.
 
 ## What this costs the rest of the attribution
+
+(Written before the correction above, and weakened by it: the test could not
+resolve an effect of this size, so it did not refute anything. The attribution
+remains unsupported because adjacency is not causation, which was true before
+any of this was measured.)
 
 Gap adjacency is not causation, and this is the piece of that ranking a
 controlled experiment could reach. It came back negative: those operators
