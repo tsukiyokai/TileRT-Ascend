@@ -451,7 +451,14 @@ def run(args, report):
                         "HCCL_OP_EXPANSION_MODE", "HCCL_BUFFSIZE",
                         "HCCL_DETERMINISTIC", "TASK_QUEUE_ENABLE",
                         "ASCEND_LAUNCH_BLOCKING", "ASCEND_CUSTOM_OPP_PATH",
-                        "ASCEND_RT_VISIBLE_DEVICES")},
+                        "ASCEND_RT_VISIBLE_DEVICES",
+                        # The launch recipe is not in the command. Leaving the
+                        # autograd cache on fails after the weights have
+                        # loaded, a shared cache root replays another arm's
+                        # compiled graph, and a bound HCCL port range refuses
+                        # the next arm -- three launches each.
+                        "TORCHINDUCTOR_AUTOGRAD_CACHE", "VLLM_CACHE_ROOT",
+                        "HCCL_NPU_SOCKET_PORT_RANGE")},
             )
             if args.cpu_affinity:
                 bind_cpu_threads(rank, target.device, report)

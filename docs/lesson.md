@@ -1,6 +1,6 @@
 # The bitter lesson
 
-195 entries below, each with the measurement that produced it. They fall into
+196 entries below, each with the measurement that produced it. They fall into
 seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
@@ -1436,6 +1436,15 @@ against what its control would have cost.
   and reads null, because `_metadata` creates its three CPU tensors and does
   its three H2D copies above the `hoisted is not None` branch. Check what runs
   before the fast path, not only what the fast path skips.
+- The licensed command does not reproduce the licensed run, because the launch
+  recipe lives in the wrapper and not in the record. Copying the command
+  verbatim cost three launches in a row: `set -u` plus an unguarded
+  `$ZSH_VERSION` in `set_env.sh` exits before anything is created; the default
+  0.85 utilisation wants 52.08 GiB of the 61.27 and a co-tenant left 50.54
+  free; and `TORCHINDUCTOR_AUTOGRAD_CACHE` unset makes AOTAutogradCache assert
+  on `OutputCode` against torch_npu's `_CompiledFxGraph` twelve minutes in,
+  after the weights have loaded. None of the three was in `runtime_env`, so
+  they are there now.
 - A control refutes the patch, not every claim in the rationale. Deriving a
   forward's positions on the device lost 0.278 milliseconds a round with
   complete three-against-three separation, and the revert concluded that a
