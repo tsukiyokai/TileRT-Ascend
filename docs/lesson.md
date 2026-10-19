@@ -1335,3 +1335,16 @@ against what its control would have cost.
   HBM contention produces the same signature -- balanced compute, unbalanced
   waiting. The attribution needs an idle host before it is more than a
   hypothesis, and the plan now says so where the finding is stated.
+- An operator's work and an operator's cost are different quantities, and I
+  removed the second largest prize from the board by confusing them. Device-side
+  Cast costs 2.86 microseconds a span, which is its work; as 483 separate
+  kernels a verify at a measured 19.30 microseconds a launch it carries 9.32
+  milliseconds, which is its cost. The same error priced MegaMoE's fusion at
+  0.78 milliseconds using a 1.2 microsecond dispatch floor plus a GM round
+  trip -- the cost of the boundary rather than of the kernel, 7.5 times low.
+- Measure the launch before arguing about fusion. Four bodies of one loop, from
+  empty to read-compute-write, cost 0.014 to 0.699 microseconds an iteration
+  and 17.45 to 31.06 for a single launch -- so the launch is 20 to 30
+  microseconds and does not depend on what the kernel does. That one number
+  turns "a megakernel would be faster" into "1867 kernels must become 207",
+  and it was one die and twenty minutes.
