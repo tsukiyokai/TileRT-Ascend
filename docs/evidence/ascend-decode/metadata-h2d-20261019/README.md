@@ -1,0 +1,67 @@
+# The chain does not pipeline, because one copy a step drains the queue
+
+`phase-attribution-20261019` found 5.53 ms a round of wall the device is not
+computing in, and ruled out launch count. This is the mechanism.
+
+## One pageable copy costs what is queued behind it
+
+`tests/glm52/bench_metadata_h2d.py`, one die of a3-187, 300 repeats, the exact
+copies `CannModel._metadata` makes. The queue depths are the real ones: 73
+kernels is one draft graph, 365 is five of them, 2489 is the target graph.
+
+| queue depth | width | pageable | pinned | removed |
+|---|---|---|---|---|
+| 0 | 1 | 108.17 | 42.39 | 65.8 |
+| 73 | 1 | 139.36 | 47.79 | 91.6 |
+| 365 | 1 | 345.88 | 50.66 | 295.2 |
+| 2489 | 1 | 1141.18 | 71.18 | 1070.0 |
+| 0 | 8 | 87.85 | 34.40 | 53.5 |
+| 73 | 8 | 158.77 | 40.86 | 117.9 |
+| 365 | 8 | 269.35 | 43.53 | 225.8 |
+| 2489 | 8 | 2936.31 | 64.29 | 2872.0 |
+
+Median host microseconds, [bench.json](bench.json). **Pageable scales with
+the queue; pinned does not.** A copy from pageable host memory has to stage,
+and the runtime drains the stream to do it, so the caller pays for every
+kernel already enqueued. Pinned memory is addressable by the engine, so
+`non_blocking=True` is actually non-blocking: 34 to 71 µs across a 2489-fold
+range of queue depth.
+
+## Why it lands on the chain and not elsewhere
+
+A round deliberately issues every device call before reading anything — that
+is `MtpRoundExecutor.advance`'s whole design, and `host_tokens` is its only
+synchronisation. So the queue is deep by construction, and each forward's
+copy pays for the forwards before it. In the chain that compounds: step *k*'s
+copy drains steps 1 through *k-1*, so no draft step is ever enqueued while
+another runs. The chain's wall is 10.27 ms against 6.72 of device compute,
+and the 3.55 ms difference is this.
+
+Summing the measured curve over the chain's own depths — step *k* sees about
+73*k* queued — gives 1.6 ms of drain against 0.3 ms pinned. The rest of the
+3.55 is the pipelining those drains prevent, which the bench cannot show and
+the round will.
+
+The target's own copy, at width 8 behind the chain's 438 kernels, is about
+270 µs against 44. The conditioned draft's copy sits behind the target's
+whole forward and blocks for it — but the host was going to wait at
+`host_tokens` anyway, and the conditioned pass depends on the target's
+output, so nothing is lost there.
+
+## The fix, and why the hoist could not have found it
+
+`_metadata` now writes persistent pinned buffers in place, one per
+destination dtype, instead of allocating three host tensors a call. The
+device copies become `non_blocking=True`.
+
+This is also why `hoist-20261019` read null at 313 → 91 launches and −0.14%
+TPOT: the three allocations and copies sit **above** the `hoisted is not None`
+early return, so the hoist removed the attention-metadata builder and kept
+the entire cost. Launch count was never the variable.
+
+## Prediction, to be judged on the round
+
+3.5 to 3.9 ms a round, 0.6 to 0.9 ms of TPOT at acceptance 4.507. Per-call
+figures have failed to predict rounds in both directions on this project, so
+this is a prediction and not a result until a paired alternating chain says
+otherwise.
