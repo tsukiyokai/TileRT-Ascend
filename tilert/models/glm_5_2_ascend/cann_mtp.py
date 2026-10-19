@@ -246,11 +246,14 @@ class CannMtp:
         self.position = length
         self.model.model.set_skip_topk(False)
 
-    def enable_graph(self, *, conditioned=False):
+    def enable_graph(self, *, conditioned_width=0):
         """Capture shared-index M1 chains after uncaptured TP warmup.
 
-        ``conditioned`` also captures the M4 target-conditioned pass, which
-        selects its own index set instead of replaying a shared one.
+        A positive ``conditioned_width`` also captures the target-conditioned
+        pass, which selects its own index set instead of replaying a shared
+        one. It must be the verify width: the pass carries one row per
+        verified token, so a graph captured at any other width is never
+        replayed.
         """
         import torch
         from .cann_mtp_graph import CannMtpGraph
@@ -258,8 +261,8 @@ class CannMtp:
         with torch.npu.device(self.device):
             if self.graph is None:
                 self.graph = CannMtpGraph(self, 1)
-            if conditioned and self.conditioned_graph is None:
-                self.conditioned_graph = CannMtpGraph(self, 4)
+            if conditioned_width and self.conditioned_graph is None:
+                self.conditioned_graph = CannMtpGraph(self, conditioned_width)
 
     def close(self):
         """Release the draft graphs before shutting down the target worker."""

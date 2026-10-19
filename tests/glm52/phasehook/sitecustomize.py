@@ -76,15 +76,16 @@ def _report():
     rounds = counts["verify"]
     if not rounds or os.environ.get("RANK", "0") != "0":
         return
-    print(f"[phase] {rounds} rounds", flush=True)
+    print(f"[phase] {rounds} rounds", file=sys.stderr, flush=True)
     accounted = 0
     for name, total in totals.most_common():
         accounted += total
         print(f"[phase] {name:12} {total / 1e6 / rounds:8.3f} ms a round  "
               f"{counts[name] / rounds:5.2f} calls  "
-              f"{total / 1e6 / counts[name]:8.3f} ms a call", flush=True)
+              f"{total / 1e6 / counts[name]:8.3f} ms a call",
+              file=sys.stderr, flush=True)
     print(f"[phase] accounted  {accounted / 1e6 / rounds:8.3f} ms a round",
-          flush=True)
+          file=sys.stderr, flush=True)
 
 
 def _install_when_ready():
@@ -108,7 +109,7 @@ def _install_when_ready():
             _wrap_target(target.CannModel)
         if not any(pending.values()):
             builtins.__import__ = original_import
-            print("[phase] hook installed", flush=True)
+            print("[phase] hook installed", file=sys.stderr, flush=True)
         return module
 
     builtins.__import__ = patched
@@ -131,7 +132,7 @@ def _chain_other_hooks():
         spec = importlib.util.spec_from_file_location("_chained_hook", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        print(f"[phase] chained {path}", flush=True)
+        print(f"[phase] chained {path}", file=sys.stderr, flush=True)
 
 
 if os.environ.get("PHASE_HOOK", "on") != "off":

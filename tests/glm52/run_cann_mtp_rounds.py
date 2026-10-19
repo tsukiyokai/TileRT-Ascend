@@ -414,7 +414,9 @@ def execute(args):
                 if args.target_graph:
                     target.enable_graph(width=args.width)
                 if args.draft_graph:
-                    draft.enable_graph(conditioned=args.conditioned_graph)
+                    draft.enable_graph(
+                        conditioned_width=(args.width
+                                           if args.conditioned_graph else 0))
             parent = saved_parent.to(target.device)
             predicted = token_ids(target.predict(parent))[0]
             agree((predicted, target.position, draft.position))

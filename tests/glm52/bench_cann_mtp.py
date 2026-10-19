@@ -421,7 +421,9 @@ def run(args, report):
                 if args.target_graph:
                     target.enable_graph(width=args.width)
                 if args.draft_graph:
-                    draft.enable_graph(conditioned=args.conditioned_graph)
+                    draft.enable_graph(
+                        conditioned_width=(args.width
+                                           if args.conditioned_graph else 0))
             sources = source_hashes(target, draft)
             for name in ("mtp_session.py", "tp_runtime.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
