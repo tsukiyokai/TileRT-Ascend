@@ -97,15 +97,13 @@ def parse_arguments(argv=None):
     if (args.target_graph or args.draft_graph) and args.max_tokens < 2:
         parser.error("Graph comparison requires a decode round")
     if args.draft_graph and args.width == 2:
-        parser.error("--draft-graph requires --width 4, 8 or 16")
+        parser.error("--draft-graph requires a width the graph can capture")
     if args.conditioned_graph and not args.draft_graph:
         parser.error("--conditioned-graph requires --draft-graph")
-    if args.compile_target and (not args.target_graph or args.width != 4):
-        parser.error("--compile-target requires --target-graph --width 4")
+    if args.compile_target and not args.target_graph:
+        parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
         parser.error("--super-kernel requires --compile-target")
-    if args.profile_output and args.width != 4:
-        parser.error("The bounded MTP capture requires width four")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0, 1]")
     return args
@@ -583,7 +581,7 @@ def execute(args):
         prefix = FullRankPrefix(main_prefix, mtp_prefix,
                                 saved_parent.to(target.device), initial)
         capture_validated_mtp(target, draft, prefix, first, rank,
-                              args.profile_output,
+                              args.profile_output, args.width,
                               with_stack=args.profile_stacks)
         atomic_json(args.output / f"profile-binding-rank-{rank}.json", {
             "validation_summary_sha256": digest(args.output / "summary.json"),

@@ -119,11 +119,15 @@ def capture_validated_model(engine, prefixes, first_token, rank,
 
 
 def capture_validated_mtp(target, draft, prefix, first_token, rank,
-                          directory, *, with_stack=False):
-    """Profile the accepted M4 objects and their existing target graph.
+                          directory, width, *, with_stack=False):
+    """Profile the accepted objects and their existing target graph.
 
     Six outputs require at most five rounds. The frozen 8K input uses
     three; the receipt records the actual count and stage markers.
+
+    ``width`` is the verify width under test. It used to be a literal 4 here
+    and in the precondition, which made the capture refuse any other width --
+    and the width that now holds the best point is 8.
     """
     import torch
     import torch.distributed as distributed
@@ -134,8 +138,8 @@ def capture_validated_mtp(target, draft, prefix, first_token, rank,
     if (prefix.seq_len != 8192 or target.capacity < 8200
             or distributed.get_rank() != rank
             or distributed.get_world_size() != 16
-            or (target.graph is not None and target.graph.width != 4)):
-        raise ValueError("M4 capture requires TP16, full 8K and M4 capacity")
+            or (target.graph is not None and target.graph.width != width)):
+        raise ValueError("Capture requires TP16, full 8K and the tested width")
     identity = profiler_identity(torch_npu)
     directory = Path(directory)
     raw = directory / f"raw-rank-{rank}"
@@ -145,7 +149,7 @@ def capture_validated_mtp(target, draft, prefix, first_token, rank,
                                engine_class=CannRankEngine)
     channel = TorchControlChannel(get_world_group().cpu_group)
     phase_args = (engine, rank, channel, lambda request, rank: prefix,
-                  PrefixRequest("capture-mtp", 8192), 4, 6, markers)
+                  PrefixRequest("capture-mtp", 8192), width, 6, markers)
 
     def barrier():
         distributed.barrier(group=channel.group)
