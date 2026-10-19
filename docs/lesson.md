@@ -1206,3 +1206,20 @@ against what its control would have cost.
   Expert parallelism gave a stable token stream for weeks and it was a
   different stream from width 4's throughout; the arm that is both stable and
   correct appeared only once the real defect was fixed.
+- Three launches died to this machine's environment before one ran, and each
+  failure looked like a result. `activate.sh` unsets PYTHONPATH and exports the
+  vendor search path whose first entry is the barrier-patched overlay, so
+  anything set before it is discarded -- the first attempt therefore ran the
+  unpatched in-tree object and read three different token streams from what it
+  called its baseline, which would have been a publishable-looking finding.
+  `set_env.sh` reads `$ZSH_VERSION` unguarded, so sourcing it under `set -u`
+  exits instantly and both arms finish in zero seconds with no record. And
+  `activate.sh` leaves another checkout of this project on PYTHONPATH, which
+  wins `import tilert` even with the tree under test ahead of it on the path --
+  passing a script path from your own tree does not make Python import your own
+  tree. Running from inside it does.
+- A chain that patches between arms must assert the tree's state before each
+  arm, or a rerun measures the patch twice and calls one of them a baseline.
+  And it must clear an arm's output directory before any check that can exit
+  early, or a stale record from the previous attempt satisfies the "did this
+  arm produce anything" test. Both bugs were in the same forty-line script.
