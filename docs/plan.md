@@ -12,7 +12,7 @@ width 8 的非确定性已闭环，而根因不在算子里：屏障补丁 `gmm1
 
 ★ 两条口径纪律，都是被自己的实验逼出来的：
 
-一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以 `debug-dcci-all`、`debug-sync-all`、`early-start`、各种 blacklist 臂「干净」只因为它们都触发了新编译。它们不构成证据。此前那条「四份补丁合装 +3.15 ms/token」同样被「是否恰好新编」混淆，需要重测。
+一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以 `debug-dcci-all`、`debug-sync-all`、`early-start`、各种 blacklist 臂「干净」只因为它们都触发了新编译。它们不构成证据。此前那条「四份补丁合装 +3.15 ms/token」的混淆更具体:两臂「one tree」共享 static kernel 的缓存索引（它落在工作目录里，分开的只有 `VLLM_CACHE_ROOT`），而 key 不含 vendor，所以后跑的那臂装的是先跑那臂编出的包——在被 capture 的宽度上两臂跑的是同一套静态核，与各自的 overlay 无关。所以那个数不能归因于补丁在被捕获宽度上的作用；哪一臂先跑、因而两臂用的是谁的源，记录里没有。正在重测。[回归](evidence/ascend-decode/patch-regression-20261019/README.md)
 
 二，**逐算子时间相加不是占用率**。那会把并发轨重复计数，早先 35 ms 开销就是这么来的。并集口径下设备在稳态里忙 60.7%、空 39.3%，而空闲全在 ≥100 µs 的坑里（172 个合 97.194 ms），<10 µs 的缝只有 0.479 ms——所以在这个粒度上 decode 不是下发速率受限。[空闲](evidence/ascend-decode/device-idle-20261019/README.md)
 
