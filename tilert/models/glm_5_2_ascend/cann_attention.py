@@ -1,12 +1,9 @@
 """CANN gather/FIA for batch one with a contiguous BF16 MLA cache.
 
-The caller supplies 2048 valid causal indices per query. Logical token
-positions equal physical cache rows; selection already enforces causality --
-but only up to width 6. At width 8 and beyond an early row sees rows written
-later in the same verify, because the call passes sparse_mode 0 with
-actual_seq_kvlen uniformly 2048 and so applies no mask at all. Measured: the
-output diverges from serial decoding at token 4 with 941 bit-wise KV checks
-failing, while the first round is clean because its tail was zeroed.
+The caller must supply 2048 valid causal indices per query, with logical
+token positions equal to physical cache rows. FIA applies no additional mask.
+Widths above six remain disabled after failed serial-equivalence checks;
+the cause of that divergence has not been isolated.
 """
 
 from types import MethodType
@@ -42,7 +39,7 @@ def install_gather_fia(impl, width=4):
     """Bind one model instance without changing the installed vLLM classes."""
     if width > GATHER_FIA_MAX_WIDTH:
         raise ValueError(
-            f"gather_fia drops causality past width {GATHER_FIA_MAX_WIDTH}; "
+            f"gather_fia is unvalidated above width {GATHER_FIA_MAX_WIDTH}; "
             "use the sfa kernel")
     impl._execute_sparse_flash_attention_process = MethodType(
         gathered_fia, impl,
