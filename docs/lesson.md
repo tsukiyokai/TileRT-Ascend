@@ -1356,3 +1356,20 @@ against what its control would have cost.
   fused into MC2, which appears as no kernel at all -- and it is why the verify
   shows zero collectives. One ordering query away from deleting the fix that
   b377291 made for accumulating sixteen bf16 partials.
+- The 19.30 microseconds a kernel is 36.02 divided by 1867, so "1867 times
+  19.30 accounts for all of it" is an identity and not a verification. I used
+  it to argue the cross-core rendezvous must be near zero. What is actually
+  measured is a bare launch at 20 to 30 microseconds independent of the body
+  and an in-graph dispatch floor of 1.2, and 19.30 falling between them says
+  the kernel-count explanation is consistent, not that it is the only one. The
+  same 36.02 fits "5 microseconds a replay plus several rendezvous a layer",
+  and the two call for opposite work: fewer kernels against fewer handoffs.
+- Three attempts at the cross-core rendezvous hung, each on a different wrong
+  reading of the protocol: one flag raised once and awaited by two subblocks;
+  the mode template parameter used as the fix, where GetffstMsg keeps only two
+  bits of it so 4 equals 0; and an arbitrary flag id, where this part encodes
+  the audience in the id -- 11 is AIC, 12 AIV, 13 both, 14 every AIV. The
+  third used 12 and still hung, so a layer of the protocol remains unread.
+  Stop after three and say the number is still missing;
+  shmem/fused_proj_reduce_kernel.cpp has carried the same unrun pattern since
+  it was written.
