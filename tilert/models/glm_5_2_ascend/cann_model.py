@@ -552,6 +552,24 @@ class CannModel:
                 logits if full_logits else None, hidden, token_ids,
             )
 
+    def indexer_buffers(self):
+        """The selected positions each indexer layer last wrote.
+
+        Only one layer in `index_topk_freq` runs the indexer and the rest
+        reuse its result, so the buffers alias; de-duplicating by storage
+        gives the distinct selections. What they are wanted for is whether
+        those positions cluster, which decides whether an eight-token sparse
+        block covers them without attending to much that was never selected.
+        """
+        buffers = {}
+        for name, layer in self.model.model.layers.items():
+            attention = getattr(layer, "self_attn", None)
+            indices = getattr(getattr(attention, "mla_attn", None),
+                              "topk_indices_buffer", None)
+            if indices is not None:
+                buffers.setdefault(indices.data_ptr(), (name, indices))
+        return [value for value in buffers.values()]
+
     def host_tokens(self, *groups):
         """Read several token groups to the host in one transfer.
 

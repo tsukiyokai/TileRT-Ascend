@@ -119,6 +119,9 @@ def arguments():
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
+    parser.add_argument("--dump-indices", type=Path,
+                        help="save each indexer layer's selected positions "
+                             "after the warmup round, for index_coverage.py")
     parser.add_argument("--lookup", action="store_true",
                         help="draft by finding where the context repeats "
                              "instead of running the MTP engine; no chain "
@@ -384,6 +387,14 @@ def run(args, report):
                 engine.start_mtp(first, args.max_tokens,
                                  args.width, ())
                 engine.advance_mtp()
+                if args.dump_indices and rank == 0:
+                    args.dump_indices.mkdir(parents=True, exist_ok=True)
+                    for name, indices in target.indexer_buffers():
+                        torch.save(indices.cpu(),
+                                   args.dump_indices / f"layer-{name}.pt")
+                    report["dumped_indexer_layers"] = len(
+                        target.indexer_buffers()
+                    )
                 engine.finish_mtp(engine.position)
                 engine.reset()
                 warmup_key = ("compiled_graph_warmup" if args.compile_target
