@@ -274,19 +274,24 @@ per-round cost. Use a period coprime to any buffer parity.
 
 ## What the round's budget looks like once the skeleton is paid for
 
-A round may cost 6.866 ms at acceptance 3.433. Device work is 40.7 ms of which
-the arithmetic needs 3.886 at the die's marginal read rate, so about 35 ms is
-overhead; the census locates 20 of it — 15.4 ms of per-call intercept and
-4.27 of redundant table traversal — and the remainder is inside kernels where
-a per-operator method cannot reach.
+A round may cost 9.01 ms at the measured acceptance of 4.507. Device work is
+40.7 ms of which the arithmetic needs 3.886 at the die's marginal read rate,
+so about 35 ms is overhead; the census locates 20 of it — 15.4 ms of per-call
+intercept and 4.27 of redundant table traversal — and the remainder is inside
+kernels where a per-operator method cannot reach.
 
 So the skeleton's prize is the 15.4 plus whatever of the unlocated 15 ms is
 re-entry rather than arithmetic, against a 3.5 ms cost if the expert matmul
 moves to the vector unit and nothing if it stays on the cube. That is the
-first accounting all night in which the target is not arithmetically absurd,
-and it is also the reason no incremental combination reaches it: the host's
-5.861 ms, the collectives' 3.70 and the weight stream's 3.886 already exceed
-6.866 between any two of them.
+first accounting in which the target is not arithmetically absurd.
+
+What it is no longer the reason for is the host path. That term was 5.861 ms
+and the skeleton claimed it as a consequence of 2,416 separate launches;
+launch count was then refuted by A/B, the cost located in pageable staging,
+and 3.384 to 3.791 ms a round removed by a pinned ring with no change to the
+kernel structure at all. So the skeleton's case now rests on the weight stream
+and the collectives, which at 3.886 and 3.70 fit inside 9.01 with 1.43 to
+spare — and on the 15.4 ms of intercept that only one kernel body can reach.
 
 ## What this document must not become
 
