@@ -1348,3 +1348,11 @@ against what its control would have cost.
   microseconds and does not depend on what the kernel does. That one number
   turns "a megakernel would be faster" into "1867 kernels must become 207",
   and it was one die and twenty minutes.
+- Adjacent in kernel order is not adjacent in time, and the difference was a
+  correctness fix. 480 pairs of Cast looked like widening to fp32 and
+  narrowing straight back with nothing in between, which would have been pure
+  launch cost; the gap between them is a median of 30.5 microseconds and every
+  one of the 480 exceeds 5, with no kernel in it. That gap is the reduction
+  fused into MC2, which appears as no kernel at all -- and it is why the verify
+  shows zero collectives. One ordering query away from deleting the fix that
+  b377291 made for accumulating sixteen bf16 partials.
