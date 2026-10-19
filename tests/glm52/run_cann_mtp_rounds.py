@@ -24,6 +24,7 @@ import sys
 from types import SimpleNamespace
 import traceback
 
+from frozen_teacher import load_teacher, teacher_run
 from prefix_io import mtp_prefix_layer
 from run_cann_model import check_prefix, load_capture
 from run_native_decode import compare_tensor
@@ -56,6 +57,8 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--capture-case", type=Path, required=True)
+    parser.add_argument("--teacher", type=Path,
+                        help="32 frozen teacher inputs and successor labels")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--width", type=int,
@@ -105,6 +108,8 @@ def parse_arguments(argv=None):
         parser.error("--compile-target requires --target-graph")
     if args.super_kernel and not args.compile_target:
         parser.error("--super-kernel requires --compile-target")
+    if args.teacher and args.compile_target:
+        parser.error("Teacher M1 comparison requires an uncompiled target")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0, 1]")
     return args
@@ -321,7 +326,8 @@ def source_hashes(target, draft):
 
     paths = {Path(__file__).resolve(),
              *[Path(__file__).with_name(name) for name in
-               ("run_cann_model.py", "run_native_decode.py", "prefix_io.py")]}
+               ("run_cann_model.py", "run_native_decode.py", "prefix_io.py",
+                "frozen_teacher.py")]}
     for value in (type(draft), type(draft.model), type(draft.model.model),
                   type(draft.model.model.layers["78"]), DefaultModelLoader,
                   process_weights_after_loading, MtpRoundExecutor):
@@ -349,6 +355,8 @@ def execute(args):
         raise ValueError("Launch exactly 16 ranks")
     physical = (rank + args.device_offset) % 16
     checkpoint = checkpoint_fingerprint(args.checkpoint)
+    teacher = (load_teacher(args.teacher, args.capture_case, args.width,
+                            args.capacity) if args.teacher else None)
     main_prefix, mtp_prefix, saved_parent, first, inputs = load_inputs(
         args, rank, checkpoint,
     )
@@ -387,7 +395,7 @@ def execute(args):
            "prompt": inputs["prompt_sha256"], "first": first,
            "parent": inputs["parent_hidden_sha256"], "source": source,
            "checkpoint": checkpoint, "width": args.width,
-           "budget": args.max_tokens, "stops": stops})
+           "budget": args.max_tokens, "stops": stops, "teacher": teacher})
     initial = inputs["initial_position"]
     checks, runs, paths = [], {}, {}
     directory = args.output / f"rank-{rank}"
@@ -401,7 +409,24 @@ def execute(args):
     if args.target_graph or args.draft_graph:
         phases.append("graph")
     phases.append("reset")
+    teacher_results = []
     with torch.inference_mode():
+        if teacher is not None:
+            for width in (1, args.width):
+                prepare_phase(target, draft, main_prefix, mtp_prefix,
+                              "teacher")
+                result = teacher_run(target, teacher, width, directory, agree)
+                prefix_checks = []
+                check_prefix(target, main_prefix, prefix_checks, "main")
+                check_prefix(SimpleNamespace(cache=[draft.cache]), [mtp_prefix],
+                             prefix_checks, "mtp")
+                result.update(prefix_checks=prefix_checks,
+                              draft_position=draft.position)
+                result["passed"] &= (draft.position == initial - 1 and all(
+                    item["passed"] for item in prefix_checks
+                ))
+                atomic_json(directory / f"teacher-m{width}.json", result)
+                teacher_results.append(result)
         for label in phases:
             cleared = prepare_phase(
                 target, draft, main_prefix, mtp_prefix, label,
@@ -513,7 +538,10 @@ def execute(args):
         ])
     checks.append({"name": "source_stable",
                    "passed": source_hashes(target, draft) == source})
-    passed = all(item["passed"] for item in checks)
+    continuation_passed = all(item["passed"] for item in checks)
+    teacher_passed = (all(item["passed"] for item in teacher_results)
+                      if teacher_results else None)
+    passed = continuation_passed and teacher_passed is not False
     report = {
         "status": "pass" if passed else "fail", "rank": rank,
         "world_size": 16, "physical_device": physical,
@@ -521,6 +549,8 @@ def execute(args):
         "hostname": platform.node(), "command": [sys.executable, *sys.argv],
         "source_commit": args.source_commit, "source_sha256": source,
         "checkpoint_sha256": checkpoint, "inputs": inputs,
+        "teacher": teacher, "teacher_results": teacher_results,
+        "teacher_passed": teacher_passed,
         "width": args.width, "max_tokens": args.max_tokens,
         "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
@@ -560,7 +590,9 @@ def execute(args):
         "compared_phases": phases,
         "logical_outputs_include_eos": True,
         "final_output_is_pending": True, "prompt_replayed": False,
-        "serial_speculative_consistency": passed if "serial" in runs else None,
+        "serial_speculative_consistency": (
+            continuation_passed if "serial" in runs else None
+        ),
         "reset_exact": all(item["passed"] for item in checks
                            if item["name"].startswith("reset.")),
         "precision_verified": False, "hf_parity": False,
@@ -575,6 +607,8 @@ def execute(args):
     path = args.output / f"rank-{rank}.json"
     atomic_json(path, report)
     receipts = gather({"rank": rank, "passed": passed,
+                       "continuation_passed": continuation_passed,
+                       "teacher_passed": teacher_passed,
                        "report_sha256": digest(path),
                        "tokens": runs["speculative"]["tokens"],
                        "positions": runs["speculative"]["positions"]})
@@ -587,7 +621,12 @@ def execute(args):
             "status": "pass" if success else "fail", "ranks": receipts,
             "all_ranks_agree": same,
             "serial_speculative_consistency": (
-                success if "serial" in runs else None
+                same and all(item["continuation_passed"] for item in receipts)
+                if "serial" in runs else None
+            ),
+            "teacher_passed": (
+                all(item["teacher_passed"] for item in receipts)
+                if teacher is not None else None
             ),
             "compared_phases": phases,
             "precision_verified": False, "hf_parity": False,

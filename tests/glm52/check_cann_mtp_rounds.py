@@ -314,7 +314,8 @@ def check_phase_preparation():
 
     storage = Storage()
     target, draft = Engine("main", storage), Engine("mtp", storage)
-    for label, should_clear in (("serial", True), ("speculative", True),
+    for label, should_clear in (("teacher", True), ("serial", True),
+                                ("speculative", True),
                                 ("reset", False)):
         events.clear()
         cleared = runner.prepare_phase(target, draft, 2, 1, label)
@@ -325,6 +326,95 @@ def check_phase_preparation():
         require(cleared == should_clear and events == expected,
                 "fresh serial/speculative, dirty reset, before injection")
         require((target.position, draft.position) == (2, 1), "P/P-1")
+
+
+def check_teacher(directory, torch):
+    prompt = [17, 19]
+    teacher = {
+        "prompt_sha256": runner.hashlib.sha256(
+            (json.dumps(prompt) + "\n").encode(),
+        ).hexdigest(),
+        "prompt_tokens": 2, "first_token_id": 23,
+        "teacher_tokens": list(range(23, 55)),
+        "expected_next_tokens": list(range(24, 56)),
+    }
+    path = directory / "teacher.json"
+    runner.atomic_json(path, teacher)
+    runner.atomic_json(directory / "manifest.json", {
+        "prompt_token_ids": prompt, "seq_len": 2, "first_token_id": 23,
+    })
+    loaded = runner.load_teacher(path, directory, 32, 34)
+    require(loaded["sha256"] == runner.digest(path), "teacher identity")
+    for width, capacity in ((32, 33), (6, 34)):
+        rejects(lambda: runner.load_teacher(path, directory, width, capacity))
+    for field, value in (("prompt_sha256", "0" * 64),
+                         ("first_token_id", 22),
+                         ("expected_next_tokens", [24, 24, *range(26, 56)])):
+        runner.atomic_json(path, {**teacher, field: value})
+        rejects(lambda: runner.load_teacher(path, directory, 32, 34))
+    runner.atomic_json(path, {
+        **teacher, "teacher_tokens": teacher["teacher_tokens"][:8],
+        "expected_next_tokens": teacher["expected_next_tokens"][:8],
+    })
+    rejects(lambda: runner.load_teacher(path, directory, 8, 34))
+
+    class Target:
+        def __init__(self, fault):
+            self.position, self.consumed, self.fault = 2, [], fault
+
+        def verify(self, ids, full_logits):
+            require(full_logits, "teacher diagnostic retains logits")
+            self.consumed.extend(ids)
+            logits = torch.zeros((len(ids), 64))
+            for row, token in enumerate(ids):
+                predicted = 0 if self.fault and token == 24 else token + 1
+                logits[row, predicted] = 2
+            self.position += len(ids)
+            return SimpleNamespace(token_ids=logits.argmax(-1), logits=logits,
+                                   last_hidden=torch.tensor(ids)[:, None])
+
+    for fault in (False, True):
+        for width in (1, 8, 32):
+            target, observed = Target(fault), []
+            report = runner.teacher_run(target, loaded, width, directory,
+                                        observed.append)
+            require(target.consumed == teacher["teacher_tokens"],
+                    "predictions must never replace frozen inputs")
+            require(len(observed) == 32 // width and target.position == 34,
+                    "teacher consumes each row once")
+            require(report["passed"] is not fault, "teacher label gate")
+            require(report["first_difference"] == (1 if fault else None),
+                    "first teacher difference")
+            if fault:
+                saved = torch.load(
+                    directory / f"teacher-m{width}-first-difference.pt",
+                    weights_only=True,
+                )
+                require(saved["position"] == 3 and saved["expected"] == 25
+                        and saved["prediction"] == 0
+                        and saved["last_hidden"].tolist() == [24],
+                        "first difference binds logits and consumed input")
+                artifact = report["first_difference_file"]
+                require(runner.digest(Path(artifact["path"]))
+                        == artifact["sha256"], "first-difference file hash")
+
+    class ShortTarget(Target):
+        def verify(self, ids, full_logits):
+            result = super().verify(ids, full_logits)
+            result.token_ids = result.token_ids[:-1]
+            return result
+
+    rejects(lambda: runner.teacher_run(ShortTarget(False), loaded, 32,
+                                       directory, lambda value: None))
+
+    class WrongLogitsTarget(Target):
+        def verify(self, ids, full_logits):
+            result = super().verify(ids, full_logits)
+            result.logits.zero_()
+            return result
+
+    rejects(lambda: runner.teacher_run(WrongLogitsTarget(False), loaded, 32,
+                                       directory, lambda value: None))
 
 
 def main():
@@ -360,6 +450,9 @@ def main():
                     ))
     with tempfile.TemporaryDirectory(prefix="cann-mtp-host-") as temporary:
         check_capture(Path(temporary), torch, record)
+    with tempfile.TemporaryDirectory(prefix="teacher-host-") as temporary:
+        record("teacher.fixed_inputs_and_first_difference",
+               lambda: check_teacher(Path(temporary), torch))
     record("cache.compare_and_mutations", lambda: check_cache(torch))
     record("cache.per_row_diagnostics",
            lambda: check_row_diagnostics(torch))
@@ -376,7 +469,7 @@ def main():
     source = [Path(__file__), path,
               *[Path(__file__).with_name(name) for name in (
                   "check_mtp_round.py", "run_cann_model.py",
-                  "run_native_decode.py", "prefix_io.py",
+                  "run_native_decode.py", "prefix_io.py", "frozen_teacher.py",
               )],
               ROOT / "tilert/models/glm_5_2_ascend/mtp_round.py",
               ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py",
