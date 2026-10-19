@@ -21,26 +21,56 @@
 
 最大的两项不是「优化」而是修两个让已有机制失效的缺陷：前者让一个配置从不可用变可用，后者让一个开关从空操作变生效。两处都是同一个字面量被写死在两个地方（`enable_graph` 捕在 4、`_graph` 选在 4），只改一处会得到「捕在对的宽度上却永不回放」。
 
-## 主要矛盾：一轮 55 ms 里 84% 是一次 draft 前向
+## 主要矛盾：固定成本,而且几乎与数据量无关
 
-相位分解（钩子，不带 profiler，1363 轮，报分布）。[相位](evidence/ascend-decode/phase-split-20261019/README.md)
+带设备同步的相位分解(不带 profiler,1363 轮,报分布):
 
-| 相位 | p10 一次 | 每轮次数 |
-|---|---|---|
-| `chain` | 0.942 ms | 6 |
-| `verify`（全模型） | **2.196** | 1 |
-| `conditioned` | **42.877** | 1 |
-| `host_tokens` | 0.489 | 1 |
+| 相位 | p10 一次 | 次数 | 一轮 |
+|---|---|---|---|
+| `verify` | 40.080 ms | 1 | 40.080(76%) |
+| `chain` | 1.731 | 6 | 10.386(20%) |
+| `conditioned` | 2.080 | 1 | 2.080 |
+| `host_tokens` | 0.263 | 1 | 0.263 |
 
-地板×次数合 51.239，对每轮 p10 的 55.33，93% 有账，剩约 4 ms 是提交与截断。
+地板×次数合 52.809,占每轮 p10 的 95%。[相位](evidence/ascend-decode/phase-synced-20261019/README.md)
 
-全模型 verify——75 个 MoE 层、dense 栈、8 行——只要 2.196 ms。**所以模型前向不是问题，板上所有瞄着它的计划（含层级 megakernel）瞄的是 55 ms 里的 2.2 ms。**
+★ 今天所有测量指向同一件事:一次 decode 的代价几乎与它携带的数据量无关。
 
-贵的那一趟贵在裸跑：六个链式步骤回放共享索引且在 width-1 图里，而条件那趟自己选索引、它的图被 `enable_graph` 写死捕在宽度 4，图只在宽度相符时回放。已修（`conditioned_width` 取 verify 宽度），正在 A B A B A B 测它值多少。
+- verify 在 6 行与 8 行同价(39.496 对 39.677,每行 0.090),过 8 才每行 0.45
+- SFA 在 1 行与 8 行同价(85.31 对 89.17,8 倍行数只贵 4.5%)
+- 单行链式步骤 1.712 ms 对 verify 每层 0.501,3.5 倍
+- `TransposeBatchMatMul` 4.2 MFLOP 花 12.08 µs,24 blocks 且 mix 0
+- verify 的固定成本外推 36.02 ms,占它 91%,是整轮权重地板的 9.3 倍
 
-口径限：`verify` 返回设备张量，所以 2.196 可能只是下发，而随后那趟可能在替它等设备。两种读法指向同一动作，故先跑对照；若轮几乎不动就说明是后者，那时再加设备同步把两者分开。
+[宽度扫描](evidence/ascend-decode/width-sweep-20261019/README.md)｜[按段](evidence/ascend-decode/verify-sections-20261019/README.md)
 
-路线因此改写：一轮预算 9.013 ms，权重地板 3.886。若条件那趟降到链式步骤同档（约 1 ms），一轮约 13 ms、TPOT 约 2.9；再往 2 ms 走，剩下的要从 verify 的 2.196 与那 4 ms 记账里省，而 verify 已近权重地板。所以先拿掉这 42.9，再看剩下的形状，而不是先写 megakernel。
+## verify 的 39.677 ms 按段,各对自己的字节
+
+| 段 | 占比 | 活字节 | 地板 | 实耗 | 倍数 |
+|---|---|---|---|---|---|
+| MoE | 34% | 4.29 GiB | 2.99 ms | 13.57 | 4.5× |
+| attention | 23% | 1.12 GiB | 0.78 | 9.20 | 11.7× |
+| 其余 | 43% | 小 | — | 16.91 | 更高 |
+
+gmm1 89.809 µs 对 32.68 地板(8 行只触及 256 个专家里的 64,活 48 MiB)= 2.75 倍;gmm2 3.56 倍。所以 MoE 是三段里最健康的那段——**MegaMoE 瞄的正是它**,而融合本身只消掉 305 处边界 ≈ 0.78 ms,占那 13.567 的 6%。
+
+## 已排除的候选,各有实测
+
+- GM 往返:一次 32 KiB 1.364 µs,依赖关系免费(对照 1.381),每轮 637 次合 0.87 ms = 1.7%。所以「缺 L0C→UB 使层级核不成立」被推翻。[交接](evidence/ascend-decode/handoff-measured-20261019/README.md)
+- `EVENT WAIT` 404.290 ms 里 99.9% 被别轨掩盖,599 次里 16 次真空
+- 设备侧 `Cast` 每段 2.86 µs
+- 按「坑前站着谁」排的 68% 空闲归因:邻接不是因果,唯一能受控检验的一块判不了[推翻](evidence/ascend-decode/positions-refuted-20261019/README.md)
+- 行数、跨行读取冗余:SFA 对行数不敏感
+
+剩下未排除的是跨核汇合本身(AIC↔AIV 的 rendezvous),而 `TransposeBatchMatMul` 的 `mix 0` 是个反例线索:它没有跨核汇合却仍然贵。
+
+## 集合通信的尾巴
+
+`hcom_allGather_` 140 次、中位 25.40 µs、p90 788.48、max 13240.94;超中位 10 倍的 50 次占 96% 的 63.554 ms,而 `Wait Time` 列总计只 0.349 ms。跨 rank 的 gather 总计 22.3–73.7 ms(均值的 107%)而 gmm1 只差 8%——不是慢卡也不是路由不均,是到达参差被全屏障放大。
+
+产地是 `cann_mtp_projection.py` 把 draft 的 `rot`/`eh_proj` 改成 `gather_output=True` 的列并行,所以 `--draft-projection-tp` 每轮买约 14 次 16 卡集合。正在 A/B。[尾巴](evidence/ascend-decode/collective-tail-20261019/README.md)
+
+而 verify(Model ID 48)里一个集合通信都没有——它的 TP 归约融进了 MC2。所以单边归约按「每轮 157 次归约」定的价是数在了另一侧;它替换 `_all_reduce_out_place`,碰不到承载尾巴的 all-gather。它仍是板上唯一消除屏障而非加速屏障的机制,而到达参差只认这一种。
 
 ## 测量纪律:0.2 ms 是 run 间地板,所以两臂必须交替
 
