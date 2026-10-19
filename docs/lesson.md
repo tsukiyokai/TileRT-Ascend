@@ -1273,3 +1273,20 @@ against what its control would have cost.
   configurations differ by 0.163 ms, the change I withdrew comes out at 1.04
   times that, and the three kernel patches at 9.3. On the mean the first read
   1.39 and looked real.
+- Read the run's own verdict file before diagnosing its exit code. Every arm
+  today exited nonzero and I spent a round of investigation concluding the
+  cause was "not yet named" -- while summary.json, which this harness has
+  always written, carried each rank's validation error in full. One said
+  KeyError natural_accepted on a single rank, a field TimedBackend records on
+  the advance_mtp branch and not on the advance_mtp_n branch this
+  configuration uses, so the pass gate had been failing on a missing field
+  rather than on anything about the run. Another said all sixteen ranks
+  reported "M4 conditioned graph counts differ", which was the exact defect I
+  was about to measure with an A/B whose treatment arm had captures 0 and
+  replays 0.
+- Fixing a hardcoded width in one place is not fixing it. enable_graph built
+  the conditioned graph at a literal 4 and _graph selected it at a literal 4;
+  I changed the first, called the result a fix, and the graph was then
+  captured at the right width and never replayed. The repair is to make one of
+  them ask the other -- the selector now compares against the graph's own
+  width, and there is no literal left to disagree with.
