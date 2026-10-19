@@ -128,3 +128,52 @@ Every causal claim a differential rather than a correlation. A retraction when
 the evidence does not establish what was claimed — eleven on the first day,
 six instrument errors on the second, and the ones caught by an agent's control
 rather than mine are the reason to keep the adversarial pass running.
+
+## 2026-10-19 evening: the launch recipe belongs in code
+
+Ten launches failed in one evening and not one of them was a fault in the
+thing being measured. Every cause was already written down.
+
+| cause | launches | machine time |
+|---|---|---|
+| `set -u` with `set_env.sh`'s unguarded `$ZSH_VERSION` | 1 | ~1 min |
+| 0.85 utilisation wanting 52.08 GiB with 50.54 free | 3 | ~4 min |
+| `TORCHINDUCTOR_AUTOGRAD_CACHE` unset | 2 | ~24 min |
+| three passes fired into a full machine, ungated | 3 | ~4 min |
+| a port range per pass instead of per arm | 1 | ~5 min, and a pair |
+
+Three of the five are in this repo's own list of environment facts "each of
+which cost a launch". I paid for them again because they were kept as prose.
+
+The evening's three driver scripts — 38, 42 and 44 lines — each rebuilt the
+same recipe and each dropped a different piece of it: one the autograd cache,
+one the gate, one the port range. That is one abstraction's worth of
+duplication and it failed three different ways.
+
+**`tests/glm52/launch_arm.sh` is that abstraction.** It encodes the guarded
+source, the overlay prepend that `activate.sh` undoes, a cache root and a port
+range per arm, the autograd cache, the gate, and the md5 of the file under
+test. A driver passes `TAG`, `WIDTH`, `TREE`, `OUT`, `PORT_BASE` and whatever
+flags differ. Exit 2 means the gate refused, so a driver waits rather than
+consuming the arm.
+
+## Three smaller things the same evening
+
+**Run the tool that exists.** I computed arm floors and paired deltas by hand
+three times. `paired.py` does exactly that — lowest round p10 per arm, pass by
+pass, with the sign string and the spread — and has done since this morning.
+
+**A container can be killed from outside.** `trt-asc` took a SIGKILL at
+21:16 and another tenant's container started a minute later, in the middle of
+a four-arm chain. A waiter that only greps a log would have waited five hours
+on a dead container, so it checks `docker inspect` too.
+
+**Read load against the core count.** A load average of 39 looked like
+contention worth moving machines for. The box has 320 cores. Measured
+properly, a3-84 was at 4% HBM and 12% load while every other A3 host was at
+89 to 94% HBM — the emptiest machine by a wide margin, and I nearly left it.
+
+**Keep a standby staged.** a3-187 now carries the same experiment tree, the
+lookup code and the fixed gate, verified by its own round checks, so a switch
+costs a launch rather than twenty minutes. Its dies are full today; that is
+exactly why the staging had to happen before they were needed.
