@@ -40,6 +40,23 @@ the one that has to reach zero, and the other two then fit if the weight
 stream lands at its optimistic end.
 [acceptance curve](evidence/ascend-decode/accept-curve-20261019/README.md)
 
+★ **But adding the terms is the wrong accounting, and it understates this
+skeleton rather than flattering it.** Overlapped work does not sum, it takes
+the maximum: weight stream and reductions at 3.886 and 3.70 are 7.59 added
+and **3.89 overlapped**, which turns 1.42 ms of headroom inside 9.01 into
+5.12. The sum is what a pipeline of separate kernels costs; the maximum is
+what one body can cost.
+
+And the reason it is a maximum only inside one body is measured here, not
+assumed. Across three captured rounds the Overlap Analysis lanes read
+Communication 15.203 / 4.798 / 4.888 ms and Communication(Not Overlapped)
+15.203 / 4.798 / 4.888 — **identical to the millisecond, so the overlap is
+exactly 0.000.** A standalone collective kernel cannot overlap by
+construction: it holds the cores, so nothing is left running the work it was
+supposed to hide behind. Reducing launches is the least of what the body
+buys; what it buys is that communication stops being a term at all.
+[phase attribution](evidence/ascend-decode/phase-attribution-20261019/README.md)
+
 ## Correction: the host path is not a consequence of the launch count
 
 "The host path exists because the round is 2,416 separately launched pieces"
