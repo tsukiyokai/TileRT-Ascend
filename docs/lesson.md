@@ -1290,3 +1290,15 @@ against what its control would have cost.
   captured at the right width and never replayed. The repair is to make one of
   them ask the other -- the selector now compares against the graph's own
   width, and there is no literal left to disagree with.
+- A missing hardware path is not automatically a large cost. I established
+  from three sources that this generation has no L0C-to-UB route and built an
+  argument on it -- that the layer-scale kernel AMD's design rests on cannot
+  work here. Measured, the global-memory round trip it forces costs 1.364
+  microseconds a tile and the ordering costs nothing, so 637 of them come to
+  0.87 milliseconds against a 52 millisecond round. The absence is real and
+  almost free, and the argument was about magnitude without ever measuring one.
+- Under core_ratio(1, 2) one AIC block's CrossCoreSetFlag faces two AIV
+  blocks' CrossCoreWaitFlag and the kernel deadlocks. The first handoff
+  benchmark hung on exactly that, and shmem/fused_proj_reduce_kernel.cpp has
+  carried the same pattern unrun since it was written -- it compiles, and
+  compiling was all it was ever asked to do.

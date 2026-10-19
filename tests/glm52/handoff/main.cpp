@@ -52,7 +52,7 @@ int main(int argc, char* argv[])
 
     std::printf("tile %zu KiB  blocks %u  iterations %d\n",
                 TILE_FLOATS * sizeof(float) / 1024, BLOCK_DIM, iterations);
-    const int modes[] = {0, 1, 2};
+    const int modes[] = {0, 1};
     for (int mode : modes) {
         handoff_demo(BLOCK_DIM, stream, (float*)source, (float*)sink, mode, 64);
         Check(aclrtSynchronizeStream(stream), "warmup");
@@ -65,9 +65,10 @@ int main(int argc, char* argv[])
         clock_gettime(CLOCK_MONOTONIC, &end);
 
         const double each = Elapsed(begin, end) / iterations;
-        std::printf("mode %d  %8.3f us a handoff  %s\n", mode, each,
-                    mode == 0 ? "ordered, with payload"
-                    : mode == 1 ? "unordered, same payload" : "flag only");
+        std::printf("mode %d  %8.3f us a round trip  %s\n", mode, each,
+                    mode == 0 ? "the read depends on the write"
+                              : "same bytes, no dependency");
+        std::fflush(stdout);
     }
 
     Check(aclrtFree(source), "free source");
