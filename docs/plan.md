@@ -4,31 +4,24 @@
 
 工作方法与今晚的教训见 [workflow.md](workflow.md) 与 [lesson.md](lesson.md)。
 
-## 状态（2026-10-19 10:40）
+## 状态（2026-10-19 11:20）
 
-确定测得的最好点是 **13.0657 ms**（width 8，三请求同一轨迹、轮数同为 227、跨度 0.818；换一个干净工作目录复现 13.0659、跨度 0.097）。它吐出的 1024 个 token 与 width 4 逐位相同，所以 trajectory gate 过。width 4 同场 14.5551 未动。
+确定测得的最好点是 **12.6037 ms**（width 8，中位 12.6427，三请求同一轨迹、轮数同为 227）。它吐出的 1024 个 token 与 width 4 逐位相同（`68f2bc184553`），trajectory gate 过。每轮 p10 55.33 ms。
 
-width 8 的非确定性已闭环，而根因不在算子里：屏障补丁 `gmm1-swiglu-barrier.patch` 一直是对的，被 static kernel 的包缓存在被 capture 的那个宽度上整条绕过。缓存 key（`static_kernel.py:1071-1092`）只含算子参数、超核选项串、确定性开关，不含 `ASCEND_CUSTOM_OPP_PATH`、不含编译器真正读的 vendor 头内容，而索引落在进程工作目录下。补丁一行：`compiler_interface.py` 加 `disable_static_kernel_compile_cache`，代价是启动时重编而非 decode 时间。两个曾带 file:line 的候选都已排除。[已闭环](evidence/ascend-decode/w4a8-race-closed-20261019/README.md)
+今天两项落地，各自在轮内配对测得：
 
-★ 两条口径纪律，都是被自己的实验逼出来的：
+| 改动 | 轮内收益 | 判据 |
+|---|---|---|
+| static kernel 缓存 key 修复 + 屏障补丁成对 | width 8 从三条流变一条、13.0657→(基线) | 227/227/227 轮，哈希等于 width 4 的流；[已闭环](evidence/ascend-decode/w4a8-race-closed-20261019/README.md) |
+| 三份 gmm1 kernel 补丁 | **每轮 −1.468 ms ＝ 每 token −0.326** | 同链两臂 p10 56.941→55.473，是 run 间地板 0.201 的 7.3 倍，两臂最近值仍差 1.090；token 流不变；[复测](evidence/ascend-decode/kernelpatch-remeasured-20261019/README.md) |
 
-一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以 `debug-dcci-all`、`debug-sync-all`、`early-start`、各种 blacklist 臂「干净」只因为它们都触发了新编译。它们不构成证据。此前那条「四份补丁合装 +3.15 ms/token」的混淆更具体:两臂「one tree」共享 static kernel 的缓存索引（它落在工作目录里，分开的只有 `VLLM_CACHE_ROOT`），而 key 不含 vendor，所以后跑的那臂装的是先跑那臂编出的包——在被 capture 的宽度上两臂跑的是同一套静态核，与各自的 overlay 无关。所以那个数不能归因于补丁在被捕获宽度上的作用；哪一臂先跑、因而两臂用的是谁的源，记录里没有。正在重测。[回归](evidence/ascend-decode/patch-regression-20261019/README.md)
+width 8 的非确定性根因不在算子里：屏障补丁 `gmm1-swiglu-barrier.patch` 一直是对的，被 static kernel 的包缓存在被 capture 的那个宽度上整条绕过。缓存 key（`static_kernel.py:1071-1092`）只含算子参数、超核选项串、确定性开关，不含 `ASCEND_CUSTOM_OPP_PATH`、不含编译器真正读的 vendor 头内容，索引落在进程工作目录下。补丁一行加 `disable_static_kernel_compile_cache`，代价是启动时重编而非 decode 时间。两个曾带 file:line 的候选都已排除。
 
-二，**逐算子时间相加不是占用率**。那会把并发轨重复计数，早先 35 ms 开销就是这么来的。并集口径下设备在稳态里忙 60.7%、空 39.3%，而空闲全在 ≥100 µs 的坑里（172 个合 97.194 ms），<10 µs 的缝只有 0.479 ms——所以在这个粒度上 decode 不是下发速率受限。[空闲](evidence/ascend-decode/device-idle-20261019/README.md)
+★ 口径纪律两条，都是被自己的实验逼出来的：
 
-## 主要矛盾：一轮 57 ms 的地板,而非权重的那部分要 10.4 倍
+一，**凡消融开关参与缓存 key，那条消融就不能跑**。`super_kernel_optimize_options` 在 key 里，所以那些「干净」的臂只因为都触发了新编译。
 
-用运行自己的记录读每轮(`advance_mtp_n` 带 `elapsed_ns`),不带 profiler——这要紧,因为 profiler 加主机侧负担而设备由主机喂,它会改变它要报的量。[每轮时钟](evidence/ascend-decode/round-clock-20261019/README.md)
-
-两次独立运行六个请求,每轮 p10 全落在 56.595–56.944(跨度 0.6%),中位 57.2–60.0,p90 58.8–67.7。所以请求间变的全在尾部而地板不动,把每轮压到自己的 p10 只值 0.111 ms/token。
-
-width 8 的接受率 4.507,所以 2 ms TPOT 下一轮可花 9.013 ms。现在 57.2,6.3 倍。权重地板 3.886 占 43%(width 4 接受率下占 57%,所以 width 8 改善的是构成不只是大小),剩给非权重的 5.127 ms 对现在的 53.3——**10.4 倍**。这替换掉此前的 6.866 ms／A=3.433,那是 width 4、hoist 前、width 8 还不正确时算的。
-
-★ 那条「采样与记账的主机往返占 68% 空闲」已被自己的实验推翻。按「坑前站着谁」排序是邻接不是因果,而其中唯一能受控检验的一块——metadata 的 H2D 拷贝——测出来是反的:改掉它每轮地板 +0.278 ms(每 token +0.062,三对三完全分离)。`copy_` 从 CPU 张量到设备张量不同步设备,它从来不是主机往返。所以 `aclnnIndex` 的 34.938 与 `aclnnArgMax` 的 13.706 也不再有分量,68% 这个数不可支取。[推翻](evidence/ascend-decode/positions-refuted-20261019/README.md)
-
-还站得住的是不依赖邻接的那些:`EVENT WAIT` 404.290 ms 里 99.9% 被别轨掩盖故不是杠杆;设备侧 `Cast` 每段 2.86 µs;空闲在 ≥100 µs 的坑里而不是下发速率的碎屑。
-
-所以现在没有一条定位到具体算子的 decode 开销线索。下一步必须是能把 57 ms 分解开的测量,而不是又一次邻接归因。
+二，**逐调用测量不预测整轮，两个方向都失败过**。四补丁那次预测 −0.9 实测 +3.15（而那个对照本身无效）；这三份预测每轮 −0.66 实测 −1.468。所以板上凡从逐调用推出的期望都只是待测项。
 
 ## 测量纪律:0.2 ms 是 run 间地板,所以两臂必须交替
 
