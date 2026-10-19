@@ -1152,3 +1152,8 @@ against what its control would have cost.
   Three kernel patches measured +0.224 ms a token against a predicted -0.2,
   with arm ranges of 0.35 and 0.59: unconfounded, harmless, and undemonstrated.
   Say which of the three it is rather than reading the sign.
+- A profile that is only written on a zero exit is a profile you will lose
+  precisely when the run was interesting. The attribution run completed all
+  4579 of its checks and produced no trace, because the harness emits
+  --profile-output only on success and 1114 checks had failed on a quantised
+  cache differing by one step. Decouple the artefact from the verdict.
