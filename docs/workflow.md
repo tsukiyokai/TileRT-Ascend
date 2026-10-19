@@ -19,6 +19,36 @@ instead.
 | attributed 1434 casts to the Python frame spanning them | a `connection_id` join |
 | concluded the cube was unnecessary from an instruction count that assumed fp16 weights | reading my own kernel |
 | "fixed" a free-memory symptom I had caused, and the fix broke execution | running an agent's working tree |
+| ranked device idle by what precedes each gap, then built a 68% attribution on it | one controlled removal, which the design could not resolve |
+| trusted a round's p10 holding to 0.6% inside a run as reproducibility between runs | a control arm repeating the previous chain's configuration |
+| expected per-call measurements to predict rounds, twice, wrong in both directions | measuring in a round, which is the same run |
+| eliminated kernel candidates for a day while the carrier was a cache key | reading back which binary the arm loaded, from the arm's own record |
+
+## 2026-10-19 additions
+
+Four habits the day argues for, each with the failure that bought it.
+
+**Measure the quantity you intend to change, in the configuration you intend
+to ship.** A profiler adds host work to a device the host feeds, so every
+figure it produced had to be hedged and one was then refuted. The round's own
+record already carried per-round elapsed time; reading that settled an A/B
+whose TPOT medians overlapped.
+
+**Keep one arm in every chain that repeats the previous chain's
+configuration.** It is the only reason a wrong conclusion was caught within
+the hour, and it costs one arm. Two identical configurations differed by 0.201
+ms in a round's p10, which is the size of the effects being looked for.
+
+**Alternate the arms when the effect is near that floor.** A B A B A B inside
+one session, paired pass by pass. One arm after the other cannot separate the
+patch from the drift, and the published conclusion that it could had to be
+withdrawn.
+
+**Check that the parts sum to the whole.** The phase hook's first report had
+the phases totalling 124.505 ms against a 57 ms round, which is how it
+announced that it was averaging warmup rounds together with measured ones. A
+decomposition that does not add up is reporting its own defect.
+
 
 ## Measurement
 
