@@ -3,6 +3,24 @@
 Paired, one session, one tree, one frozen prefix, width 4, the composed flags,
 each arm its own cache root, each figure read from that arm's own record.
 
+## 2026-10-19: this comparison cannot attribute anything to the patches
+
+The static-kernel package cache's index lives under the process's working
+directory, and only `VLLM_CACHE_ROOT` was separated per arm. Its key omits the
+vendor path and the header contents, so the arm that ran second installed the
+package the arm that ran first compiled. At the captured width — the only
+width that has static kernels — both arms therefore executed identical
+kernels, whatever their overlays said.
+
+So the +3.15 ms is not a measurement of the four patches at the captured
+width: the patches were not there. What it could still be measuring is their
+effect at the non-captured widths, or the compact declaration, which is a
+Python-level change and applies at every width — and the page below already
+localises the cost to that declaration.
+
+Which arm ran first, and hence whose source both arms ran, is not recorded.
+[the cache](../w4a8-race-closed-20261019/README.md)
+
 | | baseline | four kernel patches + compact declaration |
 |---|---|---|
 | TPOT | 14.9121 / 14.4877 / 14.3187 | 17.6350 / 17.8901 / 17.5922 |
