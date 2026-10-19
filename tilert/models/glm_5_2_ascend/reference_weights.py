@@ -97,6 +97,9 @@ def unpack_w4(packed):
 def w4_msd_product(codes, integer, scales, correction, activation_scale,
                    output_dtype=torch.bfloat16):
     """Emulate CANN 9.2.0 API-dequant MSD with separate FP32 additions."""
+    # A3 Fixpipe uses a 1+8+10-bit scale, truncating the low 13 FP32 bits.
+    scale_bits = scales.contiguous().view(torch.int32) & -8192
+    scales = scale_bits.view(torch.float32)
     high = torch.div(codes, 16, rounding_mode="floor")
     low = torch.bitwise_and(codes, 15) - 8
     high_product = high @ integer.T
@@ -174,7 +177,8 @@ class ReferenceWeights:
             ),
             "integer_projection": (
                 "W8: INT32 dot * FP32 weight scale * FP32 A8 scale; "
-                "W4: CANN 9.2.0 API-dequant MSD with FP16 partials"),
+                "W4: CANN 9.2.0 API-dequant MSD with FP16 partials "
+                "and Fixpipe scale truncated to 1+8+10 bits"),
             "projection_output": "BF16 before TP reduction",
             "tp_sum": "FP32 rank-order sum, final BF16; not bitwise HCCL",
             "w4_scale_bias": "Checkpoint correction added once after 16H+L",
