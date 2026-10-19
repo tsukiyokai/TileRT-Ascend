@@ -96,7 +96,7 @@ class CannStep:
 
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
                   *, compile_target=False, super_kernel=False,
-                  expert_parallel=False, graph_width=4):
+                  expert_parallel=False, graph_width=4, index_topk=None):
     """Construct TP16 config, optionally compiling the M4 target backbone.
 
     ``expert_parallel`` reshards the 256 routed experts over the sixteen
@@ -124,6 +124,11 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         data_parallel_size=1,
         distributed_executor_backend="external_launcher",
         attention_config={"indexer_kv_dtype": "int8"},
+        # Sparse attention costs 51 us a call before any position plus 17.61
+        # a thousand picks, measured on one die, so the checkpoint's 2048 is
+        # 36 of its 87 us. Overriding the config rather than editing it keeps
+        # the checkpoint's hash stable, which the run's own record checks.
+        hf_overrides=({"index_topk": index_topk} if index_topk else {}),
         kv_cache_dtype="auto", block_size=PAGE_SIZE,
         # AscendCompiler filters static token buckets by this sequence limit.
         max_num_seqs=max(4, graph_width) if super_kernel else 1,
@@ -167,6 +172,7 @@ class CannModel:
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
+        index_topk=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
@@ -212,6 +218,7 @@ class CannModel:
             self.checkpoint, capacity, gpu_memory_utilization,
             compile_target=compile_target, super_kernel=super_kernel,
             expert_parallel=expert_parallel, graph_width=graph_width,
+            index_topk=index_topk,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(

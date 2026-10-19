@@ -119,6 +119,10 @@ def arguments():
     parser.add_argument("--attention-kernel", choices=("sfa", "gather_fia"),
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
+    parser.add_argument("--index-topk", type=int,
+                        help="override the checkpoint's 2048 selected "
+                             "positions; sparse attention costs 17.61 us "
+                             "a thousand picks in the graph")
     parser.add_argument("--cpu-affinity", action="store_true")
     parser.add_argument("--rounds-per-command", type=int, default=1,
                         help="Rounds each broadcast command batches")
@@ -345,6 +349,7 @@ def run(args, report):
                        super_kernel=args.super_kernel,
                        attention_kernel=args.attention_kernel,
                        fp32_head=args.fp32_head,
+                       index_topk=args.index_topk,
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
                        graph_width=args.width,
