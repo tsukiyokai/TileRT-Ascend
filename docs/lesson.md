@@ -1312,3 +1312,12 @@ against what its control would have cost.
   width 8. Each one was silent in a different way: a no-op flag, a captured
   graph that never replayed, a parser error, and a failed gate. The repair in
   every case was to make one place ask another rather than restate the number.
+- This machine is shared and another tenant's residency moves between runs.
+  An arm launched at 0.85 utilisation after the baseline rose to 12.7 GiB a
+  die died ninety seconds in, and the message -- free memory less than the
+  desired utilisation -- was in the rank record, not the log, which only
+  showed sixteen SIGTERMs and a ChildFailedError. Check free HBM before
+  launching; `tests/glm52/precheck.sh` does it in four lines. The last time
+  this symptom appeared I treated it as a code defect and "fixed" it by
+  binding the device in the reduction's installer, which introduced an aicore
+  507015 and was reverted.
