@@ -29,6 +29,7 @@ utilisation=${UTILISATION:-0.78}
 set +u
 source /workspace/environment/activate.sh
 set -u
+export PYTHONPATH="$tree${PYTHONPATH:+:$PYTHONPATH}"
 [ -n "$overlay" ] && export ASCEND_CUSTOM_OPP_PATH="$overlay:${ASCEND_CUSTOM_OPP_PATH}"
 
 # A cache root per arm, because a shared one replays another arm's compiled
