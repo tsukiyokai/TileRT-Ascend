@@ -58,6 +58,32 @@ host read, and the device tasks executing inside its window belong to other
 streams. The heuristic credits the blocking call rather than the producer —
 the same error as reading a `aclrtSynchronizeStream` duration as a cost.
 
+## The four forward-path conversion sites, and why reading them does not settle it
+
+In `vllm_ascend/quantization/methods/w4a8/w4a8.py` the load path converts at
+`:353-436` and `:657-664`, which is once per run and irrelevant here. The
+forward path has exactly four:
+
+| line | what it converts | guard |
+|---|---|---|
+| 546 | `pertoken_scale` to float32, reshaped and made contiguous | none; the value is genuinely per-call |
+| 566 | `w1_scale` elements to `w2_scale`'s dtype | yes — only when the dtypes differ |
+| 590 | `group_list` to int64 | none; per-call, 256 elements |
+| 620 | `w1_scale[0]` to `w2_scale`'s dtype | **none** |
+
+`:620` is the one worth suspecting, since it converts a loaded weight scale
+unconditionally on every call while `:566` does the same thing behind a dtype
+test. But whether either emits a kernel depends on the dtypes the load path
+actually produces — `:359` builds a uint64 tensor and `:435-436` route through
+`_process_scale`, so if both scales end up int64 then `.to()` returns the same
+tensor and launches nothing.
+
+That cannot be settled by reading, which is why
+`tests/glm52/profile_cast_sites.sh` exists rather than a conclusion. It fixes
+the two things that wasted the first attempt: the trace is copied out before
+the harness's verdict is consulted, and `ASCEND_CUSTOM_OPP_PATH` is inherited
+rather than exported.
+
 ## Attributed properly, through `connection_id`
 
 A device task carries `connection_id` in its `args` and so does the launching
