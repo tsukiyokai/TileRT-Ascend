@@ -35,6 +35,20 @@ def _record(name, begin):
     samples[name].append((time.perf_counter_ns() - begin) / 1e6)
 
 
+def _sync():
+    """Charge each phase its own device time rather than the next phase's.
+
+    Without this the verify returns as soon as its graph is dispatched and the
+    pass after it blocks on the device, so the hook reported 2.196 ms for a
+    full-model forward whose weight read alone is 3.886 -- a figure below its
+    own floor, which is how the defect showed. The barrier costs nothing it
+    was not already paying: the next phase blocks on the same work.
+    """
+    import torch
+
+    torch.npu.synchronize()
+
+
 def _wrap_draft(draft_class):
     original = draft_class.forward
 
@@ -47,6 +61,7 @@ def _wrap_draft(draft_class):
         try:
             return original(self, tokens, parent, **kwargs)
         finally:
+            _sync()
             _record(name, begin)
             if name == "conditioned":
                 verified[0] = False
@@ -63,6 +78,7 @@ def _wrap_target(model_class):
             try:
                 return _original(self, *args, **kwargs)
             finally:
+                _sync()
                 _record(_name, begin)
                 if _name == "verify":
                     verified[0] = True
