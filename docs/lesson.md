@@ -1,6 +1,6 @@
 # The bitter lesson
 
-194 entries below, each with the measurement that produced it. They fall into
+195 entries below, each with the measurement that produced it. They fall into
 seven shapes, and naming the shape is faster than remembering the instance.
 
 **An instrument reading its own overhead.** A bandwidth ceiling measured one
@@ -1436,6 +1436,16 @@ against what its control would have cost.
   and reads null, because `_metadata` creates its three CPU tensors and does
   its three H2D copies above the `hoisted is not None` branch. Check what runs
   before the fast path, not only what the fast path skips.
+- A control refutes the patch, not every claim in the rationale. Deriving a
+  forward's positions on the device lost 0.278 milliseconds a round with
+  complete three-against-three separation, and the revert concluded that a
+  copy from a CPU tensor to a device tensor does not synchronise the device.
+  Both arms kept that copy with a pageable source, so residency was never the
+  variable; what varied was two copies against three device kernels, 27 more
+  launches a round. Measured directly afterwards, a pageable copy costs 139
+  microseconds behind one draft graph and 2936 behind the target graph while
+  pinned holds 34 to 71 across the whole range. Write down which variable the
+  experiment moved, because the sentence that explains a loss outlives it.
 - Four acceptance points cost four runs and were already in the first one. The
   draft chain is autoregressive, so a narrower width drafts a prefix and
   `1 + mean(min(matched_drafts, w-1))` over one record's own spans reproduces a

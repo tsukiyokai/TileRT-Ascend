@@ -59,6 +59,31 @@ TPOT: the three allocations and copies sit **above** the `hoisted is not None`
 early return, so the hoist removed the attention-metadata builder and kept
 the entire cost. Launch count was never the variable.
 
+## This is not the change `29ada2c` reverted
+
+`cc794c2` touched the same lines and was reverted the same morning on a paired
+width-8 chain with complete three-against-three separation: the round floor
+rose 0.278 ms. Its revert message concludes that "a copy_ from a CPU tensor to
+a device tensor does not synchronise the device; it was never a host round
+trip, which is what the premise assumed."
+
+That conclusion is wider than its experiment. Both of its arms kept
+`self.seq_lens.copy_(length_cpu)` with a pageable source, so neither arm ever
+varied the thing in question; what varied was two copies against three device
+kernels — a subtraction, an add and a widening copy — nine forwards a round,
+twenty-seven more launches. The patch failed on launch count, which is what
+the revert measured and what the bench above does not dispute.
+
+The variable this change moves is the source buffer's residency, and it adds
+no device operation: the same copies, the same fills, the same counts, from
+pinned memory instead of a fresh allocation. So the downside is bounded at
+nothing, and the device-side `_offsets` arithmetic `cc794c2` introduced stays
+reverted.
+
+`positions-20261019/tree` still carries that patch, and `topk-run3` is running
+from it. Its arms both carry the 0.278 ms, so their comparison holds, but its
+absolute TPOT of 12.19 is not the project's floor.
+
 ## Prediction, to be judged on the round
 
 3.5 to 3.9 ms a round, 0.6 to 0.9 ms of TPOT at acceptance 4.507. Per-call
