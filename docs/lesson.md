@@ -944,8 +944,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     grouping that settles it, and the data for that grouping was in the records
     the whole time.
 
-100. The width cost is in graph replay, not in any operator. Attention is flat
-     in both picks and width -- 109.057 us at width 8 with 2048 picks against
+100. [Narrowed below.] The width cost is in graph replay, not in any operator.
+     Attention is flat in both picks and width -- 109.057 us at width 8 with 2048 picks against
      103.898 with 512, and 107.370 at width 16 -- so the per-row scoring
      hypothesis fails and `--index-topk` stays closed. Every operator measured
      today is flat in the rows, yet the engine pays 0.66 ms per unit of width
@@ -953,3 +953,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      dividing one record's `replays` by another's `rounds` gave exactly 6.0 and
      looked like six replays a round; it was three warmup plus three measured
      requests. Two scopes divided by each other, for the third time today.
+
+101. A substitute operator's flatness is not the operator's. The attention
+     measured flat in picks and width was
+     `npu_fused_infer_attention_score_v2` on a gathered layout; the engine
+     calls `npu_sparse_flash_attention` on a paged cache with a block table,
+     whose tiling function rejected four attempts at an argument set. So
+     attention is not excluded as the carrier of the 0.66 ms a width unit -- it
+     is the only per-query-row operator in a layer and the only one left
+     unmeasured, which makes it the leading candidate rather than a cleared
+     one.

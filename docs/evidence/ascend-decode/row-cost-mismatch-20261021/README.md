@@ -177,8 +177,22 @@ which looked like six replays a round. It is not: three warmup requests and
 three measured ones at the same round count is 6 x 225 = 1350. One replay a
 round, and the six was two record scopes divided by each other.
 
-So the width cost sits in graph replay rather than in any single operator: a
-bare operator call on one die does not include the graph, every operator
-measured is flat in the rows, and the engine pays 0.66 ms per unit of width
-every round. That is the honest location, and narrowing it further needs the
-engine.
+## Attention is not excluded after all
+
+The operator measured above is `npu_fused_infer_attention_score_v2` with a
+gathered layout. The engine calls `npu_sparse_flash_attention` with
+`layout_kv="PA_BSND"` and a `block_table` -- a different operator on a paged
+cache, and the one whose row sensitivity four attempts failed to measure (its
+tiling function rejects every argument set tried here). So the flatness
+measured belongs to the substitute, not to the operator the round pays for.
+
+Attention therefore remains the leading candidate for the width cost: it is
+the only operator in a layer whose work is per query row against a large
+context, and it is the only one not measured. The paged capture's query shape,
+`1,4,512` under TND, is one token -- which is either a draft forward from the
+MTP path or a phase other than verify, and resolving which needs the engine.
+
+So the honest position is narrower than the previous paragraph claimed: the
+width cost is paid inside graph replay, every operator that could be measured
+on one die is flat in the rows, and the one that could not be measured is the
+one most likely to carry it.
