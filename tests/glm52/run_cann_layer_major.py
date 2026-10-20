@@ -1,12 +1,15 @@
-"""Run frozen TP16 teacher tokens through one resident CANN layer at a time.
+"""Run frozen TP16 inputs through one resident CANN layer at a time.
 
 Each decoder invocation uses M1 or the complete M32 teacher chunk. Hidden and
 residual travel separately; shared index selections are restored per query.
+An optional trace replays two overlapping M8 target calls with frozen commits.
 This records numerical and residency evidence, without measuring latency.
 """
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import gc
+import hashlib
 from importlib.metadata import version
 import inspect
 import json
@@ -37,7 +40,10 @@ def arguments():
     parser.add_argument("--layers", type=int, choices=range(1, 79), default=78,
                         help="Execute the first N main-model layers")
     parser.add_argument("--steps", type=int, choices=range(1, 33), default=32)
-    parser.add_argument("--query-width", type=int, choices=(1, 32), default=1)
+    parser.add_argument("--query-width", type=int, choices=(1, 8, 32),
+                        default=1)
+    parser.add_argument("--round-trace", type=Path,
+                        help="Replay the first two measured M8 target calls")
     parser.add_argument("--baseline", type=Path,
                         help="Full CANN layer traces for every requested row")
     parser.add_argument("--attention-kernel",
@@ -45,6 +51,14 @@ def arguments():
                         default="sfa")
     parser.add_argument("--fp32-head", action="store_true")
     args = parser.parse_args()
+    if args.round_trace:
+        if (args.query_width != 8 or args.steps != 32
+                or args.attention_kernel != "sfa" or not args.fp32_head
+                or args.baseline is not None):
+            parser.error("Round replay requires M8, SFA, FP32 head, the full "
+                         "teacher reference and no token-major baseline")
+    elif args.query_width == 8:
+        parser.error("M8 requires --round-trace")
     if args.query_width == 32 and args.steps != 32:
         parser.error("M32 requires all 32 teacher inputs")
     if args.query_width == 32 and args.attention_kernel == "gather_fia":
@@ -79,6 +93,166 @@ def read_teacher(args, inputs):
         "prompt_identity": identity, "teacher_tokens": tokens,
         "expected_next_tokens": expected, "scope": report["scope"],
     }
+
+
+def read_round_trace(path, inputs, checkpoint, teacher, expected, rank):
+    raw = path.read_bytes()
+    report = json.loads(raw)
+    identity = ("prompt_sha256", "prompt_length", "last_prompt_token",
+                "initial_position", "first_token_id", "request_id",
+                "generation", "capture_manifest_sha256")
+    if (report["rank"] != 0 or report["world_size"] != 16
+            or report["width"] != 8 or report["capacity"] != CAPACITY
+            or report["fp32_head"] is not True
+            or report["checkpoint_sha256"] != checkpoint
+            or any(report["inputs"][k] != inputs[k] for k in identity)
+            or (rank == 0 and report["inputs"]["prefix_sha256"]
+                != inputs["prefix_sha256"])):
+        raise ValueError("Round trace target/capture identity differs")
+    index = report["warmup"]
+    request = report["rank_requests"][index]
+    if (report["requests"][index]["warmup"] is not False
+            or request["injected"][0] != 8192
+            or request["first_token"] != inputs["first_token_id"]
+            or len(request["rounds"]) < 2):
+        raise ValueError("Round trace requires two measured target calls")
+    tokens, schedule, scored_rows, labels = [], [], [], []
+    committed, position = [request["first_token"]], 8192
+    for call in request["rounds"][:2]:
+        candidates, predictions = call["candidates"], call["predictions"]
+        if (call["width"] != 8 or len(candidates) != len(predictions)
+                or len(candidates) != 8 or any(
+                    type(x) is not int or not 0 <= x < 154880
+                    for x in candidates + predictions)):
+            raise ValueError("Round trace requires eight vocabulary IDs")
+        matched = 0
+        for proposed, predicted in zip(candidates[1:], predictions):
+            if proposed != predicted:
+                break
+            matched += 1
+        accepted = predictions[:min(matched + 1,
+                                    report["max_tokens"] - len(committed))]
+        if (not accepted or candidates[0] != committed[-1]
+                or call["before"] != position
+                or call["written"] != position + 8
+                or call["retained"] != position + len(accepted)
+                or call["accepted_tokens"] != accepted
+                or call["matched_drafts"] != matched
+                or call["natural_accepted"] != matched + 1):
+            raise ValueError("Round trace commit/position contract differs")
+        offset = position - 8192
+        if committed == teacher[:len(committed)]:
+            for row, token in enumerate(candidates):
+                if (offset + row >= len(teacher)
+                        or token != teacher[offset + row]):
+                    break
+                scored_rows.append(len(tokens) + row)
+                labels.append(expected[offset + row])
+        schedule.append({"position": position, "retained": call["retained"],
+                         "tokens": list(candidates),
+                         "historical_predictions": list(predictions),
+                         "historical_accepted_tokens": list(accepted)})
+        tokens.extend(candidates)
+        committed.extend(accepted)
+        position = call["retained"]
+    if not scored_rows:
+        raise ValueError("Round trace has no trustworthy teacher successors")
+    return tokens, schedule, scored_rows, labels, {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(raw).hexdigest(), "request_index": index,
+        "source_commit": report["source_commit"], "schedule": schedule,
+        "historical_execution": {name: report[name] for name in (
+            "target_graph", "compile_target", "super_kernel",
+            "draft_graph", "conditioned_graph")},
+        "scope": "Frozen target calls; historical predictions are diagnostic",
+    }
+
+
+@contextmanager
+def replay_attention(layer, metadata, number):
+    impl = layer.self_attn.mla_attn.mla_attn.impl
+    original, calls = impl._execute_sparse_flash_attention_process, []
+
+    def values(query, key, table):
+        return {"query": query.cpu().tolist(), "key": key.cpu().tolist(),
+                "block_table": table.cpu().clone()}
+
+    def capture(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                actual_seq_lengths_query, actual_seq_lengths_key,
+                block_table=None):
+        table = (attn_metadata.block_table if block_table is None
+                 else block_table)
+        record = {"sfa": values(actual_seq_lengths_query,
+                                actual_seq_lengths_key, table)}
+        indexer = metadata.get(
+            f"model.layers.{number}.self_attn.indexer.k_cache",
+        )
+        if indexer is not None:
+            record["indexer"] = values(indexer.actual_seq_lengths_query,
+                                       indexer.actual_seq_lengths_key,
+                                       indexer.block_table)
+        calls.append(record)
+        return original(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                        actual_seq_lengths_query, actual_seq_lengths_key,
+                        block_table=block_table)
+
+    method = "_execute_sparse_flash_attention_process"
+    with patch.object(impl, method, capture):
+        yield calls
+
+
+def snapshot_round(engine, plan, width, protected, attention):
+    import torch
+
+    start, retained = plan["position"], plan["retained"]
+    written, cache = start + width, engine.cache[0]
+    snapshot = {name: value[start:written].cpu().clone()
+                for name, value in cache.items()}
+    def same(left, right):
+        return torch.equal(left.contiguous().view(torch.uint8),
+                           right.contiguous().view(torch.uint8))
+
+    if len(attention) != 1:
+        raise ValueError("Expected one actual SFA call per replay chunk")
+    checks = []
+    pages = (written + 127) // 128
+    expected_table = engine.block_table.cpu()[:, :pages]
+    for name in ("sfa", "indexer") if "index_keys" in cache else ("sfa",):
+        actual = attention[0].get(name)
+        checks.append({"name": name + ".lengths", "passed":
+                       actual is not None and actual["query"] == [width]
+                       and actual["key"] == [written]})
+        table = actual["block_table"] if actual is not None else None
+        checks.append({"name": name + ".block_table", "passed":
+                       table is not None and table.ndim == 2
+                       and table.shape[0] == 1 and table.shape[1] >= pages
+                       and torch.equal(table[:, :pages], expected_table)})
+    for name, expected in (protected or {}).items():
+        actual = cache[name][8192:start].cpu()
+        checks.append({"name": "accepted_prefix." + name,
+                       "passed": same(actual, expected)})
+    metadata = {"input_ids": engine.input_ids.cpu().tolist(),
+                "positions": engine.positions.cpu().tolist(),
+                "slots": engine.slots.cpu().tolist(),
+                "seq_lens": engine.seq_lens.cpu().tolist()}
+    checks.append({"name": "call_metadata", "passed":
+                   metadata["input_ids"] == plan["tokens"]
+                   and metadata["positions"] == metadata["slots"]
+                   == list(range(start, written))
+                   and metadata["seq_lens"] == [written]})
+    engine.position = written
+    engine.truncate(retained)
+    for name, value in snapshot.items():
+        checks.append({"name": "new_cache_finite." + name,
+                       "passed": bool(torch.isfinite(value).all())})
+        checks.append({"name": "rejected_tail_preserved." + name,
+                       "passed": same(cache[name][retained:written].cpu(),
+                                      value[retained - start:])})
+    protected = {name: value[8192:retained].cpu().clone()
+                 for name, value in cache.items()}
+    return {"position": start, "written": written, "retained": retained,
+            **metadata, "attention": attention[0],
+            "cache_rows": snapshot}, protected, checks
 
 
 def read_baseline(args, rank, checkpoint, inputs, teacher):
@@ -190,7 +364,7 @@ def bind_cache(engine, number, prefix):
 
 
 def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
-              width=1):
+              width=1, schedule=None):
     import torch
     from vllm.model_executor.model_loader.utils import (
         process_weights_after_loading,
@@ -209,6 +383,10 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
     old_moe = list(compilation.static_all_moe_layers)
     old_eplb = list(VllmEplbAdaptor._registered_moe_layers)
     checks, inputs, reductions = [], [], []
+    call_snapshots, protected = [], None
+    positions = (list(range(8192, 8192 + len(teacher))) if schedule is None
+                 else [plan["position"] + row for plan in schedule
+                       for row in range(width)])
     try:
         def prepare():
             with torch.device(engine.device):
@@ -257,7 +435,17 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
               patch.object(engine, "_tp_sum_original", reduce)):
             for offset in range(0, len(teacher), width):
                 rows = slice(offset, offset + width)
-                engine.position = 8192 + offset
+                plan = (None if schedule is None
+                        else schedule[offset // width])
+                if plan is not None:
+                    engine.replay_progress.update(
+                        layer=number, round=offset // width,
+                        position=plan["position"],
+                        written=plan["position"] + width,
+                        retained=plan["retained"], phase="forward",
+                    )
+                engine.position = (8192 + offset if plan is None
+                                   else plan["position"])
                 metadata = engine._metadata(width)
                 engine.input_ids.copy_(torch.tensor(
                     teacher[rows], dtype=engine.input_ids.dtype,
@@ -267,10 +455,12 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
                     layer.self_attn.topk_indices_buffer[:width].copy_(
                         shared[rows],
                     )
+                capture = (nullcontext([]) if plan is None
+                           else replay_attention(layer, metadata, number))
                 with set_ascend_forward_context(
                     metadata, engine.config, num_tokens=width,
                     num_actual_tokens=width, model_instance=engine.model,
-                ):
+                ), capture as attention:
                     h, r = layer(
                         engine.positions, hidden[rows],
                         None if residual is None else residual[rows],
@@ -280,7 +470,19 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
                 merged.append(torch.ops._C_ascend.npu_add_rms_norm_bias(
                     h, r, engine.norm_units, None, 1e-5,
                 )[2].detach().clone())
-        engine.position = 8192 + len(teacher)
+                if plan is not None:
+                    engine.replay_progress["phase"] = "cache_snapshot"
+                    snapshot, protected, local = snapshot_round(
+                        engine, plan, width, protected, attention,
+                    )
+                    call_snapshots.append(snapshot)
+                    checks.extend({**item, "name":
+                                   f"round{offset // width}." + item["name"]}
+                                  for item in local)
+                    if offset == 0:
+                        check_prefix(engine, [prefix], checks, "round0.after")
+        if schedule is None:
+            engine.position = 8192 + len(teacher)
         torch.npu.synchronize(engine.device)
         calls = len(teacher) // width
         if len(selected) != calls or len(inputs) != calls:
@@ -293,7 +495,7 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
             checks.append({"name": f"token{offset}.causal_indices", "passed":
                            row.numel() == 2048 and row.unique().numel() == 2048
                            and bool(torch.all((row >= 0)
-                                              & (row <= 8192 + offset)))})
+                                              & (row <= positions[offset])))})
         if skip_topk:
             checks.append({"name": "shared_indices_restored_per_token",
                            "passed": torch.equal(choices, shared.cpu())})
@@ -307,22 +509,30 @@ def run_layer(engine, factory, checkpoint, number, prefix, state, teacher,
             path = Path(inspect.getfile(inspect.unwrap(value))).resolve()
             sources[str(path)] = digest(path)
         output_h, output_r = torch.cat(next_hidden), torch.cat(next_residual)
-        checks.append({"name": "teacher_row_shapes", "passed":
+        checks.append({"name": ("teacher_row_shapes" if schedule is None
+                                else "replay_row_shapes"), "passed":
                        output_h.shape == output_r.shape
                        == (len(teacher), 6144)
                        and indices.shape == (len(teacher), 2048)})
+        token_field = ("teacher_tokens" if schedule is None
+                       else "candidate_tokens")
         data = {
-            "layer": number, "teacher_tokens": teacher,
-            "positions": list(range(8192, engine.position)),
+            "layer": number,
+            token_field: teacher,
+            "positions": positions,
             "input_hidden": raw_hidden, "input_residual": raw_residual,
             "input_merged": torch.cat(inputs).cpu(),
             "hidden": output_h.cpu(), "residual": output_r.cpu(),
             "merged": torch.cat(merged).cpu(), "indices": choices,
-            "skip_topk": skip_topk, "cache_rows": {
+            "skip_topk": skip_topk,
+        }
+        if schedule is None:
+            data["cache_rows"] = {
                 name: value[8192:engine.position].cpu().clone()
                 for name, value in engine.cache[0].items()
-            },
-        }
+            }
+        else:
+            data["round_calls"] = call_snapshots
         return ((output_h, output_r, shared if skip_topk else indices), data,
                 checks, coverage, sources, references)
     finally:
@@ -413,6 +623,14 @@ def execute(args):
     if inputs["initial_position"] != 8192 or len(prefixes) != 78:
         raise ValueError("Expected the captured 8192-row, 78-layer prefix")
     teacher, expected, teacher_source = read_teacher(args, inputs)
+    schedule, round_trace = None, None
+    scored_rows = list(range(len(teacher)))
+    if args.round_trace:
+        replay = read_round_trace(
+            args.round_trace, inputs, fingerprint, teacher, expected, rank,
+        )
+        teacher, schedule, scored_rows, expected, round_trace = replay
+    token_field = "candidate_tokens" if round_trace else "teacher_tokens"
     baseline, baseline_hashes = read_baseline(
         args, rank, fingerprint, inputs, teacher,
     )
@@ -423,6 +641,7 @@ def execute(args):
     engine.attention_kernel = args.attention_kernel
     engine.fp32_head = args.fp32_head
     engine.graph_width, engine.hoist_metadata = 32, False
+    engine.replay_progress = args.replay_call = {} if round_trace else None
     engine.onesided_endpoint, engine._onesided = None, None
     engine._tp_sum_group, engine.graph = None, None
     torch.npu.set_device(engine.device)
@@ -443,7 +662,8 @@ def execute(args):
         try:
             if engine.worker.device != engine.device:
                 raise ValueError("Worker remapped the physical device")
-            identities = gather((teacher, expected, fingerprint,
+            identities = gather((teacher, expected, schedule, scored_rows,
+                                 round_trace, fingerprint,
                                  inputs["prompt_sha256"],
                                  inputs["request_id"], inputs["generation"]))
             if any(item != identities[0] for item in identities):
@@ -495,7 +715,7 @@ def execute(args):
                 torch.npu.reset_peak_memory_stats(engine.device)
                 result = run_layer(engine, factory, checkpoint, number,
                                    prefixes[number], state, teacher,
-                                   args.query_width)
+                                   args.query_width, schedule)
                 state, data, local, loaded, source, refs = result
                 del result
                 gc.collect()
@@ -536,22 +756,31 @@ def execute(args):
                 })
                 checked(f"layer{number}.release",
                         lambda: require_released(alive))
-            predictions = []
+            predictions, scored_predictions = [], []
             if args.layers == 78:
                 hidden, residual, _ = state
                 normalized, logits = final_logits(
                     engine, hidden, residual, args.query_width,
                 )
                 predictions = logits.argmax(dim=-1).tolist()
+                scored_predictions = [predictions[row] for row in scored_rows]
                 path = directory / "final.pt"
+                final = {"normalized": normalized, "logits": logits,
+                         token_field: teacher, "predicted_tokens": predictions}
+                if round_trace:
+                    top2 = logits.topk(2, dim=-1)
+                    final.update(
+                        scored_rows=scored_rows, expected_tokens=expected,
+                        top2_tokens=top2.indices, top2_scores=top2.values,
+                        expected_scores=logits[scored_rows, expected],
+                    )
                 with path.open("xb") as stream:
-                    torch.save({"normalized": normalized,
-                                "logits": logits,
-                                "teacher_tokens": teacher,
-                                "predicted_tokens": predictions}, stream)
+                    torch.save(final, stream)
                 artifacts[str(path)] = digest(path)
-                checks.append({"name": "greedy_matches_frozen_trajectory",
-                               "passed": predictions == expected})
+                label_check = ("trusted_successor_labels" if round_trace
+                               else "greedy_matches_frozen_trajectory")
+                checks.append({"name": label_check,
+                               "passed": scored_predictions == expected})
                 dtype = torch.float32 if args.fp32_head else torch.bfloat16
                 checks.append({"name": "logits_shape_and_dtype", "passed":
                                logits.shape == (len(teacher), 154880)
@@ -568,17 +797,20 @@ def execute(args):
                 item == predictions for item in all_predictions
             )})
             passed = all(item["passed"] for item in checks)
+            scope = ("Layer-major frozen target-round replay; eager, no MTP"
+                     if round_trace else "Layer-major frozen teacher replay")
             report = {
                 "status": "pass" if passed else "fail",
-                "rank": rank, "scope": "Layer-major frozen teacher replay",
+                "rank": rank,
+                "scope": scope,
                 "precision_verified": False, "performance_measured": False,
                 "layers": args.layers, "steps": len(teacher),
                 "capacity": CAPACITY, "query_width": args.query_width,
-                "position": engine.position, "teacher_tokens": teacher,
+                "position": engine.position, token_field: teacher,
                 "expected_tokens": expected, "predicted_tokens": predictions,
                 "greedy_correct": sum(a == b for a, b
-                                      in zip(predictions, expected)),
-                "greedy_total": len(predictions),
+                                      in zip(scored_predictions, expected)),
+                "greedy_total": len(scored_predictions),
                 "full_model_executed": args.layers == 78,
                 "attention_kernel": args.attention_kernel,
                 "fp32_head": args.fp32_head,
@@ -597,6 +829,10 @@ def execute(args):
                     "HCCL_DETERMINISTIC", "HCCL_BUFFSIZE",
                     "ASCEND_LAUNCH_BLOCKING", "TASK_QUEUE_ENABLE")},
             }
+            if round_trace:
+                report.update(round_trace=round_trace, scored_rows=scored_rows,
+                              scored_predictions=scored_predictions,
+                              target_graph=False, conditioned_mtp=False)
             path = args.output / f"rank-{rank}.json"
             checked("report", lambda: write_json(path, report))
             ranks = gather({"rank": rank, "status": report["status"],
@@ -627,6 +863,10 @@ def main():
         path = args.output / f"rank-{os.environ.get('RANK')}-error.json"
         if not path.exists():
             write_json(path, {"layer": args.layer, "status": "error",
+                              "replay_call": getattr(args, "replay_call",
+                                                     None),
+                              "round_trace": (str(args.round_trace)
+                                              if args.round_trace else None),
                               "traceback": traceback.format_exc()})
         raise
 
