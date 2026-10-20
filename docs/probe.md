@@ -79,6 +79,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [Capacity sweep](evidence/ascend-decode/routed-kernel-20261020/README.md) | Rows an expert as a build-time capacity, 2／4／8／16／32 at16 experts on16 blocks. | Padding is not free: 49.289／51.969／55.263／63.308／79.820µs, a fit of 47.25µs+1.02µs a row. The cube is flat in rows but the epilogue is linear in them. The fixed term is weight streaming -- 2.36MB a block,16 at once,799GB/s =69% of the die's peak -- so that is the floor to attack, and capacity must follow the group list rather than the worst case. |
 
+| 10-20 | [INT4 weights](evidence/ascend-decode/int4-weights-20261020/README.md) | Seven `MatmulType` variants with an `int4b_t` operand, then six basic-API copy probes. | The capture shows the vendor reading `DT_INT4` in `FRACTAL_NZ`, so A3 does 4-bit weights; vendor165.2µs on18.9MB is114GB/s (10% of peak) against this kernel's49.3µs on37.7MB =765 (66%). The high-level `Matmul` rejects int4 in every combination because it plans to widen to INT8 during the GM→L1 copy and MTE2 will not; but int4 reaches UB, A1, B1 and A2 unaided, and L1→L0B int4 is in the library already. Hand-rolled L1／L0 would be ~24.8µs a layer. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
