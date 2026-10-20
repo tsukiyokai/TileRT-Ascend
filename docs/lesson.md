@@ -642,3 +642,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     plainest replacement is 2.93x the vendor, with `index_add_` alone at
     131.957 us against the vendor's whole unpermute at 31.181, so the ceiling
     is not currently reachable either.
+
+72. The MoE matmul is fixed cost. Sixteen rows cost 146.431 us and 256 cost
+    150.565 -- sixteen times the work for 2.8 percent more time -- so under
+    three percent of the round's 12.3 ms MoE line item is arithmetic. The
+    premise that it is computation, reducible by a faster matmul, is wrong:
+    a faster matmul buys three percent of it, which makes the hand-written
+    kernel's 2.33x disadvantage beside the point and its value purely as a
+    vehicle for covering several layers in one launch. The round model's
+    45.88 ms fixed term is the sum of per-layer taxes paid once each because
+    each is a separate launch, and that is the only exit the measurements
+    leave open.
