@@ -601,3 +601,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     reference: mine disagreed with the kernel about whether the scale bias
     goes inside or outside the scale, so it could not settle which side was
     wrong, while the vendor needs none of my checkpoint conventions to hold.
+
+68. Bisect before hypothesising, and count the defects before explaining them.
+    Two archived kernel builds against one judge: a04e6ce gives 0.47461 where
+    the vendor gives 0.45117, ba67cf3 gives 0.00000. So there are two
+    independent defects -- a structural one the stage-major restructuring
+    introduced, and a five-percent numerical one that predates it -- and every
+    one of the ten failed hypotheses had been trying to explain both at once
+    with a single mechanism. The commit that produced the session's best
+    kernel timing, 79.206 us against the vendor's 157.176, is the one whose
+    output is absent; the timing stands and the saving it implied does not.
