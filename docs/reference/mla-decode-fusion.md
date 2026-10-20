@@ -2908,3 +2908,299 @@ is a per-die or per-core bandwidth rather than aggregate HBM; (iii) the op is be
 per head rather than once per layer, which would multiply the launch count and show up in our
 3008-kernels-per-round figure. Determining which costs one plog read of
 `SFA block dim: %u aiv Num: %u aic Num: %u.` and is the highest-value next measurement.
+
+---
+
+## 11. `SparseFlashMla` + `SparseFlashMlaMetadata` — the A3-supported sparse MLA op that DOES split S2, with an AI-CPU balanced scheduler
+
+Same clone and commit (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20).
+`attention/sparse_flash_mla/` and `attention/sparse_flash_mla_metadata/`.
+
+The earlier Gaps entry recorded "nothing states ... whether `sparse_flash_mla` is A3-capable
+(`flash_mla` itself is 950-only)". It is A3-capable, and it is the structural answer.
+
+### 11.1 Product support — A3 is supported
+
+`attention/sparse_flash_mla/README.md`:
+
+> # SparseFlashMla
+>
+> ## 产品支持情况
+>
+> | 产品                                                          | 是否支持 |
+> | :------------------------------------------------------------ | :------: |
+> |<term>Ascend 950PR&950DT系列产品</term>                         |     √    |
+> |<term>Atlas A3系列产品</term>         |     √    |
+> |<term>Atlas A2系列产品</term>         |     √    |
+> |<term>Atlas 200I/500 A2推理系列产品</term>                      |     ×    |
+> |<term>Atlas推理系列产品</term>                                 |     ×    |
+> |<term>Atlas训练系列产品</term>                                 |     ×    |
+
+> - 算子功能：
+>
+>   `SparseFlashMla`算子旨在完成以下公式描述的Attention计算，支持SWA（Sliding Window Attention）、CSA（Compressed Sparse Attention）、HCA（Heavily Compressed Attention）三类Attention计算场景。调用时需要使用`SparseFlashMlaMetadata`生成的任务列表`metadata`。
+>
+>   典型调用流程如下：
+>
+>   1. 准备`q`、`ori_kv`、`cmp_kv`、序列长度、`block table`、`sinks`等输入。
+>   2. 调用`SparseFlashMlaMetadata`生成`metadata`。
+>   3. 调用`SparseFlashMla`，将上一步得到的`metadata`传入主算子。
+
+### 11.2 The metadata op's stated purpose is exactly the missing load balance
+
+`attention/sparse_flash_mla_metadata/README.md`:
+
+> - 算子功能：`SparseFlashMlaMetadata`是`SparseFlashMla`算子的前置算子，用于后续Attention计算生成负载均衡的任务划分方案。本算子不执行实际的Attention计算，而是根据输入参数在AI CPU计算出每个AI Core应处理的Attention计算起止范围，从而最大化计算资源的利用率，避免各Core间负载不均衡的问题。
+
+> | metadata | 输出 | 表示`SparseFlashMla`主算子使用的任务切分结果，shape固定为(2048, )。 | INT32 | ND |
+
+A fixed 2048-int32 (8 KiB) task list, computed on the AI CPU, consumed by the main kernel.
+
+The A3 constraint note, which confirms a per-token sparse index list is the A3 use case:
+
+> - Atlas A3系列产品约束：
+>   - SWA稀疏ori_kv场景下，仅支持SWA模板，`has_ori_kv`为true、`has_cmp_kv`为false、`ori_topk`大于0、`ori_mask_mode`为0，`ori_win_left`和`ori_win_right`为非负数，且必须传入`ori_topk_length`。`ori_topk`应与配套主算子`ori_sparse_indices`最后一维K保持一致；`ori_topk_length`表示每个q token和KV head的左对齐有效索引条目数，取值应在[0, K]范围内；Metadata仅使用`ori_topk_length`生成任务切分。配套主算子在PA_BBND场景仍要求传入`seqused_ori_kv`。
+
+> - <term>Atlas A3系列产品</term> ：num_heads_q/num_heads_kv仅支持1、2、4、8、16、32、64、128，不支持seqused_q、cmp_topk_length；SWA稀疏ori_kv场景支持ori_topk_length、ori_topk大于0及ori_mask_mode为0，ori_win_left和ori_win_right支持非负数；其他SWA场景ori_topk为0、ori_mask_mode为4、ori_win_left为127、ori_win_right为0；cmp_topk支持[0, 8192]，cmp_mask_mode仅支持3，SWA不传入cmp_kv，cmp_ratio不参与计算、CSA支持1、2或4、HCA支持128。
+
+Note `Metadata仅使用ori_topk_length生成任务切分` — the split is computed from the *actual*
+per-token valid index count, not from a padded worst case. That is precisely what
+`SparseFlashAttention` on `arch22` cannot do (section 9.6: it pads to 512 and multiplies the
+zeros; `oriTopkLength` exists only in `arch35`, section 10.4).
+
+### 11.3 `BalanceSchedule` — the scheduler, verbatim
+
+`attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.cpp`:
+
+```cpp
+bool SparseFlashMlaMetadataCpuKernel::BalanceSchedule(SplitResult& splitRes)
+{
+    SplitContext splitContext(batchSize_);
+
+    // 1、划分基本块，统计信息
+    CalcSplitInfo(splitContext);
+    // 全空case
+    if (splitContext.splitInfo.isKvSeqAllZero) {
+        splitRes.usedCoreNum = 1U;
+        splitRes.bN2End[0] = batchSize_ * numHeadsKv_;
+        splitRes.gS1End[0] = 0U;
+        splitRes.s2End[0] = 0U;
+        return true;
+    }
+    CalcCostInfo(splitContext);
+
+    // 2、获取每个核的分配方案
+    splitRes.maxCost = INT64_MAX;
+    splitRes.usedCoreNum = 1U;
+
+    CalcSplitPlan(splitRes.maxCost, splitContext, splitRes);
+    // 3、存在FD任务，对FD进行负载均衡分配
+    if (splitRes.numOfFdHead > 0U) {
+        SplitFD(splitRes);
+    }
+    splitRes.usedCoreNum = std::max(splitRes.usedCoreNum, 1U); // 至少使用1个core
+    return true;
+}
+```
+
+`CalcSplitPlan` walks a `(bN2, s1G, s2)` cursor across cores until the cost is exhausted:
+
+```cpp
+void SparseFlashMlaMetadataCpuKernel::CalcSplitPlan(int64_t costLimit, const SplitContext& splitContext,
+                                                    SplitResult& result)
+{
+    const CostInfo& costInfo = splitContext.costInfo;
+    const SplitInfo& splitInfo = splitContext.splitInfo;
+    if (aicCoreNum_ == 0U) {
+        return;
+    }
+    result.maxCost = 0U;
+    result.usedCoreNum = 0U;
+
+    AssignContext assignContext{};
+    assignContext.curBIdx = 0U;
+    assignContext.curS1GIdx = 0U;
+    assignContext.unassignedCost = costInfo.totalCost;
+    assignContext.bN2Cost = costInfo.bN2CostOfEachBatch[assignContext.curBIdx];
+    assignContext.bN2Block = costInfo.bN2BlockOfEachBatch[assignContext.curBIdx];
+    assignContext.bN2S2Loop = costInfo.bN2S2LoopOfEachBatch[assignContext.curBIdx];
+    CalcBatchCache(assignContext.curBIdx, splitContext, assignContext.batchCache);
+    CalcS1GCache(assignContext.curS1GIdx, splitContext, assignContext.batchCache, assignContext.s1GCache);
+    assignContext.curS2Idx = assignContext.s1GCache.s2Start;
+    // 负载分配
+    for (uint32_t i = 0; i < aicCoreNum_; ++i) {
+        if (result.maxCost > costLimit) {
+            return;
+        }
+        if (assignContext.isFinished || assignContext.unassignedCost <= 0) {
+            break;
+        }
+        assignContext.curCoreIdx = i;
+        AssignBlocksToCore(splitContext, assignContext, result);
+    }
+    result.usedCoreNum = assignContext.curCoreIdx + 1;
+}
+```
+
+and the cursor explicitly advances along S2 *within* an `(s1G)` unit — the axis
+`SparseFlashAttention` pins at `actBatchS2 = 1`:
+
+```cpp
+    bool UpdateS1G = false;
+    bool UpdateBatch = false;
+
+    // Update S2
+    if (assignContext.curS2Idx >= assignContext.s1GCache.s2End) { // 边界assignInfo.s2End是取不到的开区间
+        assignContext.curS2Idx = 0U;
+        assignContext.curS1GIdx++;
+        UpdateS1G = true;
+    }
+
+    // Update S1G
+    if (assignContext.curS1GIdx >= splitInfo.s1GBaseNum[assignContext.curBIdx]) {
+        assignContext.curS1GIdx = 0U;
+        assignContext.curBN2Idx++;
+    }
+```
+
+### 11.4 `SplitFD` — the flash-decode combine is itself load-balanced across AIVs
+
+```cpp
+void SparseFlashMlaMetadataCpuKernel::SplitFD(SplitResult& splitRes)
+{
+    // 计算FD的总数据量
+    uint64_t totalFDLoad = 0;
+    for (uint32_t i = 0; i < splitRes.numOfFdHead; i++) {
+        totalFDLoad += splitRes.fdRes.fdS2SplitNum[i] * splitRes.fdRes.fdMSize[i];
+    }
+    // 计算当前最大冗余vec核数
+    uint32_t emptyVectorNum = aivCoreNum_ - splitRes.numOfFdHead;
+    // 计算每个核处理的load
+    uint64_t averageLoad = (totalFDLoad + aivCoreNum_ - 1U) / aivCoreNum_; // 向上取整，避免核负载为0
+    uint32_t curCoreIndex = 0;
+    for (uint32_t i = 0; i < splitRes.numOfFdHead; i++) {
+        // 冗余vec核数为0，此时规约任务无法进行更小的切分，只能1个vec核计算1个规约任务
+        if (emptyVectorNum == 0U) {
+            splitRes.fdRes.fdIdx[curCoreIndex] = i;
+            splitRes.fdRes.fdMStart[curCoreIndex] = 0U;
+            splitRes.fdRes.fdMNum[curCoreIndex] = splitRes.fdRes.fdMSize[i];
+            curCoreIndex++;
+            continue;
+        }
+        // 计算当前归约任务所用核数，向下取整，避免使用核数超出总核数
+        uint32_t curFDVectorNum = splitRes.fdRes.fdS2SplitNum[i] * splitRes.fdRes.fdMSize[i] / averageLoad;
+        curFDVectorNum = std::max(1U, curFDVectorNum);
+        // 计算当前归约任务每个核的行数，向上取整，避免行数为0
+        uint32_t curAveMSize = (splitRes.fdRes.fdMSize[i] + curFDVectorNum - 1U) / curFDVectorNum;
+        curFDVectorNum = (splitRes.fdRes.fdMSize[i] + curAveMSize - 1U) / curAveMSize;
+        // 需要使用的vec核数与当前剩余可用vec核数取最小
+        curFDVectorNum = std::min(curFDVectorNum, emptyVectorNum + 1U); // 1: Fd任务自身带一个核
+        // FD负载分配
+        for (uint32_t vid = 0; vid < curFDVectorNum; vid++) {
+            splitRes.fdRes.fdIdx[curCoreIndex] = i;
+            splitRes.fdRes.fdMStart[curCoreIndex] = vid * curAveMSize;
+            splitRes.fdRes.fdMNum[curCoreIndex] =
+                (vid < curFDVectorNum - 1) ? curAveMSize : (splitRes.fdRes.fdMSize[i] - vid * curAveMSize);
+            curCoreIndex++;
+        }
+        // 更新冗余vec核数
+        emptyVectorNum -= (curFDVectorNum - 1U); // 1: 空余核不包含FD自身的核，要-1
+    }
+    splitRes.fdRes.fdUsedVecNum = curCoreIndex;
+}
+```
+
+### 11.5 `GenMetadata` — the exact wire format of the per-core task list
+
+```cpp
+    } else {
+        for (size_t i = 0; i < aicCoreNum_; ++i) {
+            if (i >= splitRes.usedCoreNum) {
+                metadataPtr->faMetadata[i][FA_CORE_ENABLE_INDEX] = 0; // AIC disenable
+                continue;
+            }
+            metadataPtr->faMetadata[i][FA_CORE_ENABLE_INDEX] = 1; // AIC enable
+            // FA START
+            metadataPtr->faMetadata[i][FA_BN2_START_INDEX] = i == 0 ? 0 : splitRes.bN2End[i - 1];
+            metadataPtr->faMetadata[i][FA_M_START_INDEX] = i == 0 ? 0 : splitRes.gS1End[i - 1];
+            metadataPtr->faMetadata[i][FA_S2_START_INDEX] = i == 0 ? 0 : splitRes.s2End[i - 1];
+            // FA END
+            metadataPtr->faMetadata[i][FA_BN2_END_INDEX] = splitRes.bN2End[i];
+            metadataPtr->faMetadata[i][FA_M_END_INDEX] = splitRes.gS1End[i];
+            metadataPtr->faMetadata[i][FA_S2_END_INDEX] = splitRes.s2End[i];
+            // firstFdDataWorkspace
+            metadataPtr->faMetadata[i][FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX] = splitRes.firstFdDataWorkspaceIdx[i];
+        }
+    }
+
+    // FD Metadata Generate
+    for (size_t i = 0; i < aivCoreNum_; ++i) {
+        if (i >= splitRes.fdRes.fdUsedVecNum) {
+            metadataPtr->fdMetadata[i][FD_CORE_ENABLE_INDEX] = 0; // AIV disenable
+            continue;
+        }
+        metadataPtr->fdMetadata[i][FD_CORE_ENABLE_INDEX] = 1; // AIV enable
+        uint32_t curFdIdx = splitRes.fdRes.fdIdx[i];
+        metadataPtr->fdMetadata[i][FD_BN2_IDX_INDEX] = splitRes.fdRes.fdBN2Idx[curFdIdx];
+        metadataPtr->fdMetadata[i][FD_M_IDX_INDEX] = splitRes.fdRes.fdMIdx[curFdIdx];
+        metadataPtr->fdMetadata[i][FD_WORKSPACE_IDX_INDEX] = splitRes.fdRes.fdWorkspaceIdx[curFdIdx];
+        metadataPtr->fdMetadata[i][FD_WORKSPACE_NUM_INDEX] = splitRes.fdRes.fdS2SplitNum[curFdIdx];
+        metadataPtr->fdMetadata[i][FD_M_START_INDEX] = splitRes.fdRes.fdMStart[i];
+        metadataPtr->fdMetadata[i][FD_M_NUM_INDEX] = splitRes.fdRes.fdMNum[i];
+    }
+    return true;
+}
+```
+
+and the op's own host tiling, which — unlike SFA — does not need to compute a split at all,
+because the metadata already carries it:
+
+```cpp
+    usedCoreNum_ = aicNum;
+    tilingData_.baseParams.set_usedCoreNum(usedCoreNum_);
+```
+
+The AI CPU kernel registration:
+
+```cpp
+namespace {
+static const char* kernelType = "SparseFlashMlaMetadata";
+REGISTER_CPU_KERNEL(kernelType, SparseFlashMlaMetadataCpuKernel);
+} // namespace
+```
+
+## Relevance
+
+CANN ships **two** sparse MLA attention operators that both claim A3 support, and they differ on
+exactly the axis that governs our batch=1 cost:
+
+| | `SparseFlashAttention` | `SparseFlashMla` |
+|---|---|---|
+| A3 (`Atlas A3系列`) | √ | √ |
+| S2 (KV) split across cores | no — `actBatchS2 = 1`, `FLASH_DECODE` literal `0U` | yes — `FA_S2_START_INDEX` / `FA_S2_END_INDEX` per core |
+| flash-decode combine | dead code behind `if constexpr (FLASH_DECODE)` | `SplitFD` + `fdMetadata` per AIV |
+| split computed where | in-kernel, `usedCoreNum = batch * q_tokens` | AI CPU, cost-model balanced, 2048-int32 task list |
+| uses actual top-k length | no (pads to 512, `oriTopkLength` is `arch35`-only) | yes — `Metadata仅使用ori_topk_length生成任务切分` |
+| per-call launch | 1 MIX_AIC kernel | 1 AI CPU kernel + 1 MIX kernel |
+
+So the fix for our 6.973 ms may not require writing a kernel at all: it may be a matter of
+calling the other operator. `SparseFlashMla` on A3 is documented for the SWA-sparse-`ori_kv`
+case with `ori_topk > 0`, `ori_mask_mode = 0`, and `ori_topk_length` passed, where
+`ori_topk` matches the last dim K of `ori_sparse_indices` — which is the shape of a DSA index
+list. The caveats to verify before betting on it: A3 is restricted to `仅支持SWA模板`
+(SWA template only) with `ori_win_left`/`ori_win_right` non-negative, so whether a pure
+top-k-without-window DSA pattern is expressible needs a parameter-level check; and it costs an
+extra AI CPU kernel per call, which at 95-ish layers is a second launch per layer against our
+already-saturated 3008-kernel budget.
+
+The deeper point for the megakernel is the *shape* of the answer. `SparseFlashMlaMetadata`
+computes, on the host-side AI CPU, a per-core `(bN2_start, M_start, S2_start) ->
+(bN2_end, M_end, S2_end)` range plus a per-AIV reduction assignment, and hands it to the kernel
+as an 8 KiB int32 blob. That is the same pattern as DeepSeek's FlashMLA `get_mla_metadata`
+already documented in section 4, and it is the mechanism our megakernel needs anyway: one
+persistent kernel reading a precomputed work list rather than a per-op tiling struct. The
+`SparseFlashMlaMetadata` field layout (`FA_CORE_ENABLE_INDEX`, `FA_*_START_INDEX`,
+`FA_*_END_INDEX`, `FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX`, `FD_WORKSPACE_NUM_INDEX`,
+`FD_M_START_INDEX`, `FD_M_NUM_INDEX`) is a ready-made schema to copy, and `SplitFD`'s
+`averageLoad = ceil(totalFDLoad / aivCoreNum)` greedy assignment is a ready-made balancer.

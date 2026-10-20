@@ -87,6 +87,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [L2 hint on the weight](evidence/ascend-decode/routed-kernel-20261020/README.md) | `SetL2CacheHint(CACHE_MODE_DISABLE)` on both projections' weights, the vendor's own `numBlocksM == 1` practice, at16 experts／16 blocks ×3 processes. | Nothing: 49.238／49.517／49.611µs against49.276／49.725／49.791 unhinted, correctness unchanged. The line is removed. The kernel is at66% of bandwidth and L2 eviction by its own weight stream does not explain the missing third. |
 
+| 10-20 | [The routed kernel is scalar bound](evidence/ascend-decode/routed-kernel-20261020/README.md) | `msprof --aic-metrics=PipeUtilization`,16 experts／16 blocks. | scalar 27.860µs／0.625, MTE2 32.826／0.733, MAC 4.845／**0.109**, vector 0.622／0.013. The cube spends62.5% of its time in scalar and11% multiplying; the vendor's MTE2-bound cases read0.93–0.99 where this reads0.733. "66% of bandwidth" was the wrong account — it explains the null L2 hint, INT4's21% instead of ~45%, and the flat block-count curve. Next lever: hoist `Matmul` out of the expert loop, or drive L1／L0 by hand. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

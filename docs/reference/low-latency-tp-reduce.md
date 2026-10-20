@@ -12761,6 +12761,162 @@ NOTHING: tile-ai/tilelang-ascend, Ascend/AscendNPU-IR, ByteDance-Seed/Triton-dis
 
 
 
+## Part 8. ★★ The vendor's own MC2 tuning case — 32.7% measured on MatmulAllReduce, and the three reasons none of it is reachable at batch=1
+
+Source: `/home/shanshan/repo/cann/asc-devkit/docs/zh/guide/operator_practice/best_practices/mc_operator_tuning.md`,
+「MC²算子性能调优案例」, in the shipped devkit on this machine. Read 2026-10-20. The sample operators it points
+at are `https://gitcode.com/cann/ops-transformer/tree/master/mc2/matmul_all_reduce`,
+`.../mc2/matmul_reduce_scatter_v2` and `.../mc2/all_gather_matmul_v2`.
+
+This is the complete, measured methodology for the fused matmul+allreduce we keep considering for the
+5.35 ms, 100%-serial TP reduce. It is worth reading in full precisely because it rules the approach out at
+batch=1 on three independent numeric grounds, each stated by the vendor rather than inferred.
+
+### 8.1 Where the gain comes from, and the exact benefit formula
+
+案例介绍, verbatim:
+
+> MC2通算融合算子的性能收益主要来自于通信、计算的并行执行，即将输入数据切分为多个子块，子块的计算和通信任务形成两条流水线，通过两条流水线上任务的并行执行，实现流水掩盖，从而提升算子性能。…输入矩阵沿M轴被切分为两块，第二块数据的Matmul计算和第一块数据的通信可以并行执行，从而达到计算和通信时间相互掩盖的目的。
+
+分析主要瓶颈点, verbatim:
+
+> MC2算子性能收益公式为：
+> 融合前算子串行耗时 = 融合前计算算子耗时 + 融合前通信算子耗时
+> MC2算子收益 = （融合前算子串行耗时 - 融合后MC2算子耗时） / 融合前算子串行耗时
+>
+> - 因素一：计算和通信的执行时间差异
+>   若计算和通信任务的执行时间相差不大，则融合后，MC2算子的计算和通信并行执行，实现流水掩盖效果，性能收益较大。若计算和通信任务的执行时间差异较大，则融合后…能够掩盖的时间较少，算子整体执行耗时与未切分串行时的算子执行耗时接近，此时无法获得较大性能收益。
+> - 因素二：数据切分导致的计算或通信的执行时间膨胀
+>   当对输入数据进行切分后，原本的整块数据被切分成若干小数据块…此时相比切分前，计算或者通信任务的执行时间可能发生膨胀（即执行时间变长）。该膨胀产生的原因包括：**切分后的数据块过小导致计算或通信的效率降低、切分的数据块过多导致增加额外的调度开销、并行执行后计算和通信对L2 Cache或device存储内存的访问冲突等。**
+
+and the three worked inflation regimes, verbatim — note that the third is a *regression*:
+
+> - 未发生膨胀：数据切分前，Matmul执行时间为200us，将Matmul的输入均匀切分为两块，假设切分后，每块数据的Matmul执行时间都是100us，通过计算的并行执行，下图实际性能收益为100us。
+> - 发生一般程度的膨胀：…每块数据的Matmul执行时间都是150us…实际性能收益为50us。
+> - 发生严重程度的膨胀：…每块数据的Matmul执行时间都是200us…**实际性能收益为劣化50us。**
+
+### 8.2 ★★★ Only M may be split — HCCL requires contiguity
+
+设计优化方案, verbatim. This is the first and hardest of the three blockers:
+
+> 该算子的数据切分策略应满足如下要求：
+> - **只切分M轴。因为通信任务调用的Hccl API要求分块数据内存连续，若按N轴切分，则每行数据都被切断，导致通信数据的内存不连续，不满足通信要求；若按M轴切分，则每行数据都是内存连续的，满足通信要求。**
+> - 若A表示长块、B表示短块，只能切出A或B连续排布的形式，例如AAAB、BAAA等情况。
+
+and the two bound regimes, verbatim:
+
+> - 计算bound：对于同一个切分后的数据块，计算执行耗时大于通信执行耗时，此时，**计算连续**，且**通信的尾块要短**。
+> - 通信bound：对于同一个切分后的数据块，通信执行耗时大于计算执行耗时，此时，**通信连续**，且**计算的头块要短**。
+
+**At decode batch=1, M is 1 — or 8 rows under the MSD stack. There is no M axis to split.** Every bit of
+MC2's mechanism is M-axis pipelining, and N is explicitly unavailable because HCCL needs each block
+contiguous.
+
+### 8.3 ★★ The empirical short-block floor is 384 rows
+
+切分算法步骤, step 1, verbatim — the third inequality is the one that matters:
+
+> 1. 根据输入矩阵的shape：M、K、N，按照经验值设置合适的M轴方向切分的短块长度。如下表达式中，a、b、c表示根据经验值给出的短块长度的备选，将K、N带入如下三个表达式后，取a、b、c的最小值m0为选定的短块长度。
+>    - `a * K * N >= 4 * 1024 * 1024 * 1024`，a取不等式的最小值
+>    - `b * K * N / 1024 + b * N >= 6 * 1024 * 1024`，b取不等式的最小值
+>    - **`c >= 3 * 128`，c取不等式的最小值**
+>    - `m0 = min(a, b, c)`
+
+`c >= 3 * 128` is 384. So **the vendor's own heuristic never produces a short block shorter than 384 rows**,
+and `m0 = min(a, b, c)` makes 384 the ceiling on the floor rather than a soft preference. A decode M of 1 or 8
+is two orders of magnitude below it.
+
+Steps 2-4, verbatim, including the memory-contention fudge factor:
+
+> 2. 根据短块长度m0和拟合公式，分别得到计算执行时间t0 = CostMM(m0) * 1.15，通信执行时间t1 = CostComm(m0) * 1.15。
+>    注意：**通信和计算并行执行时，可能出现抢占内存带宽的情况，导致执行时间增加，一般按经验在拟合公式中乘以1.15的系数**，用户可以根据实测情况调整该系数。
+> 3. 根据短块的长度…配平通算，得到长块的长度，**长块长度尽量对齐128个元素，以保证计算亲和**。…将短块的通信时间和长块的计算时间匹配相等：将t1作为长块的计算执行时间，带入t1 = CostMM(m1)公式，计算得到m1，即为长块的长度。
+> 4. 根据短块长度m0、长块长度m1、原始M轴长度M，得出长块的切块个数count = (M - m0) / m1。该式一般不能整除，此时需要做如下处理：
+>    - 将结果的小数部分舍弃，保留整数部分作为切块个数。
+>    - 由于舍弃了小数部分，M轴长度有剩余，因此需要调整长块长度m1 = (M - m0) / count。
+>    - 为保持计算亲和，将长块长度m1调整至128对齐，即向下取128倍数的整数，更新长块长度m1。
+>    - 由于调整m1后，M轴长度有剩余，因此调整短块长度m0 = M - (m1 * count)。
+>    - 最终得到短块长度m0，长块长度m1，长块个数count。
+
+### 8.4 ★ The fitted AllReduce cost model, with a ~14.8 us fixed floor
+
+步骤 3, verbatim — the calibration recipe and the resulting formula:
+
+> 3. 将步骤2得到的数据块分别做AllReduce通信，利用msOpProf工具采集执行时间，得到每个数据块的执行时间t1, t2, ..., tn。然后，作图分析数据量与对应的执行时间的关系，拟合得到公式 t = CostComm(m)…该映射关系一般为线性，**若不满足线性关系，可以采用分段拟合的方式。**
+>
+>    数据量 x = m * N * sizeof(dataType)，单位是Bytes。该拟合公式表示为：
+>    - **x小于8MB：t = -0.9698202 * x * x + 27.0622573 * x + 14.769，单位是us。**
+>    - **x大于等于8MB：t = 13.58491263 * x + 61.508333，单位是us。**
+
+(The coefficients only make dimensional sense with `x` in MB despite the 单位是Bytes note; the worked example
+in §8.5 confirms it, substituting x = 6 MB.) The piece to keep is the **14.769 us constant term**: an AllReduce
+on this platform has a fixed cost of roughly 15 us that no amount of message-size reduction removes. Step 2
+gives the calibration grid, verbatim: 「将输入数据按M轴切分，分别切成M轴为256、512、768、1024、2048的若干数据块」.
+
+### 8.5 The worked case: 1874 → 1262 us, 32.7%
+
+验证优化方案性能收益, verbatim:
+
+> 本MatmulAllReduce案例中，给定的输入矩阵Shape为M=4096，K=3072，N=8192，数据类型为half，分核数为8，通过融合前msOpProf工具采集，得到该输入的**Matmul计算执行时间为803us，AllReduce通信的执行时间为1071us，总耗时1874us，属于通信bound场景**。按照上述的切分算法，本案例的具体切分情况如下：
+>
+> 1. 根据经验值选定短块（bound场景中短块为头块，即切分后的第一个数据块）M方向长度m0为384，则通信数据量x为：384 * 8192 * 2 / 1024 / 1024 = 6MB。按通信拟合公式估算通信的执行时间为143us。考虑可能会发生内存带宽冲突，因此再乘以1.15的系数，得出通信执行时间164us。
+> 2. 计算长块M方向长度。根据短块通信时间，配平长块的计算执行时间同样为164us，按计算拟合公式估算出该长度m1为768。
+> 3. 根据M=4096、m0=384、m1=768，计算长块个数：(4096 - 384) / 768 = 4.83，向下取整为4。
+> 4. 根据短块长度m0=384，长块个数4，调整长块m1长度：(4096 - 384) / 4 = 928，向下按128对齐，调整m1为896。
+> 5. 根据长块长度m1=896，长块个数4，调整短块m0长度：4096 - 896 * 4 = 512。
+> 6. 最终得到将原始输入矩阵切分为5个数据块，长度分别为：**{512，896，896，896，896}**。
+>
+> …按该切分策略测试，**融合后该算子的执行时间为1262us，则融合算子的性能收益为(1874 - 1262) / 1874 = 32.7%**。
+
+the tiling that expresses it, verbatim:
+
+```cpp
+MatmulAllReduceCustomTilingData *tiling = context->GetTilingData();
+tiling->param.rankDim = 8;
+tiling->param.tileM = 512; // 短块大小
+tiling->param.tileNum = 1; // 短块个数
+tiling->param.tailM = 896; // 长块大小
+tiling->param.tailNum = 4; // 长块个数
+tiling->param.rankM = 4096;
+tiling->param.rankN = 8192;
+tiling->param.rankK = 4096;
+tiling->param.isTransposeA = 0;
+tiling->param.isTransposeB = 0;
+tiling->param.cToFloatLen = 0;
+tiling->param.nd2NzWorkLen = true;
+tiling->param.dataType = static_cast(HCCL_DATA_TYPE_MAP.at(aType));
+```
+
+and the closing caution, verbatim:
+
+> 上文提到，切分数据会引起计算或通信执行时间的膨胀，使实测结果与理论值有偏差。**比如切块数量较多时，执行时间的膨胀对性能影响较大，可能导致性能收益变小或者出现性能劣化**，因此最终需要根据上述理论切分策略，结合实测，对切分策略做调整。
+>
+> 总结：MC2算子通过数据切分后计算和通信的并行执行，获得性能收益，但受数据切分后执行时间膨胀的影响。
+
+## Relevance
+
+This closes the MC2 question for our regime with the vendor's own numbers rather than by argument, and it does
+so three times over. **One: only the M axis may be split, because 「通信任务调用的Hccl API要求分块数据内存连续」
+and an N split cuts every row.** At decode batch=1, M is 1 — 8 rows under the MSD stack — so there is no axis to
+pipeline on. **Two: the vendor's own short-block heuristic has a hard floor of `c >= 3 * 128` = 384 rows, taken
+as `m0 = min(a, b, c)`,** which puts the smallest block the method contemplates two orders of magnitude above
+our M. **Three: the entire gain is 流水掩盖 between a compute pipeline and a comm pipeline, and the worked case
+is comm-bound with Matmul 803 us against AllReduce 1071 us** — a ratio achievable only because K=3072 and
+M=4096 give the Matmul real work to hide behind. At M=1 the matmul is trivial and there is nothing to overlap
+with. So the earlier MonoMoE finding that fusing the TP all-reduce does not pay (README finding 4) now has a
+mechanism and a numeric threshold attached, from Huawei's own tuning guide.
+
+Two numbers from it are useful regardless of whether we ever use MC2. The fitted AllReduce cost has a
+**14.769 us constant term** below 8 MB — a fixed per-call floor that no message-size reduction removes, which
+bounds from below any design that issues one all-reduce per layer: at 78 layers that intercept alone is about
+1.15 ms, and our measured 5.35 ms TP reduce should be read against it. And the **1.15 inflation coefficient**
+is the vendor's own empirical allowance for compute and communication contending for memory bandwidth when run
+in parallel — 「通信和计算并行执行时，可能出现抢占内存带宽的情况」 — which is the same contention MegaMoE's
+authors measured as ~50% compute inflation and which §50.4's 512-byte serialization rule explains the mechanism
+of. Any in-kernel one-sided reduce we write will pay some version of it, and 15% is the vendor's starting
+estimate for a well-behaved case.
+
+
 ## Gaps
 
 Looked for and could not find:

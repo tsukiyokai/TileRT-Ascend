@@ -123,3 +123,41 @@ So the hint is a no-op for this kernel and the line is gone. The negative is
 worth more than the line was: this kernel streams 37.7 MB a layer at 66% of
 the die's bandwidth, and whatever accounts for the missing third, L2
 eviction by its own weight stream is not it.
+
+## It is not bandwidth bound. It is scalar bound.
+
+`msprof --aic-metrics=PipeUtilization` on the same binary, sixteen experts on
+sixteen blocks:
+
+| pipe | time, µs | ratio |
+|---|---|---|
+| scalar | 27.860 | **0.625** |
+| MTE2 | 32.826 | 0.733 |
+| fixpipe | 13.924 | 0.311 |
+| MTE1 | 12.563 | 0.284 |
+| MAC | 4.845 | **0.109** |
+| vector (AIV) | 0.622 | 0.013 |
+
+The cube spends 62.5% of its time in the scalar unit and 11% doing the
+multiplication. The vendor's own MTE2-bound cases read 0.93 and 0.99 here;
+this reads 0.733, so MTE2 is heavy but not the wall.
+
+That overturns the account this page has been giving. "66% of the die's
+bandwidth" described a kernel that was not bandwidth limited: it is limited by
+the `Matmul` library's scalar control path, with the weight stream partly
+hidden behind it. Three things fall into place at once -- the L2 hint buying
+nothing, INT4 halving the weight bytes for only 21% rather than the ~45% a
+bandwidth-bound kernel would have given, and the wall being nearly flat in
+block count from eight to sixteen.
+
+The scalar work is per invocation, and this kernel invokes a lot: `Init`,
+`SetOrgShape`, `SetTensorA`, `SetTensorB`, `IterateAll` and `End` for each of
+two projections for each of sixteen experts, so thirty-two constructions and
+teardowns against 4.845 µs of actual MAC. `ASCENDC_CUBE_ONLY` is defined
+before the include, so the KFC messaging the vendor measures at 15.02 of
+17.85 µs is already gone; what remains is the library's own control flow.
+
+So the next lever on this kernel is not bandwidth and not cores. It is either
+hoisting the `Matmul` object out of the expert loop, or driving L1 and L0 by
+hand -- `DataCopy`, `LoadData`, `Mmad`, `Fixpipe` -- which this project has
+already proven end to end on the INT4 probe.
