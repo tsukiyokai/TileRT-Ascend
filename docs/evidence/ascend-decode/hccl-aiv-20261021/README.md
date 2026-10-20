@@ -106,3 +106,29 @@ dispatch -- a kernel's issue under graph replay is 1.064 us.
 So the decomposition of this project's largest cost is complete, and what is
 left of it is an intrinsic per-call cost inside HCCL at 120 us with the better
 expansion mode.
+
+## The remaining floor resists HCCL's own knobs
+
+On top of AIV, sixteen ranks, the same 144 KB all_reduce:
+
+    AIV baseline                 164.43 us
+    HCCL_BUFFSIZE=1              175.45
+    HCCL_BUFFSIZE=8              208.03
+    HCCL_ALGO=level0:fullmesh    168.02
+    HCCL_DETERMINISTIC=false     178.96
+    HCCL_INTRA_ROCE_ENABLE=0     rejected, EI0001
+
+Nothing improves and two make it worse. So the 120 us floor is not the buffer
+size, not the algorithm selection, and not the determinism mode.
+
+## Which closes the knob side and names what is left
+
+The floor is now excluded as: the bytes (37 us of transport), the participants
+(70 us of fan-out, separately measured), host dispatch (1.064 us a kernel under
+graph replay), the expansion engine (AIV already took 40 percent of it), the
+buffer, the algorithm, and determinism.
+
+What remains is the handshake intrinsic to a collective on this communicator.
+Nothing on the configuration side reaches it, so the only way past is fewer
+calls -- which means an execution structure that does not synchronise every
+layer, not a better setting.

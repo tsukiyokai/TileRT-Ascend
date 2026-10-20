@@ -1684,3 +1684,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      middle one. The 120 us that remains is the largest single term in this
      project and is neither bytes nor participants nor host dispatch, where a
      kernel's issue under graph replay is 1.064 us.
+
+164. The residual HCCL floor resists every knob. On top of AIV at sixteen
+     ranks, the same 144 KB all_reduce: baseline 164.43 us, HCCL_BUFFSIZE=1
+     175.45, =8 208.03, HCCL_ALGO=level0:fullmesh 168.02,
+     HCCL_DETERMINISTIC=false 178.96, HCCL_INTRA_ROCE_ENABLE rejected as an
+     invalid variable. Nothing improves and two are worse. So the 120 us is
+     excluded as bytes, participants, host dispatch, the expansion engine, the
+     buffer, the algorithm and determinism -- it is the handshake intrinsic to
+     a collective, and the only way past is fewer calls, which is an execution
+     structure rather than a setting.
