@@ -1314,3 +1314,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      failure first. It also explains why the engine runs SFA rather than
      gather_fia, which is not an oversight but an unvalidated width. That gate
      now bounds two things: the tree, and gather_fia's own 21.3 us a layer.
+
+134. The sentinel index cannot explain the width-six gate. `selection_mask`
+     scatters zeros at `topk_indices` without filtering the `-1` the engine
+     uses for unused slots, where `sfa_v1.py` filters it explicitly -- and a
+     `-1` scatters to column `capacity - 1`. But the causal term masks that
+     column for every query whose slot is below it, and at an 8K context in a
+     9344 cache none reaches it. Excluded on paper, which is where a suspect
+     with an arithmetic answer should be settled.
