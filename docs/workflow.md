@@ -279,3 +279,37 @@ Then two ordering rules. `chain.sh` exits on a failing arm, so anything
 unproven goes last. And kill single-die work first: a kernel of ours squatting
 device 1 made rank 1 unable to join HCCL, which reports as
 `EI0015 ... unconnected ranks: "[1,]"` and looks like a network fault.
+
+
+## One arm, one variable, and a warm directory
+
+The queueing apparatus is gone. `chain.sh`, the per-sweep drivers, the settle
+loops and the waiters each cost more than they returned: every failure today
+was in the machinery rather than in an experiment -- a lost env var, a gate
+read once before launching, a settle reading a field that does not exist in
+the container, one failing arm taking fourteen with it, a `pkill -f` matching
+its own shell. What survives is `launch_arm.sh`, which encodes the real traps,
+and one rule: run one arm, change one thing, read the record.
+
+The cold-cache cost is the reason the rule needs a second half. A first arm on
+a fresh machine compiles 245 static kernels at 8 to 12 seconds each -- the
+progress bar's own estimate is 32 to 46 minutes -- where the same arm on a
+machine with a warm cache takes five and a half. The 101 MB of output lands in
+the arm's own directory, because `launch_arm.sh` does `cd "$out"` for exactly
+the reason recorded above: a shared static-kernel cache voided a paired
+measurement, since its key covers the dumped operator parameters and the
+super-kernel option string and not the vendor source.
+
+So isolate by what the change touches, not by habit. An arm that changes only
+host-side Python -- a drafter module, a flag the graph does not see -- can run
+from an already-warm directory with `--output` pointing elsewhere, and the
+compiled kernels are reused: `grep -c "static kernel compile start"` returns
+zero, which is the check. An arm that changes an operator or monkeypatches a
+vendor call needs its own directory, or it will replay a package compiled
+before the change.
+
+And read what the launcher already passes before claiming a flag is off.
+`launch_arm.sh` supplies `--target-graph --compile-target --super-kernel
+--attention-kernel sfa --fp32-head` itself, so the seven `store_true` flags
+being off in the bench's own defaults does not mean they are off in a run.
+Two of the largest were already on in every number this project has recorded.
