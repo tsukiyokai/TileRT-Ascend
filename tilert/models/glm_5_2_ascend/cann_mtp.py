@@ -49,7 +49,11 @@ def draft_config(target_config):
     if target_config.speculative_config is not None:
         raise ValueError("The target must not own a speculative model")
     hf = target_config.model_config.hf_config
-    if (hf.model_type != "glm_moe_dsa" or hf.num_hidden_layers != LAYER
+    # The depth is not checked against a literal: a truncated backbone is a
+    # legitimate configuration for an arm that measures the ratio between two
+    # others, and what this guard is for is the model family and its single
+    # shared-index MTP layer.
+    if (hf.model_type != "glm_moe_dsa"
             or hf.num_nextn_predict_layers != 1
             or not hf.index_share_for_mtp_iteration):
         raise ValueError("Expected GLM-5.2 with one shared-index MTP layer")
