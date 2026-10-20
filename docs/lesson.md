@@ -289,3 +289,19 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     combination, and the activation's two INT4 halves stack along M so the
     weight is still read once. Ask what the library objects to before
     replacing the library.
+
+43. A probe whose signal is ambiguous is worth nothing. Searching for where a
+    misplaced INT4 half had landed returned a confident offset for several
+    rounds -- and it was meaningless, because the test data was an arithmetic
+    progression whose low nibbles are a sawtooth of period sixteen, matching
+    itself at every aligned phase. A pseudo-random generator turned the same
+    search into a −1 that could be acted on. Before trusting a probe, ask what
+    else its answer is consistent with.
+
+44. Change one variable. The INT4 write that would not land was confounded
+    between its source tensor and its destination offset. Swapping the order
+    of the two writes left the failure where it was, and sending the
+    known-good source to the suspect offset failed too -- two runs, and the
+    offset was named without a guess. The sanitizer did the same for two
+    earlier defects, each fix halving the deviating count, which is how a real
+    defect behaves.

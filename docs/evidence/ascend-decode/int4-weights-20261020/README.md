@@ -169,3 +169,64 @@ activation into two INT4 halves and stacks them, the cube runs one INT4
 matmul an expert, and the vector half recombines with the shift before the
 dequantisation it already does. The down projection takes the same treatment,
 its activation being the intermediate the vector has just quantised.
+
+## The INT4 kernel runs, and one defect is left
+
+`routed_int4` builds and runs the whole chain -- vector split, INT4 matmul,
+recombine, activate, requantise, split again, INT4 matmul, recombine, BF16 --
+in one launch. Four experts on four blocks take 39.350 µs against the INT8
+form's 47.108, which is the halved weight traffic showing through. It is not
+correct yet: 35530 of 49152 values deviate.
+
+The defect is isolated to one thing. An INT4 `DataCopy` to global memory lands
+when its destination offset is zero and lands nowhere when it is not:
+
+- The high halves, written at offset zero, are exact -- 98 → 6, 112 → 7,
+  −73 → −5, 80 → 5, 13 → 0, −106 → −7, 24 → 1, which is `floor(x / 16)` every
+  time.
+- The low halves, written at nibble 12288, appear nowhere in the allocation. A
+  search of the whole buffer for the expected sequence returns −1, and the
+  bytes that should hold them read the same eight values across completely
+  different input data -- they are a previous run's residue.
+- Swapping which call goes first changes nothing, so it is not the second
+  write that fails.
+- Writing the known-good high half to the suspect offset also fails, so it is
+  the offset and not the source.
+- Three addressings fail alike: a `GlobalTensor<int4b_t>` subscript, a
+  `__gm__ int4b_t*` offset, and that offset taken through a byte pointer.
+
+The same `DataCopy` at offset zero, with and without `DataCopyParams`, works
+in a plain vector kernel -- six probes above say so -- so the next cut is a
+non-zero destination offset in that isolated probe rather than in this kernel.
+
+## What the sanitizer was for
+
+Three defects came out of `mssanitizer --tool=memcheck` in one run, each as
+"illegal write of size 32, 0 bytes after the nearest allocation", naming the
+buffer by its size:
+
+- 512 bytes: `middle`. 24576: `stacked`. 8192: `partial`. An expert's offset
+  was being computed in nibbles and applied to a pointer, so every expert
+  wrote two regions along.
+- Then reads of 928 and writes of 992 bytes off the ends: the cube works in
+  sixteen-row tiles and the `Matmul` library reads and writes the whole tile
+  whatever M says, while M here is four. Every buffer along M now carries a
+  tile.
+
+Each fix halved the deviating count -- 44042, then 25458 -- which is how a
+real defect behaves and how a guess does not.
+
+## Two things the algorithm owes to being told not to be naive
+
+The split was eight float operations computing `((x + 8) mod 16) - 8` and then
+the remainder. It is now five, and it starts from `floor(x / 16)`, which is an
+INT4 for every INT8 rather than only for those within 119. The eight that the
+low half still owes comes back as `8 * sum(w)` a column -- a function of the
+weight alone, so a loader computes it once and the epilogue adds it where it
+is already scaling. No clamp, no correction term, no range lost.
+
+The test data was an arithmetic progression, whose low nibbles are a sawtooth
+of period sixteen. A search for where a half actually landed then matches at
+every aligned phase and answers almost anywhere; worse, a wrong answer can
+hide behind a right one. With a pseudo-random generator the same search
+returns −1 and means it.
