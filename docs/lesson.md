@@ -1732,3 +1732,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      nothing under lever84-20261020 carries any HCCL variable, so the 9.3794 ms
      was measured on the AI CPU path and the gain is still ahead rather than
      already counted.
+
+168. A collective costs 10 microseconds on the device and the rest is the host,
+     which overturns today's attribution. The repository's own
+     `a3-calibration/hccl_latency.cpp` -- built, never recorded -- gives, at
+     sixteen devices under AIV: one 12 KB collective at 10.74 us device and
+     382.94 us host wall; 156 of them chained at 1564.14 us device, 10.0 each,
+     and 5054.61 host, 32.4 each. So the 183 to 296 us measured through torch is
+     host-side issue and synchronisation, and it amortises twelvefold when calls
+     are not separated by a wait. The earlier claim that the floor is "neither
+     bandwidth nor participants nor host dispatch" rested on a compute kernel's
+     1.064 us replay issue, which is a different host path. The direction
+     reverses with it: not fewer calls but no wait between them.
