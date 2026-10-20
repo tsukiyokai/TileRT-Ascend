@@ -1250,3 +1250,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      arm in the queue without answering anything. That the increment is flat in
      the size is itself evidence: the cost is the task list, not the data,
      which is the same thing the row cost turned out to be.
+
+127. Holding several captured graphs does not slow the small one. Size 4
+     replays at 516.989 us alone and 516.696 with four larger graphs resident,
+     and size 32 is 12.9 percent dearer than size 4 -- so replaying the
+     smallest graph that covers a draft is free of interference, which was the
+     lever's last unverified premise. Every link of the chain from the round
+     model to a one-line configuration change is now measured on one die or in
+     the arms' own records.

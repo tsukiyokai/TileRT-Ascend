@@ -70,3 +70,30 @@ Five sizes at the engine's depth is about 1 GiB against the 48 GiB a rank holds
 at 0.78 utilisation with the model taking 17. So the lever cannot fail for
 memory, and the configuration caps the list at the requested width -- {2, 4, 8,
 16, 24} at width 24.
+
+## And holding several graphs does not slow the small one
+
+    size 4, captured alone            516.989 us
+    size 4, four larger held too      516.696 us   ratio 0.999
+    size 32, held alongside           583.245 us   12.9 percent dearer
+
+So the lever's premise holds: a small graph replays at its own cost whether or
+not larger ones are resident, and the small one is 12.9 percent cheaper than
+the wide one -- 0.65 ms a round at this synthetic layer's five operators.
+
+The engine's layer has about 7.8 kernels including the attention and the MoE,
+so the spread there should be wider than 12.9 percent; the round model's 0.66 ms
+a row across a 24-row width is 15.8 ms, which is 29 percent of the round. What
+the arms measure is where in that range the real engine sits.
+
+## The chain, with every link measured
+
+    round = 45.88 ms + 0.66 a row            arms' own records, within-arm
+    operators flat in rows, cold and warm    126.969 -> 121.955 us a layer
+    so the row cost is capture's             replay 527 -> 583, eager 569 -> 554
+    copy oracle saturates at 13.474          the engine's own token stream
+    2.9 ms needs 13 at the merged fixed term 30.15 ms
+    removing the row cost reaches 2.24       arithmetic on the above
+    the removal is a list, not a rewrite     cudagraph_capture_sizes
+    several sizes cost 195 MiB each          synthetic capture
+    and do not slow each other               0.999
