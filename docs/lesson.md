@@ -1099,3 +1099,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      loses. The lever is therefore not "replace HCCL" but "unbatch and push",
      156 pushes at 26 us being 4.1 ms a round against 17.56, and the two are
      alternatives rather than complements.
+
+114. An absorbed reduction costs 30 us where a standalone one costs 858. Six
+     super kernels a round declare an all-reduce in their name and cost about
+     30 us each; the twenty standalone collectives cost 858. So the lever on
+     the round's 17.56 ms of collectives is absorption, not a faster primitive:
+     the two-rank scaling shows the one-sided push is a latency optimisation
+     that loses past a megabyte, and 858 us a call is well past that. Absorbing
+     the remaining twenty the way six already are is worth about 17 ms a round
+     and the mechanism is already in the compiler -- so the question is what
+     condition decides which form it emits, which is answerable by reading.
