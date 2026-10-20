@@ -769,8 +769,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     four percent of a layer; the decode attention is already three boundaries;
     the routed experts in one kernel save 8.48 ms and the one-sided reduce 6.5,
     taking the round to about 40 ms. TPOT is then 40 over acceptance, so 2.9 ms
-    needs 13.8 tokens accepted a round against today's 5.441 -- and width 32
-    accepts 6.053, so widening cannot reach it. The acceptance curve is flat
-    where the cost curve is steep. What remains is a drafter that is right far
-    more often, which for a model that copies its input is where the headroom
-    is.
+    needs 13.8 tokens accepted a round against today's 5.441. Corrected since:
+    that is conditional on the edit rate, not impossible. At width 32 and
+    budget 64 the tree accepts 14.542 at an edit rate of 0.02, 6.851 at 0.05
+    and 3.890 at 0.10, and the measured 5.441 places the workload near 0.05.
+    An agentic coding model's output is bimodal -- long near-verbatim copies
+    punctuated by short rewrites -- so a single width tuned for the mean is
+    wrong at both ends, and the drafter should widen inside a copy stretch and
+    narrow inside a rewrite.
