@@ -397,6 +397,27 @@ int main(int argc, char** argv)
             std::printf("\n  its row scale: %g %g", middle_scale_host[0],
                         middle_scale_host[1]);
         }
+        // Row zero's scale matches the reference exactly and row one's does
+        // not, so check the projection a row at a time.
+        for (int64_t row = 0; row < ROWS; ++row) {
+            std::printf("\n  row %lld product: want", (long long)row);
+            for (int64_t column = 0; column < 3; ++column) {
+                int32_t want = 0;
+                for (int64_t inner = 0; inner < HIDDEN; ++inner) {
+                    want += rows_host[row * HIDDEN + inner]
+                            * gu_host[column * HIDDEN + inner];
+                }
+                std::printf(" %d", want);
+            }
+            std::printf("  got");
+            for (int64_t column = 0; column < 3; ++column) {
+                const int32_t high = partial_host[row * GATE_UP + column];
+                const int32_t low =
+                    partial_host[(ROWS + row) * GATE_UP + column];
+                std::printf(" %d", 16 * high + low
+                                   + (int32_t)gu_bias_host[column]);
+            }
+        }
         std::printf("\n  product, first 4 columns: want");
         for (int64_t column = 0; column < 4; ++column) {
             int32_t want = 0;
@@ -450,6 +471,14 @@ int main(int argc, char** argv)
             for (int64_t column = 0; column < HALF; ++column) {
                 code[column] = static_cast<int8_t>(
                     std::nearbyintf(activation[column] / quantum));
+            }
+            if (expert == 0 && row < 2) {
+                std::printf("  reference row %lld: quantum %g  code",
+                            (long long)row, quantum);
+                for (int64_t at = 0; at < 8; ++at) {
+                    std::printf(" %4d", (int)code[at]);
+                }
+                std::printf("\n");
             }
             for (int64_t column = 0; column < HIDDEN; ++column) {
                 int32_t product = 0;

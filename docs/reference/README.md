@@ -31,6 +31,7 @@ ForeachAddList 1.622 / 0.018.
 | `ascend-decode-latency-baselines.md` | What batch-1 decode TPOT anyone has actually published on Ascend, so our 10.8528 ms has a reference frame — and the ten-commit host-side lever catalogue behind the best of them (vllm-ascend PR #19033, 910_93, c=1 TPOT 8.2→7.6 ms plain and 7.0→5.1 ms with MTP) |
 | `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem. **Part 7 is the in-kernel collective without a host barrier** — `aclshmem_quiet`'s implementation, epoch/magic tagging, and the A3 AMO limits. **Part 8 is the vendor's MC2 tuning case** — 32.7% measured on MatmulAllReduce, and the three numeric reasons none of it reaches batch=1, plus the AllReduce cost fit with its 14.769 us constant term |
 | `speculative-acceptance.md` | prompt lookup, SuffixDecoding, EAGLE/Medusa/tree drafts, MTP, acceptance-length measurements |
+| `ascend-custom-op-packaging.md` | **Read off the machines, not published** — how a hand-written AscendC kernel reaches the graph. The vendor package file by file; `binList` / `simplifiedKey` / `staticKey` decoded with their generator sources; `opc` as the whole toolchain (**not** `msopgen`) with the exact invocation; what `op_proto` and `op_api` do and do not need rebuilding; the `ASCEND_CUSTOM_OPP_PATH` first-wins resolver confirmed from plog; and the torch-custom-op channel that needs no packaging at all. **§10 is seven superseded assumptions**, including that a `<<<>>>` kernel cannot reach the graph (it can, and we already did it once) and that a one-operator `.o` swap could carry a kernel that fuses two operators (it cannot) |
 | `tilert-rocm-glm52-structure.md` | The TileRT ROCm GLM-5.2 binary, disassembled — kernel inventory and structure, for comparison against what we generate |
 | `tilelang-ascend.md` | **Deprioritized** (hand-written AscendC was chosen instead). Kept for the AscendC primitives it documents: pipe flag protocol, real L1/UB address maps, Cube↔Vector handoff, and the tile-ai repo inventory |
 
@@ -180,6 +181,27 @@ ForeachAddList 1.622 / 0.018.
    cheap — needs a custom-operator project); split AIC/AIV kernels (works with `<<<>>>` today, more launches,
    each 4.5x cheaper).
 
+13. **The integration path was never missing, and the vendor-package route cannot carry this kernel.**
+    `ascend-custom-op-packaging.md` §9-§10. Two things were held and both are wrong. First, a `<<<>>>`
+    kernel does reach the captured decode graph — not as a CANN operator, but as a torch custom op on
+    `dispatch_key="PrivateUse1"` with a `fake_impl`, which is how vLLM-Ascend ships its own Triton
+    kernels (`vllm_ascend/ops/triton/linearnorm/split_qkv_rmsnorm_rope_vnorm.py:473-478`) and how
+    **this project already shipped an AscendC kernel into production once**
+    (`torch-allreduce-20261018`: `aclshmem_torch.so` + `libtp_push_kernel.so`, in-graph, 22.3 µs
+    against HCCL's 63.5). The hook is already in the engine at `cann_model.py:257-260`, where four
+    overrides live, installed after `load_model()` and before capture. Second, an `.o` swap inside the
+    vendor package *cannot* carry the routed-expert kernel, because that kernel replaces
+    `GroupedMatmulSwigluQuantV2` **and** `GroupedMatmul` and keeps the intermediate in UB, while a
+    binary override preserves the operator's prototype by construction — so the graph still issues the
+    second operator and the GM round trip between them survives. A per-operator override can only
+    deliver a win internal to one operator, which is exactly what the four landed
+    `patches/cann-gmm-swiglu-v2/` patches did (−1.468 ms a round). Fusing two operators means changing
+    the caller. Also retired there: that packaging needs `msopgen` (it needs `opc`, against sources
+    that already ship inside the package), that `simplifiedKey`/`staticKey` must be hand-written (both
+    are generated, and our own build script asserts `opc` reproduced them), that `op_proto` must be
+    rebuilt for a reused prototype (`ge::TensorType::ALL()` on every parameter), and that the existing
+    overlay is someone else's precedent (it is the output of our `tests/glm52/build_gmm1_barrier.sh`).
+
 ## Corrections to earlier findings in this file
 
 Each of these overturns something stated above, with the newer source winning. Read them before acting on
@@ -242,6 +264,21 @@ finding 3.
   range is **0-5**, not 0-7: 6 and 7 are reserved and using them is 「未定义行为」.
 - **`GroupedMatmul` is not in `ops-nn`.** It is in `hicann/ops-transformer` under `gmm/`, with the fused MoE
   megakernel in `mc2/mega_moe` including an A3-specific `mega_moe_kernel_a3.hpp` (`fused-moe-expert.md` Part 8).
+- **Finding 12's tiling-key-switched design may not be expressible, and moving into an operator project costs
+  `__mix__` and `__schedmode__` rather than buying anything.** `ascend-custom-op-packaging.md` §5.1-§5.2, from the
+  installed compiler. The op-project build textually includes your `.cpp` with `#define __global__ inline` and
+  generates `auto_gen_<func>_kernel` as the real `cce_kernel`
+  (`asc_op_compile_base/asc_op_compiler/compile_op.py:784-830`), so `__mix__(1,2)` lands on a non-kernel function
+  and bisheng hard-errors, and `__schedmode__(1)` on an inlined callee is dropped — the framework substitutes
+  `intercoreSync`/`crossCoreSync` in the descriptor, which is **unverified** and is the first thing to check on a
+  first build, since this file records `__schedmode__(1)` as required. The ratio then comes from hardware via
+  `GetTaskRationImpl()` (`dav_c220/kernel_operator_sys_var_impl.h:43-54`). And `kernel_info_infer.py:218-238`
+  accepts only `KERNEL_TYPE_MIX_AIC_1_1` or `MIX_AIC_1_2` as the keyed form's second argument, with the first
+  required to be a numeric literal (regex at `:110`); `KERNEL_TASK_TYPE_DEFAULT` takes the full enum. If that
+  holds, finding 12's nine-`AIC_ONLY`-plus-three-`AIV_ONLY` single binary cannot be built on CANN 9.2.0 and the
+  4.5x lever needs separate binaries — design three, not design two. Unresolved: the `swiglu_gated_mlp` reading
+  came from a public repository, not this installation, so grep that kernel for whether its `AIC_ONLY` sites use
+  the keyed macro or the default one.
 
 ## Where to look things up
 

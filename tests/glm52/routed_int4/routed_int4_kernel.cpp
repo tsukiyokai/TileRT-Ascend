@@ -174,6 +174,12 @@ struct Workspace {
     TBuf<TPosition::VECCALC> scale_buffer;
     TBuf<TPosition::VECCALC> token_buffer;
     TBuf<TPosition::VECCALC> hold_buffer;
+    // A reduction's destination is written a whole 32-byte block at a time,
+    // so the row maxima need a block each and cannot share the buffer that
+    // holds the incoming per-token scales: row zero's reduction would stamp
+    // over row one's scale, which is exactly what it did -- row zero's
+    // quantum matched the reference and row one's did not.
+    TBuf<TPosition::VECCALC> rowmax_buffer;
     LocalTensor<int8_t> narrow;
     LocalTensor<float> value;
     LocalTensor<float> other;
@@ -186,6 +192,7 @@ struct Workspace {
     LocalTensor<float> scale;
     LocalTensor<float> token;
     LocalTensor<float> activation;
+    LocalTensor<float> rowmax;
 
     __aicore__ inline void Init(TPipe& pipe, int64_t span)
     {
@@ -213,6 +220,9 @@ struct Workspace {
         scale = scale_buffer.Get<float>();
         token = token_buffer.Get<float>();
         activation = hold_buffer.Get<float>();
+        pipe.InitBuffer(rowmax_buffer,
+                        ROWS * BLOCK_FLOATS * sizeof(float));
+        rowmax = rowmax_buffer.Get<float>();
     }
 };
 
@@ -417,13 +427,14 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
         DataCopy(activation[row * HALF], held.value, HALF);
         Abs(held.work, held.value, HALF);
         PipeBarrier<PIPE_V>();
-        ReduceMax(token[row], held.work, held.work, HALF, false);
+        ReduceMax(held.rowmax[row * BLOCK_FLOATS], held.work, held.work,
+                  HALF, false);
         PipeBarrier<PIPE_ALL>();
     }
     DataSyncBarrier<MemDsbT::UB>();
 
     for (int64_t row = 0; row < ROWS; ++row) {
-        const float largest = token.GetValue(row);
+        const float largest = held.rowmax.GetValue(row * BLOCK_FLOATS);
         const float quantum = largest / QUANTUM_SPAN;
         Muls(held.value, activation[row * HALF], 1.0F / quantum, HALF);
         PipeBarrier<PIPE_V>();

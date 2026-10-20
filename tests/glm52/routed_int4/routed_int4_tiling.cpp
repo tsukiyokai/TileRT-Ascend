@@ -29,6 +29,11 @@ extern "C" int routed_int4_build_tiling(int rows, int columns, int inner,
     tiling.SetShape(rows, columns, inner);
     tiling.SetOrgShape(rows, width, inner);
     tiling.SetBias(false);
+    // No fixed split here. The 128 by 512 corner that is worth 16% on the
+    // INT8 kernel costs this one a factor of two: swept at sixteen experts
+    // on sixteen blocks, the library's own choice gives 39.480 µs against
+    // 80.243 at 128 by 512, 79.756 at 128 by 1024 and 39.276 at 256 by 512.
+    // The lever does not transfer across the operand width.
     tiling.SetBufferSpace(-1, -1, -1);
 
     AscendC::tiling::TCubeTiling cube;
