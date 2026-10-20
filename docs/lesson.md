@@ -633,3 +633,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     vendor's advantage is structural: fractal-NZ weights dequantised inside
     L0C through the fixpipe, against ND weights dequantised on the vector side
     with a unified-buffer round trip per expert.
+
+71. Price a lever at the shape it will run at. The permutation pair was
+    budgeted from 45.772 + 55.979 us and is 22.045 + 31.181 at the decode
+    shape -- twelve tokens, top eight, 96 sorted rows -- so the saving ceiling
+    falls from 7.1 ms a round to 4.15. A measurement taken at one shape and
+    carried into another budget inflates whatever it is subtracted from. The
+    plainest replacement is 2.93x the vendor, with `index_add_` alone at
+    131.957 us against the vendor's whole unpermute at 31.181, so the ceiling
+    is not currently reachable either.

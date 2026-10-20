@@ -93,11 +93,17 @@ def slice_corrections(gu_scale, gu_bias, down_scale, down_bias,
     per_rank = gu_scale.shape[1] // world
     rows = slice(rank * per_rank, (rank + 1) * per_rank)
     column = min(rank, down_bias.shape[-1] - 1)
+    # Contiguous, because the kernel reads these through data_ptr() and a
+    # sliced view carries strides it cannot see.
     return {
-        "gu_scale": gu_scale[:, rows].reshape(gu_scale.shape[0], -1),
-        "gu_bias": gu_bias[:, rows].reshape(gu_bias.shape[0], -1),
-        "down_scale": down_scale.reshape(down_scale.shape[0], -1),
-        "down_bias": down_bias[..., column].reshape(down_bias.shape[0], -1),
+        "gu_scale": gu_scale[:, rows].reshape(gu_scale.shape[0], -1)
+                            .contiguous(),
+        "gu_bias": gu_bias[:, rows].reshape(gu_bias.shape[0], -1)
+                           .contiguous(),
+        "down_scale": down_scale.reshape(down_scale.shape[0], -1)
+                                .contiguous(),
+        "down_bias": down_bias[..., column].reshape(down_bias.shape[0], -1)
+                              .contiguous(),
     }
 
 

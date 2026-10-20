@@ -53,6 +53,7 @@ constexpr size_t MATMUL_WORKSPACE = 16u << 20;
 // What the kernel copies in one go, so what the caller must provide.
 constexpr int64_t MAX_EXPERTS = 256;
 constexpr int64_t MAX_TAKEN = 32 * 8;
+constexpr int64_t SCALE_SPAN = 8;
 
 /** The sync base, the tilings and the scratch, built once.
  *
@@ -191,6 +192,19 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
     TORCH_CHECK(gu_bias.dtype() == at::kFloat, "gu_bias must be FP32");
     TORCH_CHECK(down_bias.dtype() == at::kFloat, "down_bias must be FP32");
 
+    // Every one of these is read through data_ptr(), so a view with its own
+    // strides silently reads the wrong memory. A sliced-then-reshaped scale
+    // did exactly that: the weights were right, the activations were right,
+    // the reference was right, and the kernel's output did not depend on the
+    // scale at all -- a boost of a million moved it by three parts in ten
+    // million.
+    for (const auto& held : {rows, gate_up, gu_bias, gu_scale, down,
+                             down_bias, down_scale, token_scale, group_count,
+                             group_start, source_row, row_weight}) {
+        TORCH_CHECK(held.is_contiguous(),
+                    "every input must be contiguous; data_ptr() carries no "
+                    "strides");
+    }
     TORCH_CHECK(group_count.dtype() == at::kInt, "group_count must be INT32");
     TORCH_CHECK(group_start.dtype() == at::kInt, "group_start must be INT32");
     // The kernel reads the whole list in one copy, so it must be the whole
@@ -223,6 +237,44 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
         group_count.data_ptr(), group_start.data_ptr(),
         source_row.data_ptr(), row_weight.data_ptr<float>(),
         held.workspace(), experts);
+    if (std::getenv("TILERT_SHOW_STACKED") != nullptr) {
+        // What Split wrote for the cube to read: the activation's two INT4
+        // halves, M-stacked. The cube's product is zero, so either this is
+        // empty or the matmul does not find it.
+        const int64_t bytes = experts * M_TILE * HIDDEN / 2;
+        at::Tensor codes = at::empty({bytes}, out.options().dtype(at::kChar));
+        TORCH_CHECK(aclrtMemcpy(codes.data_ptr(), bytes, held.stacked(),
+                                bytes, ACL_MEMCPY_DEVICE_TO_DEVICE)
+                    == ACL_SUCCESS, "stacked readback failed");
+        return codes;
+    }
+    if (std::getenv("TILERT_SHOW_PARTIAL") != nullptr) {
+        // The cube's INT32 product, before any dequantisation. A host
+        // reference computes this exactly, so comparing it separates a wrong
+        // matmul from a wrong recombination.
+        const int64_t span = experts * M_TILE * GATE_UP;
+        at::Tensor product = at::empty({span},
+                                       out.options().dtype(at::kInt));
+        TORCH_CHECK(aclrtMemcpy(product.data_ptr(), span * sizeof(int32_t),
+                                held.partial(), span * sizeof(int32_t),
+                                ACL_MEMCPY_DEVICE_TO_DEVICE) == ACL_SUCCESS,
+                    "partial readback failed");
+        return product;
+    }
+    if (std::getenv("TILERT_SHOW_MIDDLE") != nullptr) {
+        // The quantum Activate chose, read back so a host reference can
+        // compare it directly rather than inferring it from the output.
+        at::Tensor quantum = at::empty({experts * SCALE_SPAN},
+                                       out.options().dtype(at::kFloat));
+        TORCH_CHECK(aclrtMemcpy(quantum.data_ptr(),
+                                experts * SCALE_SPAN * sizeof(float),
+                                held.middle_scale(),
+                                experts * SCALE_SPAN * sizeof(float),
+                                ACL_MEMCPY_DEVICE_TO_DEVICE) == ACL_SUCCESS,
+                    "middle_scale readback failed");
+        return at::stack({out.reshape({-1}).slice(0, 0, quantum.numel()),
+                          quantum});
+    }
     return out;
 }
 
