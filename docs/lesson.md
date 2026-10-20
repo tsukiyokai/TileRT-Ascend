@@ -1063,3 +1063,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      sixteenth of the work and still pays its fixed cost. 32.21 ms of kernels
      plus 17.56 of collectives is 87 percent of the round, which is exactly
      what the boundary merges and the one-sided push address.
+
+111. Repeating one operator measures it out of cache. A 72 MB weight matmul
+     costs 31.056 us when one weight is repeated -- 2264 GB/s, above what HBM
+     gives -- and 62 us from four distinct weights onward, 1136 GB/s. Every
+     single-operator timing today repeated one weight: the projections at 12 to
+     19 us, the grouped matmul at 62 to 70, attention at 85, a layer at 214 in a
+     graph. The engine's 52.7 us a kernel sits nearer the cold figure, as a
+     model reading a different weight every layer should. The comparisons
+     survive because both sides were equally warm, so the 21.04 ms of merges
+     holds as a proportion; the absolute projections of 2.98 and 3.73 ms do not,
+     being built on warm sums. Rotate over a bank larger than the cache, or
+     quote only ratios.
