@@ -35,6 +35,8 @@ constexpr int64_t HALF = 128;
 constexpr int64_t MAX_ROWS = 32;
 // One vector repeat of FP32, in elements.
 constexpr int64_t SLACK = 64;
+// One tile of the 6144-wide output a vector core walks at a time.
+constexpr int64_t TILE = 512;
 constexpr int64_t GATE_UP = 2 * HALF;
 // CANN's own Matmul-to-vector example uses mode 2 and flag 8. A3 allows
 // flag ids 0 through 10 only, and the Matmul library consumes some itself, so
@@ -47,6 +49,7 @@ constexpr int64_t GATE_UP = 2 * HALF;
 // in this kernel; stay off 8, 9 and 10.
 constexpr uint16_t GATE_READY = 4;
 constexpr uint16_t VECTOR_ALIVE = 5;
+constexpr uint16_t DOWN_READY = 6;
 
 using AQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, false>;
 using BQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, true>;
@@ -152,6 +155,8 @@ struct Epilogue {
     TBuf<TPosition::VECCALC> scale_buffer;
     TBuf<TPosition::VECCALC> narrow_buffer;
     TBuf<TPosition::VECCALC> token_buffer;
+    TBuf<TPosition::VECCALC> half_buffer;
+    TBuf<TPosition::VECCALC> code_buffer;
     LocalTensor<int32_t> product;
     LocalTensor<float> gate;
     LocalTensor<float> up;
@@ -159,6 +164,8 @@ struct Epilogue {
     LocalTensor<float> scale;
     LocalTensor<bfloat16_t> narrow;
     LocalTensor<float> token;
+    LocalTensor<half> half_value;
+    LocalTensor<int8_t> code;
 
     __aicore__ inline void Init(TPipe& pipe)
     {
@@ -175,6 +182,8 @@ struct Epilogue {
         pipe.InitBuffer(scale_buffer, (GATE_UP + SLACK) * sizeof(float));
         pipe.InitBuffer(narrow_buffer, (HALF + SLACK) * sizeof(bfloat16_t));
         pipe.InitBuffer(token_buffer, MAX_ROWS * sizeof(float));
+        pipe.InitBuffer(half_buffer, (HALF + SLACK) * sizeof(half));
+        pipe.InitBuffer(code_buffer, (HALF + SLACK) * sizeof(int8_t));
         product = product_buffer.Get<int32_t>();
         gate = gate_buffer.Get<float>();
         up = up_buffer.Get<float>();
@@ -182,6 +191,8 @@ struct Epilogue {
         scale = scale_buffer.Get<float>();
         narrow = narrow_buffer.Get<bfloat16_t>();
         token = token_buffer.Get<float>();
+        half_value = half_buffer.Get<half>();
+        code = code_buffer.Get<int8_t>();
     }
 };
 
@@ -207,7 +218,8 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
                                 __gm__ float* token_scale,
                                 __gm__ bfloat16_t* out, int64_t rows,
                                 int64_t first, int64_t stride,
-                                int64_t channel, int64_t channels)
+                                int64_t channel, int64_t channels,
+                                __gm__ int8_t* middle, float middle_scale)
 {
     Epilogue held;
     held.Init(pipe);
@@ -215,6 +227,8 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     GlobalTensor<float> scale_global;
     GlobalTensor<float> token_global;
     GlobalTensor<bfloat16_t> out_global;
+    GlobalTensor<int8_t> middle_global;
+    middle_global.SetGlobalBuffer(middle, rows * HALF);
     // With a length. `SetGlobalBuffer(ptr)` alone leaves the tensor's extent
     // unset, and then only the offset-zero row reads back correctly: row 0
     // was right and rows 1 through 7 wrong, every run, from a `partial` that
@@ -267,6 +281,97 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
         SwiGlu(held, channels);
         PipeBarrier<PIPE_ALL>();
         DataCopy(out_global[row * HALF + channel], held.narrow, channels);
+        // The same activation, quantised for the down projection. A static
+        // scale, so the row maximum over all `HALF` columns -- which this
+        // split spreads across blocks -- is a separate change.
+        Muls(held.work, held.gate, 1.0F / middle_scale, channels);
+        PipeBarrier<PIPE_V>();
+        Cast(held.half_value, held.work, RoundMode::CAST_RINT, channels);
+        PipeBarrier<PIPE_V>();
+        Cast(held.code, held.half_value, RoundMode::CAST_RINT, channels);
+        PipeBarrier<PIPE_ALL>();
+        DataCopy(middle_global[row * HALF + channel], held.code, channels);
+    }
+}
+
+/** The second cube stage: the down projection, split on its own N axis.
+ *
+ * Its K axis is all `HALF` intermediate columns, which the first stage spread
+ * across blocks -- so a grid barrier, not a per-pair flag, is what has to
+ * stand between them.
+ */
+__aicore__ inline void ProjectDown(TPipe& pipe, __gm__ int8_t* middle,
+                                   __gm__ int8_t* down, __gm__ int32_t* wide,
+                                   __gm__ uint8_t* tiling, int64_t rows,
+                                   int64_t column, int64_t columns)
+{
+    TCubeTiling cube;
+    auto* destination = (uint32_t*)&cube;
+    auto* source = (__gm__ uint32_t*)tiling;
+    for (uint32_t word = 0; word < sizeof(TCubeTiling) / sizeof(uint32_t);
+         ++word) {
+        destination[word] = source[word];
+    }
+    Matmul<AQuant, BQuant, CProduct, BiasNone> mm;
+    mm.Init(&cube, &pipe);
+    GlobalTensor<int8_t> a;
+    GlobalTensor<int8_t> b;
+    GlobalTensor<int32_t> c;
+    a.SetGlobalBuffer((__gm__ int8_t*)middle, rows * HALF);
+    b.SetGlobalBuffer((__gm__ int8_t*)down + column * HALF,
+                      columns * HALF);
+    c.SetGlobalBuffer((__gm__ int32_t*)wide + column, rows * HIDDEN);
+    mm.SetOrgShape(rows, HIDDEN, HALF);
+    mm.SetTensorA(a);
+    mm.SetTensorB(b, true);
+    mm.IterateAll(c);
+    mm.End();
+}
+
+/** Scale the down projection's INT32 product into BF16. */
+__aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* wide,
+                              __gm__ float* down_scale, float middle_scale,
+                              __gm__ bfloat16_t* out, int64_t rows,
+                              int64_t column, int64_t columns)
+{
+    TBuf<TPosition::VECCALC> product_buffer;
+    TBuf<TPosition::VECCALC> value_buffer;
+    TBuf<TPosition::VECCALC> scale_buffer;
+    TBuf<TPosition::VECCALC> narrow_buffer;
+    pipe.InitBuffer(product_buffer, (TILE + SLACK) * sizeof(int32_t));
+    pipe.InitBuffer(value_buffer, (TILE + SLACK) * sizeof(float));
+    pipe.InitBuffer(scale_buffer, (TILE + SLACK) * sizeof(float));
+    pipe.InitBuffer(narrow_buffer, (TILE + SLACK) * sizeof(bfloat16_t));
+    LocalTensor<int32_t> product = product_buffer.Get<int32_t>();
+    LocalTensor<float> value = value_buffer.Get<float>();
+    LocalTensor<float> scale = scale_buffer.Get<float>();
+    LocalTensor<bfloat16_t> narrow = narrow_buffer.Get<bfloat16_t>();
+
+    GlobalTensor<int32_t> wide_global;
+    GlobalTensor<float> scale_global;
+    GlobalTensor<bfloat16_t> out_global;
+    wide_global.SetGlobalBuffer(wide, rows * HIDDEN);
+    scale_global.SetGlobalBuffer(down_scale, HIDDEN);
+    out_global.SetGlobalBuffer(out, rows * HIDDEN);
+
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t done = 0; done < columns; done += TILE) {
+            const int64_t count = (columns - done < TILE) ? columns - done
+                                                          : TILE;
+            const int64_t at = row * HIDDEN + column + done;
+            DataCopy(product, wide_global[at], count);
+            DataCopy(scale, scale_global[column + done], count);
+            PipeBarrier<PIPE_ALL>();
+            Cast(value, product, RoundMode::CAST_NONE, count);
+            PipeBarrier<PIPE_V>();
+            Mul(value, value, scale, count);
+            PipeBarrier<PIPE_V>();
+            Muls(value, value, middle_scale, count);
+            PipeBarrier<PIPE_V>();
+            Cast(narrow, value, RoundMode::CAST_RINT, count);
+            PipeBarrier<PIPE_ALL>();
+            DataCopy(out_global[at], narrow, count);
+        }
     }
 }
 
@@ -283,7 +388,10 @@ __aicore__ void mix_expert_fused(
     __gm__ int32_t* partial, __gm__ float* gu_scale,
     __gm__ float* token_scale, __gm__ bfloat16_t* out,
     __gm__ uint8_t* tiling, int64_t rows, int64_t stages,
-    int64_t blocks)
+    int64_t blocks, __gm__ int8_t* middle, __gm__ int8_t* down,
+    __gm__ float* down_scale, __gm__ int32_t* wide,
+    __gm__ bfloat16_t* narrow_out, __gm__ uint8_t* down_tiling,
+    float middle_scale)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     SetSyncBaseAddr(sync_base);
@@ -381,7 +489,7 @@ __aicore__ void mix_expert_fused(
             // by `GetSubBlockIdx` left half the output unwritten, and at
             // eight rows the vector work is too small to be worth a split.
             Activate(vector_pipe, partial, gu_scale, token_scale, out, rows,
-                     0, 1, channel, channels);
+                     0, 1, channel, channels, middle, middle_scale);
         }
     }
 }
@@ -415,37 +523,44 @@ __aicore__ void mix_expert_project(
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
 void mix_expert_activate(__gm__ int32_t* partial, __gm__ float* gu_scale,
                          __gm__ float* token_scale, __gm__ bfloat16_t* out,
-                         int64_t rows, int64_t blocks)
+                         int64_t rows, int64_t blocks, __gm__ int8_t* middle,
+                         float middle_scale)
 {
     TPipe pipe;
     const int64_t block = GetBlockIdx() * blocks / GetBlockNum();
     const int64_t channels = HALF / blocks;
     Activate(pipe, partial, gu_scale, token_scale, out, rows, 0, 1,
-             block * channels, channels);
+             block * channels, channels, middle, middle_scale);
 }
 
 void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                              void* x, void* gate_up, void* partial,
                              float* gu_scale, float* token_scale, void* out,
-                             void* tiling, int64_t rows, int64_t stages)
+                             void* tiling, int64_t rows, int64_t stages,
+                             void* middle, void* down, float* down_scale,
+                             void* wide, void* narrow_out, void* down_tiling,
+                             float middle_scale)
 {
     mix_expert_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)x, (__gm__ int8_t*)gate_up,
         (__gm__ int32_t*)partial, gu_scale, token_scale,
         (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)tiling, rows, stages,
-        blocks);
+        blocks, (__gm__ int8_t*)middle, (__gm__ int8_t*)down, down_scale,
+        (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)narrow_out,
+        (__gm__ uint8_t*)down_tiling, middle_scale);
 }
 
 void mix_expert_staged_launch(uint32_t blocks, void* stream,
                               uint64_t sync_base, void* x, void* gate_up,
                               void* partial, float* gu_scale,
                               float* token_scale, void* out, void* tiling,
-                              int64_t rows)
+                              int64_t rows, void* middle, float middle_scale)
 {
     mix_expert_project<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)x, (__gm__ int8_t*)gate_up,
         (__gm__ int32_t*)partial, (__gm__ uint8_t*)tiling, rows, blocks);
     mix_expert_activate<<<blocks, nullptr, stream>>>(
         (__gm__ int32_t*)partial, gu_scale, token_scale,
-        (__gm__ bfloat16_t*)out, rows, blocks);
+        (__gm__ bfloat16_t*)out, rows, blocks, (__gm__ int8_t*)middle,
+        middle_scale);
 }

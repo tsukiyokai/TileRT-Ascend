@@ -10,6 +10,9 @@ decode round 53.05 ms unprofiled; best TPOT 11.6198 ms; prompt-lookup acceptance
 tokens/round; ~3008 kernels/round; per-call launch floors AI_VECTOR_CORE 0.70 us,
 AI_CORE 2.30 us, MIX_AIV 12.04 us, MIX_AIC 13.58 us (505 MIX_AIC calls/round, 6.5/layer),
 giving an 11.5 ms launch floor with 82% on MIX; TP reduce 5.35 ms and 100% serial.
+First fused brick measured 2026-10-20: 12.307 us at 8 rows / 4 blocks, against 15.093 for the same work as two
+kernels and 14.801 for the vendor pair (`QuantBatchMatmulV3` 11.661 + `DequantSwigluQuant` 3.140) — 17% faster
+than the two vendor operators as one kernel, exact against the two-kernel arm, 24 consecutive clean runs.
 Per family, ms spent vs ms of bytes it must move: SparseFlashAttention 6.973 / 1.382;
 GroupedMatmulSwigluQuantV2 6.793 / 2.272; GroupedMatmul 5.596 / 1.212;
 QuantBatchMatmulV3 3.810 / 0.780; MlaPrologV3 2.950 / 2.745; Cast 2.300 / 0.076;
@@ -22,9 +25,9 @@ ForeachAddList 1.622 / 0.018.
 | `megakernel-persistent-decode.md` | Hazy Research Llama-1B megakernel (full text), MPK / Mirage Persistent Kernel, FlashMoE/FlashDMoE, **CANN SuperKernel device-side source**, ThunderMLA, Event Tensor / ETC, plus a cross-system comparison table |
 | `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence) |
 | `ascend-launch-overhead-and-sync.md` | **Internal Wiki only — do not publish.** Measured MIX head-overhead decomposition, the CrossCoreSetFlag counter limit and MlaPrologV3's real CV pipeline, the 0–7 event-id budget, A3 buffer capacities, `blade/runtime` (an existing Ascend megakernel runtime with `aclrtLaunchMega`), an internal plan for an Ascend MPK, heterogeneous workers, Async-MoE scoreboard sync |
-| `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming |
+| `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming. **Part 8 is grouped matmul over 256 experts inside a hand-written kernel** — `group_list_type`'s three modes, per-expert weight addressing, the 128-group TensorList cap |
 | `mla-decode-fusion.md` | MlaPrologV3, SparseFlashAttention / DSA, FusedInferAttentionScore, FlashMLA, weight absorption |
-| `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem |
+| `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem. **Part 7 is the in-kernel collective without a host barrier** — `aclshmem_quiet`'s implementation, epoch/magic tagging, and the A3 AMO limits |
 | `speculative-acceptance.md` | prompt lookup, SuffixDecoding, EAGLE/Medusa/tree drafts, MTP, acceptance-length measurements |
 | `tilelang-ascend.md` | **Deprioritized** (hand-written AscendC was chosen instead). Kept for the AscendC primitives it documents: pipe flag protocol, real L1/UB address maps, Cube↔Vector handoff, and the tile-ai repo inventory |
 
@@ -95,6 +98,46 @@ ForeachAddList 1.622 / 0.018.
    on SWE-Bench against PLD's 3.2, and our measured 7.1 is at that state of the art. vllm-ascend
    also caps `num_speculative_tokens + 1 <= 16` via `npu_fused_infer_attention_score`.
 
+## Corrections to earlier findings in this file
+
+Each of these overturns something stated above, with the newer source winning. Read them before acting on
+finding 3.
+
+- **flagId on A3 is 0-15, not 0-10, and each AIC and each AIV has its own 16.** Established twice independently
+  (`ascend-fusion-mechanics.md` §38.4 from the current `CrossCoreSetFlag` page; §40 from a separate pass). The range
+  only *looks* like 0-10 because `SyncAll<false>` reserves 11/12/13 and `SyncAll<true>` reserves 14. Out-of-range
+  ids are silently truncated to the low 4 bits, so an id reaching 16 aliases onto 0 — inside `Matmul`'s `[0, 2N-1]`.
+  Counter depth is 15 (two of three sources; the API pages say 16), and overflow is a hard error, not a hang.
+- **There is no flag-counter reset primitive.** A counter only falls by executing matching Waits (§40). Mode 2
+  AIC→AIV requires exactly M Waits per Set with each AIV owning its own counter, and unpaired use is explicitly
+  「未定义行为」 (§38.2). The three published disciplines are drain-at-a-barrier (MegaGDN), a 15-deep credit window
+  (`catlass` `CrossCoreSetFlagWithReverse`), and flagId rotation (MegaMoE). The unbounded alternative is a GM
+  counter, which touches no flagId at all (§40).
+- **`PIPE_S` is an unsupported pipe for every sync mode A3 has — and it is the header default** for
+  `CrossCoreWaitFlag` (§38.3). Write the pipe out.
+- **Mode 2 only reaches a cube's own two subblocks**: AIC[i] can flag AIV[2i] and AIV[2i+1] and nothing else, so the
+  cube's output tile must be the exact union of its two AIVs' input tiles (§37, with the shipped two-line tiling
+  recipe in §41.3).
+- **The two halves of a MIX kernel number the grid differently.** `GetBlockNum()` returns the AIC count on *both*
+  halves, while the AIV's `GetBlockIdx()` is a global AIV index in `[0, 2N)`. Shipped code works around it with
+  `aivNum = GetBlockNum() * GetSubBlockNum()` and the comment 「doc say aivNum has already mul subNum, by we test
+  are not」 (§39.2). `SetDim` counts AIV in `matmul_fused`, AIC in `rope_matrix` — check per API, never assume.
+- **The cube→vector path has no cache-coherence problem on A3, only an ordering one.** On 2201 the three caches are
+  L2 (shared, no coherence issue), DCache (per-core, Scalar-only) and ICache (read-only); FIXPIPE→GM and MTE2→UB
+  both go through L2 (§35.1). What is needed is `DataSyncBarrier<MemDsbT::DDR>()` before raising the flag, not
+  `DataCacheCleanAndInvalid`. Finding 3b's "no L0C→UB path" is confirmed, and the L1 escape is closed too:
+  `Fixpipe(L0C→UB)`, `DataCopy(L0C→UB)` and `DataCopyL1ToUB` are all 不支持 on A3 (§35.4).
+- **`GroupedMatmul` is not in `ops-nn`.** It is in `hicann/ops-transformer` under `gmm/`, with the fused MoE
+  megakernel in `mc2/mega_moe` including an A3-specific `mega_moe_kernel_a3.hpp` (`fused-moe-expert.md` Part 8).
+
+## Where to look things up
+
+`asc.gitcode.com/api/` is a complete static mirror of the Ascend C API reference: path-addressable, newer than the
+`doc_center` copies, and every page carries an explicit 「产品支持情况」 block naming Atlas A3. Start there.
+`hiascend.com/document/detail/...` returns an empty body to a fetcher; `hiascend.com/doc_center/source/...` works
+but its id space is undiscoverable. CANN 9.2.0 is not published on the portal at all — 900 is the newest text.
+Details and the URL shape in `ascend-fusion-mechanics.md` §35.0.
+
 ## Reading order if you are about to write the megakernel
 
 0. `megakernel-persistent-decode.md` §8 — MegaGDN. The minimum viable Ascend megakernel, with
@@ -114,6 +157,12 @@ ForeachAddList 1.622 / 0.018.
    scoreboard AIV).
 5. `megakernel-persistent-decode.md` §1 and §2 — the two canonical designs, for the paged
    on-chip allocator and the AOT/JIT task-launch distinction.
+6. `ascend-fusion-mechanics.md` §37-§41 — the MIX brick, start to finish, learned the hard way. §38 is the
+   authoritative `CrossCoreSetFlag` semantics (pairing arity, counter residue, the `PIPE_S` trap). §39 is two
+   complete vendor kernels: a shipped multi-block `ASCENDC_CUBE_ONLY` + flag handoff (`rope_matrix`) and the KFC
+   route where the AIV drives the cube and waits on a `TQue`. §41 is the per-layer kernel: the Matmul object's
+   lifetime across stages, `SyncAll<false>()` as a mid-kernel phase boundary with a shipped three-barrier example,
+   and the pairing tiling. §35 is the A3 cache model that makes the handoff rule one instruction.
 
 ## Provenance rule
 

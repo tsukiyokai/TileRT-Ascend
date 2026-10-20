@@ -2874,6 +2874,5105 @@ for our brief's instruction that generalization is not a goal.
 
 ---
 
+---
+
+## Part 8 — Grouped matmul over 256 experts inside a hand-written kernel: the group list, per-expert weight addressing, and where the code actually lives
+
+Collected 2026-10-20 for question 2.2. Everything below is verbatim.
+
+## Relevance
+This is the material for driving all 256 routed experts from inside one hand-written kernel, against our measured
+`GroupedMatmul` 5.596 ms / 1.212 ms of bytes and `GroupedMatmulSwigluQuantV2` 6.793 / 2.272.
+- **The repo guess in our notes was wrong, and this is a clean negative from a 40200-path tree walk:
+  `GroupedMatmul` is not in `ops-nn` at all.** It lives in `hicann/ops-transformer` under `gmm/`, with
+  `mc2/mega_moe` holding the fused MoE megakernel — including an A3-specific `mega_moe_kernel_a3.hpp`. That file is
+  the closest published thing to what we are building.
+- **The per-group matmul re-point is quoted in full from two independent places**: the official device-side decoder
+  `GetSplitValueFromGroupList` (all three `groupListType` modes), and the hand-written 910B kernel's `MMCompute` —
+  `SetOrgShape(group M, N, K)` → `SetSingleShape(tile)` → `SetTensorA(xGm[xOffset])` → `SetTensorB(weightGmLocal)` →
+  `IterateAll`, with `UpdateMnConfig` bumping all five offsets per group. Note how that differs from §39.1's
+  `rope_matrix`, which re-points with `SetTensorA`/`SetTensorB`/`SetTail` only: a grouped matmul must also move
+  `SetOrgShape` and `SetSingleShape` because the group's logical shape changes, not just its base address.
+- **Per-expert weight addressing has two idioms**, both quoted: a TensorList of GM pointers dereferenced via
+  `GetTensorAddr<T>(index, ptr)` (MegaMoE and the official GMM), or one contiguous `[E, K, N]` buffer advanced by
+  `k * n` when `listLen == 1`. For us the second is the one to use, and the reason is a hard limit in the first:
+  **the TensorList forms cap at 128 groups, and we have 256 experts.** `CATLASS` separately sizes
+  `MAX_TENSOR_COUNT = 256`.
+- **`group_list_type` is three-valued** — 0 cumsum, 1 count, 2 sparse `[[groupIdx, groupSize], ...]` compacted —
+  with a three-way worked example below. Five different kernels disagree on which they honour, so the value must be
+  read off the specific kernel rather than assumed. This supersedes the looser note in
+  `a5-950-mc2-*` memory that `group_list_type` defaults to cumsum.
+- **MegaMoE takes no host `groupList` at all**, deriving both forms on device from round-tagged per-rank counters.
+  At batch=1 with top-8 of 256 that is the right shape for us too: the group list is eight entries, computable on
+  device from the router output, and shipping it from the host would cost a launch.
+
+# TOPIC B — grouped matmul over many experts inside a hand-written kernel
+
+## B1. `cann/asc-devkit` `quant_group_matmul` — FULL KERNEL SOURCE
+
+Verification note: of the 31 fenced blocks in this section, 28 were machine-checked as exact
+literal substrings of the files downloaded from gitcode; the 3 that are not are each labelled
+in place as either a `grep -n` inventory, a concatenation of two stated line ranges, or an
+HTML-table elision.
+
+
+Repo: `cann/asc-devkit` on gitcode.com, branch `master`. Fetched 2026-10-20.
+Tree walked with the gitcode v5 contents API
+(`https://gitcode.com/api/v5/repos/cann/asc-devkit/contents/<path>?ref=master`);
+files pulled raw from `https://raw.gitcode.com/cann/asc-devkit/raw/master/<path>`.
+
+### B1.0 Real repo paths (the ones in the task brief were approximate)
+
+The quant group matmul sample is ONE directory, and the `.asc` file inside it is the thing
+named `quant_group_matmul_custom`:
+
+- `examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/`
+  - `quant_group_matmul_custom.asc`  (684 lines, 32673 bytes — device kernel AND host main in one file)
+  - `README.md` (31646 bytes), `README_en.md` (35749 bytes)
+  - `CMakeLists.txt`, `data_utils.h`
+  - `scripts/gen_data.py`, `scripts/verify_result.py`
+  - `figures/CV流水优化1.png`, `figures/CV流水优化2.png`
+
+404 / does-not-exist (recorded as requested):
+
+- `https://gitcode.com/cann/asc-devkit/tree/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_custom/`
+  — NO SUCH DIRECTORY. There is no sibling `quant_group_matmul_custom/` directory anywhere in the
+  repo; a full dir-level scan of the tree (4000 directories, `git/trees/master?recursive=1` paginated
+  at 100/page over 40 pages) returns exactly one path matching `group.*matmul`:
+  `examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance`.
+- `https://gitcode.com/api/v5/repos/cann/asc-devkit` — HTTP 400 (repo metadata endpoint rejects;
+  the `contents` and `git/trees` endpoints work fine).
+- Note on the tree API: `git/trees/master?recursive=1` returns ONLY `type":"tree"` entries
+  (directories), never blobs, so file discovery has to go through the `contents` endpoint.
+
+There is no separate `.h` device header for this sample: the whole kernel plus the host `main()`
+live in the single `.asc` translation unit. The `02_simd_c_api` / `03_simt_api` trees have no
+group-matmul counterpart.
+
+The one `.h` device header among the matrix best practices is
+`examples/01_simd_cpp_api/05_best_practices/01_matrix_compute/matmul_high_performance/matmul.h`
+(and `matmul_mxfp4_high_performance/matmul_mx.h`) — not grouped.
+
+---
+
+### B1.1 The group-list loop (item 1)
+
+`groupList` semantics, decided here: `groupListGlobal.GetValue(groupIdx)` is the ROW COUNT OF THAT
+GROUP (per-group count), NOT a cumulative sum. The running sum is maintained on device by
+`groupConfig.globalRowOffset += groupConfig.groupM;` at the bottom of the loop. The comment on the
+struct field says so outright ("当前Group的M维度行数 (从groupList动态读取)" / "跨Group累积的全局行偏移").
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 40-54: sync flag ids, and the GroupConfig struct whose comments fix the groupList semantics.
+```cpp
+// ==================== 同步标志与常量 ====================
+constexpr uint64_t SYNC_AIC_TO_AIV = 5;
+constexpr uint64_t SYNC_AIV_TO_AIC = 3;
+constexpr uint32_t BROADCAST_DIM = 2; // Broadcast维度
+constexpr uint32_t BUFFER_NUM = 2;    // UB队列Buffer数, 设为2开启double buffer
+
+// 记录当前子块在全局和Group内的位置信息, 在Process循环中逐步更新
+struct GroupConfig {
+    uint32_t groupM = 0;          // 当前Group的M维度行数 (从groupList动态读取)
+    uint32_t mIdx = 0;            // 当前子块在Group内M方向的块索引
+    uint32_t nIdx = 0;            // 当前子块在Group内N方向的块索引
+    uint32_t numBlocksM = 0;      // 当前Group M方向分块数 = AscendC::Std::ceil_div(groupM, SINGLE_M)
+    uint32_t numBlocksN = 0;      // N方向分块数 = AscendC::Std::ceil_div(N, SINGLE_N), 所有Group相同
+    uint32_t globalRowOffset = 0; // 跨Group累积的全局行偏移, 影响x/perTokenScale/y的行定位
+};
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 250-288: `Process()` — the group loop with the preCount cross-group round-robin, the GM read of the group list, and the globalRowOffset accumulation.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::Process()
+{
+    GroupConfig groupConfig;
+    groupConfig.numBlocksN = AscendC::Std::ceil_div(N, SINGLE_N);
+
+    // preCount: 上一Group末尾未被CORE_NUM整除的余数块数, 实现跨Group连续轮询
+    for (uint32_t groupIdx = 0, preCount = 0; groupIdx < GROUP_NUM; ++groupIdx) {
+        uint32_t groupM = static_cast<int32_t>(groupListGlobal.GetValue(groupIdx));
+        if (groupM <= 0) {
+            continue;
+        }
+        groupConfig.groupM = static_cast<uint32_t>(groupM);
+        groupConfig.numBlocksM = AscendC::Std::ceil_div(groupConfig.groupM, SINGLE_M);
+
+        uint32_t curCount = preCount + groupConfig.numBlocksN * groupConfig.numBlocksM;
+        uint32_t curBlockIdx = coreIdx >= preCount ? coreIdx : coreIdx + CORE_NUM;
+
+        while (curBlockIdx < curCount) {
+            groupConfig.mIdx = (curBlockIdx - preCount) / groupConfig.numBlocksN;
+            groupConfig.nIdx = (curBlockIdx - preCount) % groupConfig.numBlocksN;
+            // Step 1: Cube侧矩阵乘 (AIC执行), AIV跳过
+            MMCompute(groupIdx, groupConfig);
+            // Step 2: Vector侧反量化+激活 (AIV执行), AIC跳过
+            VectorCompute(groupIdx, groupConfig);
+            curBlockIdx += CORE_NUM;
+        }
+        // 余数传递给下一Group, 跨Group保证负载均衡
+        preCount = curCount % CORE_NUM;
+        groupConfig.globalRowOffset += groupConfig.groupM;
+    }
+    // Step 3: 流水收尾, 等待最后若干Vector任务完成
+    PostCompute();
+}
+```
+
+---
+
+### B1.2 Every `SetGlobalBuffer` and the per-group pointer arithmetic (item 2)
+
+Note the shape of this design: `SetGlobalBuffer` is called ONCE per tensor in `Init()`, with NO
+length argument and NO per-group re-pointing. Per-expert addressing is done instead by indexing the
+`GlobalTensor` with a scalar offset at use time (`xGlobal[xOffset]`, `weightGlobal[weightOffset]`),
+and handing that slice to `SetTensorA` / `SetTensorB`. The per-expert weight offset is
+`groupIdx * N * K + curOffsetN * K`.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 186-217: `Init()` — all seven `SetGlobalBuffer` calls, including workspace reinterpreted as the int32 Cube-output staging tensor, and the AIV coreIdx division by GetTaskRation().
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::
+    Init(
+        __gm__ uint8_t* x, __gm__ uint8_t* weight, __gm__ uint8_t* bias, __gm__ uint8_t* groupList,
+        __gm__ uint8_t* scale, __gm__ uint8_t* perTokenScale, __gm__ uint8_t* y, __gm__ uint8_t* workspace,
+        AscendC::TPipe* tPipeIn)
+{
+    xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(x));
+    weightGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(weight));
+    mmOutGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace)); // workspace作为Cube输出中转
+    scaleGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scale));
+    perTokenScaleGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(perTokenScale));
+    groupListGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(groupList));
+    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(y));
+
+    // 获取核索引: __mix__(1,2)模式下, AIC和AIV的GetBlockIdx()各自独立编号
+    //   AIC侧返回0~CORE_NUM-1, AIV侧返回0~2*CORE_NUM-1
+    //   AIV需除以GetTaskRation()(=2)得到逻辑核号, 与对应AIC共享同一coreIdx
+    subBlockIdx = AscendC::GetSubBlockIdx();
+    coreIdx = AscendC::GetBlockIdx();
+    if ASCEND_IS_AIV {
+        coreIdx /= AscendC::GetTaskRation();
+    }
+    pipe = tPipeIn;
+    InitUbBuffer();
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 290-330: `MMCompute()` — the tail handling, then the two offset expressions (`xOffset`, `weightOffset`) that do the per-expert addressing, then the matmul object calls.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::MMCompute(uint32_t groupIdx, GroupConfig& groupConfig)
+{
+    uint32_t curOffsetN = groupConfig.nIdx * SINGLE_N;
+    uint32_t curOffsetM = groupConfig.mIdx * SINGLE_M;
+
+    uint32_t curSingleN = SINGLE_N;
+    if (groupConfig.nIdx == groupConfig.numBlocksN - 1) {
+        curSingleN = N - curOffsetN;
+    }
+    uint32_t curSingleM = SINGLE_M;
+    if (groupConfig.mIdx == groupConfig.numBlocksM - 1) {
+        curSingleM = groupConfig.groupM - curOffsetM;
+    }
+
+    uint64_t xOffset = (groupConfig.globalRowOffset + curOffsetM) * K;
+    uint64_t weightOffset = groupIdx * N * K + curOffsetN * K;
+
+    if ASCEND_IS_AIC {
+        matmulObj.SetOrgShape(groupConfig.groupM, N, K);
+        matmulObj.SetSingleShape(curSingleM, curSingleN, K);
+        matmulObj.SetTensorA(xGlobal[xOffset]);
+        auto weightSlice = weightGlobal[weightOffset];
+        matmulObj.SetTensorB(weightSlice);
+
+        while (matmulObj.Iterate()) {
+            if (cubeTaskIdx >= PIPELINE_DEPTH) {
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+            }
+            uint64_t workSpaceOffset = BASE_N * BASE_M * (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+            matmulObj.GetTensorC(mmOutGlobal[workSpaceOffset], 0, true);
+            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+            cubeTaskIdx++;
+        }
+    }
+}
+```
+
+The offsets again, isolated (verbatim, lines 310-311 of the same file):
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 310-311. The two pointer-arithmetic expressions. `globalRowOffset` is the cumulative row sum built from the per-group counts; `weightOffset` strides whole experts by `N*K` and then N-blocks by `K` (valid because weight is stored NZ with the N-fractal outermost — see item 5).
+```cpp
+    uint64_t xOffset = (groupConfig.globalRowOffset + curOffsetM) * K;
+    uint64_t weightOffset = groupIdx * N * K + curOffsetN * K;
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 356-367 (inside `VectorCompute`): the scale / output offsets, i.e. per-group per-channel scale addressing `groupIdx * N + nIdx * SINGLE_N` and the output row addressing.
+```cpp
+    uint64_t scaleOffset = groupIdx * N + groupConfig.nIdx * SINGLE_N;
+    uint64_t outOffset = (groupConfig.globalRowOffset + groupConfig.mIdx * SINGLE_M) * N + groupConfig.nIdx * SINGLE_N;
+    uint32_t taskRation = AscendC::GetTaskRation();
+
+    // ---- 外层offsetN循环: 每次对应一次Cube Iterate, 沿N轴遍历 ----
+    for (uint32_t offsetN = 0, vecCount = 0; offsetN < curCubeN; offsetN += BASE_N) {
+        uint32_t curVecBaseN = BASE_N;
+        if (unlikely(offsetN + BASE_N >= curCubeN)) {
+            curVecBaseN = curCubeN - offsetN;
+        }
+        uint32_t alignBaseN = AscendC::Std::ceil_div(curVecBaseN, uint32_t(8)) * 8;
+        // Step 1: 拷贝per-channel scale到UB
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 476-503: `DataCopyPerTokenScaleAndBrcb()` — per-token scale offset is the GLOBAL row number, i.e. globalRowOffset + mIdx*SINGLE_M + offsetM, with the comment stating it.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::
+    DataCopyPerTokenScaleAndBrcb(GroupConfig& groupConfig, uint32_t curBaseM, uint32_t alignBaseN, uint32_t offsetM)
+{
+    // perTokenScale偏移: 全局行号 = globalRowOffset + mIdx×baseM + offsetM
+    uint64_t perTokenScaleOffset = groupConfig.globalRowOffset + groupConfig.mIdx * SINGLE_M + offsetM;
+
+    // GM → UB: 拷贝curBaseM个float
+    AscendC::DataCopyPadExtParams<float> padParams;
+    AscendC::DataCopyExtParams perTokenScaleParams{1, static_cast<uint32_t>(curBaseM * sizeof(float)), 0, 0, 0};
+    LocalTensor<float> perTokenScaleLocal = perTokenScaleInQueue.AllocTensor<float>();
+    DataCopyPad(perTokenScaleLocal, perTokenScaleGlobal[perTokenScaleOffset], perTokenScaleParams, padParams);
+    perTokenScaleInQueue.EnQue(perTokenScaleLocal);
+
+    // Broadcast: [curBaseM, 1] → [curBaseM, alignBaseN], 每行一个scale扩展到所有列
+    perTokenScaleInUb = perTokenScaleInQueue.DeQue<float>();
+    const uint32_t broadCastDst[BROADCAST_DIM] = {curBaseM, alignBaseN};
+    const uint32_t broadCastSrc[BROADCAST_DIM] = {curBaseM, 1};
+    AscendC::BroadCast<float, BROADCAST_DIM, 1>(
+        pertokenBrcbLocal, perTokenScaleInUb, broadCastDst, broadCastSrc, sharedTmpLocal);
+    perTokenScaleInQueue.FreeTensor(perTokenScaleInUb);
+}
+```
+
+---
+
+### B1.3 Matmul-object API calls and the type declaration (item 3)
+
+What this kernel actually calls: `SetOrgShape`, `SetSingleShape`, `SetTensorA`, `SetTensorB`,
+`Iterate()` (in a `while`), `GetTensorC(dst, 0, true)`, and `REGIST_MATMUL_OBJ`.
+What it does NOT call: `SetBias` (bias is passed in but `Data(0)`, unused), `SetQuantScalar`,
+`SetQuantVector` (dequant is done on the Vector side with `AscendDequant`, not in FIXPIPE),
+`IterateAll`, `End()`, `SetWorkspace`, `GetUserWorkspace`, `SyncAll`. For verbatim
+`SetQuantScalar`/`SetQuantVector`/`SetBias`/`IterateAll`/`End` from the same repo see section 7.
+
+The type declaration is a `matmul::Matmul<...>` with a compile-time-constant
+`MatmulApiStaticTiling`, not a runtime `TCubeTiling` — and `REGIST_MATMUL_OBJ` is passed
+`(TCubeTiling*)nullptr` for exactly that reason.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 84-126: class head, the UB sizing constants, the "tiling constantization" block, the four `MatmulType` aliases (A=GM/ND/int8, B=GM/NZ/int8, C=GM/ND/int32, BIAS=GM/ND/int32), the arch-conditional depthA1/stepKa for dav-2201 vs others, and `GetCustomConstantCFG()`.
+```cpp
+// ==================== 量化分组矩阵乘 Kernel 类 ====================
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+class QuantGroupMatmul {
+    // Vector单次处理的元素数: 24行 × BASE_N列 (UB容量约束, 24行int32=24×256=6144元素)
+    static constexpr uint32_t UB_CAL_SIZE = 24 * BASE_N;
+    // tmpBuff总大小, 用于存放反量化中间结果和API临时空间
+    static constexpr uint32_t UB_REST_BYTES = 118784u;
+
+    // ==================== Tiling常量化配置 ====================
+    // 将Tiling参数从运行时变量提升为编译期常量, 消除Matmul初始化和迭代间的Scalar计算开销
+    static constexpr MatmulShapeParams shapeParams = {SINGLE_M, SINGLE_N, K, BASE_M, BASE_N, BASE_K};
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+    static constexpr int32_t TILING_DEPTHA_PARAM = 16;
+    static constexpr int32_t TILING_STEPKA_PARAM = 8;
+#else
+    static constexpr int32_t TILING_DEPTHA_PARAM = 8;
+    static constexpr int32_t TILING_STEPKA_PARAM = 4;
+#endif
+    static constexpr int32_t TILING_DEPTHB_PARAM = 8;
+    static constexpr int32_t TILING_STEPKB_PARAM = 4;
+    static constexpr int32_t TILING_STEPMN_PARAM = 1;
+
+    using A_TYPE = MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AType>;
+    using B_TYPE = MatmulType<AscendC::TPosition::GM, CubeFormat::NZ, BType>;
+    using C_TYPE = MatmulType<AscendC::TPosition::GM, CubeFormat::ND, CType>;
+    using BIAS_TYPE = MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasType>;
+
+    static __aicore__ inline constexpr MatmulApiStaticTiling GetCustomConstantCFG()
+    {
+        MatmulConfig mmCFG = GetMMConfig<MatmulConfigMode::CONFIG_MDL>(shapeParams);
+        mmCFG.enUnitFlag = true;
+        auto constantCFG = AscendC::GetMatmulApiTiling<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE>(mmCFG);
+        constantCFG.depthA1 = TILING_DEPTHA_PARAM;
+        constantCFG.depthB1 = TILING_DEPTHB_PARAM;
+        constantCFG.stepKa = TILING_STEPKA_PARAM;
+        constantCFG.stepKb = TILING_STEPKB_PARAM;
+        constantCFG.stepM = TILING_STEPMN_PARAM;
+        constantCFG.stepN = TILING_STEPMN_PARAM;
+        return constantCFG;
+    }
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 128-150: the public surface and the private method list — note `CONSTANT_CFG` and the `matmul::Matmul<...>` member declaration with its template args.
+```cpp
+public:
+    __aicore__ inline QuantGroupMatmul() {}
+    __aicore__ inline void Init(
+        __gm__ uint8_t* x, __gm__ uint8_t* weight, __gm__ uint8_t* bias, __gm__ uint8_t* groupList,
+        __gm__ uint8_t* scale, __gm__ uint8_t* perTokenScale, __gm__ uint8_t* y, __gm__ uint8_t* workspace,
+        AscendC::TPipe* tPipeIn);
+    __aicore__ inline void Process();
+
+    // Tiling常量化: 编译期确定Tiling参数, 消除运行时Scalar计算开销
+    constexpr static auto CONSTANT_CFG = GetCustomConstantCFG();
+    matmul::Matmul<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, CONSTANT_CFG> matmulObj;
+
+private:
+    __aicore__ inline void InitUbBuffer();
+    __aicore__ inline void MMCompute(uint32_t groupIdx, GroupConfig& groupConfig);
+    __aicore__ inline void VectorCompute(uint32_t groupIdx, GroupConfig& groupConfig);
+    __aicore__ inline void PostCompute();
+    __aicore__ inline void ComputeDequantAndActivate(
+        GroupConfig& groupConfig, uint32_t curVecBaseM, uint32_t alignBaseN, uint32_t curVecBaseN, uint32_t offsetM);
+    __aicore__ inline void DataCopyScale(uint32_t curBaseN, uint32_t alignBaseN, uint64_t scaleOffset);
+    __aicore__ inline void DataCopyPerTokenScaleAndBrcb(
+        GroupConfig& groupConfig, uint32_t curBaseM, uint32_t alignBaseN, uint32_t offsetM);
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 151-185: the private members — every GlobalTensor with its logical shape in the comment, the four TQue queues, the single TBuf and its sub-tensors, and the two task counters `cubeTaskIdx` / `vecTaskIdx` that drive the ring workspace.
+```cpp
+private:
+    GlobalTensor<int8_t> xGlobal;            // 左矩阵 x[M, K] int8
+    GlobalTensor<int8_t> weightGlobal;       // 右矩阵 weight[GROUP_NUM, K, N] int8, NZ布局存储
+    GlobalTensor<int32_t> mmOutGlobal;       // Cube输出 → workspace, int32
+    GlobalTensor<float> scaleGlobal;         // per-channel反量化scale [GROUP_NUM, N]
+    GlobalTensor<float> perTokenScaleGlobal; // per-token反量化scale [M]
+    GlobalTensor<int64_t> groupListGlobal;   // 每组行数 [GROUP_NUM]
+    GlobalTensor<half> yGlobal;              // 最终输出 y[M, N] half
+
+    // ---- UB队列 (double buffer) ----
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> vecInQueue;           // Cube int32结果输入
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> vecOutQueue;         // half输出
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> scaleInQueue;         // per-channel scale
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> perTokenScaleInQueue; // per-token scale
+
+    // ---- UB临时缓冲 ----
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuff; // 中间计算结果和API临时空间
+
+    // ---- tmpBuff内部分区 (Vector侧使用) ----
+    LocalTensor<float> dequantMiddleResult; // [UB_CAL_SIZE] AscendDequant输出: int32×scale → float
+    LocalTensor<float> pertokenBrcbLocal; // [UB_CAL_SIZE] perTokenScale广播后: [vecBaseM, 1] → [vecBaseM, alignBaseN]
+    LocalTensor<float> mulsResultLocal;   // [UB_CAL_SIZE] per-token反量化结果: dequant × perTokenScale
+    LocalTensor<float> actResultLocal;    // [UB_CAL_SIZE] FasterGelu激活结果
+    LocalTensor<uint8_t> sharedTmpLocal;  // [2×UB_CAL_SIZE×4] AscendDequant/BroadCast API内部临时空间
+    LocalTensor<float> scaleInUb;         // 当前N切片的per-channel scale, 在offsetN循环内有效
+    LocalTensor<float> perTokenScaleInUb; // 当前M切片的per-token scale, 在offsetM循环内有效
+
+    uint32_t subBlockIdx;     // AIV子块索引 (__mix__模式下多AIV共享同一coreIdx时区分任务)
+    uint32_t coreIdx;         // 当前核的逻辑索引 (AIC和AIV共享同一coreIdx)
+    uint32_t cubeTaskIdx = 0; // AIC侧: 按Iterate粒度递增, 用于环形workspace Slot分配
+    uint32_t vecTaskIdx = 0;  // AIV侧: 按offsetN粒度递增, 与cubeTaskIdx天然同步
+
+    AscendC::TPipe* pipe; // 管道对象, 管理UB buffer分配
+};
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 313-330: the matmul call sequence proper. `SetOrgShape(groupM, N, K)` uses the CURRENT group M (not global M); `SetSingleShape` the per-block tail-corrected shape; the `while (Iterate())` loop writes each BASE_M x BASE_N tile to its own workspace slot via `GetTensorC(dst, 0, true)` (third arg = enSequentialWrite).
+```cpp
+    if ASCEND_IS_AIC {
+        matmulObj.SetOrgShape(groupConfig.groupM, N, K);
+        matmulObj.SetSingleShape(curSingleM, curSingleN, K);
+        matmulObj.SetTensorA(xGlobal[xOffset]);
+        auto weightSlice = weightGlobal[weightOffset];
+        matmulObj.SetTensorB(weightSlice);
+
+        while (matmulObj.Iterate()) {
+            if (cubeTaskIdx >= PIPELINE_DEPTH) {
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+            }
+            uint64_t workSpaceOffset = BASE_N * BASE_M * (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+            matmulObj.GetTensorC(mmOutGlobal[workSpaceOffset], 0, true);
+            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+            cubeTaskIdx++;
+        }
+    }
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 504-535: the kernel entry point — `__mix__(1,1)` vs `__mix__(1,2)` by scenario, the `__kfc_workspace__` qualifier on the workspace arg, `InitSocState()`, the AIC-only `REGIST_MATMUL_OBJ(&tPipe, GetSysWorkSpacePtr(), op.matmulObj, (TCubeTiling*)nullptr)`, and the closing `PipeBarrier<PIPE_ALL>()`.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+#if SCENARIO_NUM == 0
+__global__ __mix__(1, 1)
+#else
+__global__ __mix__(1, 2)
+#endif
+    void quant_group_matmul_custom(
+        __gm__ uint8_t* x, __gm__ uint8_t* weight, __gm__ uint8_t* bias, __gm__ uint8_t* groupList,
+        __gm__ uint8_t* scale, __gm__ uint8_t* perTokenScale, __gm__ uint8_t* y,
+        __kfc_workspace__ __gm__ uint8_t* workspace)
+{
+    AscendC::InitSocState();
+    AscendC::TPipe tPipe;
+
+    QuantGroupMatmul<
+        AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+        PIPELINE_DEPTH>
+        op;
+
+    // REGIST_MATMUL_OBJ: 仅在AIC侧初始化Matmul对象
+    if ASCEND_IS_AIC {
+        REGIST_MATMUL_OBJ(&tPipe, GetSysWorkSpacePtr(), op.matmulObj, (TCubeTiling*)nullptr);
+    }
+
+    op.Init(x, weight, bias, groupList, scale, perTokenScale, y, workspace, &tPipe);
+    op.Process();
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+```
+
+---
+
+### B1.4 Workspace slot arithmetic and the CV sync (items 4 and 6)
+
+The whole workspace discipline is three lines of arithmetic plus two cross-core flags. There is no
+`GetUserWorkspace`/`SetWorkspace`/`SyncAll` here: the user workspace is passed as the last kernel
+argument tagged `__kfc_workspace__`, the system workspace is reached separately via
+`GetSysWorkSpacePtr()` inside `REGIST_MATMUL_OBJ`, and the host sizes the user part as
+`PIPELINE_DEPTH * BASE_N * BASE_M * sizeof(int32_t) * CORE_NUM`.
+
+Producer side (AIC), verbatim:
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 320-329: Cube waits for a slot to be released only once it has gotten PIPELINE_DEPTH tiles ahead; the slot address is per-core AND per-pipeline-stage.
+```cpp
+        while (matmulObj.Iterate()) {
+            if (cubeTaskIdx >= PIPELINE_DEPTH) {
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+            }
+            uint64_t workSpaceOffset = BASE_N * BASE_M * (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+            matmulObj.GetTensorC(mmOutGlobal[workSpaceOffset], 0, true);
+            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+            cubeTaskIdx++;
+        }
+    }
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 332-398: `VectorCompute()` in full — the consumer side. The matching `mmOutOffset` uses `vecTaskIdx` where the producer used `cubeTaskIdx`; the two counters are kept in lockstep because the AIV `offsetN` loop granularity equals the AIC `Iterate` granularity. Note the `taskRation` filter that splits the offsetM iterations across the two AIVs, and the `CrossCoreSetFlag<2, PIPE_MTE2>` release at the end of each offsetN step.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::VectorCompute(uint32_t groupIdx, GroupConfig& groupConfig)
+{
+    if ASCEND_IS_AIC {
+        return;
+    }
+    uint32_t curCubeN = SINGLE_N;
+    if (groupConfig.nIdx == groupConfig.numBlocksN - 1) {
+        curCubeN = N - groupConfig.nIdx * SINGLE_N;
+    }
+    uint32_t curCubeM = SINGLE_M;
+    if (groupConfig.mIdx == groupConfig.numBlocksM - 1) {
+        curCubeM = groupConfig.groupM - groupConfig.mIdx * SINGLE_M;
+    }
+
+    // vecBaseM: UB容量约束下单次Vector迭代可处理的行数
+    uint32_t vecBaseM = UB_CAL_SIZE / BASE_N;
+    vecBaseM = vecBaseM < curCubeM ? vecBaseM : curCubeM;
+
+    uint64_t scaleOffset = groupIdx * N + groupConfig.nIdx * SINGLE_N;
+    uint64_t outOffset = (groupConfig.globalRowOffset + groupConfig.mIdx * SINGLE_M) * N + groupConfig.nIdx * SINGLE_N;
+    uint32_t taskRation = AscendC::GetTaskRation();
+
+    // ---- 外层offsetN循环: 每次对应一次Cube Iterate, 沿N轴遍历 ----
+    for (uint32_t offsetN = 0, vecCount = 0; offsetN < curCubeN; offsetN += BASE_N) {
+        uint32_t curVecBaseN = BASE_N;
+        if (unlikely(offsetN + BASE_N >= curCubeN)) {
+            curVecBaseN = curCubeN - offsetN;
+        }
+        uint32_t alignBaseN = AscendC::Std::ceil_div(curVecBaseN, uint32_t(8)) * 8;
+        // Step 1: 拷贝per-channel scale到UB
+        DataCopyScale(curVecBaseN, alignBaseN, scaleOffset + offsetN);
+        uint64_t mmOutOffset = BASE_N * BASE_M * (coreIdx + (vecTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+
+        AscendC::CrossCoreWaitFlag<2>(SYNC_AIC_TO_AIV);
+
+        // ---- 内层offsetM循环: 沿M轴遍历, 每次处理curVecBaseM行 ----
+        for (uint32_t offsetM = 0; offsetM < curCubeM; offsetM += vecBaseM) {
+            vecCount++;
+            // AIV子任务过滤: __mix__多AIV场景下, 仅处理分配给当前subBlockIdx的任务
+            if (taskRation != 0 && vecCount % taskRation != subBlockIdx) {
+                continue;
+            }
+            uint32_t curVecBaseM = (offsetM + vecBaseM >= curCubeM) ? (curCubeM - offsetM) : vecBaseM;
+            // workspace → UB
+            LocalTensor<CType> mmOutLocal = vecInQueue.AllocTensor<CType>();
+            DataCopyPad2D(
+                mmOutLocal, mmOutGlobal[mmOutOffset + offsetM * curVecBaseN], curVecBaseM, curVecBaseN, curVecBaseN);
+            vecInQueue.EnQue(mmOutLocal);
+            // Step 2~5: 反量化+激活+类型转换
+            ComputeDequantAndActivate(groupConfig, curVecBaseM, alignBaseN, curVecBaseN, offsetM);
+            // UB → GM
+            LocalTensor<half> yLocal = vecOutQueue.DeQue<half>();
+            DataCopyPad2D(yGlobal[outOffset + offsetM * N + offsetN], yLocal, curVecBaseM, curVecBaseN, alignBaseN, N);
+            vecOutQueue.FreeTensor(yLocal);
+        }
+        scaleInQueue.FreeTensor(scaleInUb);
+        AscendC::CrossCoreSetFlag<2, PIPE_MTE2>(SYNC_AIV_TO_AIC);
+        vecTaskIdx++;
+    }
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 399-416: `PostCompute()` — pipeline drain. AIC must absorb exactly `min(cubeTaskIdx, PIPELINE_DEPTH)` outstanding releases or the kernel deadlocks/exits early.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::PostCompute()
+{
+    if ASCEND_IS_AIC {
+        if (likely(cubeTaskIdx > 0)) {
+            uint32_t loop = cubeTaskIdx < PIPELINE_DEPTH ? cubeTaskIdx : PIPELINE_DEPTH;
+            for (int32_t idx = 0; idx < loop; ++idx) {
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+            }
+        }
+    }
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 417-454 + 455-474: `ComputeDequantAndActivate()` and `DataCopyScale()` — this is where every `PipeBarrier<PIPE_V>()` in the kernel lives (five of them), and where the UB temp-space aliasing is justified in comments.
+```cpp
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::
+    ComputeDequantAndActivate(
+        GroupConfig& groupConfig, uint32_t curVecBaseM, uint32_t alignBaseN, uint32_t curVecBaseN, uint32_t offsetM)
+{
+    // Step 1: 读取per-token scale并Broadcast
+    DataCopyPerTokenScaleAndBrcb(groupConfig, curVecBaseM, alignBaseN, offsetM);
+
+    LocalTensor<CType> mmOutInUb = vecInQueue.DeQue<CType>();
+
+    // Step 2: per-channel反量化: result[i][j] = mmOut[i][j] × scale[j]
+    AscendDequant(dequantMiddleResult, mmOutInUb, scaleInUb, sharedTmpLocal, {curVecBaseM, alignBaseN, curVecBaseN});
+    AscendC::PipeBarrier<PIPE_V>();
+    vecInQueue.FreeTensor(mmOutInUb);
+
+    // Step 3: per-token反量化: result[i][j] = dequant[i][j] × perTokenScale[i]
+    uint32_t computeSize = curVecBaseM * alignBaseN;
+    Mul(mulsResultLocal, dequantMiddleResult, pertokenBrcbLocal, computeSize);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // Step 4: FasterGelu激活
+    // 临时空间复用dequantMiddleResult和pertokenBrcbLocal的空间 (时序上不冲突)
+    LocalTensor<uint8_t> actTmpLocal = tmpBuff.GetWithOffset<uint8_t>(2 * UB_CAL_SIZE * sizeof(float), 0);
+    FasterGelu(actResultLocal, mulsResultLocal, actTmpLocal, computeSize);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // Step 5: float32 → float16
+    LocalTensor<half> yLocalInUb = vecOutQueue.AllocTensor<half>();
+    Cast(yLocalInUb, actResultLocal, AscendC::RoundMode::CAST_NONE, computeSize);
+    AscendC::PipeBarrier<PIPE_V>();
+    vecOutQueue.EnQue(yLocalInUb);
+}
+
+// ==================== DataCopyScale: 拷贝per-channel scale到UB ====================
+template <
+    typename AType, typename BType, typename CType, typename BiasType, uint32_t M, uint32_t N, uint32_t K,
+    uint32_t BASE_M, uint32_t BASE_N, uint32_t BASE_K, uint32_t SINGLE_M, uint32_t SINGLE_N, uint32_t GROUP_NUM,
+    uint32_t CORE_NUM, uint32_t PIPELINE_DEPTH>
+__aicore__ inline void QuantGroupMatmul<
+    AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+    PIPELINE_DEPTH>::DataCopyScale(uint32_t curBaseN, uint32_t alignBaseN, uint64_t scaleOffset)
+{
+    // GM → UB: 拷贝curBaseN个float (一维拷贝, blockCount=1)
+    AscendC::DataCopyPadExtParams<float> padParams;
+    AscendC::DataCopyExtParams scaleParams{1, static_cast<uint32_t>(curBaseN * sizeof(float)), 1, 1, 0};
+    LocalTensor<float> scaleLocal = scaleInQueue.AllocTensor<float>();
+    DataCopyPad(scaleLocal, scaleGlobal[scaleOffset], scaleParams, padParams);
+    scaleInQueue.EnQue(scaleLocal);
+
+    scaleInUb = scaleInQueue.DeQue<float>();
+    scaleInUb.SetSize(alignBaseN); // 设置逻辑大小为对齐后的值, 供后续API使用
+}
+```
+
+Full inventory of barriers / flags in this kernel (grep result, verbatim lines with numbers):
+
+```text
+322:                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+326:            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+371:        AscendC::CrossCoreWaitFlag<2>(SYNC_AIC_TO_AIV);
+394:        AscendC::CrossCoreSetFlag<2, PIPE_MTE2>(SYNC_AIV_TO_AIC);
+411:                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+434:    AscendC::PipeBarrier<PIPE_V>();
+440:    AscendC::PipeBarrier<PIPE_V>();
+446:    AscendC::PipeBarrier<PIPE_V>();
+451:    AscendC::PipeBarrier<PIPE_V>();
+533:    AscendC::PipeBarrier<PIPE_ALL>();
+```
+
+(`SyncAll` appears zero times; there is no inter-core sync at all — cores are independent, only
+AIC<->AIV on the same physical core synchronise.)
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 610-647 of the host `main()`: the shape/tiling constants, the arch split (dav-2201: SINGLE_M=BASE_M=128, CORE_NUM=24; dav-3510: 256/256/32), and the USER_WORKSPACE_SIZE formula that must match the device slot arithmetic exactly.
+```cpp
+int32_t main(int32_t argc, char* argv[])
+{
+    // 全局矩阵维度: x[M, K] × weight[GROUP_NUM, K, N] → y[M, N]
+    constexpr uint32_t M = 8192;
+    constexpr uint32_t N = 8192;
+    constexpr uint32_t K = 1024;
+    constexpr uint32_t BASE_N = 256;
+    constexpr uint32_t BASE_K = 128;
+    constexpr uint32_t GROUP_NUM = 8; // 分组数, 每组使用不同weight
+    constexpr uint32_t PIPELINE_DEPTH = (scenarioNum >= 2) ? 4 : 1;
+    constexpr uint32_t SINGLE_N = 1024;
+#if (NPU_ARCH == 2201)
+    constexpr uint32_t SINGLE_M = 128;
+    constexpr uint32_t BASE_M = 128;  // M方向基块: 每次Iterate计算128行
+    constexpr uint32_t CORE_NUM = 24; // 参与计算的AI Core核数
+#elif (NPU_ARCH == 3510)
+    constexpr uint32_t SINGLE_M = 256;
+    constexpr uint32_t BASE_M = 256;  // M方向基块: 每次Iterate计算256行
+    constexpr uint32_t CORE_NUM = 32; // 参与计算的AI Core核数
+#endif
+
+    // 数据类型定义
+    using AType = int8_t;
+    using BType = int8_t;
+    using CType = int32_t;
+    using BiasType = int32_t;
+
+    constexpr size_t USER_WORKSPACE_SIZE = PIPELINE_DEPTH * BASE_N * BASE_M * sizeof(int32_t) * CORE_NUM;
+
+#if defined(ASCENDC_CPU_DEBUG) && (__NPU_ARCH__ == 2201)
+    auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance("Ascend910B1");
+#elif defined(ASCENDC_CPU_DEBUG) && (__NPU_ARCH__ == 3510)
+    auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance("Ascend950PR_9589");
+#else
+    auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
+#endif
+    size_t systemWorkspaceSize = static_cast<size_t>(ascendcPlatform->GetLibApiWorkSpaceSize());
+    size_t workspaceSize = USER_WORKSPACE_SIZE + systemWorkspaceSize;
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc
+author/date: last touched by yhf0922, 2026-09-04T16:53:45+08:00 (commit 55215c137e9f, "声明CeilDivision接口，整改替换CeilDivision为ceil_div"); Copyright (c) 2025 Huawei Technologies Co., Ltd. — repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 648-684: the rest of host main — workspace = user + GetLibApiWorkSpaceSize(), the argument sizes with their shapes in comments, and the `<<<CORE_NUM, 0, stream>>>` launch with the full template argument list.
+```cpp
+
+    aclInit(nullptr);
+    int32_t deviceId = 0;
+    aclrtSetDevice(deviceId);
+    aclrtStream stream = nullptr;
+    aclrtCreateStream(&stream);
+
+    OpArgs args{
+        .x = Data(M * K * sizeof(int8_t)),                  // x[8192, 1024] int8, 8MB
+        .weight = Data(GROUP_NUM * K * N * sizeof(int8_t)), // weight[8, 1024, 8192] int8, 64MB
+        .bias = Data(0),                                    // 无偏置
+        .groupList = Data(GROUP_NUM * sizeof(int64_t)),     // groupList[8] int64, 64B
+        .scale = Data(GROUP_NUM * N * sizeof(float)),       // scale[8, 8192] float, 256KB
+        .perTokenScale = Data(M * sizeof(float)),           // perTokenScale[8192] float, 32KB
+        .workspace = Data(workspaceSize, false),            // workspace
+        .y = Data(M * N * sizeof(int16_t), false)           // y[8192, 8192] half, 128MB
+    };
+
+    CreateInput(args);
+
+    quant_group_matmul_custom<
+        AType, BType, CType, BiasType, M, N, K, BASE_M, BASE_N, BASE_K, SINGLE_M, SINGLE_N, GROUP_NUM, CORE_NUM,
+        PIPELINE_DEPTH><<<CORE_NUM, 0, stream>>>(
+        args.x.device, args.weight.device, args.bias.device, args.groupList.device, args.scale.device,
+        args.perTokenScale.device, args.y.device, args.workspace.device);
+
+    aclrtSynchronizeStream(stream);
+    aclrtMemcpy(args.y.host, args.y.size, args.y.device, args.y.size, ACL_MEMCPY_DEVICE_TO_HOST);
+    WriteFile("./output/output.bin", args.y.host, args.y.size);
+    FreeData(args);
+
+    aclrtDestroyStream(stream);
+    aclrtResetDevice(deviceId);
+    aclFinalize();
+
+    return 0;
+}
+```
+
+---
+
+### B1.5 groupList semantics, NZ weight layout, and the tiling struct (item 5)
+
+There is no `TilingData` struct for this sample at all: every tiling number is a C++ template
+parameter / `constexpr`, and the matmul tiling is a `constexpr MatmulApiStaticTiling` computed by
+`GetMatmulApiTiling` at compile time (see section 3). The only host-side "tiling code" is the
+constant block in `main()` quoted just above.
+
+The decisive evidence for `groupList` = per-group row counts (NOT cumulative sum) is the data
+generator: it writes `[1024]*8` to `groupList.bin` and does its OWN `np.cumsum` on the host to slice
+the golden. The device never sees the cumsum.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/scripts/gen_data.py
+author/date: unknown (not in file header) — Copyright (c) 2025 Huawei Technologies Co., Ltd.; repo cann/asc-devkit branch master, fetched 2026-10-20
+Lines 15-70: the whole generator. `groupList = np.array([1024] * groupNum, dtype=np.int64)` is per-group counts; `index = np.cumsum(groupList)` is host-only; and the last lines give the exact NZ fractal transform for the weight (k/16,16 x n/32,32 -> transpose to put the N-fractal outermost), which is what makes `weightOffset = groupIdx*N*K + curOffsetN*K` correct.
+```python
+import os
+import numpy as np
+
+
+def FastGelu(x):
+    abs_x = np.abs(x)
+    x2 = np.exp(0.851 * (x - abs_x))
+    x3 = 1 + np.exp(-1.702 * abs_x)
+    return x * x2 / x3
+
+
+def gen_golden_data():
+    groupNum = 8
+    m = 8192
+    k = 1024
+    n = 8192
+    groupList = np.array([1024] * groupNum, dtype=np.int64)
+
+    x = np.random.randint(-10, 10, [m, k]).astype(np.int8)
+    weight = np.random.randint(-10, 10, [groupNum, k, n]).astype(np.int8)
+    scale = np.random.normal(0, 0.01, (groupNum, n)).astype(np.float32)
+    perTokenScale = np.random.normal(0, 0.01, (m, 1)).astype(np.float32)
+
+    # 关键优化：一次性转换为 float32，让 BLAS 加速矩阵乘法
+    x_f32 = x.astype(np.float32)
+    weight_f32 = weight.astype(np.float32)
+
+    # 预计算分割索引
+    index = np.cumsum(groupList)
+    indices = [0] + index.tolist()
+
+    mmOut = np.empty((m, n), dtype=np.float32)
+
+    for i in range(groupNum):
+        start_idx = indices[i]
+        end_idx = indices[i + 1]
+        # 直接使用 float32 矩阵乘法，BLAS 会多核并行加速
+        mmOut[start_idx:end_idx] = np.dot(x_f32[start_idx:end_idx], weight_f32[i])
+        # 应用 scale 和 perTokenScale
+        mmOut[start_idx:end_idx] *= scale[i] * perTokenScale[start_idx:end_idx]
+
+    golden = FastGelu(mmOut)
+    golden = golden.astype(np.float16)
+    os.makedirs("input", exist_ok=True)
+    os.makedirs("output", exist_ok=True)
+
+    x.tofile("./input/x.bin")
+    weight_nz = weight.reshape([groupNum, k // 16, 16, n // 32, 32]).transpose([0, 3, 1, 2, 4])
+    weight_nz.tofile("./input/weight.bin")
+    groupList.tofile("./input/groupList.bin")
+    scale.tofile("./input/scale.bin")
+    perTokenScale.tofile("./input/perTokenScale.bin")
+    golden.tofile("./output/golden.bin")
+
+
+if __name__ == "__main__":
+```
+
+The README spells out the same semantics in its own pseudo-code, with the comment
+"本组行数, 本例=1024" (= rows of THIS group) on the groupList read:
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+README.md lines 186-216: the block-dimension definitions and the annotated Process loop.
+`````markdown
+Process函数采用**跨Group连续轮询**策略分配子块给多个Core。核心思想是将所有Group的子块在逻辑上连续编号，每个Core按`CORE_NUM`步长轮询取块，用`preCount`变量记录上一Group末尾未被`CORE_NUM`整除的余数，实现跨Group的连续分配，避免核间负载不均。
+
+**分块维度说明**：
+
+- **GroupM**：当前Group的M维度行数，从groupList动态读取。本样例每组GroupM=1024
+- **numBlocksM = AscendC::Std::ceil_div(GroupM, SINGLE_M)**：当前Group在M方向的子块数。Atlas A2下 AscendC::Std::ceil_div(1024, 128) = 8，Ascend 950PR下 AscendC::Std::ceil_div(1024, 256) = 4
+- **numBlocksN = AscendC::Std::ceil_div(N, SINGLE_N)**：N方向的子块数，所有Group相同。AscendC::Std::ceil_div(8192, 1024) = 8
+
+每个Group共 `numBlocksM × numBlocksN` 个子块，通过`(mIdx, nIdx)`二维坐标定位。每个子块大小为 `[SINGLE_M, SINGLE_N]`，Cube内部按`[BASE_M, BASE_N]`粒度计算（每个子块需 `SINGLE_N/BASE_N × SINGLE_M/BASE_M` 次Iterate）。
+
+```cpp
+for (groupIdx = 0, preCount = 0; groupIdx < GROUP_NUM; ++groupIdx) {
+    groupM = groupListGlobal.GetValue(groupIdx);          // 本组行数, 本例=1024
+    numBlocksM = AscendC::Std::ceil_div(groupM, SINGLE_M);                   // M方向分块数
+    numBlocksN = AscendC::Std::ceil_div(N, SINGLE_N);                         // N方向分块数, 所有组相同=8
+    curCount = preCount + numBlocksM * numBlocksN;          // 含上组余数的连续编号上界
+
+    // 核心分配公式：确定当前Core在本Group中的第一个块编号
+    curBlock = coreIdx >= preCount ? coreIdx : coreIdx + CORE_NUM;
+
+    while (curBlock < curCount) {
+        mIdx = (curBlock - preCount) / numBlocksN;          // 组内M方向块索引
+        nIdx = (curBlock - preCount) % numBlocksN;          // 组内N方向块索引
+        MMCompute(groupIdx, groupConfig);                    // Cube计算
+        VectorCompute(groupIdx, groupConfig);                // Vector计算
+        curBlock += CORE_NUM;                                // 轮询步进，步长为CORE_NUM
+    }
+    preCount = curCount % CORE_NUM;                          // 余数传递给下一组
+    globalRowOffset += groupM;                               // 全局行偏移累积
+}
+```
+`````
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+README.md lines 337-364: the workspace ring-slot design stated in prose + the layout diagram, including the exact offset formula and the stated sync granularity ("同步粒度为Iterate（=BASE_M×BASE_N），而非子块（=SINGLE_M×SINGLE_N）").
+`````markdown
+**Workspace环形Slot复用**
+
+workspace是Cube和Vector之间的中转站，采用环形分槽设计。这里的 Slot 指由 `workSpaceOffset = BASE_N × BASE_M × (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) × CORE_NUM)` 定位的一段连续空间，单个 core 的 Slot 大小为 `BASE_M×BASE_N×sizeof(int32_t)`，每层 pipeline 的 Slot 总空间为 `CORE_NUM×BASE_M×BASE_N×sizeof(int32_t)`，`PIPELINE_DEPTH` 个 Slot 轮流使用，Cube 写入当前 Slot 的同时，Vector 可以处理之前 Slot 的数据：
+
+```
+workspace布局:
+Slot 0: Core0[BASE_M×BASE_N] + Core1[BASE_M×BASE_N] + ... + Core(CORE_NUM-1)[BASE_M×BASE_N]
+Slot 1: Core0[BASE_M×BASE_N] + Core1[BASE_M×BASE_N] + ... + Core(CORE_NUM-1)[BASE_M×BASE_N]
+Slot 2: ...
+Slot 3: ...
+
+workSpaceOffset = BASE_N × BASE_M × (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) × CORE_NUM)
+```
+
+- 当`cubeTaskIdx < PIPELINE_DEPTH`时，Cube无需等待，直接写入新Slot
+- 当`cubeTaskIdx >= PIPELINE_DEPTH`时，Cube需等待Vector释放对应Slot（`CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC)`）
+- 同步粒度为Iterate（=BASE_M×BASE_N），而非子块（=SINGLE_M×SINGLE_N）
+
+**4级流水时序**：
+
+```
+时间 ──────────────────────────────────────────────────────────────>
+Cube:  |─Iter0→Slot0─|─Iter1→Slot1─|─Iter2→Slot2─|─Iter3→Slot3─|─Iter4→Slot0─| ...
+                      (Wait)                                     (Wait)
+Vec:                 |─Slot0处理─|─Slot1处理─|─Slot2处理─|─Slot3处理─| ...
+```
+
+前4次Iterate（Slot 0~3）Cube无需等待，连续写入；第5次Iterate复用Slot 0时，需等Vector释放。由此形成Cube-Vector流水重叠，相比Case 1的串行模式，显著减少Cube空闲等待时间。
+`````
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+README.md lines 229-250: the tiling-constantization and UnitFlag rationale.
+`````markdown
+8组共512块，Core0~7各处理22块，Core8~23各处理21块，最大负载差仅1块。
+
+**③ Tiling常量化**
+
+所有Tiling参数通过`MatmulApiStaticTiling`在编译期确定，运行时无需Scalar动态计算，减少Scalar开销：
+
+```cpp
+constexpr static auto CONSTANT_CFG = GetCustomConstantCFG();
+matmul::Matmul<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, CONSTANT_CFG> matmulObj;
+```
+
+
+**④ Matmul UnitFlag优化**
+
+本样例通过`mmCFG.enUnitFlag = true`开启Matmul的UnitFlag优化，实现Cube计算与搬运的512B细粒度流水同步：
+
+```cpp
+static constexpr MatmulShapeParams shapeParams = {SINGLE_M, SINGLE_N, K, BASE_M, BASE_N, BASE_K};
+MatmulConfig mmCFG = GetMMConfig<MatmulConfigMode::CONFIG_MDL>(shapeParams);
+mmCFG.enUnitFlag = true;  // 开启UnitFlag
+auto constantCFG = AscendC::GetMatmulApiTiling<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE>(mmCFG);
+```
+`````
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+README.md lines 126-156: the data-flow path through the memory hierarchy — this is the megakernel-relevant shape of the fusion (L0C -> GM workspace -> UB, no L0C->UB on dav-2201).
+`````markdown
+
+### 数据流路径
+
+```text
+存储位置                        数据类型           流水
+
+GM (x, weight)                   int8
+  |                                               MTE2
+L1                               int8
+  |                                               MTE1
+L0A / L0B                        int8
+  |  Iterate                                     MMAD
+L0C                              int32
+  |                                               FIXPIPE
+GM (workspace)                   int32
+  |  DataCopyPad2D                                MTE2
+UB vecInQueue                    int32
+  |  AscendDequant (×scale)   int32 → float       VECTOR
+UB dequantMiddleResult            float
+  |  Mul (×perTokenScale)     float → float       VECTOR
+UB mulsResultLocal                float
+  |  FasterGelu               float → float       VECTOR
+UB actResultLocal                 float
+  |  Cast                     float → half        VECTOR
+UB vecOutQueue                    half
+  |  DataCopyPad2D                                MTE3
+GM (y)                            half
+
+注：scale[float] 和 perTokenScale[float] 通过 MTE2 独立搬入UB，
+    分别参与 AscendDequant 和 Mul 步骤。
+```
+`````
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/CMakeLists.txt
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+CMakeLists.txt in full: `dav-2201` is the default arch, SCENARIO_NUM 0..2 is the only knob, and NPU_ARCH / SCENARIO_NUM are injected as compile definitions.
+```cmake
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+
+
+cmake_minimum_required(VERSION 3.16)
+
+set(CMAKE_ASC_RUN_MODE "npu" CACHE STRING "Run mode: npu, sim")
+set(CMAKE_ASC_ARCHITECTURES "dav-2201" CACHE STRING "NPU architecture: dav-2201, dav-3510")
+set(SCENARIO_NUM 0 CACHE STRING "Case type to compile (0-2)")
+if(NOT SCENARIO_NUM MATCHES "^[0-2]$")
+    message(FATAL_ERROR "Unsupported SCENARIO_NUM=${SCENARIO_NUM}, only 0, 1 and 2 are supported")
+endif()
+
+find_package(ASC REQUIRED)
+
+project(kernel_samples LANGUAGES ASC CXX)
+
+add_executable(demo
+    quant_group_matmul_custom.asc
+)
+
+if(CMAKE_ASC_ARCHITECTURES STREQUAL "dav-2201")
+    set(NPU_ARCH_ID 2201)
+elseif(CMAKE_ASC_ARCHITECTURES STREQUAL "dav-3510")
+    set(NPU_ARCH_ID 3510)
+else()
+    message(FATAL_ERROR "Unsupported CMAKE_ASC_ARCHITECTURES=${CMAKE_ASC_ARCHITECTURES}, only dav-2201 and dav-3510 are supported")
+endif()
+
+target_link_libraries(demo PRIVATE
+    tiling_api
+    register
+    platform
+    m
+    dl
+)
+message(STATUS "[INFO] SCENARIO_NUM is ${SCENARIO_NUM}")
+
+target_compile_definitions(demo PRIVATE
+    NPU_ARCH=${NPU_ARCH_ID}
+    SCENARIO_NUM=${SCENARIO_NUM}
+)
+
+target_compile_options(demo PRIVATE
+    $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${CMAKE_ASC_ARCHITECTURES}>
+)
+```
+
+---
+
+### B1.6 `CrossCoreSetFlag` / `SyncAll` / `PipeBarrier` in the sibling fusion sample
+
+Same directory tree, `matmul_gelu_high_performance/mmad_gelu.asc` — the hand-written (basic-API,
+no Matmul object) CV fusion. Useful contrast: it uses `Fixpipe` directly and, on dav-3510 only,
+can land L0C straight into UB (`CFG_ROW_MAJOR_UB`, `dualDstCtl = 0b01`), which the dav-2201 path
+cannot — it must go through GM.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/matmul_gelu_high_performance/mmad_gelu.asc
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+mmad_gelu.asc lines 519-614: the Fixpipe-out + CrossCoreSetFlag<0x2, PIPE_FIX>(0x8) producer and the GM-staging consumer with its intra-core SetFlag/WaitFlag pairs.
+```cpp
+
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+        // ---- A2/A3架构：仅支持GM中转模式，Fixpipe CO1 → GM ----
+        AscendC::FixpipeParamsV220 fixpipeParams;
+        fixpipeParams.nSize = curN;
+        fixpipeParams.mSize = curM;
+        fixpipeParams.srcStride = curMAlign;
+        fixpipeParams.dstStride = N;
+        fixpipeParams.ndNum = 1;
+        fixpipeParams.srcNdStride = 0;
+        fixpipeParams.dstNdStride = 0;
+        fixpipeParams.unitFlag = 3;
+        AscendC::Fixpipe<float, float, CFG_ROW_MAJOR_GM>(
+            cGM[mBlockIdx * baseM * N + nBlockIdx * baseN], cLocal, fixpipeParams);
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+        // ---- Ascend 950PR架构：根据SCENARIO_NUM选择GM中转/UB直通模式 ----
+        if constexpr (scenarioNum == 1) {
+            // ---- GM中转模式：Fixpipe CO1 → GM ----
+            AscendC::FixpipeParamsArch3510<AscendC::CO2Layout::ROW_MAJOR> fixpipeParams;
+            fixpipeParams.mSize = curM;
+            fixpipeParams.nSize = curN;
+            fixpipeParams.srcStride = curMAlign;
+            fixpipeParams.dstStride = N;
+            fixpipeParams.unitFlag = 3;
+            AscendC::Fixpipe<float, float, CFG_ROW_MAJOR_GM>(
+                cGM[mBlockIdx * baseM * N + nBlockIdx * baseN], cLocal, fixpipeParams);
+        } else {
+            // ---- UB直通模式：Fixpipe CO1 → UB（dualDstCtl=0b01按M维度拆分） ----
+            AscendC::FixpipeParamsArch3510<AscendC::CO2Layout::ROW_MAJOR> fixpipeParams;
+            fixpipeParams.mSize = AscendC::Std::ceil_div(curM, 2) * 2;
+            fixpipeParams.nSize = curN;
+            fixpipeParams.srcStride = curMAlign;
+            fixpipeParams.dstStride = curN;
+            fixpipeParams.dualDstCtl = 0b01;
+            fixpipeParams.unitFlag = 3;
+            AscendC::Fixpipe<float, float, CFG_ROW_MAJOR_UB>(xUB, cLocal, fixpipeParams);
+        }
+#endif
+        // 通知AIV侧数据已就绪
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0x8);
+    }
+
+    // AIV侧（GM中转）：等待AIC写入GM → DataCopy GM→xUB → GELU计算 → DataCopy geluOutUB→GM
+    __aicore__ inline void GeluFromGM(uint32_t mBlockIdx, uint32_t nBlockIdx)
+    {
+        // 等待AIC侧Fixpipe完成，Matmul结果已写入GM
+        AscendC::CrossCoreWaitFlag<0x2>(0x8);
+
+        uint32_t curM = (mBlockIdx != baseMCount) ? baseM : tailM;
+        uint32_t curN = (nBlockIdx != baseNCount) ? baseN : tailN;
+        uint32_t halfM = curM / 2;
+        uint32_t computeLen = halfM * curN;
+        uint32_t localSubIdx = AscendC::GetSubBlockIdx() % 2;
+        uint32_t gmOffset = mBlockIdx * baseM * N + nBlockIdx * baseN + localSubIdx * baseM / 2 * N;
+
+        // ---- Step 1: DataCopy GM → xUB ----
+        AscendC::DataCopyExtParams copyInParams;
+        copyInParams.blockCount = halfM;
+        copyInParams.blockLen = curN * sizeof(float);
+        copyInParams.srcStride = (N - curN) * sizeof(float);
+        copyInParams.dstStride = 0;
+        AscendC::DataCopyPadExtParams<float> padParams = {false, 0, 0, 0};
+        AscendC::DataCopyPad<float>(xUB, cGM[gmOffset], copyInParams, padParams);
+
+        // 等待MTE2（GM→UB）完成，确保V侧可以读取
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+
+        // ---- Step 2: GELU计算 ----
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+        // A2/A3: MemBase方式
+        GeluMemBaseCompute(xUB, geluOutUB, computeLen);
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+        // Ascend 950PR: RegBase方式
+        GeluRegBaseCompute(xUB, geluOutUB, computeLen);
+#endif
+
+        // 等待V计算完成，MTE3可以开始搬运
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+        // ---- Step 3: DataCopy geluOutUB → GM ----
+        AscendC::DataCopyParams copyOutParams;
+        copyOutParams.blockCount = halfM;
+        copyOutParams.blockLen = curN * sizeof(float);
+        copyOutParams.srcStride = 0;
+        copyOutParams.dstStride = (N - curN) * sizeof(float);
+        AscendC::DataCopyPad<float>(cGM[gmOffset], geluOutUB, copyOutParams);
+
+        // ---- 反向同步：确保V读完xUB后，下一轮循环的MTE2才能重新写入xUB ----
+        // SetFlag挂在V队列（V执行完GELU后才置位），WaitFlag挂在MTE2队列
+        // （下轮写xUB前必须等待），防止新数据覆盖尚未读完的旧数据
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+    }
+```
+
+---
+
+### B1.7 `SetQuantScalar` / `SetQuantVector` / `SetBias` / `IterateAll` / `End` (verbatim, nearest sample)
+
+These five APIs do not appear in the group-matmul kernel. The repo's canonical use is
+`examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_quant/matmul_quant.asc` — int8 x int8 ->
+half with FIXPIPE-side dequant, i.e. the alternative to doing `AscendDequant` on the Vector side.
+Note that `SetQuantVector` takes a `GlobalTensor<uint64_t>` and that the host must declare the mode
+through `tilingApi.SetDequantType(DequantType::TENSOR | SCALAR)`.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_quant/matmul_quant.asc
+author/date: unknown (not in file header) — Copyright (c) 2025 Huawei Technologies Co., Ltd.; repo cann/asc-devkit branch master, fetched 2026-10-20
+matmul_quant.asc lines 42-99: the `AscendC::Matmul<...CFG_MDL>` declaration (runtime TCubeTiling flavour), `quantGlobal` as GlobalTensor<uint64_t>, and the GlobalTensor re-pointing idiom `aGlobal = aGlobal[offsetA];` — the alternative to indexing at use site.
+```cpp
+template <typename AType, typename BType, typename CType, typename BiasType>
+class MatmulKernel {
+public:
+    __aicore__ inline MatmulKernel(){};
+    __aicore__ inline void Init(
+        __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c, __gm__ uint8_t* quant,
+        const TCubeTiling& tiling);
+    __aicore__ inline void Process();
+
+    AscendC::Matmul<
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AType>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BType>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, CType>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasType>, CFG_MDL>
+        matmulObj;
+
+private:
+    __aicore__ inline void CalcOffset(
+        int32_t blockIdx, int32_t& offsetA, int32_t& offsetB, int32_t& offsetC, int32_t& offsetBias);
+
+    AscendC::GlobalTensor<AType> aGlobal;
+    AscendC::GlobalTensor<BType> bGlobal;
+    AscendC::GlobalTensor<BiasType> biasGlobal;
+    AscendC::GlobalTensor<CType> cGlobal;
+    AscendC::GlobalTensor<uint64_t> quantGlobal;
+    TCubeTiling tiling;
+    int32_t mCoreIndex;
+    int32_t nCoreIndex;
+};
+
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulKernel<AType, BType, CType, BiasType>::Init(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c, __gm__ uint8_t* quant,
+    const TCubeTiling& tiling)
+{
+    this->tiling = tiling;
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ AType*>(a), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BType*>(b), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(c), tiling.M * tiling.N);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasType*>(bias), tiling.N);
+    quantGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(quant), tiling.N);
+
+    int32_t offsetA = 0;
+    int32_t offsetB = 0;
+    int32_t offsetC = 0;
+    int32_t offsetBias = 0;
+    CalcOffset(AscendC::GetBlockIdx(), offsetA, offsetB, offsetC, offsetBias);
+    aGlobal = aGlobal[offsetA];
+    bGlobal = bGlobal[offsetB];
+    cGlobal = cGlobal[offsetC];
+    biasGlobal = biasGlobal[offsetBias];
+    quantGlobal = quantGlobal[offsetBias];
+
+    if (GetSysWorkSpacePtr() == nullptr) {
+        return;
+    }
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_quant/matmul_quant.asc
+author/date: unknown (not in file header) — Copyright (c) 2025 Huawei Technologies Co., Ltd.; repo cann/asc-devkit branch master, fetched 2026-10-20
+matmul_quant.asc lines 101-168: `SetQuantVector` / `SetQuantScalar` (with the float->uint64 bit reinterpretation), `SetTail`, `SetTensorA/B` with the trans flags, conditional `SetBias`, `IterateAll(cGlobal)`, `End()`, `CalcOffset` with the full offset algebra, and the `REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), ..., &tiling)` runtime-tiling form.
+```cpp
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulKernel<AType, BType, CType, BiasType>::Process()
+{
+    if (matmul::GetBlockIdx() >= tiling.usedCoreNum) {
+        return;
+    }
+
+#if defined(CUSTOM_QUANT_VECTOR)
+    matmulObj.SetQuantVector(quantGlobal);
+#else
+    float quantFloat = 0.1f;
+    uint64_t quantValue = static_cast<uint64_t>(*reinterpret_cast<int32_t*>(&quantFloat));
+    matmulObj.SetQuantScalar(quantValue);
+#endif
+
+    // process with tail block
+    int tailN = tiling.N - nCoreIndex * tiling.singleCoreN;
+    tailN = tailN < tiling.singleCoreN ? tailN : tiling.singleCoreN;
+    int tailM = tiling.M - mCoreIndex * tiling.singleCoreM;
+    tailM = tailM < tiling.singleCoreM ? tailM : tiling.singleCoreM;
+    if (tailM < tiling.singleCoreM || tailN < tiling.singleCoreN) {
+        matmulObj.SetTail(tailM, tailN);
+    }
+
+    matmulObj.SetTensorA(aGlobal, IS_TRANS_A);
+    matmulObj.SetTensorB(bGlobal, IS_TRANS_B);
+    if (tiling.isBias) {
+        matmulObj.SetBias(biasGlobal);
+    }
+    matmulObj.IterateAll(cGlobal);
+    matmulObj.End();
+}
+
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulKernel<AType, BType, CType, BiasType>::CalcOffset(
+    int32_t blockIdx, int32_t& offsetA, int32_t& offsetB, int32_t& offsetC, int32_t& offsetBias)
+{
+    const TCubeTiling& tiling = this->tiling;
+
+    auto mSingleBlocks = (tiling.M + tiling.singleCoreM - 1) / tiling.singleCoreM; // split M into mSingleBlocks cores
+    mCoreIndex = blockIdx % mSingleBlocks;
+    nCoreIndex = blockIdx / mSingleBlocks;
+
+    offsetA = mCoreIndex * tiling.Ka * tiling.singleCoreM;
+    if (IS_TRANS_A) {
+        offsetA = mCoreIndex * tiling.singleCoreM;
+    }
+    offsetB = nCoreIndex * tiling.singleCoreN;
+    if (IS_TRANS_B) {
+        offsetB = nCoreIndex * tiling.Kb * tiling.singleCoreN;
+    }
+    offsetC = mCoreIndex * tiling.N * tiling.singleCoreM + nCoreIndex * tiling.singleCoreN;
+    offsetBias = nCoreIndex * tiling.singleCoreN;
+}
+
+__global__ __cube__ void matmul_quant_custom(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c, __gm__ uint8_t* quant,
+    __gm__ uint8_t* workspace, __gm__ uint8_t* tilingGm)
+{
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+    AscendC::TPipe pipe;
+
+    MatmulKernel<int8_t, int8_t, half, int32_t> matmulKernel;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulKernel.matmulObj, &tiling);
+    matmulKernel.Init(a, b, bias, c, quant, tiling);
+    matmulKernel.Process();
+}
+```
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_quant/matmul_quant.asc
+author/date: unknown (not in file header) — Copyright (c) 2025 Huawei Technologies Co., Ltd.; repo cann/asc-devkit branch master, fetched 2026-10-20
+matmul_quant.asc lines 31-40 and 170-203: `CopyTiling` (the uint32-at-a-time GM->stack copy of TCubeTiling) and the host `GenerateTiling` with `SetDequantType`, `SetOrgShape`, `SetShape`, `EnableBias`, `SetBufferSpace(-1,-1,-1)`.
+```cpp
+__aicore__ inline void CopyTiling(TCubeTiling* tiling, __gm__ uint8_t* tilingGM)
+{
+    uint32_t* ptr = reinterpret_cast<uint32_t*>(tiling);
+    auto tiling32 = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+
+    for (uint32_t i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); i++, ptr++) {
+        *ptr = *(tiling32 + i);
+    }
+    return;
+}
+
+void GenerateTiling(platform_ascendc::PlatformAscendC* ascendcPlatform, uint8_t* tilingBuf)
+{
+    optiling::TCubeTiling tilingData;
+    matmul_tiling::MultiCoreMatmulTiling tilingApi(*ascendcPlatform);
+
+    tilingApi.SetDim(ascendcPlatform->GetCoreNumAic());
+    tilingApi.SetAType(
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT8, IS_TRANS_A);
+    tilingApi.SetBType(
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT8, IS_TRANS_B);
+    tilingApi.SetCType(
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tilingApi.SetBiasType(
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT32);
+
+#if defined(CUSTOM_QUANT_VECTOR)
+    tilingApi.SetDequantType(matmul_tiling::DequantType::TENSOR); // set TENSOR quant mode
+#else
+    tilingApi.SetDequantType(matmul_tiling::DequantType::SCALAR); // set SCALAR quant mode
+#endif
+
+    tilingApi.SetOrgShape(M, N, K);
+    tilingApi.SetShape(M, N, K);
+    tilingApi.EnableBias(IS_BIAS);
+    tilingApi.SetBufferSpace(-1, -1, -1);
+
+    int64_t res = tilingApi.GetTiling(tilingData); // Get matmul tiling data.
+    if (res == -1) {
+        std::cout << "gen tiling failed" << std::endl;
+        return;
+    }
+    uint32_t tcubeTilingSize = tilingData.GetDataSize();
+    tilingData.SaveToBuffer(tilingBuf, tcubeTilingSize);
+}
+```
+
+---
+
+### B1.8 `SetWorkspace` and `GetUserWorkspace` reference docs (item 4, API semantics)
+
+Quoted because the group kernel deliberately does neither, and the distinction matters for a
+megakernel: `SetWorkspace` is for the ASYNC `Iterate`/`GetTensorC` and `IterateNBatch` paths, and
+is explicitly unsupported under MixDualMaster.
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/docs/zh/api/SIMD-API/adv_api/cube_compute/Matmul_Kernel/SetWorkspace.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+SetWorkspace.md in full.
+`````markdown
+# SetWorkspace
+
+## 产品支持情况
+
+<!-- npu="950" id2 -->
+- Ascend 950PR&950DT系列产品：支持
+<!-- end id2 -->
+<!-- npu="A3" id3 -->
+- Atlas A3系列产品：支持
+<!-- end id3 -->
+<!-- npu="910b" id4 -->
+- Atlas A2系列产品：支持
+<!-- end id4 -->
+<!-- npu="310b" id5 -->
+- Atlas 200I/500 A2推理产品：不支持
+<!-- end id5 -->
+<!-- npu="310p" id6 -->
+- Atlas推理系列产品AI Core：不支持
+- Atlas推理系列产品Vector Core：不支持
+<!-- end id6 -->
+<!-- npu="910" id7 -->
+- Atlas训练系列产品：不支持
+<!-- end id7 -->
+<!-- npu="x90" id1 -->
+- Kirin X90处理器系列产品：支持
+<!-- end id1 -->
+<!-- @ref: asc-devkit/res/docs/zh/api/SIMD-API/adv_api/cube_compute/Matmul_Kernel/SetWorkspace_res.md#id1 -->
+
+## 功能说明
+
+[Iterate](Iterate.md)计算的[异步场景](GetTensorC.md#li17508136205415)，调用本接口申请一块临时空间来缓存计算结果，然后调用[GetTensorC](GetTensorC.md)时会在该临时空间中获取C的矩阵分片。
+
+[IterateNBatch](IterateNBatch.md)计算时，调用本接口申请一块临时空间来缓存计算结果，然后根据[同步或异步场景](IterateNBatch.md)进行其它接口的调用。
+
+## 函数原型
+
+建议用户使用GlobalTensor类型传入：
+
+```
+template <class T> __aicore__ inline void SetWorkspace(GlobalTensor<T>& addr)
+```
+
+```
+template <class T> __aicore__ inline void SetWorkspace(__gm__ const T* addr, int size)
+```
+
+## 参数说明
+
+| 参数名 | 输入/输出 | 描述 |
+| --- | --- | --- |
+| addr | 输入 | 用户传入的GM上的workspace空间，GlobalTensor类型。 |
+| addr | 输入 | 用户传入的GM上的workspace空间，GM地址类型。 |
+| size | 输入 | 传入GM地址时，需要配合传入元素个数。 |
+
+## 返回值说明
+
+无
+
+## 约束说明
+
+当开启MixDualMaster（双主模式）场景时，即模板参数[enableMixDualMaster](MatmulConfig.md#matmulconfig-params)设置为true，不支持使用该接口。
+
+## 调用示例
+
+```
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+mm.SetWorkspace(workspaceGM);    //设置异步时使用的临时空间
+mm.SetTensorA(gm_a);
+mm.SetTensorB(gm_b);
+if (tiling.isBias) {
+    mm.SetBias(biasGlobal);
+}
+mm.template Iterate<false>();
+for (int i = 0; i < singleCoreM/baseM * singleCoreN/baseN; ++i) {
+    mm.template GetTensorC<false>(ub_c);
+}
+```
+`````
+
+https://raw.gitcode.com/cann/asc-devkit/raw/master/docs/zh/api/SIMD-API/basic_api/resource_management/workspace/GetUserWorkspace.md
+author/date: unknown — repo cann/asc-devkit branch master, fetched 2026-10-20
+GetUserWorkspace.md, the functional-description half verbatim (the parameter table is raw HTML boilerplate and is elided; the full file is 3115 bytes).
+`````markdown
+# GetUserWorkspace<a name="ZH-CN_TOPIC_0000001666932721"></a>
+
+## 产品支持情况<a name="section1550532418810"></a>
+
+<!-- npu="950" id1 -->
+- Ascend 950PR&950DT系列产品：支持
+<!-- end id1 -->
+<!-- npu="A3" id2 -->
+- Atlas A3系列产品：支持
+<!-- end id2 -->
+<!-- npu="910b" id3 -->
+- Atlas A2系列产品：支持
+<!-- end id3 -->
+<!-- npu="310b" id4 -->
+- Atlas 200I/500 A2推理产品：不支持
+<!-- end id4 -->
+<!-- npu="310p" id5 -->
+- Atlas推理系列产品AI Core：支持
+<!-- end id5 -->
+<!-- npu="310p" id6 -->
+- Atlas推理系列产品Vector Core：不支持
+<!-- end id6 -->
+<!-- npu="910" id7 -->
+- Atlas训练系列产品：支持
+<!-- end id7 -->
+<!-- npu="x90" id8 -->
+- Kirin X90处理器系列产品：支持
+<!-- end id8 -->
+<!-- npu="9030" id9 -->
+- Kirin 9030处理器系列产品：支持
+<!-- end id9 -->
+<!-- @ref: asc-devkit/res/docs/zh/api/SIMD-API/basic_api/resource_management/workspace/GetUserWorkspace_res.md#id1 -->
+
+
+## 功能说明<a name="section618mcpsimp"></a>
+
+获取用户使用的workspace指针。核函数（Kernel）直调开发方式下，如果未开启HAVE\_WORKSPACE编译选项，框架不会自动设置系统workspace。如果使用了[Matmul核函数（Kernel）侧接口](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md)等需要系统workspace的高阶API，核函数（Kernel）侧需要通过[SetSysWorkSpace](SetSysWorkSpace.md)设置系统workspace，此时用户workspace需要通过该接口获取。
+
+## 函数原型<a name="section620mcpsimp"></a>
+
+```
+__aicore__ inline GM_ADDR GetUserWorkspace(GM_ADDR workspace)
+```
+
+[... HTML parameter table elided ...]
+
+## 约束说明<a name="section633mcpsimp"></a>
+
+无
+
+## 返回值说明<a name="section640mcpsimp"></a>
+
+用户使用workspace指针。
+`````
+
+---
+
+### B1.9 Everything else under `05_best_practices` (names only, as requested)
+
+Full path prefix: `examples/01_simd_cpp_api/05_best_practices/`
+
+- `00_vector_compute/`
+  - `add_high_performance`
+- `01_matrix_compute/`
+  - `matmul_basic_api_high_performance`  (`mmad.asc`)
+  - `matmul_hif8_high_performance`  (`matmul_hif8.asc`)
+  - `matmul_high_performance`  (`matmul.asc` + `matmul.h`)
+  - `matmul_mxfp4_basic_api_high_performance`  (`mmad_mx.asc`)
+  - `matmul_mxfp4_high_performance`  (`matmul_mx.asc` + `matmul_mx.h`)
+- `02_reg_compute/`
+  - `gelu_eltwise_high_performance`
+  - `gelu_high_performance`
+  - `softmax_high_performance`
+- `03_fusion_compute/`
+  - `matmul_gelu_high_performance`  (`mmad_gelu.asc`)
+  - `quant_group_matmul_high_performance`  (`quant_group_matmul_custom.asc`)  <- the target
+  - `ssbuf_aiv_aic_comm`  (`ssbuf_aiv_aic_comm.asc`, 950PR only)
+- `04_memory_access/`
+  - `bank_conflict_3510`
+  - `bank_conflict_nd2nz`
+  - `bank_conflict_ub`
+  - `data_copy`
+
+Adjacent and likely useful for a megakernel, under
+`examples/01_simd_cpp_api/04_advanced_api/00_matmul/` (41 samples, names only):
+`batch_matmul`, `batch_matmul_bias_reuse`, `batch_matmul_iterate_n_batch`, `matmul`,
+`matmul_a2b2_share`, `matmul_async_iterate`, `matmul_async_iterate_all`, `matmul_callback`,
+`matmul_channelsplit_output`, `matmul_co1_output`, `matmul_constant_tiling`,
+`matmul_format_column_major`, `matmul_format_gemv`, `matmul_format_nd_align`, `matmul_fp8`,
+`matmul_fused`, `matmul_fused_manual`, `matmul_ibshareAB`, `matmul_ibshareB`, `matmul_int4`,
+`matmul_k_reorder_load`, `matmul_l0cache`, `matmul_l2cache`, `matmul_mixdualmaster`,
+`matmul_mn_double_buffer`, `matmul_multi_core_unaligned`, `matmul_mx`, `matmul_mx_scale_cache`,
+`matmul_mx_ub_tscm_nz`, `matmul_nbuffer33`, `matmul_partial_output`, `matmul_preload`,
+`matmul_quant`, `matmul_sparse`, `matmul_splitk`, `matmul_splitm`, `matmul_triangle`,
+`matmul_tscm`, `matmul_tscm_src_vecout`, `matmul_unitflag`, `matmul_vecout`.
+
+---
+
+### B1.10 Bridge to TOPIC A — the credit-based flag discipline in this kernel (independently re-verified)
+
+Re-verified by me directly against the downloaded
+`examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/quant_group_matmul_custom.asc`
+with `grep -n 'PIPELINE_DEPTH\|SYNC_AIC_TO_AIV\|SYNC_AIV_TO_AIC\|CrossCore\|cubeTaskIdx\|vecTaskIdx\|workSpaceOffset'`.
+This is the same question as Topic A, answered inside a grouped-matmul kernel: how do you drive
+an **unbounded** number of CV handoffs (one per `Iterate`, over all 8 — or 256 — groups) with a
+flag counter that saturates at 15?
+
+The answer in this source is a credit window of depth `PIPELINE_DEPTH`, not flagId rotation.
+Exactly two flagIds are used for the whole kernel:
+
+```cpp
+constexpr uint64_t SYNC_AIC_TO_AIV = 5;
+constexpr uint64_t SYNC_AIV_TO_AIC = 3;
+```
+
+```cpp
+//   0: __mix__(1,1) + PIPELINE_DEPTH=1  — 基准: 单AIV, 无流水重叠
+//   1: __mix__(1,2) + PIPELINE_DEPTH=1  — 双AIV, 无流水重叠
+//   2: __mix__(1,2) + PIPELINE_DEPTH=4  — 双AIV, 4级流水
+```
+
+```cpp
+    uint32_t cubeTaskIdx = 0; // AIC侧: 按Iterate粒度递增, 用于环形workspace Slot分配
+    uint32_t vecTaskIdx = 0;  // AIV侧: 按offsetN粒度递增, 与cubeTaskIdx天然同步
+```
+
+Producer (AIC). The `if (cubeTaskIdx >= PIPELINE_DEPTH)` guard is the credit check: it holds the
+number of outstanding `SYNC_AIC_TO_AIV` Sets at no more than `PIPELINE_DEPTH`, so with
+`PIPELINE_DEPTH = 4` the counter never approaches 15 however many groups there are:
+
+```cpp
+            if (cubeTaskIdx >= PIPELINE_DEPTH) {
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+            }
+            uint64_t workSpaceOffset = BASE_N * BASE_M * (coreIdx + (cubeTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+            matmulObj.GetTensorC(mmOutGlobal[workSpaceOffset], 0, true);
+            AscendC::CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+            cubeTaskIdx++;
+```
+
+Consumer (AIV), using the identical ring formula with its own counter:
+
+```cpp
+        uint64_t mmOutOffset = BASE_N * BASE_M * (coreIdx + (vecTaskIdx % PIPELINE_DEPTH) * CORE_NUM);
+```
+
+```cpp
+        AscendC::CrossCoreWaitFlag<2>(SYNC_AIC_TO_AIV);
+```
+
+```cpp
+        AscendC::CrossCoreSetFlag<2, PIPE_MTE2>(SYNC_AIV_TO_AIC);
+        vecTaskIdx++;
+```
+
+The epilogue drains exactly the credits still outstanding — the same "drain the handshake"
+discipline as `mega_kernel.cpp`'s stage boundaries in A2:
+
+```cpp
+        if (likely(cubeTaskIdx > 0)) {
+            uint32_t loop = cubeTaskIdx < PIPELINE_DEPTH ? cubeTaskIdx : PIPELINE_DEPTH;
+```
+
+```cpp
+                AscendC::CrossCoreWaitFlag<2>(SYNC_AIV_TO_AIC);
+```
+
+And the host-side workspace must be sized to the same ring depth, which is how the device ring
+index and the host allocation stay consistent:
+
+```cpp
+    constexpr uint32_t PIPELINE_DEPTH = (scenarioNum >= 2) ? 4 : 1;
+```
+
+```cpp
+    constexpr size_t USER_WORKSPACE_SIZE = PIPELINE_DEPTH * BASE_N * BASE_M * sizeof(int32_t) * CORE_NUM;
+```
+
+Consequence for a 78-layer / 256-expert hand-written kernel: `PIPELINE_DEPTH` is the only thing
+that has to respect the 15 limit. Pick `PIPELINE_DEPTH <= 15` (this sample picks 4) and the number
+of experts, groups, layers and `Iterate` calls becomes irrelevant to flag exhaustion.
+
+
+---
+
+## B2. Megakernel workspace slot arithmetic — host allocation vs device indexing
+
+This is the pattern the two topics share, and it is worth having verbatim because it is the
+contract a hand-written megakernel has to keep between host and device.
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/megagdn_pto/mega_kernel.py
+
+Author: Huawei Technologies Co., Ltd. (repo `huawei-csl/megagdn-pto`, branch `main`). Fetched 2026-10-20.
+
+Host side: every stage's scratch is allocated as `block_dim * <slots_per_core>` tiles. `bd` is the
+AI-Core block count. `kkt_ws` gets 2 slots per core (the `ci & 1` double buffer), `h_ws` gets 4:
+
+```python
+    kkt_ws    = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
+    wy_ws_a1  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    wy_ws_a2  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    h_ws      = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
+    o_ws_qk   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    o_ws_qs   = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
+    o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    o_out     = torch.empty_like(v)
+```
+
+Note also that each stage gets its own distinct GM pointer passed as a separate kernel argument —
+the megakernel does not carve one monolithic workspace with offsets; it takes 7 workspace
+pointers (`kkt_ws`, `wy_ws_a1`, `wy_ws_a2`, `h_ws`, `o_ws_qk`, `o_ws_qs`, `o_ws_gated`) alongside
+the inter-stage tensors:
+
+```python
+    lib.call_kernel(
+        bd, stream,
+        _vp(q), _vp(k), _vp(v), _vp(g_in), _vp(beta),
+        _vp(msk_lower), _vp(msk_full), _vp(minus_identity), _vp(cu_seqlens),
+        _vp(o_out),
+        _vp(g_sum), _vp(g_t), _vp(beta_t),
+        _vp(A), _vp(A_inv_f32), _vp(A_inv),
+        _vp(w), _vp(u), _vp(s), _vp(v_new), _vp(fs),
+        _vp(h0), has_initial_state,
+        _vp(kkt_ws), _vp(wy_ws_a1), _vp(wy_ws_a2), _vp(h_ws),
+        _vp(o_ws_qk), _vp(o_ws_qs), _vp(o_ws_gated),
+        H, kh,
+        N_seq, T, T, num_matrices,
+    )
+```
+
+Device side, kkt stage — `(cid * 2 + slot) * ChunkSquare`, i.e. core-major, slot-minor, which is
+exactly the `bd * 2` host shape:
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/kernels/pto/scaled_dot_kkt.cpp
+
+```cpp
+        GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>> _gm(
+            workspace_handle +
+                (static_cast<int64_t>(cid) * 2 + slot) * ChunkSquare,
+            _gs);
+        TSTORE(_gm, _l0);
+```
+
+Device side, chunk_h stage — four *named* slots per core (not a ring), with a per-core base and
+a further `vid` (Vec sub-block) sub-offset:
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/kernels/pto/chunk_h.cpp
+
+```cpp
+  constexpr int32_t WS_WS = 0;
+  constexpr int32_t WS_K = DD;
+  constexpr int32_t WS_S = DD * 2;
+  constexpr int32_t WS_KV = DD * 3;
+  constexpr int32_t WS_PER_CORE = DD * 4;
+```
+
+```cpp
+    int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
+```
+
+```cpp
+        GmTensor2D<half> s_global(workspace_handle + ws_base + WS_S, s_shape,
+```
+
+```cpp
+          workspace_handle + ws_base + WS_S + vid * HalfC * D, s_shape,
+```
+
+So two distinct idioms coexist in the same megakernel: a depth-2 ring keyed on a loop counter
+(kkt, flags 0/1 vs 2/3), and a fixed set of named per-core buffers (chunk_h, flags 0/1/2/3 used
+as four distinct producer-consumer edges rather than as a ring).
+
+
+---
+
+## B3. ★★★ MegaMoE (Huawei) — `hicann/ops-transformer`, the REAL per-expert GEMM megakernel
+
+This is the headline find. It is Huawei's production MoE megakernel, public, with an A3-specific
+device kernel, and it answers TOPIC A and TOPIC B in the same file. Found via
+`gh search code 'MegaMoE'`, which surfaced `hicann/ops-transformer:mc2/...`.
+
+Repo: https://github.com/hicann/ops-transformer (branch `master`), listed with
+`gh api repos/hicann/ops-transformer/git/trees/master?recursive=1`. Fetched 2026-10-20.
+Copyright headers: `Copyright (c) 2026 Huawei Technologies Co., Ltd.`, CANN Open Software
+License Agreement Version 2.0.
+
+### B3.0 The MegaMoE file tree (sizes in bytes)
+
+```
+mc2/mega_moe/CMakeLists.txt                                                      1230
+mc2/mega_moe/README.md                                                          64734
+mc2/mega_moe/docs/torchapi_mega_moe.md                                         109678
+mc2/mega_moe/op_api/aclnn_mega_moe.cpp                                           9154
+mc2/mega_moe/op_graph/CMakeLists.txt                                              992
+mc2/mega_moe/op_host/CMakeLists.txt                                              1939
+mc2/mega_moe/op_host/mega_moe_def.cpp                                           23569
+mc2/mega_moe/op_host/mega_moe_infershape.cpp                                     3974
+mc2/mega_moe/op_host/op_tiling/arch22/mega_moe_tiling_arch22.cpp                92919
+mc2/mega_moe/op_host/op_tiling/arch35/mega_moe_tiling.cpp                      180931
+mc2/mega_moe/op_host/op_tiling/mega_moe_tiling_host.h                            2825
+mc2/mega_moe/op_kernel/arch22/mega_moe.cpp                                       4536
+mc2/mega_moe/op_kernel/arch22/mega_moe_a2.h                                     23968
+mc2/mega_moe/op_kernel/arch22/mega_moe_arch22.h                                 16551
+mc2/mega_moe/op_kernel/arch22/mega_moe_exception_dump_policy.h                   3140
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_bf16.hpp                       92559
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_bf16_w4a8.hpp                  99332
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_int8.hpp                       94688
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a3.hpp                           116061   <-- the A3 kernel
+mc2/mega_moe/op_kernel/arch22/mega_moe_tiling_a2a3.h                             2682
+mc2/mega_moe/op_kernel/arch22/mega_moe_tiling_key.h                              2916
+mc2/mega_moe/op_kernel/arch22/moe_permute_prologue/moe_permute_prologue.hpp      21847
+mc2/mega_moe/op_kernel/arch22/moe_permute_prologue/moe_permute_prologue_tiling.h 2303
+mc2/mega_moe/op_kernel/arch22/unpermute/mc2_mega_moe_moe_token_unpermute.h       17239
+mc2/mega_moe/op_kernel/arch22/unpermute/mc2_mega_moe_moe_token_unpermute_tiling.h 2231
+mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_pertoken_row.hpp               9061
+mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_pertoken_swiglu.hpp           24536
+mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_pertoken_v2.hpp               14605
+mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_w4a8post_pertoken_swiglu.hpp  28416
+mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_w4a8post_pertoken_v2.hpp      16735
+mc2/mega_moe/op_kernel/arch22/utils/block_mmad_preload_async_fixpipe_quant.hpp   25250
+mc2/mega_moe/op_kernel/arch22/utils/block_mmad_w4a4.hpp                          25447
+mc2/mega_moe/op_kernel/arch22/utils/const_args.hpp                               3046
+mc2/mega_moe/op_kernel/arch22/utils/copy_gm_to_l1_custom.hpp                     2054
+mc2/mega_moe/op_kernel/arch22/utils/copy_l0c_to_gm_custom.hpp                    2523
+mc2/mega_moe/op_kernel/arch22/utils/dispatch_policy_custom.hpp                   8164
+mc2/mega_moe/op_kernel/arch22/utils/gated_activation.hpp                        11467
+mc2/mega_moe/op_kernel/arch22/utils/get_tensor_addr.hpp                          1378
+mc2/mega_moe/op_kernel/arch22/utils/hccl_shmem.hpp                              33496
+mc2/mega_moe/op_kernel/arch22/utils/layout3d.hpp                                 1219
+mc2/mega_moe/op_kernel/arch22/utils/select_helper.hpp                            1377
+mc2/mega_moe/op_kernel/arch22/utils/weight_l2_prefetch.hpp                        5501
+mc2/mega_moe/op_kernel/arch22/utilsA2/block_epilogue_pertoken_row_a2_bf16.hpp     8884
+mc2/mega_moe/op_kernel/arch22/utilsA2/block_epilogue_pertoken_row_a2_int8.hpp     8907
+mc2/mega_moe/op_kernel/arch22/utilsA2/block_epilogue_pertoken_swiglu_a2_bf16.hpp 23466
+mc2/mega_moe/op_kernel/arch22/utilsA2/block_epilogue_pertoken_swiglu_a2_int8.hpp 21803
+```
+
+A mirror of the same tree also exists at `yjyang62/CANN:mc2/mega_moe/...` with an `arch35`
+variant (`mc2/mega_moe/op_kernel/arch35/mega_moe.h`); the analysis-tool script
+`hicann/ops-transformer:mc2/tools/dump_analysis/dump_analysis_megamoe.py` is also public.
+
+### B3.1 ★★★ THE flagId ALLOCATION PLAN, verbatim — the answer to TOPIC A
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a3.hpp
+
+Author: Huawei Technologies Co., Ltd., 2026. Repo `hicann/ops-transformer`, branch `master`. Fetched 2026-10-20.
+
+Lines 50-72. This comment is the complete flagId budget of a production A3 megakernel. Read it
+twice: `syncgmm 流 0-8`, `C2V=9`, `V2C=10`, and `SyncAll<false>` is noted as occupying `11-13`.
+It also states the 4-bit truncation rule explicitly:
+
+```cpp
+#include "utils/get_tensor_addr.hpp"
+#include "utils/weight_l2_prefetch.hpp"
+#include "mega_moe_exception_dump_policy.h"
+
+namespace Catlass::Gemm::Kernel {
+
+using namespace AscendC;
+using namespace Mc2Tiling;
+
+constexpr uint16_t SYNCFLAGC2V = 9;
+constexpr uint16_t SYNCFLAGV2C = 10;
+constexpr int32_t UB_MOVE_NUM = 16 * 1024;
+
+// 发送侧逐 chunk 处理的 chunk 大小（= moe_permute_prologue 的 MAX_TOKENS=1024）
+constexpr int64_t PERMUTE_CHUNK = 1024;
+// 相邻 chunk 通过 SyncAll<false> 全核屏障串行化，不同时执行，因此 C2V/V2C 固定占用 flag 9/10，
+// 每 chunk 复用同一组 flag（syncgmm 流 0-8、C2V=9、V2C=10、GMM2-combine 0-8）。
+// 注意 mode0/1/2 下 flagId 仅 0-15，超出截取低 4bit；若改为按 chunk 偏移必须满足
+// C2V(chunk n) != V2C(chunk m) 且不落入 syncgmm 流 0-8 与 SyncAll<false> 的 11-13。
+constexpr uint16_t PERMUTE_CHUNK_FLAG_STRIDE = 0;
+// prologue 每核计数区按 AIV 核数上限分配（host 侧 workspace 须按实际 aivNum 分配且 <= 此值）
+constexpr int64_t PERMUTE_MAX_CORES = 128;
+
+// Atlas A3 (910_93) kernel.
+```
+
+And the constant it all hangs on:
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/mc2/mega_moe/op_kernel/arch22/utils/const_args.hpp
+
+```cpp
+constexpr uint16_t CROSS_CORE_FLAG_MAX_SET_COUNT = 15;
+constexpr uint32_t MAX_EXPERTS_PER_RANK = 128;
+constexpr uint32_t MAX_RANK_PER_CORE = 32;
+constexpr static uint16_t SYNCFLAGC2V = 9;
+constexpr static uint16_t SYNCFLAGV2C = 10;
+```
+
+### B3.2 ★★★ THE ROTATION ITSELF — `flagId = counter / 15`
+
+Every per-expert handshake in this kernel computes its flagId by integer-dividing a
+monotonically increasing counter by `CROSS_CORE_FLAG_MAX_SET_COUNT`. Each flagId absorbs
+exactly 15 Sets, then the next flagId takes over. With 128 experts per rank, `128 / 15 = 8`,
+which is precisely why the comment reserves the "syncgmm 流" as flagIds **0-8**.
+
+AIV side (producer) — note the Set and the counter increment are adjacent, so there is never a
+second Set of the same flagId without an intervening increment past the /15 boundary:
+
+```cpp
+        // 轮就绪信号：rounds==1 时即 chunk cumsum/路由就绪信号，rounds>1 时为轮表就绪信号
+        uint16_t syncgmm1Idx = 0;
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+        syncgmm1Idx++;
+```
+
+```cpp
+            AscendC::SyncAll<true>();
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+            syncgmm1Idx++;
+```
+
+AIC side (consumer), inside the grouped-matmul loop. The `for (; syncGroupIdx <= groupIdx; ...)`
+catch-up loop is how a core that skipped empty experts still drains the right number of credits:
+
+```cpp
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+                for (; syncGroupIdx <= groupIdx; syncGroupIdx++) {
+                    AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                    syncgmmIdx++;
+                }
+```
+
+The epilogue drain, so the counters end balanced before the next round:
+
+```cpp
+        for (; syncGroupIdx < params.expertPerRank; syncGroupIdx++) {
+            AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+            syncgmmIdx++;
+        }
+```
+
+Two more independent rotations in the combine path, using the expert index directly:
+
+```cpp
+        for (uint32_t t_groupIdx = 0; t_groupIdx < params.expertPerRank; ++t_groupIdx) {
+            int32_t flagId = t_groupIdx / CROSS_CORE_FLAG_MAX_SET_COUNT;
+            AscendC::CrossCoreWaitFlag<0x2>(flagId);
+            AscendC::SyncAll<true>();
+```
+
+```cpp
+                for (; syncLoopIdx <= groupIdx; syncLoopIdx++) {
+                    int32_t flag_id = syncLoopIdx / CROSS_CORE_FLAG_MAX_SET_COUNT;
+                    AscendC::CrossCoreWaitFlag<0x2>(flag_id);
+                }
+```
+
+```cpp
+        if constexpr (std::is_same_v<ElementB, AscendC::int4b_t>) {
+            for (; syncLoopIdx < params.expertPerRank; syncLoopIdx++) {
+                int32_t flag_id = syncLoopIdx / CROSS_CORE_FLAG_MAX_SET_COUNT;
+                AscendC::CrossCoreWaitFlag<0x2>(flag_id);
+            }
+        }
+```
+
+### B3.3 ★ THE PER-ROUND COUNTER RESET — how the rotation restarts without exhausting flagIds
+
+The outer AIC loop over chunks and receive-rounds. `syncgmmIdx = 0;` at the bottom of the round
+is the reset: the flagId stream restarts at 0 every round, which is legal because the
+barrier/`SyncAll` has drained everything. The Chinese comments state the invariant directly —
+`syncgmmIdx/syncgmm1Idx 按轮归零，flag 槽位按轮复用` ("zeroed per round, flag slots reused per round"):
+
+```cpp
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        if (IsRankMasked(RuntimeRank(params))) {
+            return;
+        }
+        syncgmmIdx = 0;
+        const int64_t bs = params.problemShape.m();
+        const int64_t numChunks = NumChunks(bs);
+        for (int64_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx) {
+            // cumsumMM 每 chunk 指向独立缓冲区（不复用，规避跨 chunk cache 陈旧读）；
+            // chunkCumsumMM 保持 chunk 级指向，供轮数推导与轮表生成读取。
+            GM_ADDR chunkCumsumPtr = ChunkCumsumPtr(params, chunkIdx);
+            chunkCumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkCumsumPtr));
+            cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkCumsumPtr));
+            // 接收端轮次切分：R ≤ B 时单轮（退化零回归）；R > B 时每轮等待 AIV 轮表就绪后
+            // 切换 cumsumMM 到轮表。syncgmmIdx/syncgmm1Idx 按轮归零，flag 槽位按轮复用。
+            int64_t numRecvRounds = 1;
+            for (int64_t roundIdx = 0;; ++roundIdx) {
+                // 原 GMM1 入口的初始等待外移到轮级：rounds==1 时即 chunk cumsum/路由就绪信号，
+                // rounds>1 时为 BuildRoundTables 完成后的轮表就绪信号
+                AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmmIdx++;
+```
+
+```cpp
+                if (roundIdx == 0) {
+                    numRecvRounds = ComputeNumRecvRounds(params);
+                }
+                if (numRecvRounds > 1) {
+                    SetRoundTableBuffers(params, chunkIdx, roundIdx);
+                }
+                GMM1(params, chunkIdx);
+                if constexpr (!std::is_same_v<ElementB, AscendC::int4b_t>) {
+                    AscendC::CrossCoreWaitFlag<0x2>(SYNCFLAGV2C + chunkIdx * PERMUTE_CHUNK_FLAG_STRIDE);
+                    GMM2(params, chunkIdx);
+                } else {
+                    GMM2(params, chunkIdx);
+                }
+                syncgmmIdx = 0; // 轮间从 flag 0 复用 syncgmm 握手（与 AIV syncgmm1Idx 对称）
+                if (roundIdx + 1 >= numRecvRounds) {
+                    break;
+                }
+            }
+        }
+    }
+```
+
+### B3.4 ★★★ TOPIC B — the per-expert GEMM loop, verbatim (GMM1)
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a3.hpp
+
+This is the whole `GMM1` method: the group loop, the group-list read, the per-expert weight
+re-pointing, the per-group problem shape, the scheduler update, and the core-to-group mapping.
+Everything TOPIC B asked for:
+
+```cpp
+    CATLASS_DEVICE
+    void GMM1(Params const& params, int64_t chunkIdx)
+    {
+        icache_preload(ICACHE_PRELOAD_LINES);
+        BlockScheduler blockScheduler;
+        BlockMmad blockMmad(resource);
+
+        int64_t gmGroupOffsetA = 0;
+        int64_t gmGroupOffsetB = 0;
+        int64_t gmGroupOffsetC = 0;
+        uint32_t startCoreIdx = 0;
+        uint32_t syncGroupIdx = 0;
+        int64_t preCurrentmSum = 0;
+        int32_t syncLoopIdx = -1;
+
+        // 说明：原 GMM1 入口的 "等待 AIV 完成 cumsum" 初始等待已外移到 AIC operator() 的
+        // 轮循环内（轮表就绪信号），syncgmmIdx 由调用方维护并已指向第一个 per-group 信号。
+
+        // W1 预取激活时 gmB1 恒 NORMAL（DISABLE 双向 bypass 使预取失效）；
+        // 未激活（超门槛）恢复 DISABLE（单 M-tile 组权重单次读）；门槛算式与 AicRange 同源。
+        const uint64_t w1PrefetchCap = static_cast<uint64_t>(WEIGHT_L2_PREFETCH_COLDSTART_CHUNKS) *
+                                       AscendC::GetBlockNum() * WEIGHT_L2_PREFETCH_CHUNK_BYTES;
+        const bool w1Prefetched =
+            WeightL2PrefetchBytesPerExpert<ElementB>(params.problemShape.k(), params.problemShape.n()) <= w1PrefetchCap;
+
+        AscendC::GlobalTensor<ElementB> gmB1;
+
+        for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
+            uint32_t currentM = cumsumMM.GetValue((params.EP - 1) * params.expertPerRank + groupIdx);
+            if (preCurrentmSum >= params.maxOutputSize) {
+                currentM = 0;
+            } else if (preCurrentmSum + currentM >= params.maxOutputSize) {
+                currentM = params.maxOutputSize - preCurrentmSum;
+            }
+
+            if constexpr (std::is_same_v<ElementB, AscendC::int4b_t>) {
+                currentM = currentM * GATE_UP_ROWS_PER_TOKEN;
+            }
+
+            int32_t arrayGroupIdx = params.listLen == 1 ? 0 : groupIdx;
+            gmB1.SetGlobalBuffer(reinterpret_cast<__gm__ ElementB*>(
+                GetTensorAddr<ElementB>(arrayGroupIdx, reinterpret_cast<GM_ADDR>(params.ptrB1))));
+            gmS.SetGlobalBuffer(reinterpret_cast<__gm__ ElementScale*>(
+                GetTensorAddr<int64_t>(arrayGroupIdx, reinterpret_cast<GM_ADDR>(params.ptrScale1))));
+
+            if constexpr (!std::is_same_v<ElementB, AscendC::int4b_t>) {
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+
+            if (!w1Prefetched && currentM <= L1TileShape::M) {
+                gmB1.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+            }
+
+            GemmCoord inGroupProblemShape{currentM, params.problemShape.n(), params.problemShape.k()};
+            LayoutA layoutA = params.layoutA.GetTileLayout(inGroupProblemShape.GetCoordMK());
+            LayoutB layoutB1 = params.layoutB1;
+            LayoutScale layoutScale = params.layoutScale1;
+            LayoutC layoutC(inGroupProblemShape.m(), inGroupProblemShape.n(), params.gmmOutPreRowStride);
+            blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+            uint32_t coreLoops = blockScheduler.GetCoreLoops();
+            // Determine the starting loopIdx of the current core under the current groupIdx
+            uint32_t startLoopIdx = ((coreIdx < startCoreIdx) ? (coreIdx + coreNum) : coreIdx) - startCoreIdx;
+            // Loop through the matmul of each groupIdx
+
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+                for (; syncGroupIdx <= groupIdx; syncGroupIdx++) {
+                    AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                    syncgmmIdx++;
+                }
+                // Compute block location
+                GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
+                GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+                // Compute initial location in logical coordinates
+                MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+                MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+                MatrixCoord offsetC{blockCoord.m() * L1TileShape::M, blockCoord.n() * L1TileShape::N};
+                int64_t gmOffsetA = layoutA.GetOffset(offsetA);
+                int64_t gmOffsetB = layoutB1.GetOffset(offsetB);
+                int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+                if (currentM > 0) {
+                    if constexpr (std::is_same_v<ElementB, AscendC::int4b_t>) {
+                        int64_t gmOffsetS = blockCoord.n() * L1TileShape::N +
+                                            (params.listLen == 1 ? groupIdx * params.problemShape.n() : 0);
+                        if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                            blockMmad(gmS[gmOffsetS], layoutScale, gmA1I4[gmGroupOffsetA + gmOffsetA], layoutA,
+                                      gmB1[gmGroupOffsetB + gmOffsetB], layoutB1, gmC[gmGroupOffsetC + gmOffsetC],
+                                      layoutC, actualBlockShape, Callback{}, Callback{});
+                        } else {
+                            blockMmad(gmS[gmOffsetS], layoutScale, gmA1I4[gmGroupOffsetA + gmOffsetA], layoutA,
+                                      gmB1[gmGroupOffsetB + gmOffsetB], layoutB1, gmC[gmGroupOffsetC + gmOffsetC],
+                                      layoutC, actualBlockShape);
+                        }
+                    } else if constexpr (std::is_same_v<ElementA, int8_t>) {
+                        int64_t gmOffsetS = blockCoord.n() * L1TileShape::N +
+                                            (params.listLen == 1 ? groupIdx * params.problemShape.n() : 0);
+                        blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB1[gmGroupOffsetB + gmOffsetB], layoutB1,
+                                  gmC[gmGroupOffsetC + gmOffsetC], layoutC, gmS[gmOffsetS], layoutScale,
+                                  actualBlockShape);
+                    } else {
+                        blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB1[gmGroupOffsetB + gmOffsetB], layoutB1,
+                                  gmC[gmGroupOffsetC + gmOffsetC], layoutC, gmS, layoutScale, actualBlockShape);
+                    }
+                }
+            }
+
+            if constexpr (std::is_same_v<ElementB, AscendC::int4b_t>) {
+                if (IsSyncTask(groupIdx, params.expertPerRank)) {
+                    syncLoopIdx++;
+                    if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                        blockMmad.SynchronizeBlock();
+                    }
+                    blockMmad.Finalize(syncLoopIdx, SYNCFLAGC2V + chunkIdx * PERMUTE_CHUNK_FLAG_STRIDE);
+                }
+            } else {
+                if ((groupIdx + 1) == params.epilogueGranularity && (groupIdx < params.expertPerRank - 1)) {
+                    syncLoopIdx++;
+                    if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                        blockMmad.SynchronizeBlock();
+                    }
+                    blockMmad.Finalize(syncLoopIdx, SYNCFLAGC2V + chunkIdx * PERMUTE_CHUNK_FLAG_STRIDE);
+                }
+            }
+
+            if constexpr (std::is_same_v<ElementB, AscendC::int4b_t>) {
+                preCurrentmSum += currentM / GATE_UP_ROWS_PER_TOKEN;
+            } else {
+                preCurrentmSum += currentM;
+            }
+            // 每个专家之间在k小于k2的时候不是密排，所以这里不取k
+            gmGroupOffsetA += inGroupProblemShape.m() * params.gmm1InputExpertSlotWidth;
+            if (params.listLen == 1) {
+                gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
+            }
+            gmGroupOffsetC += inGroupProblemShape.m() * params.gmmOutPreRowStride;
+            startCoreIdx = (startCoreIdx + coreLoops) % coreNum;
+        }
+
+        for (; syncGroupIdx < params.expertPerRank; syncGroupIdx++) {
+            AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+            syncgmmIdx++;
+        }
+
+        if constexpr (!std::is_same_v<ElementB, AscendC::int4b_t>) {
+            if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                blockMmad.SynchronizeBlock();
+            }
+            blockMmad.Finalize(syncLoopIdx + 1, SYNCFLAGC2V + chunkIdx * PERMUTE_CHUNK_FLAG_STRIDE);
+        }
+    }
+```
+
+### B3.5 ★★ Per-expert weight addressing on device — `GetTensorAddr`, the whole file
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/mc2/mega_moe/op_kernel/arch22/utils/get_tensor_addr.hpp
+
+Author: Huawei Technologies Co., Ltd., 2026. Fetched 2026-10-20.
+
+This is how a 256-expert weight *list* is addressed from device code: the kernel receives a
+single `GM_ADDR` that points at a TensorList descriptor — a `uint64_t` offset followed by an
+array of `uint64_t` device pointers — and indexes it per expert. Whole file:
+
+```cpp
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file get_tensor_addr.hpp
+ * \brief
+ */
+
+#ifndef GET_TENSOR_ADDR_HPP
+#define GET_TENSOR_ADDR_HPP
+#include "kernel_operator.h"
+
+#define FORCE_INLINE_AICORE inline __attribute__((always_inline)) __aicore__
+
+template <typename T>
+FORCE_INLINE_AICORE __gm__ T* GetTensorAddr(uint32_t index, GM_ADDR tensorPtr)
+{
+    __gm__ uint64_t* dataAddr = reinterpret_cast<__gm__ uint64_t*>(tensorPtr);
+    uint64_t tensorPtrOffset = *dataAddr; // The offset of the data address from the first address.
+    // Moving 3 bits to the right means dividing by sizeof(uint64 t).
+    __gm__ uint64_t* retPtr = dataAddr + (tensorPtrOffset >> 3);
+    return reinterpret_cast<__gm__ T*>(*(retPtr + index));
+}
+
+#endif // GET_TENSOR_ADDR_HPP
+```
+
+The two addressing modes, isolated. `params.listLen` selects between them:
+
+```cpp
+            int32_t arrayGroupIdx = params.listLen == 1 ? 0 : groupIdx;
+            gmB1.SetGlobalBuffer(reinterpret_cast<__gm__ ElementB*>(
+                GetTensorAddr<ElementB>(arrayGroupIdx, reinterpret_cast<GM_ADDR>(params.ptrB1))));
+```
+
+```cpp
+            if (params.listLen == 1) {
+                gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
+            }
+```
+
+That is: `listLen == 1` means one contiguous `[E, K, N]` weight tensor, advanced by `K*N` per
+expert; `listLen != 1` means a TensorList of `E` separate allocations, re-pointed per expert via
+`GetTensorAddr`. The per-expert scale is re-pointed the same way, and in the contiguous case its
+offset carries the extra `groupIdx * N` term:
+
+```cpp
+                        int64_t gmOffsetS = blockCoord.n() * L1TileShape::N +
+                                            (params.listLen == 1 ? groupIdx * params.problemShape.n() : 0);
+```
+
+### B3.6 The GMM2 loop — same shape, second projection
+
+```cpp
+        uint32_t n2 = params.problemShape.k();
+        uint32_t k2 = params.problemShape.n() / 2;
+```
+
+```cpp
+                GetTensorAddr<ElementB>(arrayGroupIdx, reinterpret_cast<GM_ADDR>(params.ptrB2))));
+```
+
+```cpp
+                GetTensorAddr<int64_t>(arrayGroupIdx, reinterpret_cast<GM_ADDR>(params.ptrScale2))));
+```
+
+```cpp
+            GemmCoord inGroupProblemShape{currentM, n2, k2}; // M N K
+```
+
+```cpp
+            LayoutA layoutA = params.layoutA2.GetTileLayout(inGroupProblemShape.GetCoordMK());
+```
+
+```cpp
+            LayoutC layoutC = LayoutC(inGroupProblemShape.m(), inGroupProblemShape.n());
+```
+
+```cpp
+            blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+```
+
+```cpp
+            gmGroupOffsetA += inGroupProblemShape.m() * inGroupProblemShape.k();
+            if (params.listLen == 1) {
+                gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
+            }
+            gmGroupOffsetC += inGroupProblemShape.m() * inGroupProblemShape.n();
+```
+
+Note `n2 = problemShape.k()` and `k2 = problemShape.n() / 2` — the `/2` is the SwiGLU gate+up
+split: GMM1 produces `2 * intermediate` columns, the epilogue gates them down to
+`intermediate`, and GMM2 projects `intermediate -> hidden`.
+
+### B3.7 The group-list read — note it is a `cumsum` table, indexed at the LAST rank
+
+```cpp
+            uint32_t currentM = cumsumMM.GetValue((params.EP - 1) * params.expertPerRank + groupIdx);
+```
+
+The tensor is named `cumsumMM` and is laid out `[EP][expertPerRank]`; row `EP-1` is read, which
+gives the count for that expert summed over all `EP` ranks. So what the GEMM loop consumes is a
+per-expert **row count**, obtained by indexing the last row of a table that is cumulative along
+the *rank* axis — not a prefix sum along the *expert* axis. The workspace sizing confirms the
+shape:
+
+```cpp
+                EP * AlignUp(EP * MAX_EXPERTS_PER_RANK + 1, ALIGN_128) * static_cast<int64_t>(sizeof(int32_t));
+```
+
+Each chunk gets its OWN cumsum buffer, explicitly to avoid stale cache reads across chunks:
+
+```cpp
+            // cumsumMM 每 chunk 指向独立缓冲区（不复用，规避跨 chunk cache 陈旧读）；
+            // chunkCumsumMM 保持 chunk 级指向，供轮数推导与轮表生成读取。
+            GM_ADDR chunkCumsumPtr = ChunkCumsumPtr(params, chunkIdx);
+            chunkCumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkCumsumPtr));
+            cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkCumsumPtr));
+```
+
+### B3.8 The template head — what a grouped-matmul megakernel is parameterised on
+
+```cpp
+template <class BlockMmad_, class BlockScheduler_, class ElementGroupList_, class BlockEpilogue1_,
+```
+
+`ElementGroupList_` is a first-class template parameter of the kernel: the group-list element
+type is part of the kernel's type, alongside the mmad block, the scheduler, and the two
+epilogues. The per-group fields of `Params`:
+
+```cpp
+        GemmCoord problemShape;
+```
+
+```cpp
+        GM_ADDR expertIdx;
+```
+
+```cpp
+        Params(GemmCoord problemShape_, uint32_t EP_, uint32_t listLen_, uint32_t expertPerRank_,
+```
+
+```cpp
+            gmmOutPreRowStride = problemShape.n() > problemShape.k() ? problemShape.n() : problemShape.k();
+            uint32_t k2 = problemShape.n() / 2;
+            gmm1InputExpertSlotWidth = problemShape.k() > k2 ? problemShape.k() : k2;
+```
+
+
+---
+
+## B4. ★★ AUTHORITATIVE `groupListType` semantics — official `GroupedMatmulV4` doc
+
+https://github.com/hicann/ops-transformer/blob/master/gmm/grouped_matmul/docs/aclnnGroupedMatmulV4.md
+(raw: https://raw.githubusercontent.com/hicann/ops-transformer/master/gmm/grouped_matmul/docs/aclnnGroupedMatmulV4.md)
+
+Author: Huawei Technologies Co., Ltd. Repo `hicann/ops-transformer`, branch `master`, 67561 bytes.
+Fetched 2026-10-20.
+
+This settles the cumsum-vs-count question, which the asc-devkit sample (B1) and the MegaMoE
+kernel (B3) each answer differently for themselves. The official op attribute has THREE modes,
+and the doc spells out all three in one sentence. Note `groupListType == 2`: an `[E, 2]` array of
+`(groupIdx, groupSize)` pairs with non-zero groups moved to the front — designed exactly for the
+case of many inactive experts:
+
+```
+    - groupListType为0时要求groupListOptional中数值为非负单调非递减数列，表示分组轴大小的cumsum结果（累积和），groupListType为1时要求groupListOptional中数值为非负数列，表示分组轴上每组大小，groupListType为2时要求groupListOptional中数值为非负数列，shape为[E, 2]，E表示Group大小，数据排布为[[groupIdx0, groupSize0], [groupIdx1, groupSize1]...]，其中groupSize为分组轴上每组大小，详见[groupListOptional配置示例](#grouplistoptional配置示例)。
+    - groupType代表需要分组的轴，如矩阵乘为C[m,n]=A[m,k]xB[k,n]，则groupType取值-1：不分组，0：m轴分组，2：k轴分组。详细参考<a href="#groupType-constraints">groupType支持场景</a>约束。
+```
+
+The parameter table entries for the three attributes that control grouping:
+
+```
+    <tr>
+      <td>splitItem（int64_t）</td>
+      <td>输入</td>
+      <td>整数型参数，代表输出是否要做tensor切分。</td>
+      <td>0/1代表输出为多tensor；2/3代表输出为单tensor。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>groupType（int64_t）</td>
+      <td>输入</td>
+      <td>整数型参数，代表需要分组的轴。</td>
+      <td>枚举值-1、0、2。如矩阵乘为C[m,n]=A[m,k]xB[k,n]，则groupType取值-1：不分组，0：m轴分组，2：k轴分组。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>groupListType（int64_t）</td>
+      <td>输入</td>
+      <td>-</td>
+      <td>枚举值0、1、2。综合约束请参见<a href="#约束说明">约束说明。</a></td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+```
+
+The worked example that makes the three encodings unambiguous — the SAME routing (9 groups with
+sizes 123, 0, 333, 0, 0, 333, 0, 0, 0) written three ways. This is the single most useful quote
+for driving 256 routed experts, because mode 2 is the sparse/compacted form:
+
+```
+      X的shape是[[789, 4096]]
+      W的shape是[[9, 4096, 7168]]
+      Y的shape是[[789, 7168]]
+
+    - groupListType为0时groupList配置如下
+      - groupListOptional：`[123, 123, 456, 456, 456, 789, 789, 789, 789]`
+
+    - groupListType为1时groupList配置如下
+      - groupListOptional：`[123, 0, 333, 0, 0, 333, 0, 0, 0]`
+
+    - groupListType为2时groupList配置如下
+      - groupListOptional在该模式会将所有非0的group移动到前面，适用于非激活专家较多场景。
+      - groupListOptional：`[[0, 123], [2, 333], [5, 333], [1, 0], [3, 0], [4, 0], [6, 0], [7, 0], [8, 0]]`
+```
+
+The 950PR/950DT constraint block, which restates the rules and adds that mode 2 is full-quant +
+m-axis only, and that zero-size groups go to the tail:
+
+```
+    - groupListType：支持取值0、1、2。
+      - 当groupListType为0时，groupListOptional必须为非负单调非递减数列；
+      - 当groupListType为1时，groupListOptional必须为非负数列。
+      - 仅全量化且groupType为0场景下支持groupListType为2，此时要求groupListOptional中数值为非负数列，shape为[E, 2]，E表示Group大小，数据排布为[[groupIdx0, groupSize0], [groupIdx1, groupSize1]...]，其中groupSize为分组轴上每组大小，此时groupedSize为零的组置于groupList末尾，非零组被前置，详见[groupListOptional配置示例](#grouplistoptional配置示例)。
+```
+
+Group-count limits per tensor arrangement — relevant because 256 experts exceeds the 128 limit of
+the multi-tensor forms. Only the single-x/single-w/single-y form reaches 25600 (non-quant
+FP16/BF16 with groupListType 0/1); the TensorList forms cap at 128:
+
+```
+      | groupType | x tensor数 | weight tensor数 | y tensor数 | splitItem| groupListOptional | 转置 | 其余场景限制 |
+```
+
+```
+      | 0 | 单个|单个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第一维；当groupListType为1时，数值的总和应小于等于x中tensor的第一维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第一维；<br> 3）groupListOptional第1维在非量化FLOAT16/BFLOAT16且groupListType为0/1时最大支持25600，其他场景最大支持1024 |1）x不支持转置；<br> 2）支持weight转置，A8W4与A4W4场景不支持weight转置 |weight中tensor需为3维，x，y中tensor需为2维|
+      | 0 | 单个|多个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第一维；当groupListType为1时，数值的总和应小于等于x中tensor的第一维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第一维；<br> 3）groupListOptional第1维最大支持128，即最多支持128个group|1）x不支持转置；<br> 2）支持weight转置，但weight的tensorList中每个tensor是否转置需保持统一 |1）x，weight，y中tensor需为2维；<br> 2）weight中每个tensor的N轴必须相等 |
+      | 0 | 多个|多个|单个 | 2/3 | 1）groupListOptional可选；<br> 2）若传入groupListOptional，当groupListType为0时，groupListOptional的差值需与x中tensor的第一维一一对应；当groupListType为1时，groupListOptional的数值需与x中tensor的第一维一一对应；当groupListType为2时，groupListOptional第二列的数值需与x中tensor的第一维一一对应；<br> 3）groupListOptional第1维最大支持128，即最多支持128个group |1）x不支持转置；<br> 2）支持weight转置，但weight的tensorList中每个tensor是否转置需保持统一|1）x，weight，y中tensor需为2维；<br> 2）weight中每个tensor的N轴必须相等 |
+      | 2 | 单个|单个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第二维；当groupListType为1时，数值的总和应小于等于x中tensor的第二维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第二维；<br> 3）groupListOptional第1维最大支持1024，即最多支持1024个group | 1）x必须转置；<br> 2）weight不能转置 |1）x，weight中tensor需为2维，y中tensor需为3维；<br> 2）bias必须传空|
+```
+
+One more constraint worth knowing, from the same doc: in the per-group-quant path the op does NOT
+validate `groupListType` and silently assumes 1:
+
+```
+        - 该场景下仅支持groupListType为1（算子不会检查groupListType的值，会认为groupListType为1），k要求为quantGroupSize的整数倍，且要求k <= 18432。其中quantGroupSize为k方向上pergroup量化长度，当前支持quantGroupSize=256。
+```
+
+### B4.1 The GroupedMatmul flagId / buffer constants
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/gmm/common/cgmct/utils/grouped_matmul_constant.h
+
+Author: Huawei Technologies Co., Ltd., 2026. Repo `hicann/ops-transformer`, branch `master`.
+Fetched 2026-10-20. Whole file — note `GMM_FLAG_ID_MAX = 16`, the two reserved cross-core flagIds
+(6 and 8), mode 4, and `GMM_MKN_LIST_LEN = 128` (the 128-group ceiling as a compile-time array
+length):
+
+```cpp
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file grouped_matmul_constant.h
+ * \brief
+ */
+#ifndef UTILS_GROUPED_MATMUL_CONSTANT_H
+#define UTILS_GROUPED_MATMUL_CONSTANT_H
+namespace Cgmct {
+namespace Gemm {
+namespace GroupedMatmul {
+constexpr uint32_t GMM_BUFFER_NUM = 2;
+constexpr uint16_t GMM_FLAG_ID_MAX = 16;
+constexpr uint16_t GMM_AIV_SYNC_AIC_FLAG = 6;
+constexpr uint16_t GMM_AIC_SYNC_AIV_FLAG = 8;
+constexpr int32_t GMM_CUBE_SYNC_MTE1_FLAG = 3;
+constexpr uint8_t GMM_AIC_SYNC_AIV_MODE = 4;
+constexpr uint64_t GMM_MAX_STEP_SCALEA_K = 16;
+constexpr uint32_t GMM_UB_ALIGN_SIZE = 32;
+constexpr uint32_t GMM_MAX_REPEAT_TIMES = 255;
+
+constexpr uint8_t GMM_SPLIT_M = 0;
+constexpr uint8_t GMM_SPLIT_K = 2;
+constexpr uint64_t GMM_CUBE_BLOCK = 16;
+constexpr uint64_t GMM_INNER_AXIS_MIN_SPLIT_VAL = 128; // ND2NZ cacheline 128
+constexpr int32_t GMM_MKN_LIST_LEN = 128;              // 128: predefined array legnth
+
+constexpr uint32_t GMM_BMM_BLOCK_NUM = 16;
+constexpr uint32_t K0_B8 = 32;
+constexpr uint32_t GMM_k0_FLOAT16 = 16;
+constexpr uint16_t GMM_DATA_BLOCK = 32;
+
+enum class QuantMode : uint32_t {
+    DEFAULT = 0x0U,
+    PERTENSOR_MODE = 0x1U,
+    PERCHANNEL_MODE = 0x1U << 1,
+    PERTOKEN_MODE = 0x1U << 2,
+    MX_PERGROUP_MODE = 0x1U << 3,
+    PERGROUP_MODE = 0x1U << 4,
+    PERBLOCK_MODE = 0x1U << 5,
+};
+} // namespace GroupedMatmul
+} // namespace Gemm
+} // namespace Cgmct
+#endif
+```
+
+### B4.2 The GroupedMatmul source tree in `hicann/ops-transformer` (so the real kernel can be found)
+
+Listed with `gh api repos/hicann/ops-transformer/git/trees/master?recursive=1` on 2026-10-20:
+
+```
+gmm/grouped_matmul/CMakeLists.txt                                                  1197
+gmm/grouped_matmul/README.md                                                       9184
+gmm/grouped_matmul/docs/GroupedMatmulTransFusionPass.md                            2285
+gmm/grouped_matmul/docs/GroupedMatmul算子设计介绍.md                                  9938
+gmm/grouped_matmul/docs/aclnnGroupedMatmul.md                                     26891
+gmm/grouped_matmul/docs/aclnnGroupedMatmulV2.md                                   28718
+gmm/grouped_matmul/docs/aclnnGroupedMatmulV3.md                                   32822
+gmm/grouped_matmul/docs/aclnnGroupedMatmulV4.md                                   67561
+gmm/grouped_matmul/docs/aclnnGroupedMatmulV5.md                                   56567
+gmm/grouped_matmul/docs/aclnnGroupedMatmulWeightNz.md                            110713
+gmm/grouped_matmul/examples/arch22/test_aclnn_grouped_matmul_a8w8.cpp             10456
+gmm/grouped_matmul/examples/arch35/...                                   (many variants)
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul.cpp                               222939
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul.h                                   4751
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul_v2.h                                4994
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul_v3.h                                5396
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul_v4.h                                7055
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul_v5.h                                6715
+gmm/grouped_matmul/op_api/aclnn_grouped_matmul_weight_nz.h                         6894
+gmm/grouped_matmul/op_api/grouped_matmul.cpp                                       4474
+gmm/grouped_matmul/op_api/grouped_matmul.h                                         1637
+gmm/grouped_matmul/op_api/grouped_matmul_950_checker.cpp                         110023
+gmm/grouped_matmul/op_api/grouped_matmul_950_checker.h                             7563
+gmm/common/cgmct/block/block_grouped_matmul_builder.h                              4797
+gmm/common/cgmct/utils/grouped_matmul_constant.h                                   2005
+experimental/gmm/grouped_matmul_quant/op_kernel/grouped_matmul_quant_w4a16.cpp    35173
+experimental/gmm/grouped_matmul_quant/op_kernel/grouped_matmul_quant_w4a16.h       4767
+experimental/gmm/gmm_add/op_kernel/grouped_matmul_utils.h                          3046
+experimental/gmm/gmm_k_dim/op_kernel/grouped_matmul_utils.h                        3046
+experimental/gmm/gmm_local_exp/op_kernel/grouped_matmul_utils.h                    3046
+experimental/gmm/gmm_local_exp_with_zero/op_kernel/grouped_matmul_utils.h          3046
+examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/op_kernel/grouped_matmul.h      16125
+examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/op_kernel/fkl_grouped_matmul_kernel.h 3012
+examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/op_kernel/grouped_matmul_tiling.h    12639
+examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/grouped_matmul.cpp              13195
+experimental/ffn/swiglu_gated_mlp/op_kernel/common/matmul_act/utils/grouped_matmul_constant.h       1669
+```
+
+Note `examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/` — a standalone
+hand-written grouped-matmul kernel for 910B specifically, outside the op framework. That is the
+closest public analogue to a hand-written AscendC grouped matmul.
+
+
+---
+
+## B5. ★★★ THE DEVICE-SIDE `groupList` DECODER and the per-group matmul re-pointing — official source
+
+This is the most directly reusable code in the whole dossier for Topic B. Two files.
+
+### B5.1 `grouped_matmul_utils.h` — `GetSplitValueFromGroupList`, all three `groupListType` modes on device
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h
+
+Author: Huawei Technologies Co., Ltd., 2026. Repo `hicann/ops-transformer`, branch `master`,
+15042 bytes. Fetched 2026-10-20.
+
+The two constants:
+
+```cpp
+constexpr uint32_t GROUP_LIST_TYPE_SPARSE = 2;
+constexpr uint32_t SPARSE_GROUP_LIST_SPLIT_VALUE_OFFSET = 1;
+```
+
+The decoder. Mode 0 takes the first difference of the cumsum and carries `preOffset` across
+iterations; mode 2 reads the second column of the `[E, 2]` array (hence `+1`); mode 1 reads the
+value directly. The `#if` guard also tells you which arches it is compiled for:
+
+```cpp
+#if ((defined(__CCE_AICORE__) && __CCE_AICORE__ != 310) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3113)) && \
+    !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 9201)
+__aicore__ inline int32_t GetSplitValueFromGroupList(uint32_t groupIdx, int32_t& preOffset,
+                                                     const GMMBaseParams* __restrict& gmmBaseParams,
+                                                     const GlobalTensor<int64_t>& groupListGm)
+{
+    int32_t splitValue = 0;
+    if (likely(gmmBaseParams->groupType != -1)) { // -1: no  need to split
+        if (gmmBaseParams->groupListType == 0) {
+            int32_t offset = static_cast<int32_t>(groupListGm.GetValue(groupIdx));
+            splitValue = offset - preOffset;
+            preOffset = offset;
+        } else if (gmmBaseParams->groupListType == GROUP_LIST_TYPE_SPARSE) {
+            splitValue = static_cast<int32_t>(groupListGm.GetValue(groupIdx + SPARSE_GROUP_LIST_SPLIT_VALUE_OFFSET));
+        } else {
+            splitValue = static_cast<int32_t>(groupListGm.GetValue(groupIdx));
+        }
+    }
+    return splitValue;
+}
+#endif
+```
+
+Note: `groupListGm` is `GlobalTensor<int64_t>` and the read is a scalar `GetValue` straight from
+GM — there is no `DataCopy` into UB for the group list in this path.
+
+The same `GetTensorAddr` TensorList trick as MegaMoE, in the official grouped matmul (note the
+index type is `uint16_t` here vs `uint32_t` in MegaMoE):
+
+```cpp
+template <typename T>
+__aicore__ inline __gm__ T* GetTensorAddr(uint16_t index, GM_ADDR tensorPtr)
+{
+    __gm__ uint64_t* dataAddr = reinterpret_cast<__gm__ uint64_t*>(tensorPtr);
+    uint64_t tensorPtrOffset = *dataAddr; // The offset of the data address from the first address.
+    // Moving 3 bits to the right means dividing by sizeof(uint64 t).
+    __gm__ uint64_t* retPtr = dataAddr + (tensorPtrOffset >> 3);
+    return reinterpret_cast<__gm__ T*>(*(retPtr + index));
+}
+```
+
+The matmul config the grouped matmul uses (basic-block sizes M128/N256/K128):
+
+```cpp
+__aicore__ static constexpr MatmulConfig GenGmmConf(bool isND2NZ)
+{
+    return {
+        .doNorm = false,
+        .doBasicBlock = false,
+        .doMultiDataLoad = true,
+        .basicM = BASIC_BLOCK_SIZE_128,
+        .basicN = BASIC_BLOCK_SIZE_256,
+        .basicK = BASIC_BLOCK_SIZE_128,
+        .intrinsicsCheck = false,
+        .isNBatch = false,
+        .enVecND2NZ = isND2NZ,
+        .doSpecialBasicBlock = false,
+        .doMTE2Preload = 0,
+```
+
+### B5.2 `grouped_matmul.h` (fast-kernel-launch, 910B) — the hand-written group loop and the per-group matmul re-point
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/examples/fast_kernel_launch_example/csrc/grouped_matmul/ascend910b/op_kernel/grouped_matmul.h
+
+Author: Huawei Technologies Co., Ltd., 2026. Repo `hicann/ops-transformer`, branch `master`,
+16125 bytes. Fetched 2026-10-20. This is a standalone hand-written grouped-matmul kernel for
+**910B specifically** (`ascend910b/`), outside the op framework — the closest public analogue to
+a hand-written AscendC grouped matmul in a megakernel.
+
+The header, showing it pulls the official utils and tiling-key headers into a hand-written kernel:
+
+```cpp
+/*!
+ * \file grouped_matmul.h
+ * \brief
+ */
+#ifndef ASCEND_OPS_GROUPED_MATMUL_H
+#define ASCEND_OPS_GROUPED_MATMUL_H
+
+// Data type definitions
+#define ORIG_DTYPE_X DT_BFLOAT16
+#define DTYPE_X bfloat16_t
+
+#define ORIG_DTYPE_WEIGHT DT_BFLOAT16
+#define DTYPE_WEIGHT bfloat16_t
+
+#define ORIG_DTYPE_Y DT_BFLOAT16
+#define DTYPE_Y bfloat16_t
+
+#define DTYPE_BIAS int
+#define DTYPE_SCALE uint64_t
+#define DTYPE_ANTIQUANT_SCALE half
+
+#include "gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h"
+#include "gmm/grouped_matmul/op_kernel/grouped_matmul_tiling_key.h"
+
+#include "grouped_matmul_tiling.h"
+
+namespace GROUPED_MATMUL {
+```
+
+`UpdateMnConfig` — THE per-group offset arithmetic, all five offsets advanced in one place. Note
+the NZ-vs-ND branch on the weight stride (`AlignUp<16>(k) * AlignUp<16>(n)` vs `k * n`):
+
+```cpp
+template <typename ComputeType>
+__aicore__ inline void GMMProcess<ComputeType>::UpdateMnConfig(MNConfig& mnConfig)
+{
+    if constexpr (B::format == CubeFormat::NZ) {
+        mnConfig.wBaseOffset += AlignUp<16>(mnConfig.k) * AlignUp<16>(mnConfig.n); // 16: nz format last two dim size
+    } else {
+        mnConfig.wBaseOffset += mnConfig.k * mnConfig.n;
+    }
+    mnConfig.nAxisBaseOffset += mnConfig.n;
+    mnConfig.scaleIndex++;
+    mnConfig.mAxisBaseOffset += mnConfig.m;
+    mnConfig.xBaseOffset += mnConfig.m * mnConfig.k;
+    mnConfig.yBaseOffset += mnConfig.m * mnConfig.n;
+}
+```
+
+`SetMNConfig` — how `groupType` decides which of M/K the `splitValue` lands on:
+
+```cpp
+    if (gmmBaseParams->groupType == 0) {
+        mnConfig.m = splitValue;
+        mnConfig.k = kListGm[valueIdx];
+        mnConfig.n = nListGm[valueIdx];
+        return;
+    }
+
+    if (gmmBaseParams->groupType == 2) {
+        mnConfig.m = mListGm[valueIdx];
+        mnConfig.k = splitValue;
+        mnConfig.n = nListGm[valueIdx];
+        return;
+    }
+
+    mnConfig.m = mListGm[groupIdx];
+    mnConfig.k = kListGm[groupIdx];
+    mnConfig.n = nListGm[groupIdx];
+    return;
+}
+```
+
+★ `Process()` — THE GROUP-LIST LOOP. Everything Topic B asked for: the loop over groups, the
+group-list read, the empty-group skip, the per-group block-dim computation, and the
+core-to-group work mapping via a running `count` that carries the core assignment across group
+boundaries. Note also `AscendC::WaitPreTaskEnd()` / `AscendC::SetNextTaskStart()` bracketing the
+whole thing — the SuperKernel inter-op barrier pair (same primitives as A5.6):
+
+```cpp
+template <typename ComputeType>
+__aicore__ inline void GMMProcess<ComputeType>::Process()
+{
+    MNConfig mnConfig;
+    if (gmmBaseParams->groupType != -1) { // -1: no split
+        if (unlikely(groupListPtr == nullptr)) {
+            return;
+        }
+        preOffset = 0;
+    }
+    AscendC::WaitPreTaskEnd();
+    for (uint32_t groupIdx = 0, count = 0; groupIdx < groupNum; ++groupIdx) {
+        UpdateMnConfig(mnConfig);
+        int32_t splitValue = GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
+        SetMNConfig(splitValue, groupIdx, mnConfig);
+        if (mnConfig.m <= 0 || mnConfig.k <= 0 || mnConfig.n <= 0) {
+            continue;
+        }
+        mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
+        mnConfig.blockDimN = Ceil(mnConfig.n, mnConfig.singleN);
+
+        uint32_t curCount = count + mnConfig.blockDimM * mnConfig.blockDimN;
+        uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
+        uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+
+        while (curBlock < curCount) {
+            MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+            computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
+            computeOp.VectorCompute(mnConfig);
+            curBlock += gmmBaseParams->coreNum;
+        }
+        count = curCount % gmmBaseParams->coreNum;
+    }
+    AscendC::SetNextTaskStart();
+}
+```
+
+The group-list GlobalTensor setup, once in `Init`:
+
+```cpp
+    GM_ADDR groupListPtr;
+    GlobalTensor<int64_t> groupListGm;
+```
+
+```cpp
+    groupListPtr = groupList;
+    if (groupListPtr != nullptr) {
+        groupListGm.SetGlobalBuffer((__gm__ int64_t*)groupList);
+```
+
+★ `SetGlobalBufferW` and `MMCompute` — THE PER-GROUP WEIGHT RE-POINTING AND THE MATMUL OBJECT
+RE-POINT. This is the exact `SetOrgShape` / `SetSingleShape` / `SetTensorA` / `SetTensorB` /
+`IterateAll` sequence Topic B asked for. Note that a FRESH `GlobalTensor<BT>` is constructed per
+group, pointed at `weightTensorPtr + wBaseOffset + wOffset`, and handed to `SetTensorB`; the
+matmul object `mm` itself is reused, only its shapes and tensors are reset:
+
+```cpp
+        wOffset = tailN * (UB_BLOCK_UNIT_SIZE / sizeof(BT)); // 32: quant is 32, float16 is 16
+    } else if constexpr (mmType::BT::format == CubeFormat::NZ) {
+        wOffset = tailN * AlignUp<16>(k); // 16: nz format last two dim size
+    } else if constexpr (transposeW) {
+        wOffset = tailN * k;
+    } else {
+        wOffset = tailN;
+    }
+    return wOffset;
+}
+
+template <typename mmType, bool sync>
+__aicore__ inline GlobalTensor<typename mmType::BT::T> GMMCompute<mmType, sync>::SetGlobalBufferW(uint32_t groupIdx,
+                                                                                                  uint32_t tailN,
+                                                                                                  MNConfig& mnConfig)
+{
+    uint64_t wOffset = SetWOffset(tailN, mnConfig.k);
+
+    GlobalTensor<BT> weightGmLocal;
+    weightGmLocal.SetGlobalBuffer((__gm__ bfloat16_t*)weightTensorPtr + mnConfig.wBaseOffset + wOffset);
+    return weightGmLocal;
+}
+
+template <typename mmType, bool sync>
+__aicore__ inline void GMMCompute<mmType, sync>::MMCompute(uint32_t groupIdx, MNConfig& mnConfig, uint32_t coreIdx)
+{
+    if (subBlockIdx != 0) {
+        return;
+    }
+    uint32_t tailN = mnConfig.nIdx * mnConfig.singleN;
+    uint32_t curSingleN = mnConfig.nIdx < mnConfig.blockDimN - 1 ? mnConfig.singleN : mnConfig.n - tailN;
+    uint32_t curSingleM =
+        mnConfig.mIdx < mnConfig.blockDimM - 1 ? mnConfig.singleM : mnConfig.m - mnConfig.mIdx * mnConfig.singleM;
+    uint64_t xOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.k;
+    if constexpr (transposeX) {
+        xOffset = mnConfig.mIdx * mnConfig.singleM;
+    }
+    uint64_t outOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.n + tailN;
+    xGm.SetGlobalBuffer((__gm__ bfloat16_t*)xTensorPtr);
+    GlobalTensor<BT> weightGmLocal = SetGlobalBufferW(groupIdx, tailN, mnConfig);
+    mm.SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+    mm.SetSingleShape(curSingleM, curSingleN, mnConfig.k);
+    mm.SetTensorA(xGm[xOffset], false);
+    mm.SetTensorB(weightGmLocal, transposeW);
+
+    yGm.SetGlobalBuffer((__gm__ bfloat16_t*)yTensorPtr + mnConfig.yBaseOffset);
+    mm.template IterateAll<sync>(yGm[outOffset], 0);
+}
+
+} // namespace GROUPED_MATMUL
+#endif // ASCEND_OPS_GROUPED_MATMUL_H
+```
+
+Reading this against `SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k)`: `SetOrgShape` is given the
+**group's** M/N/K (not the whole tensor's), and `SetSingleShape` the current tile's. So the
+"original shape" the matmul sees is re-declared per group, and the global position is carried
+entirely in the `GlobalTensor` offsets (`xGm[xOffset]`, `weightGmLocal`, `yGm[outOffset]`) with
+`mnConfig.{x,w,y}BaseOffset` advanced by `UpdateMnConfig` at the top of each iteration. That is a
+materially different idiom from the asc-devkit sample (B1.2), which keeps one `SetGlobalBuffer`
+for the lifetime of the kernel and slices only at `SetTensorA`/`SetTensorB`.
+
+
+### B5.3 The SwiGLU epilogue inside the fused MegaMoE kernel — where the `/2` gate/up split happens
+
+https://raw.githubusercontent.com/hicann/ops-transformer/master/mc2/mega_moe/op_kernel/arch22/utils/block_epilogue_pertoken_swiglu.hpp
+
+Author: Huawei Technologies Co., Ltd., 2026. Repo `hicann/ops-transformer`, branch `master`,
+24536 bytes. Fetched 2026-10-20.
+
+The class, specialised on a dispatch-policy tag that names the whole fusion
+(`PerTokenDequantSwigluQuant`):
+
+```cpp
+class BlockEpilogue<EpilogueAtlasA2PerTokenDequantSwigluQuant<UB_STAGES_>, CType_,
+```
+
+```cpp
+    using DispatchPolicy = EpilogueAtlasA2PerTokenDequantSwigluQuant<UB_STAGES_>;
+```
+
+The non-quantised `operator()`. Two things to take from it. First, `branchLength =
+shapeC.column() / 2` — the gate and up halves are the two halves of GMM1's N, which is why
+MegaMoE's GMM2 sets `k2 = params.problemShape.n() / 2` (B3.6). Second, the epilogue is
+parallelised over **rows** (`blockM`) across `epilogueCoreNum` cores via `GetTaskRange`, and the
+per-expert context is carried entirely in the caller's `gmC` / `gmD` base offsets plus
+`gmmOutPreRowStride` — the epilogue itself never sees a `groupIdx`:
+
+```cpp
+    CATLASS_DEVICE
+    void operator()(AscendC::GlobalTensor<ElementC> const& gmC, MatrixCoord const& shapeC,
+                    AscendC::GlobalTensor<ElementD> const& gmD, Arch::Resource<ArchTag> const& resource,
+                    uint32_t epilogueCoreNum = 40, float activationClamp = 0.0f, uint32_t activationCode = 0,
+                    float activationParams1 = SwigluOaiActivation::DEFAULT_ALPHA,
+                    float activationParams2 = SituActivation::DEFAULT_BETA, uint32_t gmmOutPreRowStride = 1,
+                    Callback&& callback = Callback{})
+    {
+        (void)resource;
+        activationCode_ = activationCode;
+        activationParams1_ = activationParams1;
+        activationParams2_ = activationParams2;
+        callback();
+        uint32_t blockM = shapeC.row();
+        uint32_t branchLength = shapeC.column() / 2;
+        uint32_t loopStartIdx = 0;
+        uint32_t tasksForIdx = 0;
+        if (!GetTaskRange(blockM, epilogueCoreNum, loopStartIdx, tasksForIdx)) {
+            return;
+        }
+
+        for (uint32_t loopIdx = loopStartIdx; loopIdx < loopStartIdx + tasksForIdx; ++loopIdx) {
+            auto gmTileC = gmC[loopIdx * gmmOutPreRowStride];
+            auto gmTileD = gmD[loopIdx * branchLength];
+            uint32_t tileCount = TileCount(branchLength);
+            uint32_t currentStage = 0;
+            LoadTile(gmTileC, branchLength, 0, TileLength(branchLength, 0), gmmOutPreRowStride, currentStage);
+            for (uint32_t tileIdx = 0; tileIdx < tileCount; ++tileIdx) {
+                uint32_t tileOffset = tileIdx * TILE_LENGTH;
+                uint32_t tileLength = TileLength(branchLength, tileOffset);
+                uint32_t nextStage = NextStage(currentStage);
+                uint32_t nextOffset = tileOffset + TILE_LENGTH;
+                if (nextOffset < branchLength) {
+                    LoadTile(gmTileC, branchLength, nextOffset, TileLength(branchLength, nextOffset),
+                             gmmOutPreRowStride, nextStage);
+                }
+                ComputeLoadedTile(currentStage, tileLength, 1.0f, false, activationClamp);
+                CopyDirectTile(currentStage, gmTileD[tileOffset], tileLength);
+                currentStage = nextStage;
+            }
+```
+
+Note the software-pipelined UB staging: `LoadTile` for tile `i+1` is issued before
+`ComputeLoadedTile` for tile `i`, with `currentStage` / `NextStage(currentStage)` rotating over
+`UB_STAGES_` buffers. That is the same depth-bounded ring idea as the flag credit windows in
+Topic A, applied to UB rather than to flags.
+
+The per-token-dequant overload additionally batches the scale loads, with its own
+`SCALE_INPUT_COUNT`-deep batching and an explicit drain:
+
+```cpp
+        uint32_t scaleBatchStart = loopStartIdx;
+        uint32_t scaleBatchCount = 0;
+        uint32_t scaleBatchIndex = 0;
+```
+
+```cpp
+            uint32_t scaleOffsetInBatch = (loopIdx - loopStartIdx) % SCALE_INPUT_COUNT;
+```
+
+```cpp
+        DrainScaleBuffers(scaleBatchIndex);
+```
+
+
+---
+
+## B6. `GroupedMatmulSwigluQuant`, CATLASS grouped-matmul templates, `ops-nn`, and MegaMoE design docs
+
+Second breadth pass over Topic B. Verification: 53 fenced blocks, 47 machine-checked as exact
+literal substrings of locally cached sources; the 6 that are not are all repo path/tree listings
+produced by `gh api .../git/trees/master?recursive=1` or directory walks, each labelled as such
+in place.
+
+### B6.0 Repo discovery — where GroupedMatmul actually lives
+
+The task brief guessed `cann/ops-nn`, `hicann/ops-nn`, `cann/cann-ops-adv`, `cann/cann-ops`,
+`cann/ops-math`. Result of probing gitcode:
+
+| candidate | status |
+| --- | --- |
+| `cann/ops-nn` | EXISTS. Walked the whole tree (6254 path entries at depth 2). NO `grouped_matmul` anywhere. Only `norm/group_norm*`, `quant/group_quant`, `quant/grouped_dynamic_*quant`, `activation/swiglu_group*`. Root categories are `activation cmake common control conv docs examples experimental foreach hash index loss matmul norm optim pooling quant rnn scripts tests torch_extension vfusion`; `matmul/` holds 34 ops, none grouped. |
+| `hicann/ops-nn` | 404 `Project not found:hicann/ops-nn` |
+| `cann/cann-ops-adv` | 404 `Project not found:cann/cann-ops-adv` |
+| `cann/cann-ops` | 404 `Project not found:cann/cann-ops` |
+| `cann/ops-math` | EXISTS (not the right place for GMM). |
+| `cann/catlass` | EXISTS. |
+| **`cann/ops-transformer`** | **EXISTS — this is the real home of every GroupedMatmul variant.** |
+
+Real paths found in `cann/ops-transformer` (branch `master`):
+
+```
+gmm/grouped_matmul
+gmm/grouped_matmul_activation_quant
+gmm/grouped_matmul_add
+gmm/grouped_matmul_finalize_routing
+gmm/grouped_matmul_swiglu_quant
+gmm/grouped_matmul_swiglu_quant_v2
+gmm/quant_grouped_matmul_dequant
+gmm/quant_grouped_matmul_inplace_add
+gmm/common
+mc2/allto_allv_grouped_mat_mul
+mc2/allto_allv_quant_grouped_mat_mul
+mc2/grouped_mat_mul_all_reduce
+mc2/grouped_mat_mul_allto_allv
+mc2/quant_grouped_mat_mul_allto_allv
+mc2/mega_moe                      <-- MegaMoE, open source
+experimental/gmm
+experimental/moe
+moe/moe_init_routing{,_v2,_v3,_v4}, moe/moe_re_routing{,_v2}, moe/moe_finalize_routing{,_v2}
+moe/moe_compute_expert_tokens, moe/moe_gating_top_k{,_softmax,_softmax_v2}
+moe/moe_token_permute*, moe/moe_token_unpermute*
+```
+
+`gmm/grouped_matmul/op_kernel` contents:
+
+```
+a16w4_msd/                                 (dir)
+arch35/                                    (dir)
+gmm_infra/                                 (dir)
+grouped_matmul.cpp
+grouped_matmul_a4w4.h
+grouped_matmul_a4w4_interface.cpp
+grouped_matmul_a4w4_regular.h
+grouped_matmul_antiquant.h
+grouped_matmul_antiquant_a16w8_msd.h
+grouped_matmul_antiquant_a8w4.h
+grouped_matmul_antiquant_a8w4_msd.h
+grouped_matmul_antiquant_a8w4_msd_new.h
+grouped_matmul_antiquant_a8w4_msd_pre.h
+grouped_matmul_antiquant_a8w4_msd_pre_nz.h
+grouped_matmul_antiquant_a8w4_pre.h
+grouped_matmul_apt.cpp
+grouped_matmul_autotiling_a8w4.h
+grouped_matmul_fixaxismove_interface.cpp
+grouped_matmul_fixaxismove_regular.h
+grouped_matmul_kernel.h                    <-- the driver loop
+grouped_matmul_pre_tiling.h
+grouped_matmul_quant_mixcore.h
+grouped_matmul_tiling_key.h
+grouped_matmul_utils.h                     <-- GetSplitValueFromGroupList
+grouped_matmul_vector.h
+```
+
+---
+
+### B6.1 AUTHORITATIVE `group_list_type` SEMANTICS
+
+#### B6.1.1 The one-line op-definition comment (host side)
+
+https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul/op_host/grouped_matmul_def.cpp
+author/date: unknown — Huawei Technologies Co., Ltd., repo cann/ops-transformer branch master, fetched 2026-10-20
+
+```cpp
+        this->Attr("split_item").AttrType(OPTIONAL).Int(0);
+        this->Attr("dtype").AttrType(OPTIONAL).Int(0); // Reserved parameter, indicate output data type, not enabled.
+        this->Attr("transpose_weight")
+            .AttrType(OPTIONAL)
+            .Bool(false); // Reserved parameter, indicate wether input weight is transposed, not enabled.
+        this->Attr("transpose_x")
+            .AttrType(OPTIONAL)
+            .Bool(false); // Reserved parameter, indicate wether input x is transposed, not enabled.
+        this->Attr("group_type").AttrType(OPTIONAL).Int(-1); // Indicates the splited dimension.
+        this->Attr("group_list_type")
+            .AttrType(OPTIONAL)
+            .Int(0); // Indicates whether the value in group_dist is cumsum or count.
+        this->Attr("act_type").AttrType(OPTIONAL).Int(0);            // Indicate activation function type.
+        this->Attr("tuning_config").AttrType(OPTIONAL).ListInt({0}); // Indicate activation function type.
+
+```
+
+#### B6.1.2 The device-side decoder — the single place the enum is turned into a per-group M
+
+https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul/op_kernel/grouped_matmul_utils.h
+author/date: unknown — Huawei Technologies Co., Ltd., repo cann/ops-transformer branch master, fetched 2026-10-20
+
+Constants first (lines 193-195):
+
+```cpp
+constexpr uint32_t STATIC_TILING_MAX_SINGLE_N = 1024;
+constexpr uint32_t GROUP_LIST_TYPE_SPARSE = 2;
+constexpr uint32_t SPARSE_GROUP_LIST_SPLIT_VALUE_OFFSET = 1;
+```
+
+`GetTensorAddr` — how a TensorList input becomes a device pointer (this is how
+multi-tensor weight lists are indexed per expert):
+
+```cpp
+    uint64_t tensorPtrOffset = *dataAddr; // The offset of the data address from the first address.
+    // Moving 3 bits to the right means dividing by sizeof(uint64 t).
+    __gm__ uint64_t* retPtr = dataAddr + (tensorPtrOffset >> 3);
+    return reinterpret_cast<__gm__ T*>(*(retPtr + index));
+}
+
+#if ((defined(__CCE_AICORE__) && __CCE_AICORE__ != 310) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3113)) && \
+    !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 9201)
+__aicore__ inline int32_t GetSplitValueFromGroupList(uint32_t groupIdx, int32_t& preOffset,
+```
+
+And the decoder itself. **This is the authoritative device-side semantics**: `groupListType == 0`
+means the value read from GM is a cumulative offset and the per-group size is
+`offset - preOffset`; anything else (i.e. `1`) means the value IS the group size; `2` is the
+sparse `[groupIdx, groupSize]` pair layout and the size sits at offset `+1`.
+
+```cpp
+#if ((defined(__CCE_AICORE__) && __CCE_AICORE__ != 310) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3113)) && \
+    !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 9201)
+__aicore__ inline int32_t GetSplitValueFromGroupList(uint32_t groupIdx, int32_t& preOffset,
+                                                     const GMMBaseParams* __restrict& gmmBaseParams,
+                                                     const GlobalTensor<int64_t>& groupListGm)
+{
+    int32_t splitValue = 0;
+    if (likely(gmmBaseParams->groupType != -1)) { // -1: no  need to split
+        if (gmmBaseParams->groupListType == 0) {
+            int32_t offset = static_cast<int32_t>(groupListGm.GetValue(groupIdx));
+            splitValue = offset - preOffset;
+            preOffset = offset;
+        } else if (gmmBaseParams->groupListType == GROUP_LIST_TYPE_SPARSE) {
+            splitValue = static_cast<int32_t>(groupListGm.GetValue(groupIdx + SPARSE_GROUP_LIST_SPLIT_VALUE_OFFSET));
+        } else {
+            splitValue = static_cast<int32_t>(groupListGm.GetValue(groupIdx));
+        }
+    }
+    return splitValue;
+}
+#endif
+
+template <typename T>
+__aicore__ inline constexpr uint32_t GetTypeBits()
+{
+```
+
+Note the guard: on `__CCE_AICORE__ == 310` and on `__NPU_ARCH__ == 9201` this function is
+compiled out entirely (a different arch-specific path is used).
+
+#### B6.1.3 The user-facing documented semantics (aclnnGroupedMatmulV4)
+
+https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul/docs/aclnnGroupedMatmulV4.md
+author/date: unknown — Huawei Technologies Co., Ltd., repo cann/ops-transformer branch master, fetched 2026-10-20
+
+The attribute table (lines 282-309):
+
+```
+      <td>splitItem（int64_t）</td>
+      <td>输入</td>
+      <td>整数型参数，代表输出是否要做tensor切分。</td>
+      <td>0/1代表输出为多tensor；2/3代表输出为单tensor。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>groupType（int64_t）</td>
+      <td>输入</td>
+      <td>整数型参数，代表需要分组的轴。</td>
+      <td>枚举值-1、0、2。如矩阵乘为C[m,n]=A[m,k]xB[k,n]，则groupType取值-1：不分组，0：m轴分组，2：k轴分组。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>groupListType（int64_t）</td>
+      <td>输入</td>
+      <td>-</td>
+      <td>枚举值0、1、2。综合约束请参见<a href="#约束说明">约束说明。</a></td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+```
+
+The constraint paragraph (line 593) — the single most explicit statement of the enum:
+
+```
+    - groupListType为0时要求groupListOptional中数值为非负单调非递减数列，表示分组轴大小的cumsum结果（累积和），groupListType为1时要求groupListOptional中数值为非负数列，表示分组轴上每组大小，groupListType为2时要求groupListOptional中数值为非负数列，shape为[E, 2]，E表示Group大小，数据排布为[[groupIdx0, groupSize0], [groupIdx1, groupSize1]...]，其中groupSize为分组轴上每组大小，详见[groupListOptional配置示例](#grouplistoptional配置示例)。
+    - groupType代表需要分组的轴，如矩阵乘为C[m,n]=A[m,k]xB[k,n]，则groupType取值-1：不分组，0：m轴分组，2：k轴分组。详细参考<a href="#groupType-constraints">groupType支持场景</a>约束。
+```
+
+The worked example that pins all three encodings against the SAME routing (lines 798-814).
+This is the thing to copy when you hand-build a groupList for 256 experts:
+
+```
+    - shape信息
+      M = 789、 K=4096、 N=7168 、E = 9（0,2,5个专家有需要处理的token，0处理123个token， 2/5处理333个token）
+      X的shape是[[789, 4096]]
+      W的shape是[[9, 4096, 7168]]
+      Y的shape是[[789, 7168]]
+
+    - groupListType为0时groupList配置如下
+      - groupListOptional：`[123, 123, 456, 456, 456, 789, 789, 789, 789]`
+
+    - groupListType为1时groupList配置如下
+      - groupListOptional：`[123, 0, 333, 0, 0, 333, 0, 0, 0]`
+
+    - groupListType为2时groupList配置如下
+      - groupListOptional在该模式会将所有非0的group移动到前面，适用于非激活专家较多场景。
+      - groupListOptional：`[[0, 123], [2, 333], [5, 333], [1, 0], [3, 0], [4, 0], [6, 0], [7, 0], [8, 0]]`
+    </details>
+
+```
+
+Ascend 950PR/950DT公共约束 (lines 824-830):
+
+```
+  - 公共约束：
+
+    - groupListType：支持取值0、1、2。
+      - 当groupListType为0时，groupListOptional必须为非负单调非递减数列；
+      - 当groupListType为1时，groupListOptional必须为非负数列。
+      - 仅全量化且groupType为0场景下支持groupListType为2，此时要求groupListOptional中数值为非负数列，shape为[E, 2]，E表示Group大小，数据排布为[[groupIdx0, groupSize0], [groupIdx1, groupSize1]...]，其中groupSize为分组轴上每组大小，此时groupedSize为零的组置于groupList末尾，非零组被前置，详见[groupListOptional配置示例](#grouplistoptional配置示例)。
+    - actType（int64\_t，计算输入）：整数型参数，代表激活函数类型，取值范围为0-5。
+```
+
+#### B6.1.4 Max group count, and the per-arch group-count ceilings
+
+From the same doc, `groupType` support table (lines 782-788). Note the hard numbers:
+`groupListOptional` first dim max **25600** for non-quant FLOAT16/BFLOAT16 with
+groupListType 0/1 single-single-single, **1024** otherwise, and only **128** when weight is a
+multi-tensor list.
+
+```
+      | groupType | x tensor数 | weight tensor数 | y tensor数 | splitItem| groupListOptional | 转置 | 其余场景限制 |
+      |:---------:|:-------:|:-------:|:-------:|:--------:|:------------------|:--------| :-------|
+      | -1 | 多个|多个|多个 | 0/1 | groupListOptional必须传空 | 1）x不支持转置；<br> 2）支持weight转置，但weight的tensorList中每个tensor是否转置需保持统一| x中tensor要求维度一致，支持2维，weight中tensor需为2维，y中tensor维度和x保持一致 |
+      | 0 | 单个|单个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第一维；当groupListType为1时，数值的总和应小于等于x中tensor的第一维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第一维；<br> 3）groupListOptional第1维在非量化FLOAT16/BFLOAT16且groupListType为0/1时最大支持25600，其他场景最大支持1024 |1）x不支持转置；<br> 2）支持weight转置，A8W4与A4W4场景不支持weight转置 |weight中tensor需为3维，x，y中tensor需为2维|
+      | 0 | 单个|多个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第一维；当groupListType为1时，数值的总和应小于等于x中tensor的第一维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第一维；<br> 3）groupListOptional第1维最大支持128，即最多支持128个group|1）x不支持转置；<br> 2）支持weight转置，但weight的tensorList中每个tensor是否转置需保持统一 |1）x，weight，y中tensor需为2维；<br> 2）weight中每个tensor的N轴必须相等 |
+      | 0 | 多个|多个|单个 | 2/3 | 1）groupListOptional可选；<br> 2）若传入groupListOptional，当groupListType为0时，groupListOptional的差值需与x中tensor的第一维一一对应；当groupListType为1时，groupListOptional的数值需与x中tensor的第一维一一对应；当groupListType为2时，groupListOptional第二列的数值需与x中tensor的第一维一一对应；<br> 3）groupListOptional第1维最大支持128，即最多支持128个group |1）x不支持转置；<br> 2）支持weight转置，但weight的tensorList中每个tensor是否转置需保持统一|1）x，weight，y中tensor需为2维；<br> 2）weight中每个tensor的N轴必须相等 |
+      | 2 | 单个|单个|单个 | 2/3 | 1）必须传groupListOptional；<br> 2）当groupListType为0时，最后一个值应小于等于x中tensor的第二维；当groupListType为1时，数值的总和应小于等于x中tensor的第二维；当groupListType为2时，第二列数值的总和应小于等于x中tensor的第二维；<br> 3）groupListOptional第1维最大支持1024，即最多支持1024个group | 1）x必须转置；<br> 2）weight不能转置 |1）x，weight中tensor需为2维，y中tensor需为3维；<br> 2）bias必须传空|
+```
+
+---
+
+### B6.2 `GroupedMatmul` production driver loop (ops-transformer, A2/A3 path)
+
+This is the `op_kernel/grouped_matmul_kernel.h` template actually shipped in `ops-transformer`
+(distinct from the `examples/fast_kernel_launch_example` copy). Quoted for the core→group
+mapping and the diagonal block walk, which the examples copy does not have in the same form.
+
+#### B6.2.1 Per-group offset bump — `UpdateMnConfig`
+
+https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul/op_kernel/grouped_matmul_kernel.h
+author/date: unknown — Huawei Technologies Co., Ltd., repo cann/ops-transformer branch master, fetched 2026-10-20
+
+```cpp
+    return;
+}
+
+template <typename ComputeType>
+__aicore__ inline void GMMProcess<ComputeType>::UpdateMnConfig(MNConfig& mnConfig)
+{
+    if constexpr (B::format == CubeFormat::NZ) {
+        mnConfig.wBaseOffset +=
+            static_cast<uint64_t>(AlignUp<16>(mnConfig.k)) * AlignUp<16>(mnConfig.n); // 16: nz format last two dim size
+    } else {
+        mnConfig.wBaseOffset += static_cast<uint64_t>(mnConfig.k) * mnConfig.n;
+    }
+    mnConfig.nAxisBaseOffset += mnConfig.n;
+    mnConfig.scaleIndex++;
+    mnConfig.mAxisBaseOffset += mnConfig.m;
+    mnConfig.xBaseOffset += static_cast<uint64_t>(mnConfig.m) * mnConfig.k;
+    mnConfig.yBaseOffset += static_cast<uint64_t>(mnConfig.m) * mnConfig.n;
+}
+
+template <typename ComputeType>
+__aicore__ inline bool GMMProcess<ComputeType>::UpdateMnConfigForGroupListMSparse(MNConfig& mnConfig,
+                                                                                  uint32_t splitValue,
+                                                                                  uint32_t groupIdx)
+{
+    mnConfig.mAxisBaseOffset += mnConfig.m;
+    mnConfig.xBaseOffset += static_cast<uint64_t>(mnConfig.m) * mnConfig.k;
+    mnConfig.yBaseOffset += static_cast<uint64_t>(mnConfig.m) * mnConfig.n;
+    mnConfig.scaleIndex++;
+    SetMNConfig(splitValue, groupIdx, mnConfig);
+    if (mnConfig.m <= 0 || mnConfig.k <= 0 || mnConfig.n <= 0) {
+        return true; // skip
+    }
+
+    mnConfig.nAxisBaseOffset = static_cast<uint64_t>(groupIdx) * mnConfig.n;
+    if constexpr (GMMProcess<ComputeType>::B::format == CubeFormat::NZ) {
+        mnConfig.wBaseOffset = static_cast<uint64_t>(AlignUp<16>(mnConfig.k)) * AlignUp<16>(mnConfig.nAxisBaseOffset);
+    } else {
+        mnConfig.wBaseOffset = static_cast<uint64_t>(mnConfig.k) * mnConfig.nAxisBaseOffset;
+    }
+```
+
+#### B6.2.2 `Process()` — the group loop plus the core→block mapping for MANY groups
+
+Key mechanic for 256 experts: `count` is a running modulo-`coreNum` cursor. Each group
+contributes `blockDimM * blockDimN` basic blocks to one global block stream; a core picks up
+blocks `curBlock += coreNum`, and at group boundaries `count = curCount % coreNum` CARRIES THE
+PHASE so the next group starts where the previous one left off. There is no per-group barrier
+and no idle core on tiny groups — a group with 0 tokens is simply `continue`d.
+
+```cpp
+}
+
+template <typename ComputeType>
+__aicore__ inline void GMMProcess<ComputeType>::Process()
+{
+    MNConfig mnConfig;
+    if (gmmBaseParams->groupType != -1) { // -1: no split
+        if (unlikely(groupListPtr == nullptr)) {
+            return;
+        }
+        preOffset = 0;
+    }
+    AscendC::WaitPreTaskEnd();
+    // 2: groupList shape: [e, 2]; 1: groupList shape: [e]
+    uint32_t groupListType = gmmBaseParams->groupListType;
+    uint32_t groupListInnerShape = groupListType == GROUP_LIST_TYPE_SPARSE ? 2 : 1;
+    uint32_t groupListShapeSize = groupNum * groupListInnerShape;
+    for (uint32_t groupIdx = 0, count = 0; groupIdx < groupListShapeSize; groupIdx += groupListInnerShape) {
+        UpdateMnConfig(mnConfig);
+        int32_t splitValue = GetSplitValueFromGroupList(groupIdx, preOffset, gmmBaseParams, groupListGm);
+        if (groupListType == GROUP_LIST_TYPE_SPARSE && splitValue <= 0) {
+            break;
+        }
+        SetMNConfig(splitValue, groupIdx, mnConfig);
+        if (mnConfig.m <= 0 || mnConfig.k <= 0 || mnConfig.n <= 0) {
+            continue;
+        }
+        mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
+        mnConfig.blockDimN = Ceil(mnConfig.n, mnConfig.singleN);
+
+        uint32_t curCount = count + mnConfig.blockDimM * mnConfig.blockDimN;
+        uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
+        uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+
+        while (curBlock < curCount) {
+            MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+            computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
+            computeOp.VectorCompute(mnConfig);
+            curBlock += gmmBaseParams->coreNum;
+        }
+        count = curCount % gmmBaseParams->coreNum;
+    }
+    computeOp.PostCompute();
+    AscendC::SetNextTaskStart();
+}
+
+```
+
+#### B6.2.3 The diagonal (anti-same-address) basic-block index computation
+
+`thresholdBlockNum = 8`, `thresholdDimM = 5` on A2/A3 (`1` on 310):
+
+```cpp
+namespace GROUPED_MATMUL {
+
+constexpr uint32_t thresholdBlockNum = 8; // 8 is obtained by tests, indicating the threshold of basic block numbers
+                                          // in both directions when assigning data blocks to cube cores when using
+                                          // diagnal strategy
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 200
+constexpr uint32_t thresholdDimM = 1; // not needs any special strategies
+#else
+constexpr uint32_t thresholdDimM = 5; // 5 is obtained by tests, indicating the threshold for distinguishing
+                                      // strategies for large/small shapes
+#endif
+```
+
+```cpp
+
+__aicore__ inline void MNBlockIdxCompute(MNConfig& mnConfig, const uint32_t curBlock, const uint32_t count,
+                                         const uint32_t thresholdM_dimN)
+{
+    if (mnConfig.blockDimM <= thresholdDimM || thresholdDimM == 1) {
+        mnConfig.mIdx = (curBlock - count) / mnConfig.blockDimN;
+        mnConfig.nIdx = (curBlock - count) % mnConfig.blockDimN;
+    } else {
+        uint32_t relativeBlock = curBlock - count;
+        uint32_t curThresholdM = relativeBlock >= AlignDown(mnConfig.blockDimM * mnConfig.blockDimN, thresholdM_dimN) ?
+                                     mnConfig.blockDimM % thresholdBlockNum :
+                                     thresholdBlockNum;
+        uint32_t curThresholdM_thresholdN = curThresholdM * thresholdBlockNum;
+        uint32_t curThresholdN =
+            relativeBlock % thresholdM_dimN >= AlignDown(curThresholdM * mnConfig.blockDimN, curThresholdM_thresholdN) ?
+                mnConfig.blockDimN % thresholdBlockNum :
+                thresholdBlockNum;
+
+        uint32_t localRelativeBlock = relativeBlock % thresholdM_dimN % curThresholdM_thresholdN;
+        mnConfig.mIdx = localRelativeBlock % curThresholdM + relativeBlock / thresholdM_dimN * thresholdBlockNum;
+        mnConfig.nIdx = (localRelativeBlock + localRelativeBlock / LeastCommonMultiple(curThresholdM, curThresholdN)) %
+                            curThresholdN +
+                        relativeBlock % thresholdM_dimN / curThresholdM_thresholdN * thresholdBlockNum;
+    }
+}
+```
+
+#### B6.2.4 Per-expert weight re-pointing and the full matmul API sequence
+
+`SetWOffset` + `SetGlobalBufferW` + `MMCompute`. Note `SetL2CacheHint(CACHE_MODE_DISABLE)` on
+the weight tensor when `blockDimM == 1` — i.e. when a group's weight is streamed once and never
+reused, do not pollute L2. This is a directly transplantable trick for a 256-expert megakernel.
+
+```cpp
+template <typename mmType, bool sync>
+__aicore__ inline uint64_t GMMCompute<mmType, sync>::SetWOffset(uint32_t tailN, uint32_t k)
+{
+    uint64_t wOffset = 0;
+    if constexpr (mmType::BT::format == CubeFormat::NZ && transposeW) {
+        wOffset = tailN * (UB_BLOCK_UNIT_SIZE / sizeof(BT)); // 32: quant is 32, float16 is 16
+    } else if constexpr (mmType::BT::format == CubeFormat::NZ) {
+        wOffset = tailN * AlignUp<16>(k); // 16: nz format last two dim size
+    } else if constexpr (transposeW) {
+        wOffset = tailN * k;
+    } else {
+        wOffset = tailN;
+    }
+    return wOffset;
+}
+
+template <typename mmType, bool sync>
+__aicore__ inline GlobalTensor<typename mmType::BT::T> GMMCompute<mmType, sync>::SetGlobalBufferW(uint32_t groupIdx,
+                                                                                                  uint32_t tailN,
+                                                                                                  MNConfig& mnConfig)
+{
+    uint64_t wOffset = SetWOffset(tailN, mnConfig.k);
+#if defined(GMM_ANTI_QUANT) && !defined(GMM_ANTI_QUANT_A8W4_MSD)
+    return weightGm[transposeW ? mnConfig.workSpaceOffset - tailN + wOffset : mnConfig.workSpaceOffset];
+#else
+    GlobalTensor<BT> weightGmLocal;
+    if (singleWeight == 0) {
+        weightGmLocal.SetGlobalBuffer(GetTensorAddr<BT>(groupIdx, weightTensorPtr) + wOffset);
+    } else if (isA8W4FakeQuant) {
+        weightGmLocal.SetGlobalBuffer(reinterpret_cast<__gm__ BT*>(weightTensorPtr) + mnConfig.wBaseOffset + wOffset);
+    } else {
+        weightGmLocal.SetGlobalBuffer(GetTensorAddr<BT>(0, weightTensorPtr) + mnConfig.wBaseOffset + wOffset);
+    }
+#if !(defined(ASCENDC_OOM) && ASCENDC_OOM == 1)
+    if (mnConfig.blockDimM == 1) {
+        weightGmLocal.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    }
+#endif
+    return weightGmLocal;
+#endif
+}
+```
+
+```cpp
+
+template <typename mmType, bool sync>
+__aicore__ inline void GMMCompute<mmType, sync>::MMCompute(uint32_t groupIdx, MNConfig& mnConfig, uint32_t coreIdx,
+                                                           uint32_t listIndex)
+{
+    if (subBlockIdx != 0) {
+        return;
+    }
+    uint32_t tailN = mnConfig.nIdx * mnConfig.singleN;
+    uint32_t curSingleN = mnConfig.nIdx < mnConfig.blockDimN - 1 ? mnConfig.singleN : mnConfig.n - tailN;
+    uint32_t curSingleM =
+        mnConfig.mIdx < mnConfig.blockDimM - 1 ? mnConfig.singleM : mnConfig.m - mnConfig.mIdx * mnConfig.singleM;
+    uint64_t xOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.k;
+    if constexpr (transposeX) {
+        xOffset = mnConfig.mIdx * mnConfig.singleM;
+    }
+    uint64_t outOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.n + tailN;
+    // init global buffer
+    if (singleX == 0) {
+        if (groupListType == GROUP_LIST_TYPE_SPARSE && groupType == 0) { // 0: split M
+            xGm.SetGlobalBuffer(GetTensorAddr<AT>(listIndex, xTensorPtr));
+        } else {
+            xGm.SetGlobalBuffer(GetTensorAddr<AT>(groupIdx, xTensorPtr));
+        }
+    } else {
+        xGm.SetGlobalBuffer(GetTensorAddr<AT>(0, xTensorPtr) + mnConfig.xBaseOffset);
+    }
+    GlobalTensor<BT> weightGmLocal = SetGlobalBufferW(groupIdx, tailN, mnConfig);
+    mm.SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+    mm.SetSingleShape(curSingleM, curSingleN, mnConfig.k);
+    mm.SetTensorA(xGm[xOffset], transposeX);
+    mm.SetTensorB(weightGmLocal, transposeW);
+#if defined(GMM_QUANT_INT8)
+    if (singleWeight == 0) {
+        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_SCALE>(groupIdx, scaleTensorPtr));
+    } else {
+        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_SCALE>(0, scaleTensorPtr) + mnConfig.nAxisBaseOffset);
+    }
+    mm.SetQuantVector(scaleGm[tailN]);
+#endif
+    SetGlobalBufferBias(groupIdx, tailN, mnConfig);
+    if (singleY == 0) {
+        if (groupListType == GROUP_LIST_TYPE_SPARSE && groupType == 0) {
+            yGm.SetGlobalBuffer(GetTensorAddr<CT>(listIndex, yTensorPtr));
+        } else {
+            yGm.SetGlobalBuffer(GetTensorAddr<CT>(groupIdx, yTensorPtr));
+        }
+    } else {
+        yGm.SetGlobalBuffer(GetTensorAddr<CT>(0, yTensorPtr) + mnConfig.yBaseOffset);
+    }
+#if defined(GMM_ANTI_QUANT)
+    mm.template IterateAll<false>(yGm[outOffset], 0, false, true);
+    mmWaitStatus = true;
+#else
+    mm.template IterateAll<sync>(yGm[outOffset], 0);
+#endif
+}
+```
+
+#### B6.2.5 The design doc on core-splitting across many groups (Chinese, verbatim)
+
+https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul/docs/GroupedMatmul%E7%AE%97%E5%AD%90%E8%AE%BE%E8%AE%A1%E4%BB%8B%E7%BB%8D.md
+author/date: unknown — Huawei Technologies Co., Ltd. (CC-BY-4.0 header), repo cann/ops-transformer branch master, fetched 2026-10-20
+
+This section states the hard constraint that forces the basic-block scheme: the kernel CANNOT
+instantiate one matmul high-level-API object per group.
+
+`````
+## 3.3 基本块分核方案
+
+GroupedMatmul实现时需要考虑输入为多个tensor的情况，即每组matmul的shape可能各不相同，而kernel侧不能为每组matmul单独配置对应的matmul高阶api接口实例（tiling结构体和core栈空间大小均不允许）。为了适配不同shape的matmul计算，GroupedMatmul采用基本块方式（横向分核），以baseM、baseN为基本块进行分核计算，此处baseM/baseN为matmul的参数。
+
+![基本块分核](../../../docs/zh/figures/gmm_horizontal_core_partition_scheme.png)
+
+## 3.4 对角线分核方案
+
+按基本块方案进行分核，容易存在同地址访问的问题，例如当基本块方案中nDim=coreNum时，则同一时间所有的核都在访问左矩阵的相同地址，对性能影响较大。因此当基本块数量超过coreNum时（没超过coreNum时，对角线方案无法解决同地址访问问题），可以采用如下对角线方案，同一时间不同核尽量错开对数据的访问，每个方块代表一个输出的基本块，数字代表基本块遍历顺序（横向分核为原始基本块分核方案）。
+
+![对角线分核](../../../docs/zh/figures/gmm_diagonal_core_partition_scheme.png)
+
+对于适合对角线优化的场景，在基本块方案上输入数据会存在多次访问，当nDim/mDim很大时，“对角线”不能直接任意往下延伸，否则在k值比较大的场景下，对角线上对应的输入数据均为不同的数据，已经加载过一次的数据被新数据从L2 cache中替换掉，后续需要加载时还是从DDR内存中加载，导致性能劣化。因此需要限制对角线范围，以充分利用L2 cache中缓存的数据。
+
+![对角线分组](../../../docs/zh/figures/gmm_diagonal_grouping_scheme.png)
+
+将对角线遍历按阈值进行分组，为尽量避免同地址访问，两个方向的阈值最好都不小于实际的物理核数，因此有：
+
+$$
+\min(T_m, T_n) \geq numCore
+$$
+
+为充分利用cache，一个分组块对应的$X$、$Weight$、$Y$的总数据量最好不超过设备的L2 cache大小，因此有:
+
+$$
+sizeof(dtype) \cdot (T_m \cdot singleM \cdot K + K \cdot T_n \cdot singleN + T_m \cdot singleM \cdot T_n \cdot singleN) \leq L2_{size}
+$$
+
+若两个条件不能同时满足，须根据实际情况做取舍。
+`````
+
+GMMArray — how per-group m/k/n lists reach the device when inputs are multi-tensor:
+
+`````
+## 3.1 tilingData设计
+
+```c++
+BEGIN_TILING_DATA_DEF(GMMTilingData)
+  TILING_DATA_FIELD_DEF_STRUCT(GMMBaseParams, gmmBaseParams);
+  TILING_DATA_FIELD_DEF_STRUCT(GMMArray, gmmArray);
+  TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTilingData);
+END_TILING_DATA_DEF;
+```
+
+tilingData主要包含上述结构里的三个部分：
+
+1. GMMBaseParams: GroupedMatmul的分组数量、Aicore核数、ub tiling参数、matmul分核tiling参数等基础tiling参数，是否有激活函数、量化类型（per token或per tensor）、激活函数类型等功能参数;
+2. GMMArray: 当输入是多tensor时，通过三个数组记录每组Matmul的shape, kernel通过GlobalTensor::GetValue()的方式获取。当输入为全单tensor时，m/k/n中的一个值在group_list中，另外两个值在所有的group中都相同，此时kernel只需要访问数组中的第一个值。
+3. TCubeTiling: matmul高阶api对应的tilingData。
+
+kernel中为了避免在栈空间中申请GMMArray中3个数组以及避免拷贝这些数组，采用GET_TILING_DATA_MEMBER接口拷贝除GMMArray之外的结构体。
+`````
+
+---
+
+### B6.3 GAP 1 — `GroupedMatmulSwigluQuant`: how SwiGLU is fused with the per-expert GEMM
+
+#### B6.3.1 Real paths
+
+```
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_pipeline.h
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant.cpp
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_a8w4_msd_mid.h
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_a8w4_msd_post.h
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_a8w4_msd_pre.h
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_kernel.h   <-- quoted below
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_split_ws.h
+gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_utils_kernel.h
+gmm/grouped_matmul_swiglu_quant_v2/op_kernel/...                 (35 files, arch35 + a4w4/a8w4 MSD)
+gmm/common/cgmct/kernel/kernel_gmm_swiglu_pertoken_quant.h       (CATLASS-style "cgmct" variant)
+gmm/common/cgmct/kernel/kernel_gmm_swiglu_mxquant.h
+gmm/common/cgmct/epilogue/block_epilogue_dequant_swiglu.h
+gmm/common/cgmct/epilogue/cgmct_block_epilogue_swiglu_mx_quant.h
+```
+
+#### B6.3.2 THE central design fact: cube and vector use TWO DIFFERENT decompositions
+
+https://github.com/hicann/ops-transformer/blob/master/gmm/grouped_matmul_swiglu_quant/op_kernel/grouped_matmul_swiglu_quant_kernel.h
+author/date: unknown — Huawei Technologies Co., Ltd., repo hicann/ops-transformer branch master (pushed 2026-10-20), fetched 2026-10-20
+
+The AIC side walks groups and basic blocks exactly like plain GroupedMatmul, writing int32
+matmul output to a GM workspace. It does NOT do SwiGLU. Note this kernel hardcodes the cumsum
+reading (`currSplitValue - prevSplitValue`) — there is no `groupListType` switch here at all.
+
+```cpp
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::CubeProcess(MNConfig& mnConfig)
+{
+    if ASCEND_IS_AIC {
+        preOffset = 0;
+        int32_t prevSplitValue = 0;
+        for (uint32_t groupIdx = 0, count = 0; groupIdx < gmmSwiglu->groupListLen; ++groupIdx) {
+            UpdateMnConfig(mnConfig);
+            int32_t currSplitValue = static_cast<int32_t>(groupListGM.GetValue(groupIdx));
+            int32_t splitValue = currSplitValue - prevSplitValue;
+            prevSplitValue = currSplitValue;
+            SetMNConfig(splitValue, groupIdx, mnConfig);
+            if (mnConfig.m <= 0 || mnConfig.k <= 0 || mnConfig.n <= 0) {
+                continue;
+            }
+            mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
+            mnConfig.blockDimN = Ceil(mnConfig.n, mnConfig.singleN);
+
+            uint32_t curCount = count + mnConfig.blockDimM * mnConfig.blockDimN;
+            uint32_t curBlock = blockIdx >= count ? blockIdx : blockIdx + gmmBaseParams->coreNum;
+            uint32_t thresholdM_dimN = THRESHOLD_BLOCK_NUM * mnConfig.blockDimN;
+
+            while (curBlock < curCount) {
+                MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+                MMCompute(groupIdx, mnConfig, blockIdx);
+                curBlock += aicCoreNum;
+            }
+            count = curCount % gmmBaseParams->coreNum;
+        }
+        GmmsqAllCoreCubeVecStageBarrier();
+    }
+}
+
+```
+
+The AIV side ignores groups for load-balancing purposes: it reduces the whole groupList to a
+total row count `vecConfig.M`, splits THAT flat row range evenly across AIV cores, and then
+walks the groupList a SECOND time to recover which expert its first row belongs to
+(`vecConfig.curGroupIdx`) and after how many rows it must advance to the next expert
+(`vecConfig.nextUpadteInterVal`). That is the per-expert scale addressing.
+Chinese step comments 第一步/第二步/第三步/第四步 are original.
+
+```cpp
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::UpdateVecConfig(uint32_t blockIdx,
+                                                                                     VecConfig& vecConfig)
+{
+    // 第一步 读取grouplist reduceSum 计算总数据个数
+    int64_t prevM = 0;
+    for (uint32_t groupIdx = 0; groupIdx < gmmSwiglu->groupListLen; groupIdx++) {
+        int64_t currM = groupListGM.GetValue(groupIdx);
+        int64_t tempM = currM - prevM;
+        prevM = currM;
+        vecConfig.M += tempM;
+    }
+    // 第二步 计算分核
+    uint32_t eachCoreTaskNum = (vecConfig.M + aivCoreNum - 1) / aivCoreNum;
+    vecConfig.usedCoreNum = vecConfig.M >= aivCoreNum ? aivCoreNum : vecConfig.M;
+    uint32_t tailCoreIdx = vecConfig.M - (eachCoreTaskNum - 1) * vecConfig.usedCoreNum;
+    vecConfig.taskNum = blockIdx < tailCoreIdx ? eachCoreTaskNum : eachCoreTaskNum - 1;
+    vecConfig.startIdx =
+        blockIdx < tailCoreIdx ? eachCoreTaskNum * blockIdx : ((eachCoreTaskNum - 1) * blockIdx + tailCoreIdx);
+    vecConfig.curIdx = vecConfig.startIdx;
+    vecConfig.startOffset = vecConfig.startIdx * gmmSwiglu->tokenLen;
+    vecConfig.curOffset = vecConfig.startOffset;
+    int64_t curStartIdx = vecConfig.startIdx;
+    prevM = 0;
+    for (uint32_t groupIdx = 0; groupIdx < gmmSwiglu->groupListLen; groupIdx++) {
+        int64_t currM = groupListGM.GetValue(groupIdx);
+        int64_t tempM = currM - prevM;
+        prevM = currM;
+        if (curStartIdx >= 0 && curStartIdx - tempM < 0) {
+            vecConfig.curGroupIdx = groupIdx;
+            vecConfig.nextUpadteInterVal = tempM - curStartIdx;
+        }
+        curStartIdx -= tempM;
+    }
+    // 第三步 计算总数据量
+    vecConfig.outLoopNum = (vecConfig.taskNum + gmmSwiglu->maxProcessRowNum - 1) / gmmSwiglu->maxProcessRowNum;
+    vecConfig.tailLoopNum = vecConfig.taskNum % gmmSwiglu->maxProcessRowNum ?
+                                vecConfig.taskNum % gmmSwiglu->maxProcessRowNum :
+                                gmmSwiglu->maxProcessRowNum;
+    pipe->Reset();
+    // 第四步 申请空间
+    pipe->InitBuffer(mmOutQueue, DOUBLE_BUFFER, gmmSwiglu->maxProcessRowNum * gmmSwiglu->tokenLen * sizeof(int32_t));
+    pipe->InitBuffer(perChannelScaleInQueue, DOUBLE_BUFFER, gmmSwiglu->tokenLen * sizeof(float));
+    pipe->InitBuffer(quantOutQueue, DOUBLE_BUFFER,
+                     gmmSwiglu->maxProcessRowNum * gmmSwiglu->tokenLen / SWIGLU_REDUCE_FACTOR * sizeof(int8_t));
+    pipe->InitBuffer(quantScaleOutQueue, DOUBLE_BUFFER,
+                     AlignUp<int32_t>(gmmSwiglu->maxProcessRowNum, ALIGN_8_ELE) * sizeof(float));
+    // two 32 byte buffer for reduceMax calculation in Quant.
+    pipe->InitBuffer(reduceWorkspace, gmmSwiglu->tokenLen / SWIGLU_REDUCE_FACTOR * sizeof(float) + UB_BLOCK_UNIT_SIZE +
+                                          UB_BLOCK_UNIT_SIZE);
+}
+
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+```
+
+#### B6.3.3 Per-expert `perChannelScale` addressing (`groupIdx * tokenLen`) and the quant buffers
+
+```cpp
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::Init(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR perChannelScale, GM_ADDR perTokenScale, GM_ADDR groupList, GM_ADDR quantOutput,
+    GM_ADDR quantScaleOutput, GM_ADDR workspace, const GMMSwigluBaseParams* __restrict gmmSwigluBaseParamsIn,
+    const TCubeTiling* __restrict mmTilingDataIN, const GMMSwiglu* __restrict gmmSwigluIN, TPipe* tPipeIN)
+{
+    aicCoreNum = GetBlockNum();
+    aivCoreNum = aicCoreNum * 2;
+    blockIdx = GetBlockIdx();
+    mmTilingData = mmTilingDataIN;
+    gmmBaseParams = gmmSwigluBaseParamsIn;
+    gmmSwiglu = gmmSwigluIN;
+    pipe = tPipeIN;
+    xTensorPtr = x;
+    weightTensorPtr = weight;
+    groupListGM.SetGlobalBuffer((__gm__ int64_t*)groupList, gmmSwiglu->groupListLen);
+    mmOutGM.SetGlobalBuffer((__gm__ int32_t*)workspace, gmmBaseParams->M * gmmSwiglu->tokenLen);
+    if ASCEND_IS_AIV {
+        perChannelScaleGM.SetGlobalBuffer((__gm__ CHANNELDTYPE*)perChannelScale,
+                                          gmmSwiglu->groupListLen * gmmSwiglu->tokenLen);
+        perTokenScaleGM.SetGlobalBuffer((__gm__ float*)perTokenScale, gmmBaseParams->M);
+        quantOutputGM.SetGlobalBuffer((__gm__ int8_t*)quantOutput,
+                                      gmmBaseParams->M * gmmSwiglu->tokenLen / SWIGLU_REDUCE_FACTOR);
+        quantScaleOutputGM.SetGlobalBuffer((__gm__ float*)quantScaleOutput, gmmBaseParams->M);
+    }
+}
+
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::Process()
+{
+    MNConfig mnConfig;
+    VecConfig vecConfig;
+    CubeProcess(mnConfig);
+    VecProcess(vecConfig);
+}
+
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+template <typename DTYPE_CS>
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::PreLoadTokenAndChannel(
+    LocalTensor<float>& channelScaleLocal, VecConfig& vecConfig)
+{
+    DataCopyExtParams copyChannelParams{1, static_cast<uint32_t>(gmmSwiglu->tokenLen * sizeof(DTYPE_CS)), 0, 0, 0};
+    DataCopyPadExtParams<DTYPE_CS> padParams{false, 0, 0, 0};
+    if constexpr (!IsSameType<DTYPE_CS, float>::value) {
+        LocalTensor<DTYPE_CS> dstLocalT = channelScaleLocal.template ReinterpretCast<DTYPE_CS>();
+        DataCopyPad(dstLocalT[gmmSwiglu->tokenLen], perChannelScaleGM[vecConfig.curGroupIdx * gmmSwiglu->tokenLen],
+                    copyChannelParams, padParams);
+        GmmsqSetWaitFlag<HardEvent::MTE2_V>();
+        Cast(channelScaleLocal, dstLocalT[gmmSwiglu->tokenLen], RoundMode::CAST_NONE, gmmSwiglu->tokenLen);
+        PipeBarrier<PIPE_V>();
+    } else {
+        DataCopyPad(channelScaleLocal, perChannelScaleGM[vecConfig.curGroupIdx * gmmSwiglu->tokenLen],
+                    copyChannelParams, padParams);
+        GmmsqSetWaitFlag<HardEvent::MTE2_V>();
+    }
+    perChannelScaleInQueue.EnQue(channelScaleLocal);
+}
+
+```
+
+#### B6.3.4 The cube-side `MMCompute` of the fused kernel — output goes to workspace, not y
+
+```cpp
+template <typename mmType, bool sync, typename CHANNELDTYPE>
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::MMCompute(uint32_t groupIdx, MNConfig& mnConfig,
+                                                                               uint32_t coreIdx)
+{
+    uint32_t tailN = mnConfig.nIdx * mnConfig.singleN;
+    uint32_t curSingleN = mnConfig.nIdx < mnConfig.blockDimN - 1 ? mnConfig.singleN : mnConfig.n - tailN;
+    uint32_t curSingleM =
+        mnConfig.mIdx < mnConfig.blockDimM - 1 ? mnConfig.singleM : mnConfig.m - mnConfig.mIdx * mnConfig.singleM;
+    uint64_t xOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.k;
+    if constexpr (transposeX) {
+        xOffset = mnConfig.mIdx * mnConfig.singleM;
+    }
+    uint64_t outOffset = mnConfig.mIdx * mnConfig.singleM * mnConfig.n + tailN;
+    xGM.SetGlobalBuffer((__gm__ int8_t*)xTensorPtr + mnConfig.xBaseOffset);
+    weightGM.SetGlobalBuffer((__gm__ int8_t*)weightTensorPtr + mnConfig.wBaseOffset + GetWOffset(tailN, mnConfig.k));
+    if (mnConfig.blockDimM == 1) {
+        weightGM.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    }
+    mnConfig.workSpaceOffset = outOffset + mnConfig.yBaseOffset;
+    mm.SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+    mm.SetSingleShape(curSingleM, curSingleN, mnConfig.k);
+    mm.SetTensorA(xGM[xOffset], transposeX);
+    mm.SetTensorB(weightGM, transposeW);
+    mm.template IterateAll<sync>(mmOutGM[mnConfig.workSpaceOffset], 0);
+}
+
+```
+
+#### B6.3.5 The AIV pipeline body, including the all-core cube/vector stage barrier
+
+`GmmsqAllCoreCubeVecStageBarrier()` is called once on the AIC side at the end of `CubeProcess`
+and twice on the AIV side (once after buffer alloc + scale preload, once implicitly by ordering).
+This is the only cross-cube/vector sync in the fused op.
+
+```cpp
+__aicore__ inline void GMMSwigluCompute<mmType, sync, CHANNELDTYPE>::VecProcess(VecConfig& vecConfig)
+{
+    if ASCEND_IS_AIV {
+        UpdateVecConfig(blockIdx, vecConfig);
+        if (blockIdx < vecConfig.usedCoreNum) {
+            LocalTensor<float> channelScaleLocal = perChannelScaleInQueue.AllocTensor<float>();
+            LocalTensor<int32_t> mmLocal = mmOutQueue.AllocTensor<int32_t>();
+            LocalTensor<int8_t> quantLocal = quantOutQueue.AllocTensor<int8_t>();
+            LocalTensor<float> quantScaleLocal = quantScaleOutQueue.AllocTensor<float>();
+            mmOutQueue.EnQue(mmLocal);
+            quantScaleOutQueue.EnQue(quantScaleLocal);
+            quantOutQueue.EnQue(quantLocal);
+            PreLoadTokenAndChannel<CHANNELDTYPE>(channelScaleLocal, vecConfig);
+        }
+        GmmsqAllCoreCubeVecStageBarrier();
+        if (blockIdx < vecConfig.usedCoreNum) {
+            int32_t eventIdVToMTE3 = static_cast<int32_t>(GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>());
+            for (uint32_t outLoopIdx = 0; outLoopIdx < vecConfig.outLoopNum; outLoopIdx++) {
+                vecConfig.innerLoopNum =
+                    outLoopIdx == (vecConfig.outLoopNum - 1) ? vecConfig.tailLoopNum : gmmSwiglu->maxProcessRowNum;
+                customDataCopyIn(outLoopIdx, vecConfig);
+                for (uint32_t innerLoopIdx = 0; innerLoopIdx < vecConfig.innerLoopNum; innerLoopIdx++) {
+                    UpdateChannelScale<CHANNELDTYPE>(innerLoopIdx, vecConfig);
+                    VectorCompute(innerLoopIdx, vecConfig);
+                }
+                SetFlag<HardEvent::V_MTE3>(eventIdVToMTE3);
+                WaitFlag<HardEvent::V_MTE3>(eventIdVToMTE3);
+                customDataCopyOut(vecConfig);
+            }
+            GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(eventIdVToMTE3);
+
+            LocalTensor<float> channelScaleLocal = perChannelScaleInQueue.DeQue<float>();
+            LocalTensor<int32_t> mmLocal = mmOutQueue.DeQue<int32_t>();
+            LocalTensor<int8_t> quantLocal = quantOutQueue.DeQue<int8_t>();
+            LocalTensor<float> quantScaleLocal = quantScaleOutQueue.DeQue<float>();
+            perChannelScaleInQueue.FreeTensor(channelScaleLocal);
+            mmOutQueue.FreeTensor(mmLocal);
+            quantScaleOutQueue.FreeTensor(quantScaleLocal);
+            quantOutQueue.FreeTensor(quantLocal);
+        } else {
+            return;
+        }
+    }
+}
+
+```
+
+---
+
+### B6.4 GAP 2 — CATLASS grouped matmul templates
+
+#### B6.4.1 Where it lives
+
+`cann/catlass` on gitcode is mirrored (same content, authenticated access works) as
+**`hicann/catlass` on GitHub**, `master`, pushed 2026-10-19, 849 MB, 3487 tracked paths.
+`cann/catlass` and `Ascend/catlass` 404 on GitHub; use `hicann/catlass`.
+
+Grouped-matmul kernel templates, real paths:
+
+```
+include/catlass/gemm/kernel/group_gemm.hpp
+include/catlass/gemm/kernel/grouped_matmul.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_k.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_k_per_token_dequant.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_gelu.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_per_tensor_per_channel_dequant_tla.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_per_token_dequant.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_per_token_dequant_multistage_workspace.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_per_token_dequant_tla.hpp
+include/catlass/gemm/kernel/grouped_matmul_slice_m_tla.hpp
+include/catlass/gemm/kernel/grouped_mx_matmul_finalize_routing_no_deter_tla.hpp
+include/catlass/gemm/kernel/grouped_mx_matmul_finalize_routing_tla.hpp
+include/catlass/gemm/kernel/grouped_mx_matmul_slice_m_aswt_tla.hpp
+include/catlass/gemm/kernel/grouped_mx_matmul_slice_m_swiglu_mx_quant_tla.hpp
+include/catlass/gemm/kernel/grouped_mx_matmul_slice_m_tla.hpp
+include/catlass/gemm/kernel/weight_quant_a8w4_grouped_mx_matmul.hpp
+include/catlass/gemm/block/block_swizzle_grouped_aswt.hpp
+examples/02_grouped_matmul_slice_m/, 05_grouped_matmul_slice_k/, 08_grouped_matmul/,
+examples/07_grouped_matmul_slice_m_per_token_dequant_moe/, 10_, 11_, 16_group_gemm/,
+examples/35_w4a8_grouped_matmul_msd/, 47_ascend950_grouped_matmul_slice_m_per_token_dequant/
+```
+
+#### B6.4.2 `GroupedMatmulSliceM` — the canonical group loop and per-group pointer advance
+
+https://github.com/hicann/catlass/blob/master/include/catlass/gemm/kernel/grouped_matmul_slice_m.hpp
+author/date: unknown — Copyright (c) 2025 Huawei Technologies Co., Ltd., repo hicann/catlass branch master, fetched 2026-10-20
+
+Note three things relevant to a hand-written megakernel:
+
+1. The groupList read is a per-element `GetValue` with an explicit cumsum-difference, and the
+   cumsum-vs-count choice is a COMPILE-TIME macro `CATLASS_EXPERIMENTAL_GROUPLIST_SEGMENTED`
+   (defined → the value IS the group size; undefined → cumsum, diff with previous).
+2. `gmGroupOffsetA/B/C` advance by `m*k`, `k*n`, `m*n` after each group — three running int64
+   accumulators, no table.
+3. `startCoreIdx = (startCoreIdx + coreLoops) % coreNum` is the whole core→group mapping. No
+   barrier between groups.
+
+```cpp
+    template <int32_t CORE_TYPE = g_coreType>
+    CATLASS_DEVICE void operator()(Params const& params);
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        BlockScheduler blockScheduler;
+        Arch::Resource<ArchTag> resource;
+        BlockMmad blockMmad(resource);
+
+        // Represent the full gm
+        AscendC::GlobalTensor<ElementA> gmA;
+        gmA.SetGlobalBuffer(params.ptrA);
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(params.ptrC);
+        AscendC::GlobalTensor<ElementGroupList> groupList;
+        groupList.SetGlobalBuffer(params.ptrGroupList);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreNum = AscendC::GetBlockNum();
+        int64_t gmGroupOffsetA = 0;
+        int64_t gmGroupOffsetB = 0;
+        int64_t gmGroupOffsetC = 0;
+
+        uint32_t startCoreIdx = 0;
+        for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+#ifdef CATLASS_EXPERIMENTAL_GROUPLIST_SEGMENTED
+            uint32_t currentM = groupList.GetValue(groupIdx);
+#else
+            uint32_t currentM = (groupIdx == 0) ? groupList.GetValue(groupIdx) :
+                                                  (groupList.GetValue(groupIdx) - groupList.GetValue(groupIdx - 1));
+#endif
+            GemmCoord inGroupProblemShape{currentM, params.problemShape.n(), params.problemShape.k()};
+
+            LayoutA layoutA = params.layoutA.GetTileLayout(inGroupProblemShape.GetCoordMK());
+            LayoutB layoutB = params.layoutB;
+            LayoutC layoutC = params.layoutC.GetTileLayout(inGroupProblemShape.GetCoordMN());
+
+            blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+            uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+            AscendC::GlobalTensor<ElementB> gmB;
+            gmB.SetGlobalBuffer(params.ptrB + gmGroupOffsetB);
+            if (CeilDiv(currentM, L1TileShape::M) == 1) {
+                gmB.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+            }
+
+            // Determine the starting loopIdx of the current core under the current groupIdx
+            uint32_t startLoopIdx;
+            if (coreIdx < startCoreIdx) {
+                startLoopIdx = coreIdx + coreNum - startCoreIdx;
+            } else {
+                startLoopIdx = coreIdx - startCoreIdx;
+            }
+            // Loop through the matmul of each groupIdx
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+                // Compute block location
+                GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
+                GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+
+                // Compute initial location in logical coordinates
+                MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+                MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+                MatrixCoord offsetC{blockCoord.m() * L1TileShape::M, blockCoord.n() * L1TileShape::N};
+                int64_t gmOffsetA = layoutA.GetOffset(offsetA);
+                int64_t gmOffsetB = layoutB.GetOffset(offsetB);
+                int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+
+                // Compute block-scoped matrix multiply-add
+                blockMmad(
+                    gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB[gmOffsetB], layoutB, gmC[gmGroupOffsetC + gmOffsetC],
+                    layoutC, actualBlockShape);
+            }
+
+            gmGroupOffsetA += static_cast<int64_t>(inGroupProblemShape.m()) * inGroupProblemShape.k();
+            gmGroupOffsetB += static_cast<int64_t>(inGroupProblemShape.k()) * inGroupProblemShape.n();
+            gmGroupOffsetC += static_cast<int64_t>(inGroupProblemShape.m()) * inGroupProblemShape.n();
+
+            startCoreIdx = (startCoreIdx + coreLoops) % coreNum;
+        }
+
+        if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+            blockMmad.SynchronizeBlock();
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+```
+
+#### B6.4.3 `GroupedMatmul` — the fully general per-group problem-shape list (MAX_TENSOR_COUNT = 256)
+
+https://github.com/hicann/catlass/blob/master/include/catlass/gemm/kernel/grouped_matmul.hpp
+author/date: unknown — Copyright (c) 2025 Huawei Technologies Co., Ltd., repo hicann/catlass branch master, fetched 2026-10-20
+
+Here there is no groupList at all; instead the host hands in GM arrays of `GemmCoord`
+problem shapes and of per-group `LayoutA/B/C`, and the kernel COPIES ALL OF THEM INTO CORE
+STACK ARRAYS of size 256 at kernel entry via `UnpackListParam` (a uint64-granular memcpy from
+GM). `MAX_TENSOR_COUNT = 256` is exactly the routed-expert count of interest, and
+`CanImplement` rejects anything larger.
+
+```cpp
+namespace detail {
+
+template <class T>
+CATLASS_DEVICE void UnpackListParam(T* const dst, GM_ADDR src, uint32_t len)
+{
+    for (uint32_t i = 0; i * sizeof(uint64_t) < len * sizeof(T); ++i) {
+        reinterpret_cast<uint64_t*>(dst)[i] = reinterpret_cast<__gm__ uint64_t*>(src)[i];
+    }
+}
+
+} // namespace detail
+
+```
+
+```cpp
+// Template for grouped matmul kernel. Compute grouped C = A * B
+template <class BlockMmad_, class BlockEpilogue_, class BlockScheduler_>
+class GroupedMatmul {
+public:
+    using BlockMmad = BlockMmad_;
+    using ArchTag = typename BlockMmad::ArchTag;
+    using L1TileShape = typename BlockMmad::L1TileShape;
+    using ElementA = typename BlockMmad::ElementA;
+    using LayoutA = typename BlockMmad::LayoutA;
+    using ElementB = typename BlockMmad::ElementB;
+    using LayoutB = typename BlockMmad::LayoutB;
+    using ElementC = typename BlockMmad::ElementC;
+    using LayoutC = typename BlockMmad::LayoutC;
+    using ElementAccumulator = typename BlockMmad::ElementAccumulator;
+
+    using BlockScheduler = BlockScheduler_;
+    static constexpr uint32_t MAX_TENSOR_COUNT = 256;
+
+```
+
+```cpp
+        uint8_t* ptrLayoutC;
+    };
+    static bool CanImplement(const Arguments& args)
+    {
+        if (args.problemCount > MAX_TENSOR_COUNT) {
+            return false;
+        }
+        return true;
+    }
+```
+
+The device body — group-problem-shape iteration plus per-group pointer advance:
+
+```cpp
+
+    template <int32_t CORE_TYPE = g_coreType>
+    CATLASS_DEVICE void operator()(Params const& params);
+
+    /// Executes matmul
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        GemmCoord problemShapeList[MAX_TENSOR_COUNT];
+        LayoutA layoutAList[MAX_TENSOR_COUNT];
+        LayoutB layoutBList[MAX_TENSOR_COUNT];
+        LayoutC layoutCList[MAX_TENSOR_COUNT];
+
+        // Get matmul information from parameters
+        detail::UnpackListParam(problemShapeList, params.ptrProblemShape, params.problemCount);
+        detail::UnpackListParam(layoutAList, params.ptrLayoutA, params.problemCount);
+        detail::UnpackListParam(layoutBList, params.ptrLayoutB, params.problemCount);
+        detail::UnpackListParam(layoutCList, params.ptrLayoutC, params.problemCount);
+
+        BlockScheduler matmulBlockScheduler;
+        Arch::Resource<ArchTag> resource;
+        BlockMmad blockMmad(resource);
+
+        // Represent the full gm
+        AscendC::GlobalTensor<ElementA> gmA;
+        gmA.SetGlobalBuffer((__gm__ ElementA*)params.ptrA);
+        AscendC::GlobalTensor<ElementB> gmB;
+        gmB.SetGlobalBuffer((__gm__ ElementB*)params.ptrB);
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer((__gm__ ElementC*)params.ptrC);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreNum = AscendC::GetBlockNum();
+        int64_t inGroupOffsetA = 0;
+        int64_t inGroupOffsetB = 0;
+        int64_t inGroupOffsetC = 0;
+
+        uint32_t startCoreIdx = 0;
+        for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+            GemmCoord problemShape = problemShapeList[groupIdx];
+            LayoutA layoutA = layoutAList[groupIdx];
+            LayoutB layoutB = layoutBList[groupIdx];
+            LayoutC layoutC = layoutCList[groupIdx];
+
+            matmulBlockScheduler.Update(problemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+            uint32_t coreLoops = matmulBlockScheduler.GetCoreLoops();
+
+            // Determine the starting loopIdx of the current core under the current groupIdx
+            uint32_t startLoopIdx;
+            if (coreIdx < startCoreIdx) {
+                startLoopIdx = coreIdx + coreNum - startCoreIdx;
+            } else {
+                startLoopIdx = coreIdx - startCoreIdx;
+            }
+            // Loop through the matmul of each groupIdx
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+                // Compute block location
+                GemmCoord blockCoord = matmulBlockScheduler.GetBlockCoord(loopIdx);
+                GemmCoord actualBlockShape = matmulBlockScheduler.GetActualBlockShape(blockCoord);
+
+                // Compute initial location in logical coordinates
+                MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+                MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+                MatrixCoord offsetC{blockCoord.m() * L1TileShape::M, blockCoord.n() * L1TileShape::N};
+                int64_t gmOffsetA = layoutA.GetOffset(offsetA);
+                int64_t gmOffsetB = layoutB.GetOffset(offsetB);
+                int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+
+                // Compute block-scoped matrix multiply-add
+                blockMmad(
+                    gmA[inGroupOffsetA + gmOffsetA], layoutA, gmB[inGroupOffsetB + gmOffsetB], layoutB,
+                    gmC[inGroupOffsetC + gmOffsetC], layoutC, actualBlockShape);
+            }
+
+            inGroupOffsetA += static_cast<int64_t>(problemShape.m()) * problemShape.k();
+            inGroupOffsetB += static_cast<int64_t>(problemShape.k()) * problemShape.n();
+            inGroupOffsetC += static_cast<int64_t>(problemShape.m()) * problemShape.n();
+
+            startCoreIdx = (startCoreIdx + coreLoops) % coreNum;
+```
+
+#### B6.4.4 `GemmGroupedAswtTailSplitSwizzle` — the per-group core window that carries across groups
+
+https://github.com/hicann/catlass/blob/master/include/catlass/gemm/block/block_swizzle_grouped_aswt.hpp
+author/date: unknown — Copyright (c) 2026 Huawei Technologies Co., Ltd., repo hicann/catlass branch master, fetched 2026-10-20
+
+This is the most directly reusable piece for a 256-expert megakernel: an explicit
+"rolling round bookkeeping (carried across groups, no barrier)" state machine, with a
+tail-split that fires only when the final wave of a group leaves at least half the cores idle.
+
+```cpp
+template <uint32_t WindowLen = 4, bool TransA = false, bool TransB = true>
+struct GemmGroupedAswtTailSplitSwizzle {
+    static constexpr uint32_t BLOCK_CUBE = 16;                // cube alignment
+    static constexpr uint32_t INNER_AXIS_MIN_SPLIT_VAL = 128; // ND2NZ cache-line size
+
+    /// Result of GetBlockShape: tile size (m, n) plus the sub-tile offset inside the base tile.
+    /// For non tail-split tiles mOffset == nOffset == 0.
+    struct AswtBlockShape {
+        uint32_t m;
+        uint32_t n;
+        uint32_t mOffset;
+        uint32_t nOffset;
+    };
+
+    /// Data members ---------------------------------------------------------------------------
+
+    // Current group problem dims.
+    uint32_t m_{0};
+    uint32_t n_{0};
+    uint32_t k_{0};
+    // Base tile. baseM_ may be rebalanced per group through UpdateBaseM().
+    uint32_t baseM_{1};
+    uint32_t baseN_{1};
+    // Derived per-problem quantities (cached while m/n unchanged across groups).
+    uint32_t mCnt_{1};
+    uint32_t nCnt_{1};
+    uint32_t totalCnt_{1};
+    uint32_t mBaseTail_{0};
+    uint32_t nBaseTail_{0};
+    uint32_t mainMWindow_{1};
+    uint32_t mainRow_{0};
+    uint32_t tailWindow_{1};
+    // Per-core rolling round bookkeeping (carried across groups, no barrier).
+    uint32_t blockNum_{1};
+    uint32_t blockIdx_{0};
+    uint32_t startBlockIdx_{0};
+    uint32_t endBlockIdx_{0};
+    uint32_t round_{0};
+    uint32_t roundIdx_{0};
+    // Tail-split state (only the last group ever sets tailCnt_ > 1).
+    uint32_t mTailCnt_{1};
+    uint32_t nTailCnt_{1};
+    uint32_t tailCnt_{1};
+    uint32_t tailBlockBase_{0};
+    uint32_t nTailAlign_{BLOCK_CUBE};
+
+```
+
+```cpp
+    /// Methods --------------------------------------------------------------------------------
+
+    CATLASS_DEVICE
+    GemmGroupedAswtTailSplitSwizzle()
+    {}
+
+    CATLASS_DEVICE
+    GemmGroupedAswtTailSplitSwizzle(uint32_t baseM, uint32_t baseN)
+        : baseM_(baseM),
+          baseN_(baseN),
+          blockNum_(AscendC::GetBlockNum()),
+          blockIdx_(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum()),
+          endBlockIdx_(AscendC::GetBlockNum() - 1)
+    {
+        // Tail-split N min alignment. For TransB (ColumnMajor weight) aclnn uses BLOCK_CUBE; for
+        // !TransB the split is additionally forced to INNER_AXIS_MIN_SPLIT_VAL inside GetBlockShape
+        // (a multiple of BLOCK_CUBE), so this default suffices for both layouts.
+        nTailAlign_ = BLOCK_CUBE;
+    }
+
+    /// Optional base-M rebalance for the current group. Pass L1_TILE_M for plain ASWT.
+    CATLASS_DEVICE
+    void UpdateBaseM(uint32_t baseM)
+    {
+        baseM_ = baseM;
+    }
+
+    /// Start a new group. Recomputes window params (cached on m/n) and rolls the core window.
+    CATLASS_DEVICE
+    void UpdateNextProblem(GemmCoord const& problemShape)
+    {
+        k_ = problemShape.k();
+        if (m_ != problemShape.m() || n_ != problemShape.n()) {
+            m_ = problemShape.m();
+            n_ = problemShape.n();
+            mCnt_ = CeilDiv(m_, baseM_);
+            nCnt_ = CeilDiv(n_, baseN_);
+            mBaseTail_ = m_ - (mCnt_ - 1) * baseM_;
+            nBaseTail_ = n_ - (nCnt_ - 1) * baseN_;
+            totalCnt_ = mCnt_ * nCnt_;
+            mainMWindow_ = (WindowLen < mCnt_) ? WindowLen : mCnt_;
+            mainRow_ = mCnt_ / mainMWindow_ - 1;
+            tailWindow_ = mCnt_ - mainMWindow_ * mainRow_;
+        }
+        // Reset tail-split state for every group (only the last group re-enables it).
+        mTailCnt_ = 1;
+        nTailCnt_ = 1;
+        tailCnt_ = 1;
+        tailBlockBase_ = 0;
+
+        roundIdx_ = 0;
+        round_ = CeilDiv(totalCnt_, blockNum_);
+        // The first physical block of the new group continues right after the previous group's end.
+        startBlockIdx_ = (endBlockIdx_ == blockNum_ - 1) ? 0 : (endBlockIdx_ + 1);
+        // The last physical block of the new group.
+        endBlockIdx_ = (totalCnt_ + startBlockIdx_ - 1) % blockNum_;
+        // Cores outside [startBlockIdx_, endBlockIdx_] handle one fewer round.
+        if (startBlockIdx_ > endBlockIdx_ && (blockIdx_ > endBlockIdx_ && blockIdx_ < startBlockIdx_)) {
+            round_ -= 1;
+        } else if (startBlockIdx_ <= endBlockIdx_ && (blockIdx_ > endBlockIdx_ || blockIdx_ < startBlockIdx_)) {
+            round_ -= 1;
+        }
+    }
+
+    /// Number of physical cores that own a tile in the current group's final wave.
+    CATLASS_DEVICE
+    uint32_t GetTailTileCnt() const
+    {
+        return Min(endBlockIdx_ + 1, totalCnt_);
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetEndBlockIdx() const
+    {
+        return endBlockIdx_;
+    }
+
+    /// Whether a tail-split is worthwhile: only when at least half the cores are idle in the final
+    /// wave (matches aclnn IfNeedSplit).
+    CATLASS_DEVICE
+    bool NeedTailSplit() const
+    {
+        return (endBlockIdx_ + 1) <= (blockNum_ / 2);
+```
+
+#### B6.4.5 The SwiGLU+MX-quant fused grouped matmul in CATLASS (bridges gap 1 and gap 2)
+
+https://github.com/hicann/catlass/blob/master/include/catlass/gemm/kernel/grouped_mx_matmul_slice_m_swiglu_mx_quant_tla.hpp
+author/date: unknown — Huawei Technologies Co., Ltd., repo hicann/catlass branch master, fetched 2026-10-20
+
+Note `N_half` — the gate/up split is handled by halving N of the in-group problem shape, and the
+two halves are addressed by separate offsets rather than by two separate GEMMs. Note also that
+here `currentM = groupList.GetValue(groupIdx)` is read as a PER-GROUP COUNT (no cumsum diff),
+i.e. this template assumes groupListType == 1.
+
+```cpp
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreNum = AscendC::GetBlockNum();
+
+        AscendC::GlobalTensor<ElementA> gmA;
+        gmA.SetGlobalBuffer((__gm__ ElementA*)params.ptrA);
+        AscendC::GlobalTensor<ElementQ> gmQ;
+        gmQ.SetGlobalBuffer((__gm__ ElementQ*)params.ptrQ);
+        AscendC::GlobalTensor<ElementGroupList> groupList;
+        groupList.SetGlobalBuffer(params.ptrGroupList);
+
+        constexpr uint32_t elems = UB_TWO_BANK_ELEMS_B32 * PER_BLOCK_SIZE;
+        mmResUb_ping_ = AscendC::LocalTensor<ElementC>(AscendC::TPosition::VECCALC, 0, elems);
+        mmResUb_pong_ = AscendC::LocalTensor<ElementC>(AscendC::TPosition::VECCALC, elems * sizeof(ElementC), elems);
+
+        int64_t gmGroupOffsetB = 0;
+        int64_t gmGroupOffsetMxScaleA = 0;
+        int64_t gmGroupOffsetMxScaleB = 0;
+        int64_t mxScaleAlignedK =
+            static_cast<int64_t>(CeilDiv<MX_BASEK_FACTOR>(params.problemShape.k()) * MX_SCALE_COPY_GROUP_NUM);
+
+        int64_t totalM = 0;
+        uint32_t startCoreIdx = 0;
+
+        auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
+
+        for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+            uint32_t currentM = groupList.GetValue(groupIdx);
+            if (currentM == 0)
+                continue;
+
+            uint32_t N = params.problemShape.n();
+            uint32_t N_half = N / N_HALF;
+
+            GemmCoord inGroupProblemShape{currentM, N_half, params.problemShape.k()};
+
+            auto layoutMxScaleA = tla::MakeMxScaleLayout<ElementMxScaleA, layout::RowMajor, false>(
+                currentM, CeilDiv<MX_SCALE_GROUP_NUM>(inGroupProblemShape.k()));
+
+            BlockScheduler matmulBlockScheduler(inGroupProblemShape, MakeCoord(L1_TILE_M, L1_TILE_N));
+            uint32_t coreLoops = matmulBlockScheduler.GetCoreLoops();
+
+            AscendC::GlobalTensor<ElementB> gmB;
+            gmB.SetGlobalBuffer(params.ptrB + gmGroupOffsetB);
+            AscendC::GlobalTensor<ElementMxScaleB> gmMxScaleB;
+            gmMxScaleB.SetGlobalBuffer(params.ptrMxScaleB + gmGroupOffsetMxScaleB);
+            AscendC::GlobalTensor<ElementMxScaleA> gmMxScaleA;
+            gmMxScaleA.SetGlobalBuffer(params.ptrMxScaleA + gmGroupOffsetMxScaleA);
+
+            if (CeilDiv(currentM, L1_TILE_M) == 1) {
+                gmB.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+            }
+
+            uint32_t startLoopIdx;
+            if (coreIdx < startCoreIdx) {
+                startLoopIdx = coreIdx + coreNum - startCoreIdx;
+            } else {
+                startLoopIdx = coreIdx - startCoreIdx;
+            }
+
+            auto tensorB = tla::MakeTensor(gmB, params.layoutB, Arch::PositionGM{});
+            auto tensorMxScaleA = tla::MakeTensor(gmMxScaleA, layoutMxScaleA, Arch::PositionGM{});
+            auto tensorMxScaleB = tla::MakeTensor(gmMxScaleB, params.layoutMxScaleB, Arch::PositionGM{});
+
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+                GemmCoord blockCoord = matmulBlockScheduler.GetBlockCoord(loopIdx);
+```
+
+Per-group advance of the three offset accumulators (A implicit, B, and BOTH mx-scale tensors):
+
+```cpp
+                GemmCoord gateBlockShape{actualBlockShape.m(), actualN_half, actualBlockShape.k()};
+                blockMmad(
+                    tensorBlockA, tensorBlockB_gate, tensorBlockC_gate, gateBlockShape, tensorBlockMxScaleA_act,
+                    tensorBlockMxScaleB_gate);
+
+                AscendC::CrossCoreSetFlag<AIC_SYNC_AIV_MODE, PIPE_FIX>(AIC_SYNC_AIV_FLAG);
+                isVecSetSyncCom_ = true;
+            }
+
+            totalM += currentM;
+            gmGroupOffsetB += inGroupProblemShape.k() * params.problemShape.n();
+            gmGroupOffsetMxScaleA += currentM * mxScaleAlignedK;
+            gmGroupOffsetMxScaleB += mxScaleAlignedK * params.problemShape.n();
+            startCoreIdx = (startCoreIdx + coreLoops) % coreNum;
+        }
+        if (isVecSetSyncCom_) {
+            AscendC::CrossCoreWaitFlag<AIC_SYNC_AIV_MODE, PIPE_FIX>(AIV_SYNC_AIC_FLAG);
+        }
+        if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+```
+
+The AIV half of the same kernel re-walks the identical group loop with its own `startCoreIdx`
+rolling cursor — so cube and vector agree on the group decomposition here, unlike the
+ops-transformer `GroupedMatmulSwigluQuant` in section 3.2:
+
+```cpp
+        gmQScale.SetGlobalBuffer((__gm__ ElementQScale*)params.ptrQScale);
+        AscendC::GlobalTensor<ElementGroupList> groupList;
+        groupList.SetGlobalBuffer(params.ptrGroupList);
+
+        blockEpilogue.UpdateGlobalAddr(gmQ, gmQScale);
+
+        constexpr uint32_t elems = UB_TWO_BANK_ELEMS_B32 * PER_BLOCK_SIZE;
+        mmResUb_ping_ = AscendC::LocalTensor<ElementC>(AscendC::TPosition::VECCALC, 0, elems);
+        mmResUb_pong_ = AscendC::LocalTensor<ElementC>(AscendC::TPosition::VECCALC, elems * sizeof(ElementC), elems);
+
+        int64_t gmGroupOffsetMxScaleA = 0;
+        int64_t mxScaleAlignedK =
+            static_cast<int64_t>(CeilDiv<MX_BASEK_FACTOR>(params.problemShape.k()) * MX_SCALE_COPY_GROUP_NUM);
+
+        int64_t totalM = 0;
+        uint32_t startCoreIdx = 0;
+
+        uint32_t N = params.problemShape.n();
+        uint32_t N_half = N / N_HALF;
+
+        for (uint32_t groupIdx = 0; groupIdx < params.problemCount; ++groupIdx) {
+            uint32_t currentM = groupList.GetValue(groupIdx);
+            if (currentM == 0)
+                continue;
+
+            GemmCoord inGroupProblemShape{currentM, N_half, params.problemShape.k()};
+
+            auto layoutMxScaleA = tla::MakeMxScaleLayout<ElementMxScaleA, layout::RowMajor, false>(
+                currentM, CeilDiv<MX_SCALE_GROUP_NUM>(inGroupProblemShape.k()));
+
+            BlockScheduler matmulBlockScheduler(inGroupProblemShape, MakeCoord(L1_TILE_M, L1_TILE_N));
+            uint32_t coreLoops = matmulBlockScheduler.GetCoreLoops();
+
+            uint32_t startLoopIdx;
+            if (aicoreIndex < startCoreIdx) {
+                startLoopIdx = aicoreIndex + aicoreNum - startCoreIdx;
+            } else {
+                startLoopIdx = aicoreIndex - startCoreIdx;
+            }
+
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aicoreNum) {
+                GemmCoord blockCoord = matmulBlockScheduler.GetBlockCoord(loopIdx);
+                GemmCoord actualBlockShape = matmulBlockScheduler.GetActualBlockShape(blockCoord);
+                uint32_t actualN_half = actualBlockShape.n();
+
+                AscendC::CrossCoreWaitFlag<AIC_SYNC_AIV_MODE, PIPE_V>(AIC_SYNC_AIV_FLAG);
+
+                GemmCoord resShape{actualBlockShape.m(), actualN_half, actualBlockShape.k()};
+                blockEpilogue(resShape, totalM, blockCoord, mmResUb_ping_, mmResUb_pong_, L1_TILE_M, L1_TILE_N);
+
+                AscendC::CrossCoreSetFlag<AIC_SYNC_AIV_MODE, PIPE_V>(AIV_SYNC_AIC_FLAG);
+            }
+
+            totalM += currentM;
+            startCoreIdx = (startCoreIdx + coreLoops) % aicoreNum;
+        }
+
+```
+
+#### B6.4.6 `examples/02_grouped_matmul_slice_m/README.md`
+
+https://github.com/hicann/catlass/blob/master/examples/02_grouped_matmul_slice_m/README.md
+author/date: unknown — repo hicann/catlass branch master, fetched 2026-10-20
+
+`````
+# GroupedMatmulSliceM Example Readme
+
+## 功能说明
+
+- 算子功能：完成分组矩阵乘（Grouped Matmul）计算。
+- 计算公式：
+
+  $$
+    C = \mathrm{GroupedGEMM}(A,B), \\
+    C_i = A_i \times B_i, \quad 0 \le i < g
+  $$
+
+  其中 $g$ 为分组数量，分组矩阵乘中的$A_i$、$B_i$、$C_i$ 的形状分别为 `(m_i,k)`、`(k,n)`、`(m_i,n)`。各组沿 m 轴连续存储，共享 n、k 维度。
+- 支持产品型号：Atlas A2/A3系列产品
+
+## 样例参数说明
+
+| 参数 | 属性 | shape | dtype | 说明 |
+| --- | --- | --- | --- | --- |
+| `A` | Input | `(m,k)` | `float16` | 各组左矩阵，layout 固定为 `RowMajor` |
+| `B` | Input | `(g,k,n)` | `float16` | 右矩阵，layout支持`RowMajor` 和 `ColumnMajor`（默认），数据类型与左矩阵一致 |
+| `groupList` | Input | `(g,)` | `int64` | m 轴分组长度的前缀和序列 |
+| `C` | Output | `(m,n)` | `float16` | 分组矩阵乘结果，当前 layout 为 `RowMajor`；有效行数由 `groupList` 的终止量决定（不大于 `m`） |
+
+## 使用范围说明
+
+推荐范围：
+
+- 分组数量 `g` 满足 `1 ≤ g ≤ 128` 且 `g ≤ m`。
+
+## 使用示例
+
+### 命令行参数
+
+```bash
+02_grouped_matmul_slice_m [problemCount] [m] [n] [k] [deviceId]
+```
+
+上述命令行参数具体说明如下：
+
+| 参数 | 默认值 | 参数说明 |
+| --- | --- | --- |
+| `problemCount` | 无 | 分组数量，必须大于 0 |
+| `m` | 无 | A 矩阵的 m 轴大小 |
+| `n` | 无 | B 矩阵的 n 轴大小 |
+| `k` | 无 | A/B 矩阵的 k 轴大小 |
+| `deviceId` | `0` | 指定运行设备 ID |
+
+### 执行示例
+
+1. 进入项目根目录，编译样例代码生成相应的算子可执行文件。
+
+    ```bash
+    bash scripts/build.sh 02_grouped_matmul_slice_m
+    ```
+
+2. 切换到可执行文件的编译目录 `output/bin`，执行算子样例程序。
+
+    ```bash
+    cd output/bin
+    ./02_grouped_matmul_slice_m 128 512 1024 2048 0
+    ```
+
+3. 执行结果如下，说明样例执行成功，精度通过：
+
+    ```text
+    Compare success.
+    ```
+`````
+
+---
+
+### B6.5 GAP 3 — Does a SECOND, independent grouped-matmul live in `ops-nn`? NO.
+
+https://github.com/hicann/ops-nn (and https://gitcode.com/cann/ops-nn)
+author/date: repo hicann/ops-nn branch master, 40200 tracked paths, fetched 2026-10-20
+
+NEGATIVE RESULT, stated explicitly. Full recursive tree of `hicann/ops-nn` (40200 paths)
+grepped case-insensitively for `grouped_mat`, `group_mat`, `gmm` → **zero matches**.
+The complete set of `group`/`moe`/`expert`/`rout`-matching op directories in ops-nn is:
+
+```
+activation/swiglu_backward_group_quant_with_dual_axis
+activation/swiglu_group
+activation/swiglu_group_grad
+activation/swiglu_group_quant
+activation/swiglu_group_quant_grad
+activation/swiglu_group_quant_with_dual_axis
+norm/group_norm
+norm/group_norm_grad
+norm/group_norm_silu
+norm/group_norm_silu_quant
+norm/group_norm_swish
+norm/group_norm_swish_grad
+norm/group_norm_v2
+quant/group_quant
+quant/grouped_dynamic_block_quant
+quant/grouped_dynamic_mx_quant
+quant/grouped_dynamic_mx_quant_with_dual_axis
+quant/grouped_quant_max
+```
+
+None of these is a matmul. `ops-nn/matmul/` holds 34 ops
+(`addmv batch_mat_mul_v3 batch_matmul_quant common convert_weight_to_int4_pack
+dual_level_quant_batch_matmul flat_quant fused_linear_cross_entropy_loss_grad
+fused_linear_online_max_sum fused_mat_mul fused_quant_mat_mul gemm gemm_syrk gemm_v2 gemm_v3
+mat_mul_v3 matmul_compress matmul_emu_split_weight matmul_v2_compress_dequant mv
+quant_batch_matmul_inplace_add quant_batch_matmul_v3 quant_batch_matmul_v4 quant_matmul
+quant_matmul_activation_quant quant_matmul_dequant quant_matmul_reduce_sum rotate_quant
+sparse4to2quant_matmul sparse_tensor_dense_mat_mul transpose_batch_mat_mul
+transpose_quant_batch_mat_mul weight_quant_batch_matmul weight_quant_batch_matmul_v2`),
+none grouped.
+
+So there is exactly ONE first-party grouped-matmul op family (in `ops-transformer/gmm/`) plus
+the CATLASS template library. The only other independent implementations found are
+third-party forks/vendored copies, e.g.
+`vllm-project/afd-plugin:csrc/npu/ascend_kernels/grouped_matmul_layered/op_kernel/grouped_matmul_utils.h`
+and `QingCheng-AI/ascend-kernel:grouped_gemm/op_kernel/grouped_matmul_utils.h`, both of which
+are copies of the ops-transformer `GetSplitValueFromGroupList`, and
+`egretwAlker/cpl-ascend-transformer-boost:src/kernels/mixkernels/gmm_add/op_kernel/gmm_add.h`
+(ATB's own gmm_add). `ops-transformer/mc2/3rd/grouped_matmul/op_kernel/mc2_3rd_quant_utils.h`
+is a vendored third-party copy inside ops-transformer itself.
+
+---
+
+### B6.6 GAP 4 — MegaMoE: public design documents (not the source)
+
+#### B6.6.0 NAME-COLLISION WARNING, read first
+
+"MegaMoE" denotes at least three different things in 2026 and they must not be conflated:
+
+1. **Huawei/CANN `MegaMoe`** — the fused operator at `ops-transformer/mc2/mega_moe`, Ascend, AIC/AIV
+   split, HCCL shmem / peermem. This is the one in scope. 116 files, fully open source,
+   arch22 (A2/A3) and arch35 (950PR/950DT) trees.
+2. **MindSpore `HyperMegaMoE`** — a separate, MindSpore-side RFC for the Multicore/HyperParallel
+   stack, forward AND backward fused, quoted in 6.2. Also Huawei, also Ascend, but a different
+   operator with a different name and its own aclnn entry points.
+3. **DeepGEMM / NVIDIA-side `MegaMoE`** — the symmetric-memory NVLink persistent megakernel
+   (dispatch → L1 GEMM → SwiGLU → L2 GEMM → combine in one CUDA kernel). AMD Primus has a
+   two-kernel analogue. These are NOT Huawei and share no code with (1).
+
+The one public write-up that surfaced for (3) is
+https://ggaaooppeenngg.github.io/zh-CN/2026/06/01/MegaMoE-%E9%80%9A%E4%BF%A1%E8%AE%A1%E7%AE%97%E8%9E%8D%E5%90%88Mega-Kernel%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/
+— it is about CUDA/NVLink symmetric memory, not Ascend. Recorded here only so it is not mistaken
+for Huawei material.
+
+Searched and found NOTHING for Huawei's MegaMoE: no arxiv paper, no hiascend.com
+`aclnnMegaMoE` doc page, no bbs.huaweicloud.com or hiascend forum post, no zhihu/CSDN article
+about the Ascend `mc2/mega_moe` operator specifically. CSDN hits
+(`gitcode.csdn.net/6a0ecbae662f9a54cb761980.html`,
+`aicoding.csdn.net/6a69d2b3662f9a54cb95e871.html`) are generic repo-overview blogspam that does
+not describe MegaMoE's internals. The authoritative design documents are the in-repo README and
+the MindSpore RFC, both quoted below.
+
+#### B6.6.1 `mc2/mega_moe/README.md` — the operator's own design statement
+
+https://github.com/hicann/ops-transformer/blob/master/mc2/mega_moe/README.md
+author/date: unknown — Huawei Technologies Co., Ltd., repo hicann/ops-transformer branch master (pushed 2026-10-20), fetched 2026-10-20
+
+983 lines. The fusion boundary, verbatim:
+
+```
+## 功能说明
+
+- 算子功能：MegaMoE算子将MoE层的专家FFN的完整计算流程及前后数据通信（即 Dispatch + Linear1 + Activation + Linear2 + Combine）融合为单个算子，实现了通信和计算的掩盖。
+
+```
+
+The A16W16 non-quant computation walkthrough, which is the clearest statement of how a single
+operator covers Dispatch / per-expert Linear1 / Activation / Linear2 / Combine. Note
+「按任意固定顺序行堆叠」 — the per-expert token matrix may be stacked in ANY fixed order, i.e.
+the kernel does not promise a particular permutation, only that `row(i,k)` is recoverable:
+
+```
+    <details>
+    <summary> A16W16 非量化场景</summary>
+
+    - **EP Dispatch**
+
+        在 Dispatch 阶段，每个 $\text{token}_i$ 将其token表示 $\mathbf{x}_i$ 发送给专家 $e_{i,0}, e_{i,1}, \dots, e_{i,\text{topK}-1}$。即对于每个 $k$，专家 $e_{i,k}$ 接收一份 $\mathbf{x}_i$。
+
+        记 $I_e = \{\, i \mid \exists k,\ \mathbf{E}[i,k]=e \,\}$ 为所有被分派给专家 $e$ 的 token 索引集合，集合 $I_e$ 的大小 $N_e = |I_e|$ 即为专家 $e$ 需要处理的 token 总数，则有 $\mathbf{X}_e \in \mathbb{R}^{N_e \times \text{hidden}}$ 是由所有满足 $i \in I_e$ 的token表示 $\mathbf{x}_i$ **按任意固定顺序行堆叠**而成的矩阵，该矩阵即为专家 $e$ 经过 Dispatch 后收到的全部 token 表示。
+
+        对于每个 $\text{token}_i$ 及其选中的第 $k$ 个专家 $e_{i,k}$，存在唯一的行索引 $\operatorname{row}(i,k) \in \{0,\dots,N_{e_{i,k}}-1\}$，使得 $\mathbf{X}_{e_{i,k}}[\operatorname{row}(i,k), :] = \mathbf{x}_i$。该映射记录了 $\mathbf{x}_i$ 在专家 $e_{i,k}$ 的输入矩阵 $\mathbf{X}_{e_{i,k}}$ 中的位置。
+
+    - **Expert Compute**
+
+        在 MoE 层中，每个专家本质上是一个独立的前馈网络（FFN），采用由 `activation` 指定的门控激活结构以提升表达能力。整个计算过程分为如下三个子步骤。
+
+        **1. Linear1 投影**
+
+        Linear1 投影是专家网络的第一层线性变换，同时产生 **gate 部分** 和 **up 部分** 所需的预激活值。其计算公式为
+        $$
+        \mathbf{H}_e = \mathbf{X}_e \cdot \mathbf{W}_1[e]
+        \quad\bigl(\in \mathbb{R}^{N_e \times 2\cdot\text{intermediateHidden}}\bigr)
+        $$
+        **2. 激活**
+
+        将 $\mathbf{H}_e$ 沿列维度拆分为 gate 分支 $\mathbf{G}_e$ 和 up 分支 $\mathbf{U}_e$，根据 `activation` 计算中间激活表示 $\mathbf{A}_e$；各可选激活类型的计算方式参见[激活函数公式](#activation-formulas)。
+
+        **3. Linear2 投影**
+
+        Linear2 投影作为第二层线性变换，将中间激活表示 $\mathbf{A}_e$ 从高维空间投影回原始的隐藏维度 $\text{hidden}$，使专家输出能够与残差连接等后续操作兼容。
+        $$
+        \mathbf{Y}_e = \mathbf{A}_e \cdot \mathbf{W}_2[e]
+        \quad\bigl(\in \mathbb{R}^{N_e \times \text{hidden}}\bigr)
+        $$
+
+        经过以上计算，专家 $e$ 的每一行输出对应其批次中的一个 token。对于 $\text{token}_i$，它在专家 $e_{i,k}$ 中的输出行即为 $\mathbf{Y}_{e_{i,k}}\bigl[\operatorname{row}(i,k),\,:\bigr]$。
+    - **Token Combine**
+
+        Combine 负责收集所有专家计算出的输出向量，按照每个 token 原先分配到的专家权重进行加权求和，最终为每个 token 生成一个融合后的输出。利用之前记录的位置索引 $\operatorname{row}(i,k)$，从专家 $e_{i,k}$ 的输出矩阵中收回属于 $\text{token}_i$ 的行，并与门控权重相乘后求和：
+
+        $$
+        \mathbf{y}_i = \sum_{k=0}^{\text{topK} - 1} w_k \;\cdot\;
+        \mathbf{Y}_{e_{i,k}}\!\bigl[\,\operatorname{row}(i,k),\,:\,\bigr]
+        \qquad\bigl(\in \mathbb{R}^{1 \times \text{hidden}}\bigr)
+        $$
+
+        其中 $w_k = \mathbf{G}[i,k]$ 为 $\text{token}_i$ 对专家 $e_{i,k}$ 的门控权重。
+
+        所有 token 的输出按输入顺序堆叠为最终输出 $\mathbf{Y} \in \mathbb{R}^{\text{totalNumTokens} \times \text{hidden}}$。
+```
+
+The supported A/W dtype matrix and the per-product exclusions (this is what tells you A3 cannot
+do A8W8-FP and 950 cannot do A16W16 / A8W8-INT / A8W4-INT):
+
+```
+    | 场景名    |  A |  W   |
+    | --- | :---:  | :---:        |
+    | A16W16   | BFLOAT16     |BFLOAT16        |
+    | A8W8-INT | INT8   | INT8         |
+    | A8W8-FP  | FLOAT8_E4M3FN、FLOAT8_E5M2 |FLOAT8_E4M3FN、FLOAT8_E5M2 |
+    | A8W4-INT | INT8        | INT4            |
+    | A8W4-FP | FLOAT8_E4M3FN        | FLOAT4_E2M1          |
+    | A4W4-FP | FLOAT4_E2M1        | FLOAT4_E2M1            |
+
+    - <term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>：不支持上表中A8W8-FP场景。
+    - <term>Ascend 950PR&950DT系列产品</term>：不支持上表中A16W16、A8W8-INT、A8W4-INT场景。
+    - <term>Ascend 950PR&950DT系列产品</term>的dispatch阶段有两条路径：`dispatchQuantMode` = 4时，按下文各量化场景的描述由算子内部对BF16的`x`做MX逐组量化；`dispatchQuantMode` = 0时为预量化直通，`x`已经是量化后的数据、缩放因子由`scales`入参给出，算子跳过下文第一阶段的量化步骤，直接用`x`与`scales`参与后续矩阵乘，其余阶段与下文一致。
+    - <term>Ascend 950PR&950DT系列产品</term>：MoE专家与共享专家可以采用不同的权重类型与量化类型，共享专家的量化输出类型由`sharedExpertQuantOutDtype`指定，未显式配置时与`dispatchQuantOutDtype`一致。
+
+```
+
+A determinism constraint worth copying into any megakernel design — `combineCommMode` = 1
+accumulates a token's several local expert outputs in FP32 and sends ONE BF16, which is
+deliberately NOT bit-identical to mode 0:
+
+```
+    - `combineCommMode` = 1时，同一token在同一张卡上的多个专家输出改为在该卡按FP32累加后一次转BF16发送，累加顺序与中间取整次数与关闭态不同，因此`y`与`combineCommMode` = 0的结果不逐位相同，差异属BF16累加顺序不同带来的正常误差；需要与关闭态逐位一致时请使用`combineCommMode` = 0。
+```
+
+#### B6.6.2 MindSpore `HyperMegaMoE` RFC — the explicit stage→unit mapping and overlap policy
+
+https://github.com/mindspore-ai/hyper-parallel/issues/654
+(mirror of https://gitcode.com/mindspore/hyper-parallel/issues/312)
+author: rainyhorse — created 2026-09-15T09:29:09Z
+
+This is the single most useful public design document, because it names which stage runs on AIV
+vs AIC, states that there is NO global barrier, and enumerates the overlap pairs.
+
+`````
+## 2 交付范围
+
+### 2.1 正向融合
+
+正向算子的逻辑名称为 `HyperMegaMoE`，ACLNN 执行接口为 `aclnnHyperMegaMoE`。
+
+融合计算链路为：
+
+```text
+AllToAll-Dispatch (AIV)
+          ↓
+GMM1 / up_proj (AIC)
+          ↓
+SwiGLU (AIV)
+          ↓
+GMM2 / down_proj (AIC)
+          ↓
+AllToAll-Combine (AIV)
+```
+
+各阶段按 token/expert tile 拆分为任务，由 AIC worker 和 AIV worker 并发执行。任务之间通过事件计数表达生产者—消费者依赖，满足数据就绪条件后即可放行下游任务，不引入全局屏障。
+
+正向对外输出最终 token 结果 `y`，shape 与输入 `x` 一致。中间的 dispatch buffer、GMM 输出、SwiGLU 输出和 combine buffer 不作为公共返回值。
+
+### 2.2 反向融合
+
+反向算子的逻辑名称为 `HyperMegaMoEGrad`，ACLNN 执行接口为 `aclnnHyperMegaMoEGrad`。
+
+反向计算链路为：
+
+```text
+AllToAll-Dispatch(dY) (AIV)
+          ↓
+act_grad: dHidden = dispatched_dY × W2ᵀ (AIC)
+          │
+          ├── SwiGLUGrad (AIV) ──→ input_grad GMM (AIC)
+          │
+          └── W2Grad GMM (AIC)
+
+AllToAll-Combine(dX) (AIV) ∥ W1Grad GMM (AIC)
+```
+
+反向必须生成：
+
+- 输入 token 梯度 `dx`；
+- `up_proj_weight` 梯度 `d_up_proj_weight`；
+- `down_proj_weight` 梯度 `d_down_proj_weight`；
+- 路由权重参与加权归并时的 `d_topk_weights`；
+- 其他不可导输入返回 `None`。
+
+W2Grad 与激活梯度分支可并行执行，W1Grad 与 Combine(dX) 可并行执行，以充分利用通信和计算之间的独立性。
+`````
+
+Section 5 — the multicore scheduling and overlap policy, verbatim:
+
+```
+## 5 多核调度与性能目标
+
+### 5.1 AIC/AIV 并发
+
+- AllToAll 通信任务和 SwiGLU 任务映射到 AIV；
+- GMM1、GMM2 及反向 GMM 任务映射到 AIC；
+- AIC/AIV worker 独立轮询任务队列，按事件依赖放行；
+- 任务粒度同时考虑首块延迟、专家 token 不均衡和 GMM 计算效率；
+- 正向和反向均保持单次融合调用语义。
+
+### 5.2 通信—计算重叠
+
+- Dispatch 与已就绪专家的 GMM1 重叠；
+- GMM1 与已就绪 tile 的 SwiGLU 重叠；
+- GMM2 完成后尽早触发 Combine；
+- 反向 W2Grad 与 act_grad 分支交错执行；
+- 反向 W1Grad 与 Combine(dX) 重叠；
+- 通信顺序避免多 rank 同时集中访问同一目标 rank。
+
+### 5.3 运行时要求
+
+- 任务配置与 tiling 可按 shape/dtype/topology 缓存并复用；
+- 动态路由信息在每次调用时正确更新；
+- 所有异步通信和跨流数据访问具备明确的完成或同步语义；
+- 多次迭代、连续正反向和异常恢复后不得复用过期事件状态；
+- 缓冲区容量与 workspace 大小由 host 侧计算并校验。
+```
+
+Section 6.3 and 6.4 — the `expert × block` and `expert × wave` granularity schemes. This is the
+chunking/round scheme the megakernel question is really about:
+
+```
+### 6.3 GMM 专家计算分组粒度优化
+
+将 GMM 就绪与调度粒度从单一专家级拓展为 `expert × block`，根据专家实际 token 数选择 block M。小批次或长尾专家使用较小 block 缩短首块等待，大批次使用较大 block 保持 GMM 效率。
+
+### 6.4 Token Wave 优化
+
+将专家 token 分成多个 wave，为每个 `expert × wave` 设置独立就绪事件。前缀 wave 到齐后立即启动对应 GMM M-tile，并将局部完成信号逐级传递到 SwiGLU、GMM2 和 Combine。尾 wave 的就绪阈值使用真实 token 数，避免等待不存在的补齐 token。
+```
+
+#### B6.6.3 arch35 (950) per-expert GEMM driving inside the ONE kernel
+
+This is the arch35 tree, distinct from the arch22/A3 kernel. Two mechanisms matter.
+
+#### (a) `ExpertLoopState` + `UpdateParamsForNextProblem` — re-point without re-Init
+
+https://github.com/hicann/ops-transformer/blob/master/mc2/mega_moe/op_kernel/arch35/common/mega_moe_types.h
+author/date: unknown — Huawei Technologies Co., Ltd., repo hicann/ops-transformer branch master, fetched 2026-10-20
+
+```cpp
+    GM_ADDR y2GmAddr;
+    GM_ADDR expertTokenNumsOutGmAddr;
+    WorkspaceInfo workspaceInfo;
+    PeermemInfo peermemInfo;
+    const MegaMoeTilingData* tilingData;
+};
+
+enum class AddrUpdateMode : int32_t {
+    GMM1,
+    GMM2
+};
+
+struct BlockJobContext {
+    uint32_t jobIndex;
+    uint32_t totalJobs;
+};
+
+// Count/flag workspace 的物理分区；当前与 BlockJobContext 同值，但其编号由 workspace 生产者和消费者共同约定。
+struct BlockWorkspaceContext {
+    uint32_t blockIdx;
+    uint32_t blockNum;
+};
+
+template <typename T>
+struct PackedElementTraits {
+    static constexpr uint32_t ELEMENTS_PER_BYTE = Std::IsSame<T, fp4x2_e2m1_t>::value ? 2U : 1U;
+};
+
+template <int32_t QuantMode>
+struct QuantTypeTraits {
+    using Type = fp8_e4m3fn_t;
+};
+
+template <>
+struct QuantTypeTraits<E5M2_QUANT> {
+    using Type = fp8_e5m2_t;
+};
+
+template <>
+struct QuantTypeTraits<E2M1_QUANT> {
+    using Type = fp4x2_e2m1_t;
+```
+
+https://github.com/hicann/ops-transformer/blob/master/mc2/mega_moe/op_kernel/arch35/common/mega_moe_gmm_common.h
+author/date: unknown — Huawei Technologies Co., Ltd., repo hicann/ops-transformer branch master, fetched 2026-10-20
+
+GMM1 and GMM2 are built from the SAME `ProblemShape` by swapping which axis is N and which is K,
+and GMM1's N is halved by `activationOutputDivisor = ACTIVATION_N_HALF` to express the gate/up
+split. `L1_TILE_M_256` for GMM2, `gmm1TileM` (or `L1_TILE_M_128` under `TopkWeightsPrefetch`)
+for GMM1.
+
+```cpp
+
+    __aicore__ static inline void FinalizeProblemConfig(ProblemConfig& config, const BlockJobContext& blockJob,
+                                                        uint32_t gmm1TileM)
+    {
+        config.blockNum = blockJob.totalJobs;
+        config.blockIdx = blockJob.jobIndex;
+        config.scaleK = CeilDiv(config.k, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE;
+        config.activationTileM = TopkWeightsPrefetch ? L1_TILE_M_128 : gmm1TileM;
+        config.blockMmadTiling = SelectBlockMmadTilingConfig(config.m, config.k, config.tileM);
+    }
+
+    __aicore__ static inline ProblemConfig BuildGmm1ProblemConfig(const ProblemShape& problemShape,
+                                                                  const BlockJobContext& blockJob, uint32_t gmm1TileM,
+                                                                  uint32_t activationOutputDivisor = ACTIVATION_N_HALF)
+    {
+        ProblemConfig config{};
+        config.m = Get<M_VALUE>(problemShape);
+        config.n = Get<N_VALUE>(problemShape);
+        config.k = Get<K_VALUE>(problemShape);
+        config.activationOutputDivisor = activationOutputDivisor;
+        config.outputN = config.n / config.activationOutputDivisor;
+        config.schedulerN = config.n;
+        config.tileM = gmm1TileM;
+        FinalizeProblemConfig(config, blockJob, gmm1TileM);
+        return config;
+    }
+
+    __aicore__ static inline ProblemConfig BuildGmm2ProblemConfig(const ProblemShape& problemShape,
+                                                                  const BlockJobContext& blockJob, uint32_t gmm1TileM,
+                                                                  uint32_t activationOutputDivisor = ACTIVATION_N_HALF)
+    {
+        ProblemConfig config{};
+        config.m = Get<M_VALUE>(problemShape);
+        config.n = Get<K_VALUE>(problemShape);
+        config.activationOutputDivisor = activationOutputDivisor;
+        config.k = Get<N_VALUE>(problemShape) / config.activationOutputDivisor;
+        config.outputN = config.n;
+        config.schedulerN = config.outputN;
+        config.tileM = L1_TILE_M_256;
+        FinalizeProblemConfig(config, blockJob, gmm1TileM);
+        return config;
+    }
+```
+
+The per-expert re-point. `blockMmad.Init(...)` is guarded by an `initConfig_` equality check so
+it runs only when the L1 tiling actually changes; every expert then only calls
+`UpdateParamsForNextProblem`. That is exactly the "one matmul instance, many problems" trick a
+hand-written megakernel needs, and it is the arch35 answer to the A2/A3 design doc's complaint
+that you cannot instantiate one matmul object per group (section 2.5).
+
+```cpp
+template <typename BlockMmad, typename DispatchPolicy = typename BlockMmad::DispatchPolicy>
+struct BlockMmadContext;
+
+template <typename BlockMmad>
+struct BlockMmadContext<BlockMmad, Blaze::Gemm::GroupedMatmulWithScaleMx<>> {
+    BlockMmad blockMmad;
+
+    template <GmmStage Stage, typename ProblemConfig>
+    __aicore__ inline void Init(const ProblemConfig& config)
+    {
+        const auto& tiling = config.blockMmadTiling;
+        // GMM1 门控激活按半宽初始化拼接入口；GELU 和 GMM2 使用普通 MMAD 的完整列宽。
+        const uint32_t tileN = Stage == GmmStage::GMM1 ? tiling.tileN / config.activationOutputDivisor : tiling.tileN;
+        const BlockMmadInitConfig requestedConfig{config.k, tiling.tileM, tileN, tiling.l1Params.kAL1,
+                                                  tiling.l1Params.scaleKL1};
+        if (!initialized_ || initConfig_ != requestedConfig) {
+            typename BlockMmad::ProblemShape problemShape{config.m, config.n, config.k, 0};
+            typename BlockMmad::MmadParams params{
+                {tiling.tileM, tileN, L0_TILE_K, 0}, tiling.l1Params, false, false, 2U};
+            blockMmad.Init(problemShape, params);
+            initConfig_ = requestedConfig;
+            initialized_ = true;
+        }
+        blockMmad.UpdateParamsForNextProblem({config.m, config.n, config.k, 0});
+    }
+
+private:
+    BlockMmadInitConfig initConfig_{};
+    bool initialized_ = false;
+};
+```
+
+And the L2 hint rule, with its exact precondition spelled out in the comment — the hot-expert
+case is explicitly excluded:
+
+```cpp
+
+/*
+ * CACHE_MODE_DISABLE 会使读取不填入 L2，仅适用于后续不会复用的数据。
+ * 当前 problem 必须覆盖完整专家且 M 方向只有一个 tile，B/scaleB 才不会被后续 M tile 或 Wave 再读。
+ * 热点专家被切到多个 Wave 时必须保留正常 L2 cache。
+ * B 与 scaleB 的物理行跨度不同，二者必须独立判定 128B cache-line 对齐，不能共用一个结果。
+ */
+template <bool IsWeightNz, typename MatmulConfig, typename TensorB, typename TensorScaleB>
+```
+
+#### (b) How the groupList itself is produced ON DEVICE: 24-bit count + 8-bit round tag
+
+https://github.com/hicann/ops-transformer/blob/master/mc2/mega_moe/op_kernel/arch35/stage/mega_moe_expert_count.h
+author/date: unknown — Copyright (c) 2026 Huawei Technologies Co., Ltd., repo hicann/ops-transformer branch master, fetched 2026-10-20
+
+There is no host-supplied groupList in MegaMoE. Each remote rank writes its per-expert token
+count into a 512-byte GM slot; the HIGH 8 BITS of each count word carry a ROUND TAG (epoch), so
+the consumer can distinguish "this iteration's count" from a stale one WITHOUT zeroing the table
+and WITHOUT a barrier. The consumer polls the whole table, checks all tags in one vector pass,
+and backs off 500 cycles on mismatch. Then a single fused VF pass does an inclusive prefix sum
+masked to the low 24 bits (`InclusivePrefixSumInt32<0x00FFFFFF>`) and, in the same VF call,
+differences the per-expert tail values to recover per-expert counts — i.e. it produces BOTH the
+cumsum form (groupListType 0) and the count form (groupListType 1) in one pass.
+
+```cpp
+
+// count 整表检查失败后的重试间隔。
+constexpr int64_t COUNT_TABLE_POLL_BACKOFF_CYCLES = 500;
+
+// 只检查 UB 快照的高 8 位轮次标签，不修改 count；成功后由前缀和计算去除标签。
+// expectedSyncRoundTag 使用 GetSyncRoundTag 返回的高 8 位标签；pending[0] 为零时才可消费快照。
+// pending 的各 lane 累积所有向量的失败结果，尾部无效 lane 不参与比较或写回。
+__simd_vf__ inline void CheckCountRoundTagsVF(__ubuf__ uint32_t* counts, __ubuf__ uint32_t* pending,
+                                              uint32_t elementCount, uint32_t expectedSyncRoundTag)
+{
+    constexpr uint32_t ELEMENTS_PER_VECTOR = AscendC::GetVecLen() / sizeof(uint32_t);
+    AscendC::Reg::RegTensor<uint32_t> countReg;
+    AscendC::Reg::RegTensor<uint32_t> epochReg;
+    AscendC::Reg::RegTensor<uint32_t> pendingReg;
+    AscendC::Reg::RegTensor<uint32_t> oneReg;
+    AscendC::Reg::RegTensor<uint32_t> resultReg;
+    AscendC::Reg::MaskReg fullMask = AscendC::Reg::CreateMask<uint32_t, AscendC::Reg::MaskPattern::ALL>();
+    AscendC::Reg::MaskReg firstLaneMask = AscendC::Reg::CreateMask<uint32_t, AscendC::Reg::MaskPattern::VL1>();
+    AscendC::Reg::Duplicate(pendingReg, 0U, fullMask);
+    AscendC::Reg::Duplicate(oneReg, 1U, fullMask);
+    for (uint32_t offset = 0U; offset < elementCount; offset += ELEMENTS_PER_VECTOR) {
+        uint32_t validCount = elementCount - offset;
+        AscendC::Reg::MaskReg activeMask = AscendC::Reg::UpdateMask<uint32_t>(validCount);
+        AscendC::Reg::MaskReg mismatchMask;
+        AscendC::Reg::LoadAlign(countReg, counts + offset);
+        AscendC::Reg::ShiftRights(epochReg, countReg, static_cast<int16_t>(24), activeMask);
+        AscendC::Reg::Compares<uint32_t, AscendC::CMPMODE::NE>(mismatchMask, epochReg, expectedSyncRoundTag >> 24U,
+                                                               activeMask);
+        AscendC::Reg::Select(pendingReg, oneReg, pendingReg, mismatchMask);
+    }
+    AscendC::Reg::Reduce<AscendC::Reg::ReduceType::MAX>(resultReg, pendingReg, fullMask);
+    AscendC::Reg::StoreAlign(pending, resultReg, firstLaneMask);
+}
+
+// MTE GM count 表按 512B 槽存放；搬入后的 counts 为连续 UB 表。
+```
+
+```cpp
+// pending 为独立、32B 对齐的 UB 暂存区（至少一个 int32）。
+// 首次立即读取；失败后等待 500 cycle，再重读整表。成功快照直接交给后续 VF cumsum。
+// 调用方保证在 AIV 上执行，且 elementCount > 0。
+__aicore__ inline void WaitForCountTable(const AscendC::GlobalTensor<int32_t>& countGm,
+                                         const AscendC::LocalTensor<int32_t>& counts,
+                                         const AscendC::LocalTensor<int32_t>& pending, uint32_t elementCount,
+                                         uint32_t expectedSyncRoundTag)
+{
+    // 首次搬运前保护此前的 Vector 访问；重试时上一轮 V_S 和 Scalar 判断已保证 VF 完成。
+    SyncFuncStatic<AscendC::HardEvent::V_MTE2, SYNC_EVENT_ID2>();
+    while (true) {
+        // Compact 将每个 GM 槽首部的 4B 紧密排入 UB，保持后续 epoch 校验和前缀和布局不变。
+        AscendC::DataCopyPad<int32_t, AscendC::PaddingMode::Compact>(
+            counts, countGm,
+            {static_cast<uint16_t>(elementCount), sizeof(int32_t),
+             static_cast<int64_t>(MTE_COUNT_SLOT_BYTES) - static_cast<int64_t>(sizeof(int32_t)), 0U, 0U},
+            {true, 0U, 0U, 0U});
+        SyncFuncStatic<AscendC::HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+        asc_vf_call<CheckCountRoundTagsVF>(reinterpret_cast<__ubuf__ uint32_t*>(counts.GetPhyAddr()),
+                                           reinterpret_cast<__ubuf__ uint32_t*>(pending.GetPhyAddr()), elementCount,
+                                           expectedSyncRoundTag);
+        SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+        if (pending.GetValue(0U) == 0) {
+            return;
+        }
+        int64_t startCycle = AscendC::GetSystemCycle();
+        while (AscendC::GetSystemCycle() - startCycle < COUNT_TABLE_POLL_BACKOFF_CYCLES) {
+        }
+    }
+}
+
+```
+
+```cpp
+/*
+ * MegaMoe count 表的融合版本：先复用 int32 prefix-scan，再在同一次 VF 中提取每个专家的累计尾值
+ * 并作差。相比先调用通用前缀和、再启动第二个 VF，融合实现省去一次 asc_vf_call 和外部流水同步。
+ */
+__simd_vf__ inline void ComputeExpertCountTablesVF(__ubuf__ int32_t* count, __ubuf__ int32_t* expertCounts,
+                                                   uint32_t elementCount, uint32_t expertCount, uint32_t worldSize,
+                                                   uint32_t maxOutputSize)
+{
+    // 去除快照中的高 8 位轮次标签，只累加低 24 位 count。
+    InclusivePrefixSumInt32<0x00FFFFFF>(count, elementCount);
+
+    // prefix 已写回 UB；后续从同一区域 Gather 前建立 VEC_STORE -> VEC_LOAD 可见性。
+    AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+
+    constexpr uint32_t ELEMENTS_PER_VECTOR = GetVecLen() / sizeof(int32_t);
+    AscendC::Reg::RegTensor<int32_t> expertEndPrefixReg;
+```
+
+#### B6.6.4 Complete `mc2/mega_moe` file inventory (for navigation)
+
+https://github.com/hicann/ops-transformer/tree/master/mc2/mega_moe
+author/date: repo hicann/ops-transformer branch master, fetched 2026-10-20
+
+The arch35 tree is organised as explicit named STAGES, which is itself the design statement:
+
+```
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_expert_count.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_gmm1_activation.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_gmm2_combine.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_gmm2_combine_dedup.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_layered_combine.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_layered_combine_send.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_layered_dispatch.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_send_mask.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_token_dedup.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_token_dispatch.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_token_dispatch_dedup.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_token_quant.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_unpermute.h
+mc2/mega_moe/op_kernel/arch35/stage/mega_moe_workspace_reset.h
+mc2/mega_moe/op_kernel/arch35/mega_moe_arch35.h           (64 KB, the driver)
+mc2/mega_moe/op_kernel/arch35/mega_moe_layered.h
+mc2/mega_moe/op_kernel/arch35/mega_moe_wave_a4w4.h
+mc2/mega_moe/op_kernel/arch35/mega_moe_wave_a8w4.h
+mc2/mega_moe/op_kernel/arch35/mega_moe_wave_a8w8.h
+mc2/mega_moe/op_kernel/arch35/blaze/gemm/policy/dispatch_policy_mega_moe.h
+mc2/mega_moe/op_kernel/arch35/blaze/gemm/block/block_mmad_mx_fp8fp4.h
+mc2/mega_moe/op_kernel/arch35/blaze/gemm/block/block_scheduler_swizzle.h
+mc2/mega_moe/op_kernel/arch35/blaze/gemm/tile/copy_gmm1_concat.h
+mc2/mega_moe/op_kernel/arch35/blaze/epilogue/block_epilogue_activation_mx_quant.h
+mc2/mega_moe/op_kernel/arch35/common/{mega_moe_constants,mega_moe_gmm_common,
+  mega_moe_gmm_epilogue_sync,mega_moe_layered_comm,mega_moe_mxfp8_utils,
+  mega_moe_peermem,mega_moe_types,mega_moe_utils,mega_moe_workspace}.h
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a3.hpp      (116 KB, the A3 driver)
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_bf16.hpp
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_bf16_w4a8.hpp
+mc2/mega_moe/op_kernel/arch22/mega_moe_kernel_a2_int8.hpp
+mc2/mega_moe/op_kernel/arch22/moe_permute_prologue/moe_permute_prologue.hpp
+mc2/mega_moe/op_kernel/arch22/unpermute/mc2_mega_moe_moe_token_unpermute.h
+mc2/mega_moe/op_kernel/arch22/utils/{block_epilogue_pertoken_swiglu,
+  block_mmad_preload_async_fixpipe_quant,block_mmad_w4a4,const_args,
+  copy_gm_to_l1_custom,copy_l0c_to_gm_custom,dispatch_policy_custom,
+  gated_activation,get_tensor_addr,hccl_shmem,layout3d,select_helper,
+  weight_l2_prefetch}.hpp
+mc2/mega_moe/docs/torchapi_mega_moe.md
+mc2/mega_moe/README.md
+mc2/mega_moe/op_host/op_tiling/arch22/mega_moe_tiling_arch22.cpp
+mc2/mega_moe/op_host/op_tiling/arch35/mega_moe_tiling.cpp
+mc2/tools/dump_analysis/dump_analysis_megamoe.py
+```
+
+---
+
+### B6.7 Summary of real repo paths (for the record)
+
+| what | where |
+| --- | --- |
+| every `GroupedMatmul*` op | `cann/ops-transformer` (gitcode) == `hicann/ops-transformer` (GitHub), dir `gmm/` |
+| MC2 grouped-matmul + comm fusion | same repo, dir `mc2/` |
+| MegaMoE | same repo, `mc2/mega_moe/` |
+| CATLASS grouped templates | `hicann/catlass` (GitHub), `include/catlass/gemm/kernel/grouped_*` |
+| `cann/ops-nn` / `hicann/ops-nn` | NO grouped matmul. Negative result, see section 5. |
+| `cann/cann-ops-adv`, `cann/cann-ops`, `hicann/ops-nn` on gitcode | 404 |
+
+### gitcode API notes (useful if this has to be redone)
+
+- `https://gitcode.com/api/v5/repos/<owner>/<repo>/git/trees/<sha-or-branch>` works unauthenticated
+  but DEFAULTS TO 20 ENTRIES. Pass `?per_page=1000`. `?recursive=1` works but is still paginated at
+  20 per page and `?recursive=true` errors with `参数类型错误`.
+- `https://gitcode.com/api/v5/repos/<o>/<r>/contents/<path>` → 404 even for real paths.
+- Raw: `https://raw.gitcode.com/<o>/<r>/raw/master/<path>` works, but more than ~3 concurrent
+  requests returns HTTP 429 for minutes. Serialize.
+- The `hicann/*` GitHub mirrors are complete, current (pushed same day) and have no such limits.
+  Use `gh api repos/hicann/ops-transformer/git/trees/master?recursive=1` (20897 entries,
+  `truncated=false`) and `gh api repos/<r>/contents/<p> -H 'Accept: application/vnd.github.raw'`.
+
+
+
 ## Gaps
 
 What was looked for and not found.

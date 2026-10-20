@@ -73,7 +73,11 @@ int main(int argc, char** argv)
         static_cast<int>(rows),
         static_cast<int>((stages & 32) ? 2 * HALF_CHANNELS
                                        : HALF_CHANNELS / blocks),
-        tiling_host.data());
+        static_cast<int>(HIDDEN), tiling_host.data());
+    std::vector<uint8_t> down_tiling_host(TILING_BYTES, 0);
+    const int down_status = mix_build_tiling(
+        static_cast<int>(rows), static_cast<int>(HIDDEN / blocks),
+        static_cast<int>(HALF), down_tiling_host.data());
     if (tiling_status != 0) {
         std::printf("mix_build_tiling returned %d\n", tiling_status);
         return 1;
@@ -123,6 +127,12 @@ int main(int argc, char** argv)
     void* fused_out = nullptr;
     void* staged_out = nullptr;
     void* tiling = nullptr;
+    void* down_tiling = nullptr;
+    void* middle = nullptr;
+    void* down = nullptr;
+    void* down_scale = nullptr;
+    void* wide = nullptr;
+    void* narrow_out = nullptr;
     Check(aclrtMalloc(&x, x_host.size(), ACL_MEM_MALLOC_HUGE_FIRST), "x");
     Check(aclrtMalloc(&weight, weight_host.size(),
                       ACL_MEM_MALLOC_HUGE_FIRST), "weight");
@@ -138,6 +148,29 @@ int main(int argc, char** argv)
                       ACL_MEM_MALLOC_HUGE_FIRST), "staged out");
     Check(aclrtMalloc(&tiling, TILING_BYTES, ACL_MEM_MALLOC_HUGE_FIRST),
           "tiling");
+    Check(aclrtMalloc(&down_tiling, TILING_BYTES, ACL_MEM_MALLOC_HUGE_FIRST),
+          "down tiling");
+    Check(aclrtMalloc(&middle, rows * HALF, ACL_MEM_MALLOC_HUGE_FIRST),
+          "middle");
+    Check(aclrtMalloc(&down, HIDDEN * HALF, ACL_MEM_MALLOC_HUGE_FIRST),
+          "down");
+    Check(aclrtMalloc(&down_scale, HIDDEN * sizeof(float),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "down scale");
+    Check(aclrtMalloc(&wide, rows * HIDDEN * sizeof(int32_t),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "wide");
+    Check(aclrtMalloc(&narrow_out, rows * HIDDEN * sizeof(uint16_t),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "narrow out");
+
+    std::vector<int8_t> down_host(HIDDEN * HALF);
+    std::vector<float> down_scale_host(HIDDEN);
+    for (size_t index = 0; index < down_host.size(); ++index) {
+        down_host[index] = static_cast<int8_t>((index % 29) - 14);
+    }
+    for (int64_t index = 0; index < HIDDEN; ++index) {
+        down_scale_host[index] = 0.00047F
+                                 + 0.0000003F * static_cast<float>(index);
+    }
+    const float middle_scale = 0.0135F;
 
     Check(aclrtMemcpy(x, x_host.size(), x_host.data(), x_host.size(),
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload x");
@@ -152,6 +185,15 @@ int main(int argc, char** argv)
           "upload token");
     Check(aclrtMemcpy(tiling, TILING_BYTES, tiling_host.data(), TILING_BYTES,
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload tiling");
+    Check(aclrtMemcpy(down_tiling, TILING_BYTES, down_tiling_host.data(),
+                      TILING_BYTES, ACL_MEMCPY_HOST_TO_DEVICE),
+          "upload down tiling");
+    Check(aclrtMemcpy(down, down_host.size(), down_host.data(),
+                      down_host.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+          "upload down");
+    Check(aclrtMemcpy(down_scale, HIDDEN * sizeof(float),
+                      down_scale_host.data(), HIDDEN * sizeof(float),
+                      ACL_MEMCPY_HOST_TO_DEVICE), "upload down scale");
 
     // A sentinel separates "written wrongly" from "never written", which a
     // zero cannot: an untouched output and a zeroed one read the same, and
@@ -172,7 +214,8 @@ int main(int argc, char** argv)
         std::fflush(stdout);
         mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                  partial, (float*)scale, (float*)token,
-                                 staged_out, tiling, rows);
+                                 staged_out, tiling, rows, middle,
+                                 middle_scale);
         Check(aclrtSynchronizeStream(stream), "staged once");
         std::printf("staged returned\n");
         std::fflush(stdout);
@@ -182,7 +225,9 @@ int main(int argc, char** argv)
         std::fflush(stdout);
         mix_expert_fused_launch(blocks, stream, sync_base, x, weight,
                                 partial, (float*)scale, (float*)token,
-                                fused_out, tiling, rows, stages);
+                                fused_out, tiling, rows, stages, middle, down,
+                                (float*)down_scale, wide, narrow_out,
+                                down_tiling, middle_scale);
         Check(aclrtSynchronizeStream(stream), "fused once");
         std::printf("fused returned\n");
         std::fflush(stdout);
@@ -297,6 +342,59 @@ int main(int argc, char** argv)
         untouched += row_untouched;
         untouched_rows += (row_untouched == HALF);
     }
+    if (stages & 128) {
+        // The whole chain on the host: two projections with a SwiGLU and a
+        // static-scale quantisation between them.
+        std::vector<int8_t> code(rows * HALF);
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t column = 0; column < HALF; ++column) {
+                int32_t gate_product = 0;
+                int32_t up_product = 0;
+                for (int64_t inner = 0; inner < HIDDEN; ++inner) {
+                    const int32_t activation = x_host[row * HIDDEN + inner];
+                    gate_product += activation
+                                    * weight_host[column * HIDDEN + inner];
+                    up_product += activation
+                                  * weight_host[(HALF + column) * HIDDEN
+                                                + inner];
+                }
+                const float gate = static_cast<float>(gate_product)
+                                   * scale_host[column] * token_host[row];
+                const float up = static_cast<float>(up_product)
+                                 * scale_host[HALF + column]
+                                 * token_host[row];
+                const float value = gate / (1.0F + std::exp(-gate)) * up;
+                const float scaled = value / middle_scale;
+                const float rounded = std::nearbyintf(scaled);
+                code[row * HALF + column] = static_cast<int8_t>(rounded);
+            }
+        }
+        std::vector<uint16_t> chain_host(rows * HIDDEN);
+        Check(aclrtMemcpy(chain_host.data(),
+                          rows * HIDDEN * sizeof(uint16_t), narrow_out,
+                          rows * HIDDEN * sizeof(uint16_t),
+                          ACL_MEMCPY_DEVICE_TO_HOST), "download chain");
+        int64_t wrong_chain = 0;
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t column = 0; column < HIDDEN; ++column) {
+                int32_t product = 0;
+                for (int64_t inner = 0; inner < HALF; ++inner) {
+                    product += code[row * HALF + inner]
+                               * down_host[column * HALF + inner];
+                }
+                const float want = static_cast<float>(product)
+                                   * down_scale_host[column] * middle_scale;
+                const int32_t slack =
+                    static_cast<int32_t>(chain_host[row * HIDDEN + column])
+                    - static_cast<int32_t>(ToBf16(want));
+                wrong_chain += (slack > 1 || slack < -1);
+            }
+        }
+        std::printf("chain against host reference, 1 ulp allowed: %lld of "
+                    "%lld\n", (long long)wrong_chain,
+                    (long long)(rows * HIDDEN));
+    }
+
     std::printf("rows %lld  blocks %u  tiling %d  untouched %lld of %lld "
                 "in %lld whole rows\n", (long long)rows, blocks,
                 tiling_status, (long long)untouched,
@@ -313,7 +411,9 @@ int main(int argc, char** argv)
         for (int step = 0; step < repeats; ++step) {
             mix_expert_fused_launch(blocks, stream, sync_base, x, weight,
                                     partial, (float*)scale, (float*)token,
-                                    fused_out, tiling, rows, stages);
+                                    fused_out, tiling, rows, stages, middle, down,
+                                (float*)down_scale, wide, narrow_out,
+                                down_tiling, middle_scale);
         }
         Check(aclrtSynchronizeStream(stream), "fused timing");
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -323,7 +423,8 @@ int main(int argc, char** argv)
         for (int step = 0; step < repeats; ++step) {
             mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                      partial, (float*)scale, (float*)token,
-                                     staged_out, tiling, rows);
+                                     staged_out, tiling, rows, middle,
+                                 middle_scale);
         }
         Check(aclrtSynchronizeStream(stream), "staged timing");
         clock_gettime(CLOCK_MONOTONIC, &end);

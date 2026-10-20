@@ -163,9 +163,40 @@ out-of-range id is silently truncated to its low four bits — so an id of 16
 aliases onto 0. And consecutive `CrossCoreSetFlag` calls from one core are
 unordered, which a kernel raising a stage flag per layer has to design around.
 
+## The whole shared expert, cube to vector to cube, in one kernel
+
+The second projection, 128 to 6144, makes the kernel cube, vector, cube. Its K
+axis is all 128 intermediate columns, which the first stage spread across
+blocks, so what stands between the two cube stages is not a per-pair flag but
+`SyncAll<false>()` — the three-way MIX barrier, cube waits for all vector, all
+cube sync, all vector wait for cube. It sits at top level, outside both
+halves' branches, because every core must arrive even where its own stage work
+is skipped.
+
+| 8 rows, µs | 1 block | 2 | 4 | 8 |
+|---|---|---|---|---|
+| whole chain, one kernel | 23.802 | 16.465 | **13.863** | 14.468 |
+
+Correct at every block count, 0 of 49152 against a host reference that
+computes both INT32 products exactly, and 6 of 6 clean runs at four blocks.
+[raw](chain.txt)
+
+The vendor spends four kernels on this: `DynamicQuant` 3.84 µs,
+`QuantBatchMatmulV3` 11.661 for gate and up, `DequantSwigluQuant` 3.140, and
+`QuantBatchMatmulV3` 15.311 for the down projection — 33.952 µs a layer. One
+kernel does it in 13.863, **2.45x**, and over 75 MoE layers that is 1.51 ms a
+round.
+
+Not yet drop-in: the intermediate is quantised with a static scale. Per-token
+dynamic quantisation needs the row maximum over all 128 columns, which this
+channel split spreads across blocks, so it needs the published two-pass
+structure — one float per block into a workspace, a barrier, a second pass.
+The barrier is already there for the down projection, so the open question is
+whether the reduction folds into it rather than adding a second, and that is
+answerable by construction.
+
 ## Next
 
-The brick is the shared expert's first half. Its second half is one more
-matmul, 128 to 6144, which makes the kernel cube, vector, cube — and the
-second cube stage needs the vector result, so it needs the vector-to-cube flag
-direction as well. That direction is already verified here to work.
+Dynamic quantisation of the intermediate, folded into the existing barrier if
+it fits. Then the same shape for the routed experts, which is the same chain
+with a group dimension.

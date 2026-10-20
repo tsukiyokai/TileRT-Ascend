@@ -12708,6 +12708,4537 @@ and the host side, verbatim — `SetDim` is in **AIV** units while the `<<<>>>` 
   does not need a vector instruction at all.
 
 
+---
+
+## 40. Flag exhaustion and rotation across many sequential stages — what real megakernels do, and the confirmation that there is no reset
+
+Collected 2026-10-20 for question 2.1, "how a single kernel stages 78 sequential layers' worth of cross-core
+handshakes". Everything below is verbatim. Collector's provenance note, verbatim:
+
+> 319 fenced blocks. 250 were machine-checked as exact literal substrings of source files cached
+> locally at fetch time. The checker parses this file with a real CommonMark parser
+> (`markdown-it-py`), so nested fences and info strings are handled correctly.
+
+## Relevance
+This answers question 2.1 and independently corroborates §38's two load-bearing claims.
+- **flagId is 0-15, not 0-10** — arrived at independently here, and with the explanation for the discrepancy:
+  the usable range only *looks* like 0-10 because AscendC reserves 11/12/13 for `SyncAll<false>` and 14 for
+  `SyncAll<true>` (§35.5). Out-of-range truncates to the low 4 bits; overflow is a hard error. This supersedes
+  README finding 3 and `ascend-launch-overhead-and-sync.md` §4.7 for a second time.
+- **There is no reset primitive. A counter only falls by executing matching Waits.** That is the independent
+  confirmation of §38's conclusion, and it is why the brick's alternation is a pairing ledger problem rather than
+  something a reset call can fix.
+- Real code does exactly one of three things, and all three are quoted below.
+  1. **Drain at a barrier.** `huawei-csl/megagdn-pto`'s seven-stage megakernel touches only flagIds 0-4 ever,
+     ping-ponged on `slot = ci & 1`, with three explicit drain blocks in `mega_kernel.cpp` that consume the Sets the
+     last loop iteration left outstanding. This is the shape to copy first: it is a working public Ascend
+     megakernel, and the drain blocks are the literal answer to "what do I do with the residue".
+  2. **Credit window.** CATLASS `cross_core_sync.hpp` `CrossCoreSetFlagWithReverse` with
+     `MAX_REVERSE_DEPTH = 15` (already quoted in §31.8) costs **2 flagIds regardless of stage count**, which is the
+     cheapest fit for 78 layers. The hazard is proven rather than theoretical: MR !325, merged 2025-12-18, changed
+     the default from 16 because 16 「会导致卡死」.
+  3. **flagId rotation.** Huawei's own MegaMoE computes
+     `flagId = syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT` with the constant `= 15`, zeroing the counter each round,
+     and its header states the entire budget verbatim: 「syncgmm 流 0-8、C2V=9、V2C=10 ... 不落入 ...
+     SyncAll<false> 的 11-13」. That is a shipped operator's flagId allocation table for A3.
+- **The unbounded alternative avoids the hardware counter entirely.** `cann/pto-isa` PR 878's
+  `TSYNCALL<TSyncAllMode::Soft>` is a GM-counter barrier — monotonic `curValue = prev + 1`, one cache-line-isolated
+  8 × int32 slot per core, poll until all are `>= curValue` — with no flag and no depth limit; its ST exercises
+  three back to back. SuperKernel's `SkMemoryWaitFlag::GEQ` plus `NotifyFunc` / `WaitFunc` / `ResetFunc` is the same
+  idea, and critically **its RESET is of the GM word, never of a hardware flag**. Combined with §35.3's
+  `WriteGmByPassDCache` / `ReadGmByPassDCache`, that is a 78-layer-safe barrier that touches no flagId at all.
+- `graph-autofusion`'s `sk_flag_diag.h` is the authoritative proof of both limits: it deliberately saturates with
+  `for (i = 0; i <= 10)` × `for (j = 0; j < 15)`.
+- `IBSet` / `IBWait` / soft `SyncAll` are GM polling loops and do **not** share the 16-deep hardware counter — so
+  they are immune to the residue failure class in §38.
+
+# TOPIC A — cross-core flag exhaustion and rotation across many sequential stages
+
+## A1. `huawei-csl/megagdn-pto` — the barrier: `SyncAllMegaKernel`
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/kernels/pto/include/kernel_utils.h
+
+Author: Huawei Technologies Co., Ltd. (repo `huawei-csl/megagdn-pto`, branch `main`,
+copyright header 2026). Fetched 2026-10-20.
+
+This is the WHOLE file. It contains the barrier (`SyncAllMegaKernel`), the FFTS message
+encoder (`GetffstMsg`), the A2/A3 path (`SyncAllA2A3`), the A5 path (`SyncAllMixA5`), and the
+cross-core set/wait helpers (`SetCrossFlag`, `SignalBothVecOnA5`, `WaitBothVecOnA5`).
+Note the hard-coded reserved flag ids 11/12/13/14 and `SYNC_FLAG_ID_MAX` usage on A5.
+
+```cpp
+/**
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
+All rights reserved.
+
+See LICENSE in the root of the software repository:
+https://github.com/huawei-csl/pto-kernels/
+for the full License text.
+*/
+#pragma once
+
+#include <pto/pto-inst.hpp>
+#include <type_traits>
+
+namespace kernel_utils {
+/**
+ * @brief Do a sync step (set-wait flag) between two pipes.
+ *
+ * @tparam SrcPipe The pipe that sets the flag.
+ * @tparam DstPipe The pipe that waits for the flag.
+ * @param [in] id The event id to sync for.
+ */
+template <pipe_t SrcPipe, pipe_t DstPipe>
+AICORE inline void SetWaitFlag(uint32_t id) {
+  set_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
+  wait_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
+}
+
+/**
+ * @brief Performs a division on two integral numbers and rounds the result up
+ * to the nearest integer.
+ *
+ * @tparam T1 Data type of dividend.
+ * @tparam T2 Data type of divisor.
+ * @param [in] value Dividend.
+ * @param [in] divisor Divisor.
+ * @return Result of division.
+ */
+template <typename T1, typename T2,
+          typename std::enable_if<std::is_integral<T1>::value &&
+                                      std::is_integral<T2>::value,
+                                  int>::type = 0>
+AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
+  return (value + divisor - 1) / divisor;
+}
+
+template <pipe_t Pipe, uint8_t VEC_NUM = 2>
+AICORE inline void SetCrossFlag(int32_t flag) {
+  ffts_cross_core_sync(Pipe, 1 | (VEC_NUM << 4) | (flag << 8));
+}
+
+template <pipe_t Pipe>
+AICORE inline void SignalBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  set_intra_block(Pipe, flag);
+  set_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
+}
+
+template <pipe_t Pipe>
+AICORE inline void WaitBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  wait_intra_block(Pipe, flag);
+  wait_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
+}
+
+/**
+ * @brief Returns the outer matrix layout based on the target architecture and
+ * matrix orientation.
+ *
+ * On DAV C310 targets, the layout depends on whether the matrix is "left-sided"
+ * (L0A). DAV C310: L0A is NZ, L0B is ZN. Older: L0A is ZZ, L0B is ZN.
+ *
+ * Link:
+ * https://pto-isa.github.io/docs/isa/cube/nz-fractal-layout/#per-buffer-nz-layouts
+ *
+ * @param is_left Whether the matrix is on the left side (L0A) or not (L0B).
+ * @return The appropriate @c BLayout for the target architecture.
+ */
+constexpr inline pto::BLayout GetOuterLayout(bool is_left) {
+#ifdef __DAV_C310__
+  return is_left ? pto::BLayout::ColMajor : pto::BLayout::RowMajor;
+#else
+  return pto::BLayout::RowMajor;
+#endif
+}
+
+/**
+ * @brief Pipe in-core barrier for vector core that is a no-op for A5.
+ *
+ */
+AICORE inline void PipeBarrierVec() {
+#if __CCE_AICORE__ == 220
+  pipe_barrier(PIPE_V);
+#endif
+}
+
+AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
+  constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+  constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+  return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
+          ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+
+template <bool isAIVOnly = true>
+AICORE inline void SyncAllA2A3() {
+// These constants are defined on A5
+#if __CCE_AICORE__ == 220
+  constexpr uint16_t SYNC_AIV_FLAG = 12;
+  constexpr uint16_t SYNC_AIC_FLAG = 11;
+  constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+  constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+  pipe_barrier(PIPE_ALL);
+  if constexpr (isAIVOnly) {
+    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+    wait_flag_dev(SYNC_AIV_ONLY_ALL);
+    return;
+  }
+#if defined(__DAV_CUBE__)
+  wait_flag_dev(SYNC_AIV_FLAG);
+  ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(SYNC_AIC_FLAG);
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+#elif defined(__DAV_VEC__)
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+  wait_flag_dev(SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+
+// ── A5 ── mirrors include/pto/npu/a5/SyncAll.hpp:101-111
+// Requires: getFFTSMsg from <pto/npu/a5/SyncAll.hpp> (A5 defines its own)
+AICORE inline void SyncAllMixA5() {
+#if __CCE_AICORE__ != 220
+  pipe_barrier(PIPE_ALL);
+#if defined(__DAV_CUBE__)
+  // 1. Wait for both paired AIVs: one flag ID per subblock (base, base +
+  // SYNC_FLAG_ID_MAX).
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+  // 2. Global all-AIC barrier.
+  ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
+  // 3. Release both paired AIVs.
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+#elif defined(__DAV_VEC__)
+  // Set on MTE3 so prior stores drain; wait on PIPE_S.
+  set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+
+template <bool isAIVOnly = true>
+AICORE inline void SyncAllMegaKernel() {
+#if __CCE_AICORE__ == 220
+  SyncAllA2A3<isAIVOnly>();
+#else
+  static_assert(isAIVOnly == false, "No support for AIV only global sync");
+  SyncAllMixA5();
+#endif
+}
+
+}  // namespace kernel_utils
+```
+
+Key arithmetic, isolated: the FFTS config word is `1 | (mode << 4) | (flagId << 8)` and the
+flagId field is masked to **4 bits** (`flagId & 0xf`), i.e. 0-15 encodable, of which 11-14 are
+taken by the barrier itself:
+
+```cpp
+AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
+  constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+  constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+  return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
+          ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+```
+
+```cpp
+template <pipe_t Pipe, uint8_t VEC_NUM = 2>
+AICORE inline void SetCrossFlag(int32_t flag) {
+  ffts_cross_core_sync(Pipe, 1 | (VEC_NUM << 4) | (flag << 8));
+}
+```
+
+## A2. `huawei-csl/megagdn-pto` — how `mega_kernel.cpp` sequences many stages
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/kernels/pto/mega_kernel.cpp
+
+Author: Huawei Technologies Co., Ltd. (repo `huawei-csl/megagdn-pto`, branch `main`). Fetched 2026-10-20.
+
+Stage list declared at the top of the file:
+
+```cpp
+// mega_kernel.cpp — GDN Mega-Kernel (group-value / GQA): all PTO stages in one
+// launch
+//
+// Same pipeline as pto_mega_kernel, but scaled_dot_kkt / wy_fast / chunk_h /
+// chunk_o use runtime H/Hg dispatch from dynamic_bsnd_groupvalue; cumsum still
+// uses H (value heads) like dynamic_bsnd.
+//
+// Stages:
+//   1. cumsum      (Vec)
+//   2. transpose   (Vec)
+//   3. kkt         (Cube+Vec)  — K has Hg heads; β,g,A use H value heads
+//   4. solve_tril  (Cube)
+//   5. wy_fast     (Vec+Cube)
+//   6. chunk_h     (Cube+Vec)
+//   7. chunk_o     (Cube+Vec)
+```
+
+The body of `mega_kernel_impl` — this is the ANSWER to "how does real code sequence many
+stages". The answer has two halves: (1) `SyncAllMegaKernel<false>()` between every pair of
+stages, and (2) an explicit per-stage DRAIN of the leftover cross-core flag Sets, so the flag
+counters return to zero before the next stage runs. Flag ids are NOT rotated across stages —
+they are re-zeroed. Note the three drain blocks and their comments, which say exactly which
+flag was left outstanding by which engine:
+
+```cpp
+AICORE inline void mega_kernel_impl(
+    __gm__ uint8_t* q_ptr, __gm__ uint8_t* k_ptr, __gm__ uint8_t* v_ptr,
+    __gm__ uint8_t* g_in_ptr, __gm__ uint8_t* beta_ptr,
+    __gm__ uint8_t* msk_lower_ptr, __gm__ uint8_t* msk_full_ptr,
+    __gm__ uint8_t* minus_id_ptr, __gm__ uint8_t* cu_seqlens_ptr,
+    __gm__ uint8_t* o_ptr, __gm__ uint8_t* g_sum_ptr, __gm__ uint8_t* g_t_ptr,
+    __gm__ uint8_t* beta_t_ptr, __gm__ uint8_t* A_ptr,
+    __gm__ uint8_t* A_inv_f32_ptr, __gm__ uint8_t* A_inv_ptr,
+    __gm__ uint8_t* w_ptr, __gm__ uint8_t* u_ptr, __gm__ uint8_t* s_ptr,
+    __gm__ uint8_t* v_new_ptr, __gm__ uint8_t* fs_ptr, __gm__ uint8_t* h0_ptr,
+    int64_t has_initial_state, __gm__ uint8_t* kkt_ws_ptr,
+    __gm__ uint8_t* wy_ws_a1_ptr, __gm__ uint8_t* wy_ws_a2_ptr,
+    __gm__ uint8_t* h_ws_ptr, __gm__ uint8_t* o_ws_qk_ptr,
+    __gm__ uint8_t* o_ws_qs_ptr, __gm__ uint8_t* o_ws_gated_ptr, int32_t H,
+    uint32_t num_key_heads, int64_t batch_size, int64_t seq_len,
+    int64_t total_tokens, uint32_t num_matrices, uint64_t ffts_addr) {
+  set_ffts_base_addr(ffts_addr);
+
+  constexpr int32_t D = GDN_D;
+  constexpr int32_t C = GDN_C;
+
+  if (num_key_heads == 0 || (static_cast<uint32_t>(H) % num_key_heads) != 0) {
+    return;
+  }
+
+  mk_cumsum::cumsum_kernel<C>(reinterpret_cast<__gm__ float*>(g_in_ptr),
+                              reinterpret_cast<__gm__ float*>(g_sum_ptr),
+                              reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr),
+                              batch_size, seq_len, H, ffts_addr);
+
+#ifdef MEGA_STOP_AFTER_CUMSUM
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+#ifdef MEGA_STOP_AFTER_SYNC1
+  return;
+#endif
+
+  mega_transpose_TH_to_HT<float>(reinterpret_cast<__gm__ float*>(g_sum_ptr),
+                                 reinterpret_cast<__gm__ float*>(g_t_ptr),
+                                 total_tokens, H);
+  mega_transpose_TH_to_HT<half>(reinterpret_cast<__gm__ half*>(beta_ptr),
+                                reinterpret_cast<__gm__ half*>(beta_t_ptr),
+                                total_tokens, H);
+
+#ifdef MEGA_STOP_AFTER_TRANSPOSE
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+  mk_kkt::kkt_kernel<D, C>(reinterpret_cast<__gm__ half*>(k_ptr),
+                           reinterpret_cast<__gm__ half*>(beta_t_ptr),
+                           reinterpret_cast<__gm__ float*>(g_t_ptr),
+                           reinterpret_cast<__gm__ float*>(msk_lower_ptr),
+                           reinterpret_cast<__gm__ half*>(kkt_ws_ptr),
+                           reinterpret_cast<__gm__ half*>(A_ptr),
+                           reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr),
+                           batch_size, seq_len, total_tokens,
+                           static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+
+// Drain the kkt handshake: Vec released both workspace slots (flags 2/3) one
+// last time after Cube's final iteration, so consume them before the next
+// stage. A2: Vec is a separate core → FFTS cross-core flag. A5: both Vec
+// sub-blocks share Cube's core → each signals its own intra-block
+//     flag (base, base + 16).
+#if defined(__DAV_CUBE__)
+  pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
+  wait_flag_dev(2);
+  wait_flag_dev(3);
+#else
+  WaitBothVecOnA5<PIPE_MTE2>(2);
+  WaitBothVecOnA5<PIPE_MTE2>(3);
+  pipe_barrier(PIPE_ALL);
+#endif
+#endif
+
+#ifdef MEGA_STOP_AFTER_KKT
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+  mega_solve_tril(reinterpret_cast<__gm__ half*>(A_inv_ptr),
+                  reinterpret_cast<__gm__ half*>(A_ptr),
+                  reinterpret_cast<__gm__ half*>(minus_id_ptr), C, num_matrices,
+                  H, reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr), 1);
+
+#ifdef MEGA_STOP_AFTER_SOLVE
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+#ifdef MEGA_STOP_AFTER_CAST
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+#ifdef MEGA_STOP_AFTER_SYNC_BEFORE_WY
+  return;
+#endif
+
+  mk_wy::wy_fast_kernel<D, C>(
+      reinterpret_cast<__gm__ half*>(k_ptr),
+      reinterpret_cast<__gm__ half*>(v_ptr),
+      reinterpret_cast<__gm__ half*>(beta_t_ptr),
+      reinterpret_cast<__gm__ float*>(g_t_ptr),
+      reinterpret_cast<__gm__ half*>(A_inv_ptr),
+      reinterpret_cast<__gm__ half*>(wy_ws_a1_ptr),
+      reinterpret_cast<__gm__ half*>(wy_ws_a2_ptr),
+      reinterpret_cast<__gm__ half*>(w_ptr),
+      reinterpret_cast<__gm__ half*>(u_ptr),
+      reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr), batch_size, seq_len,
+      total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+
+// Drain the wy_fast handshake: Cube freed the A2/A1 slots (flags 3/4) one last
+// time after Vec's final iteration.
+// A5: Cube signalled both sub-blocks (base, base + 16); each sub-block waits on
+//     its own flag, so a plain intra-block wait is what mirrors the signal.
+#if defined(__DAV_VEC__)
+  if (get_block_idx() < num_matrices) {
+    pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
+    wait_flag_dev(3);
+    wait_flag_dev(4);
+#else
+    wait_intra_block(PIPE_MTE3, 3);
+    wait_intra_block(PIPE_MTE3, 4);
+    pipe_barrier(PIPE_ALL);
+#endif
+  }
+#endif
+
+#ifdef MEGA_STOP_AFTER_WY
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+  mk_h::chunk_h_kernel<D, C>(
+      reinterpret_cast<__gm__ half*>(k_ptr),
+      reinterpret_cast<__gm__ half*>(w_ptr),
+      reinterpret_cast<__gm__ half*>(u_ptr),
+      reinterpret_cast<__gm__ float*>(g_t_ptr),
+      reinterpret_cast<__gm__ half*>(s_ptr),
+      reinterpret_cast<__gm__ half*>(v_new_ptr),
+      reinterpret_cast<__gm__ half*>(fs_ptr),
+      reinterpret_cast<__gm__ half*>(h0_ptr), has_initial_state, 1,
+      reinterpret_cast<__gm__ half*>(h_ws_ptr),
+      reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr), batch_size, seq_len,
+      total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+
+#ifdef MEGA_STOP_AFTER_H
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+  mk_o::chunk_o_kernel<D, C>(
+      reinterpret_cast<__gm__ half*>(q_ptr),
+      reinterpret_cast<__gm__ half*>(k_ptr),
+      reinterpret_cast<__gm__ half*>(v_new_ptr),
+      reinterpret_cast<__gm__ half*>(s_ptr),
+      reinterpret_cast<__gm__ float*>(g_t_ptr),
+      reinterpret_cast<__gm__ float*>(msk_full_ptr),
+      reinterpret_cast<__gm__ half*>(o_ws_qk_ptr),
+      reinterpret_cast<__gm__ half*>(o_ws_qs_ptr),
+      reinterpret_cast<__gm__ half*>(o_ws_gated_ptr),
+      reinterpret_cast<__gm__ half*>(o_ptr),
+      reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr), batch_size, seq_len,
+      total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+
+// Drain the chunk_o handshake: Vec's final "workspace free" (flag 3) is never
+// consumed by Cube's loop, so consume it here.
+#if defined(__DAV_CUBE__)
+  if (get_block_idx() < num_matrices) {
+    pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
+    wait_flag_dev(3);
+#else
+    WaitBothVecOnA5<PIPE_MTE2>(3);
+    pipe_barrier(PIPE_ALL);
+#endif
+  }
+#endif
+}
+
+```
+
+Mechanism, stated plainly (this is the finding, not a quote): megagdn-pto does **not** rotate
+flagIds. It uses only flag ids 0,1,2,3,4 inside a stage (strict ping-pong on a double-buffer
+`slot = ci & 1`), and ids 11-14 reserved for the barrier. Between stages it calls
+`SyncAllMegaKernel<false>()` and then explicitly **consumes the leftover Sets** so every
+counter returns to zero. That is why 7 stages (and by extension 78 layers) do not exhaust
+anything: the number of *live* flags is bounded by the stage, not by the kernel.
+
+The per-stage ping-pong, verbatim, from the kkt stage. Cube waits on `2+slot`, sets `slot`;
+Vec waits on `slot`, sets `2+slot`; Vec primes both `2` and `3` before the loop so Cube does
+not deadlock on the first iteration:
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/kernels/pto/scaled_dot_kkt.cpp
+
+Author: Huawei Technologies Co., Ltd. (repo `huawei-csl/megagdn-pto`, branch `main`). Fetched 2026-10-20.
+
+```cpp
+    // ── Double-buffering via workspace slots ──────────────────────────
+    // slot = ci & 1: alternates between 0 and 1 each chunk iteration.
+    // Cube writes KK^T to workspace[slot], then signals Vec.
+    // While Vec processes slot[0], Cube can write slot[1] (next chunk).
+    // This overlaps Cube computation with Vec computation for pipelining.
+    for (int64_t ci = 0; ci < num_chunks; ++ci) {
+      int32_t slot = static_cast<int32_t>(ci & 1);
+      // Wait for Vec to finish reading the previous KK^T from this slot.
+      // A2: Cube and Vec are separate cores → FFTS cross-core flag.
+      // A5: Cube and both Vec sub-blocks live in ONE core → intra-block flags,
+      //     and each Vec sub-block signals its own flag (base and base+16).
+#if __CCE_AICORE__ == 220
+      wait_flag_dev(2 + slot);
+#else
+      WaitBothVecOnA5<PIPE_MTE2>(2 + slot);
+#endif
+      pipe_barrier(PIPE_ALL);
+```
+
+```cpp
+      // ── Cross-core synchronization (Cube → Vec) ──────────────────────
+      // ffts_cross_core_sync(pipe, config): Signal across physical cores.
+      // Unlike set_flag/wait_flag (which sync pipes within ONE core), this
+      // syncs between the Cube core and Vec core (they are separate hardware
+      // units).
+      //
+      // Config encoding: 1 | (mode << 4) | (flag_id << 8)
+      //   mode=2: broadcast to all cores on same block
+      //   flag_id: which flag to set (0,1,2,3...)
+      //
+      // The receiving side calls wait_flag_dev(flag_id) to wait for this
+      // signal.
+      //
+      // In this kernel:
+      //   Cube sets flag 0/1 → Vec waits on wait_flag_dev(0/1) (KK^T ready)
+      //   Vec sets flag 2/3 → Cube waits on wait_flag_dev(2/3) (workspace free)
+      //
+      // Signal Vec that this slot's KK^T is ready
+      // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (slot << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_FIX>(slot);
+#else
+      pipe_barrier(PIPE_ALL);
+      SignalBothVecOnA5<PIPE_FIX>(slot);
+#endif
+    }
+```
+
+```cpp
+  // Initial cross-core sync: release both workspace slots so Cube can start.
+  // Vec tells Cube "slots 0 and 1 are free" by setting flags 2 and 3.
+  // Without this, Cube would hang on wait_flag_dev(2/3) at the first iteration.
+  // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+  // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+#if __CCE_AICORE__ == 220
+  SetCrossFlag<PIPE_MTE3>(2);
+  SetCrossFlag<PIPE_MTE3>(3);
+#else
+  set_intra_block(PIPE_MTE3, 2);
+  set_intra_block(PIPE_MTE3, 3);
+#endif
+```
+
+```cpp
+      pipe_barrier(PIPE_ALL);
+      // Signal Cube that this workspace slot is free for reuse.
+      // Flag (2+slot): slot 0 → flag 2, slot 1 → flag 3.
+      // Cube is waiting on wait_flag_dev(2+slot) before writing the next chunk.
+      // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((2 + slot) << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_MTE3>(2 + slot);
+#else
+      set_intra_block(PIPE_MTE3, 2 + slot);
+#endif
+```
+
+## A3. `huawei-csl/megagdn-pto` — repo file listing (code + docs, archival output trees elided)
+
+https://github.com/huawei-csl/megagdn-pto (branch `main`), listed via
+`gh api repos/huawei-csl/megagdn-pto/git/trees/main?recursive=1` on 2026-10-20.
+
+```
+.clang-format
+.github/skills/pre-commit-validation/SKILL.md
+.github/skills/pto-kernel-compilation/SKILL.md
+.github/workflows/build-single-kernels-on-a2a3.yml
+.github/workflows/build-single-kernels-on-a5.yml
+.github/workflows/pre-commit-check.yml
+.gitignore
+.gitlab-ci.yml
+.gitmodules
+.pre-commit-config.yaml
+README.md
+benchmarks/eval_acc/run_eval_suite.sh
+benchmarks/eval_acc/run_lm_eval.py
+benchmarks/kernel/bench_gdn_kernels.py
+benchmarks/kernel/bench_kda_vs_gdn.py
+benchmarks/kernel/bench_pto_pipeline_latency.py
+benchmarks/vllm_prefill/benchmark_prefill.py
+benchmarks/vllm_prefill/run_prefill_sweep.sh
+blog/fig/eval_accuracy.png
+blog/fig/kernel_stages_N16_L8192_H16.png
+blog/fig/prefill_qwen36_35b_a3b_w8a8.png
+blog/fig/prefill_qwen36_35b_a3b_w8a8_v019.png
+blog/fig/torch_profiling.png
+blog/mega_gdn_en.md
+blog/mega_gdn_zh.md
+docker/overrides/kv_cache_utils.py
+docker/overrides/model_runner_v1.py
+docker/overrides/worker_init.py
+docker/overrides/worker_init_v19.py
+docker/run_kimi_docker.sh
+docker/start_sglang_ascend.sh
+docker/start_vllm_ascend.sh
+kernels/pto/chunk_cumsum.cpp
+kernels/pto/chunk_h.cpp
+kernels/pto/chunk_h_kda.cpp
+kernels/pto/chunk_o.cpp
+kernels/pto/chunk_o_kda.cpp
+kernels/pto/gate_cumsum_kda.cpp
+kernels/pto/include/kernel_utils.h
+kernels/pto/kkt_kda.cpp
+kernels/pto/mega_kernel.cpp
+kernels/pto/mega_kernel_kda.cpp
+kernels/pto/scaled_dot_kkt.cpp
+kernels/pto/tri_inverse.cpp
+kernels/pto/wy_fast.cpp
+kernels/pto/wy_kda.cpp
+kernels/triton_baseline/__init__.py
+kernels/triton_baseline/fla_vendor/SOURCES.md
+kernels/triton_baseline/fla_vendor/__init__.py
+kernels/triton_baseline/fla_vendor/ascend_triton_utils.py
+kernels/triton_baseline/fla_vendor/chunk.py
+kernels/triton_baseline/fla_vendor/chunk_delta_h.py
+kernels/triton_baseline/fla_vendor/chunk_o.py
+kernels/triton_baseline/fla_vendor/chunk_scaled_dot_kkt.py
+kernels/triton_baseline/fla_vendor/cumsum.py
+kernels/triton_baseline/fla_vendor/solve_tril.py
+kernels/triton_baseline/fla_vendor/utils.py
+kernels/triton_baseline/fla_vendor/wy_fast.py
+megagdn_pto/__init__.py
+megagdn_pto/compile.py
+megagdn_pto/fast_inverse.py
+megagdn_pto/kda_kernel_libs.py
+megagdn_pto/kda_mega_kernel.py
+megagdn_pto/kernel_libs.py
+megagdn_pto/mega_kernel.py
+outputs/data/archive/...        (eval.json / *.jsonl result trees, many dirs — not source)
+```
+
+The Chinese blog states which primitive the megakernel relies on for the inter-stage barrier,
+and points at the upstream PR:
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/blog/mega_gdn_zh.md
+
+Author: Huawei Technologies Co., Ltd. Fetched 2026-10-20.
+
+```
+## 简单粗暴实现Megakernel
+
+本文不去硬啃Prefill图模式的坑，改用更简单粗暴的方案：GDN 各阶段的源码只有几百行C++，把源码直接合并成一个NPU kernel函数，用熟悉的 `<<< >>>` 语法只 **launch 一次**。
+
+跨阶段之间需要对所有核做同步，保证读写次序。这里用**PTO-ISA**新加的`TSyncAll`（见 [pto-isa PR](https://gitcode.com/cann/pto-isa/pull/878)）。
+
+融合算子代码在 `megagdn-pto/kernels/pto/mega_kernel.cpp`。Megakernel的源码依然保持简短可读，并不复杂。`launch_mega_kernel` 入口只有几百行量级的代码。各阶段**复用**单算子的源文件，不需要复制黏贴。这是编译器支持的写法：一个 AICORE 函数可以调用另一个 AICORE 函数，类似 CUDA 的 `__forceinline__ __device__`。
+```
+
+---
+
+## A4. `cann/pto-isa` PR 878 — `TSYNCALL`, the SOFTWARE (GM-counter) barrier
+
+This is the single most load-bearing find for Topic A. It is an unbounded-depth barrier that
+does not consume a hardware flagId at all, and it is the primitive megagdn-pto's blog points at.
+
+https://gitcode.com/cann/pto-isa/pull/878
+
+Title: `[WIP][Feature] TSYNCALL`. State: closed. Repo `cann/pto-isa`.
+Assignees include WenboCodes, csjlchen, syfeng (Siyuan Feng), ChanKaLok, qukelin, Zhanghaijian,
+linjiashu, bluesky901, zhoubotcam, SherwinBai. Fetched via
+`https://gitcode.com/api/v5/repos/cann/pto-isa/pulls/878` on 2026-10-20.
+
+PR body, verbatim:
+
+```
+## 描述
+
+仿照asc 实现 TSYNCALL() 全核同步指令
+
+支持：
+1. 硬件FFTS实现同步，限制kernel 类型
+2. 软件实现同步，不限制kernel 类型
+
+## 关联的Issue
+<!-- 如果这个PR是为了解决特定的Issue，请在这里提供Issue链接。-->
+<!-- 如果这个PR是为了解决特定的问题单，请在这里描述问题单单号。-->
+
+## 测试
+<!--描述进行了哪些测试来验证你的改动。包括但不限于二级冒烟、算子泛化等。-->
+
+## 文档更新
+<!--如果这个PR包含文档的更新，请在这里指出。例如：更新了README.md文件。-->
+
+## 类型标签
+<!--  [x] 表示选中 -->
+- [ ] Bug修复
+- [x] 新特性
+- [ ] 性能优化
+- [ ] 文档更新
+- [ ] 其他，请描述：
+```
+
+Files touched by the PR (from `https://gitcode.com/cann/pto-isa/pull/878.diff`):
+
+```
+docs/PTOISA_zh.md
+docs/isa/README_zh.md
+docs/isa/TSYNCALL_zh.md
+docs/menu_apis.md
+include/pto/common/cpu_stub.hpp
+include/pto/common/kernel_meta.hpp
+include/pto/common/pto_instr.hpp
+include/pto/common/type.hpp
+include/pto/npu/a2a3/TSync.hpp
+include/pto/pto-inst.hpp
+tests/npu/a2a3/src/st/CMakeLists.txt
+tests/npu/a2a3/src/st/testcase/CMakeLists.txt
+tests/npu/a2a3/src/st/testcase/tsyncall/CMakeLists.txt
+tests/npu/a2a3/src/st/testcase/tsyncall/gen_data.py
+tests/npu/a2a3/src/st/testcase/tsyncall/main.cpp
+tests/npu/a2a3/src/st/testcase/tsyncall/make_mix_register_elf.py
+tests/npu/a2a3/src/st/testcase/tsyncall/tsyncall_kernel.cpp
+tests/npu/a2a3/src/st/testcase/tsyncall/tsyncall_mix_1_1_kernel.cpp
+tests/npu/a2a3/src/st/testcase/tsyncall/tsyncall_mix_1_2_kernel.cpp
+tests/npu/a2a3/src/st/testcase/tsyncall/tsyncall_mix_common.hpp
+tests/npu/a2a3/src/st/testcase/tsyncall/tsyncall_soft_kernel.cpp
+```
+
+### A4.1 `docs/isa/TSYNCALL_zh.md` — the whole new doc file, verbatim
+
+https://gitcode.com/cann/pto-isa/blob/master/docs/isa/TSYNCALL_zh.md (added by PR 878)
+
+Author: Huawei Technologies Co., Ltd. / cann/pto-isa contributors. Fetched 2026-10-20.
+
+````markdown
+# TSYNCALL
+
+## 简介
+
+`TSYNCALL` 是 A2/A3 NPU 后端的跨核同步屏障，默认硬件路径语义对齐 AscendC `dav_c220` 的无参硬件 `SyncAll()`。
+
+默认形式 `TSYNCALL()` 同步当前 kernel 内的 AIV cores。`TSYNCALL<false>()` 预留给 AIC/AIV 混合同步场景。软件形式 `TSYNCALL<TSyncAllMode::Soft>(...)` 使用 GM workspace 轮询实现 AIV-only barrier，不依赖 FFTS 调度。
+
+## C++ 内建接口
+
+声明于 `include/pto/common/pto_instr.hpp`：
+
+```cpp
+template <bool IsAIVOnly = true>
+PTO_INST void TSYNCALL();
+
+template <TSyncAllMode Mode, bool IsAIVOnly = true>
+PTO_INST void TSYNCALL(__gm__ int32_t *gmWorkspace, __ubuf__ int32_t *ubWorkspace, int32_t usedCores = 0);
+```
+
+## 参数
+
+- `gmWorkspace`: 软件模式使用的 GM workspace。调用前需要初始化为 0。
+- `ubWorkspace`: 软件模式使用的 UB scratch，容量至少为 `usedCores * 8 * sizeof(int32_t)`。
+- `usedCores`: 参与软件 barrier 的 AIV core 数。为 0 时使用 `get_block_num()`。
+
+## 约束
+
+- 当前实现仅覆盖 A2/A3 后端。
+- 软件模式当前仅支持 AIV-only kernel。
+- 软件模式要求所有参与 core 以相同顺序进入同一组 barrier；每个参与 core 在 `gmWorkspace` 中占用 8 个 `int32_t`，用于按 cache line 隔离同步计数。
+- 软件模式只提供 barrier 到达语义。若 barrier 前后还需要观察其他 GM 数据，调用方仍需保证对应数据的 cache 可见性。
+- 硬件 AIV-only `TSYNCALL()` 需要 kernel ELF 中带 `.ascend.meta.<kernel>_mix_aiv` metadata，使 runtime 按 `KERNEL_TYPE_MIX_AIV_1_0` 调度。
+- `TSYNCALL` 不返回 `RecordEvent`，也不作为 `Event<SrcOp, DstOp>` 的依赖操作使用。
+- 在 auto 模式下与现有同步指令保持一致，不直接发射硬件同步。
+````
+
+### A4.2 `include/pto/npu/a2a3/TSync.hpp` — the implementation, verbatim (the `+` side of the diff)
+
+https://gitcode.com/cann/pto-isa/blob/master/include/pto/npu/a2a3/TSync.hpp (as changed by PR 878)
+
+Author: Huawei Technologies Co., Ltd. / cann/pto-isa contributors. Fetched 2026-10-20 from
+`https://gitcode.com/cann/pto-isa/pull/878.diff`.
+
+First: the reserved flag-id constants. Note `SYNC_FLAG_ID_MAX = 16` and that 11-14 are the
+barrier's own ids, so a user kernel on A2/A3 only has 0-10 free:
+
+```cpp
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_FLAG_ID_MAX = 16;
+constexpr int32_t SYNCALL_SOFT_SLOT_INT32 = 8;
+```
+
+The hardware path (one FFTS flag per direction, exactly one Set + one Wait per call):
+
+```cpp
+template <bool IsAIVOnly = true>
+PTO_INTERNAL void TSYNCALL_IMPL()
+{
+#ifndef __PTO_AUTO__
+    pipe_barrier(PIPE_ALL);
+    if constexpr (IsAIVOnly) {
+#if defined(__DAV_VEC__)
+        ffts_cross_core_sync(PIPE_MTE3, getFFTSMsg(0x0, SYNC_AIV_ONLY_ALL));
+        wait_flag_dev(SYNC_AIV_ONLY_ALL);
+#endif
+        return;
+    }
+
+#if defined(__DAV_CUBE__)
+    wait_flag_dev(SYNC_AIV_FLAG);
+    ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
+    wait_flag_dev(SYNC_AIC_FLAG);
+    ffts_cross_core_sync(PIPE_MTE3, getFFTSMsg(0x2, SYNC_AIC_AIV_FLAG));
+#elif defined(__DAV_VEC__)
+    ffts_cross_core_sync(PIPE_MTE3, getFFTSMsg(0x2, SYNC_AIV_FLAG));
+    wait_flag_dev(SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+```
+
+The software path's GM/cache helpers — `dcci` + `dsb(DSB_DDR)` per cache line, one 8-int32
+slot per participant:
+
+```cpp
+PTO_INTERNAL void TSYNCALL_SOFT_DCCI(__gm__ void *ptr)
+{
+    __asm__ __volatile__("");
+    dcci(ptr, SINGLE_CACHE_LINE);
+    __asm__ __volatile__("");
+}
+
+PTO_INTERNAL void TSYNCALL_SOFT_DCCI_RANGE(__gm__ int32_t *ptr, int32_t lines)
+{
+    for (int32_t i = 0; i < lines; ++i) {
+        TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(ptr + i * SYNCALL_SOFT_SLOT_INT32));
+    }
+    dsb(DSB_DDR);
+}
+
+PTO_INTERNAL int32_t TSYNCALL_SOFT_GM_LOAD(__gm__ int32_t *src)
+{
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(src));
+    dsb(DSB_DDR);
+    return src[0];
+}
+```
+
+Participant indexing for mix (AIC+AIV) kernels. AIC blocks occupy `[0, aicBlocks)`, AIV
+sub-blocks occupy `[aicBlocks, aicBlocks + aicBlocks*aivRatio)`:
+
+```cpp
+PTO_INTERNAL int32_t TSYNCALL_GET_MIX_AIV_RATIO()
+{
+#if defined(__MIX_CORE_AIV_RATION__)
+    return static_cast<int32_t>(__MIX_CORE_AIV_RATION__);
+#elif defined(__DAV_VEC__)
+    return static_cast<int32_t>(get_subblockdim());
+#else
+    return 1;
+#endif
+}
+
+PTO_INTERNAL int32_t TSYNCALL_GET_MIX_AIC_BLOCKS()
+{
+#if defined(__MIX_CORE_AIC_BLOCKS__)
+    return static_cast<int32_t>(__MIX_CORE_AIC_BLOCKS__);
+#else
+    return static_cast<int32_t>(get_block_num());
+#endif
+}
+
+PTO_INTERNAL int32_t TSYNCALL_GET_MIX_PARTICIPANT_COUNT()
+{
+    return static_cast<int32_t>(TSYNCALL_GET_MIX_AIC_BLOCKS() * (1 + TSYNCALL_GET_MIX_AIV_RATIO()));
+}
+
+PTO_INTERNAL int32_t TSYNCALL_GET_MIX_PARTICIPANT_IDX()
+{
+#if defined(__DAV_VEC__)
+    return static_cast<int32_t>(TSYNCALL_GET_MIX_AIC_BLOCKS() + get_block_idx() * get_subblockdim() +
+                                get_subblockid());
+#else
+    return static_cast<int32_t>(get_block_idx());
+#endif
+}
+```
+
+The AIV-only software barrier. THIS IS THE ROTATION-FREE ANSWER: the per-core counter is
+monotonically incremented (`curValue = ubWorkspace[0] + 1`) and every core spins until all
+counters are `>= curValue`. There is no 15-deep limit and no flagId to run out of; the counter
+is an `int32_t` in GM:
+
+```cpp
+template <bool IsAIVOnly = true>
+PTO_INTERNAL void TSYNCALL_SOFT_IMPL(__gm__ int32_t *gmWorkspace, __ubuf__ int32_t *ubWorkspace,
+                                     int32_t usedCores = 0)
+{
+#ifndef __PTO_AUTO__
+    PTO_STATIC_ASSERT(IsAIVOnly, "Software TSYNCALL currently only supports AIV-only kernels.");
+    pipe_barrier(PIPE_ALL);
+
+#if defined(__DAV_VEC__)
+    const int32_t totalBlocks = (usedCores != 0) ? usedCores : static_cast<int32_t>(get_block_num());
+    const int32_t blockIdx = static_cast<int32_t>(get_block_idx());
+    __gm__ int32_t *localSyncGM = gmWorkspace + blockIdx * SYNCALL_SOFT_SLOT_INT32;
+
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(localSyncGM));
+    copy_gm_to_ubuf(static_cast<__ubuf__ void *>(ubWorkspace), static_cast<__gm__ void *>(localSyncGM), 0, 1, 1, 0,
+                    0);
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+
+    const int32_t curValue = ubWorkspace[0] + 1;
+    ubWorkspace[0] = curValue;
+
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    copy_ubuf_to_gm(static_cast<__gm__ void *>(localSyncGM), static_cast<__ubuf__ void *>(ubWorkspace), 0, 1, 1, 0,
+                    0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(localSyncGM));
+    dsb(DSB_DDR);
+
+    while (true) {
+        TSYNCALL_SOFT_DCCI_RANGE(gmWorkspace, totalBlocks);
+        copy_gm_to_ubuf(static_cast<__ubuf__ void *>(ubWorkspace), static_cast<__gm__ void *>(gmWorkspace), 0, 1,
+                        totalBlocks, 0, 0);
+        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+
+        int32_t readyCount = 0;
+        for (int32_t i = 0; i < totalBlocks; ++i) {
+            if (ubWorkspace[i * SYNCALL_SOFT_SLOT_INT32] >= curValue) {
+                ++readyCount;
+            }
+        }
+        pipe_barrier(PIPE_ALL);
+        if (readyCount >= totalBlocks) {
+            break;
+        }
+    }
+#endif
+    pipe_barrier(PIPE_ALL);
+#endif
+}
+```
+
+The mix (AIC+AIV) software barrier. The AIC side cannot use UB, so it writes its counter via
+L1 (`create_cbuf_matrix` + `copy_cbuf_to_gm`) and polls GM scalar-wise:
+
+```cpp
+PTO_INTERNAL void TSYNCALL_SOFT_AIC_STORE_SLOT(__gm__ int32_t *dst, __cbuf__ int32_t *l1Workspace, int32_t value)
+{
+    constexpr int64_t repeatConfig = (static_cast<int64_t>(1) << 16) | 1;
+    create_cbuf_matrix(l1Workspace, repeatConfig, static_cast<uint32_t>(value));
+    pipe_barrier(PIPE_ALL);
+    copy_cbuf_to_gm(static_cast<__gm__ void *>(dst), static_cast<__cbuf__ void *>(l1Workspace), 0, 1, 1, 0, 0);
+    pipe_barrier(PIPE_ALL);
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(dst));
+    dsb(DSB_DDR);
+}
+
+template <bool IsAIVOnly = false>
+PTO_INTERNAL void TSYNCALL_SOFT_MIX_IMPL(__gm__ int32_t *gmWorkspace, __ubuf__ int32_t *ubWorkspace,
+                                         __cbuf__ int32_t *l1Workspace, int32_t usedCores = 0)
+{
+#ifndef __PTO_AUTO__
+    PTO_STATIC_ASSERT(!IsAIVOnly, "Software TSYNCALL mix overload is for AIC/AIV kernels.");
+    pipe_barrier(PIPE_ALL);
+
+#if defined(__DAV_CUBE__)
+    (void)ubWorkspace;
+    const int32_t totalBlocks = (usedCores != 0) ? usedCores : TSYNCALL_GET_MIX_PARTICIPANT_COUNT();
+    const int32_t blockIdx = TSYNCALL_GET_MIX_PARTICIPANT_IDX();
+    __gm__ int32_t *localSyncGM = gmWorkspace + blockIdx * SYNCALL_SOFT_SLOT_INT32;
+
+    const int32_t curValue = TSYNCALL_SOFT_GM_LOAD(localSyncGM) + 1;
+    TSYNCALL_SOFT_AIC_STORE_SLOT(localSyncGM, l1Workspace, curValue);
+
+    while (true) {
+        int32_t readyCount = 0;
+        for (int32_t i = 0; i < totalBlocks; ++i) {
+            __gm__ int32_t *syncGM = gmWorkspace + i * SYNCALL_SOFT_SLOT_INT32;
+            if (TSYNCALL_SOFT_GM_LOAD(syncGM) >= curValue) {
+                ++readyCount;
+            }
+        }
+        pipe_barrier(PIPE_ALL);
+        if (readyCount >= totalBlocks) {
+            break;
+        }
+    }
+#elif defined(__DAV_VEC__)
+    (void)l1Workspace;
+    const int32_t totalBlocks = (usedCores != 0) ? usedCores : TSYNCALL_GET_MIX_PARTICIPANT_COUNT();
+    const int32_t blockIdx = TSYNCALL_GET_MIX_PARTICIPANT_IDX();
+    __gm__ int32_t *localSyncGM = gmWorkspace + blockIdx * SYNCALL_SOFT_SLOT_INT32;
+
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(localSyncGM));
+    dsb(DSB_DDR);
+    copy_gm_to_ubuf(static_cast<__ubuf__ void *>(ubWorkspace), static_cast<__gm__ void *>(localSyncGM), 0, 1, 1, 0,
+                    0);
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+
+    const int32_t curValue = ubWorkspace[0] + 1;
+    ubWorkspace[0] = curValue;
+
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    copy_ubuf_to_gm(static_cast<__gm__ void *>(localSyncGM), static_cast<__ubuf__ void *>(ubWorkspace), 0, 1, 1, 0,
+                    0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    TSYNCALL_SOFT_DCCI(static_cast<__gm__ void *>(localSyncGM));
+    dsb(DSB_DDR);
+
+    while (true) {
+        TSYNCALL_SOFT_DCCI_RANGE(gmWorkspace, totalBlocks);
+        copy_gm_to_ubuf(static_cast<__ubuf__ void *>(ubWorkspace), static_cast<__gm__ void *>(gmWorkspace), 0, 1,
+                        totalBlocks, 0, 0);
+        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+
+        int32_t readyCount = 0;
+        for (int32_t i = 0; i < totalBlocks; ++i) {
+            if (ubWorkspace[i * SYNCALL_SOFT_SLOT_INT32] >= curValue) {
+                ++readyCount;
+            }
+        }
+        pipe_barrier(PIPE_ALL);
+        if (readyCount >= totalBlocks) {
+            break;
+        }
+    }
+#endif
+    pipe_barrier(PIPE_ALL);
+#endif
+}
+```
+
+### A4.3 `include/pto/common/type.hpp` and `pto_instr.hpp` — the public surface
+
+```cpp
+enum class TSyncAllMode : uint8_t
+{
+    Hard = 0,
+    Soft = 1,
+};
+```
+
+```cpp
+template <bool IsAIVOnly = true>
+PTO_INST void TSYNCALL()
+{
+#if defined(PTO_NPU_ARCH_A2A3) || defined(__CPU_SIM)
+    TSYNCALL_IMPL<IsAIVOnly>();
+#else
+    PTO_STATIC_ASSERT(IsAIVOnly != IsAIVOnly, "TSYNCALL currently only supports the A2/A3 backend.");
+#endif
+}
+
+template <TSyncAllMode Mode, bool IsAIVOnly = true>
+PTO_INST void TSYNCALL(__gm__ int32_t *gmWorkspace, __ubuf__ int32_t *ubWorkspace, int32_t usedCores = 0)
+{
+#if defined(PTO_NPU_ARCH_A2A3) || defined(__CPU_SIM)
+    if constexpr (Mode == TSyncAllMode::Hard) {
+        (void)gmWorkspace;
+        (void)ubWorkspace;
+        (void)usedCores;
+        TSYNCALL_IMPL<IsAIVOnly>();
+    } else {
+        TSYNCALL_SOFT_IMPL<IsAIVOnly>(gmWorkspace, ubWorkspace, usedCores);
+    }
+#else
+    PTO_STATIC_ASSERT(Mode != Mode, "TSYNCALL currently only supports the A2/A3 backend.");
+#endif
+}
+
+template <TSyncAllMode Mode, bool IsAIVOnly = false>
+PTO_INST void TSYNCALL(__gm__ int32_t *gmWorkspace, __ubuf__ int32_t *ubWorkspace, __cbuf__ int32_t *l1Workspace,
+                       int32_t usedCores = 0)
+{
+#if defined(PTO_NPU_ARCH_A2A3) || defined(__CPU_SIM)
+    if constexpr (Mode == TSyncAllMode::Hard) {
+        (void)gmWorkspace;
+        (void)ubWorkspace;
+        (void)l1Workspace;
+        (void)usedCores;
+        TSYNCALL_IMPL<IsAIVOnly>();
+    } else {
+        TSYNCALL_SOFT_MIX_IMPL<IsAIVOnly>(gmWorkspace, ubWorkspace, l1Workspace, usedCores);
+    }
+#else
+    PTO_STATIC_ASSERT(Mode != Mode, "TSYNCALL currently only supports the A2/A3 backend.");
+#endif
+}
+```
+
+### A4.4 `include/pto/common/kernel_meta.hpp` — the ELF metadata the hardware barrier requires
+
+The hardware AIV-only `TSYNCALL()` only works if the kernel ELF carries
+`.ascend.meta.<kernel>_mix_aiv`. This is the whole new file:
+
+```cpp
+#ifndef PTO_COMMON_KERNEL_META_HPP
+#define PTO_COMMON_KERNEL_META_HPP
+
+#include <stdint.h>
+
+namespace pto {
+namespace detail {
+constexpr uint16_t PTO_META_F_TYPE_KTYPE = 1;
+constexpr uint16_t PTO_META_F_TYPE_MIX_TASK_RATION = 3;
+constexpr uint32_t PTO_META_K_TYPE_MIX_AIC_MAIN = 4;
+constexpr uint32_t PTO_META_K_TYPE_MIX_AIV_MAIN = 5;
+
+struct PtoMetaBaseTlv {
+    uint16_t type;
+    uint16_t len;
+};
+
+struct PtoMetaKType {
+    PtoMetaBaseTlv head;
+    uint32_t ktype;
+};
+
+struct PtoMetaMixCoreType {
+    PtoMetaBaseTlv head;
+    uint16_t taskRation0;
+    uint16_t taskRation1;
+};
+
+struct PtoMetaFunLevelMixCoreType {
+    PtoMetaKType ktypeMeta;
+    PtoMetaMixCoreType mixCoreType;
+};
+} // namespace detail
+} // namespace pto
+
+#define PTO_DETAIL_CONCAT_INNER(a, b) a##b
+#define PTO_DETAIL_CONCAT(a, b) PTO_DETAIL_CONCAT_INNER(a, b)
+#define PTO_A2A3_TSYNCALL_AIV_KERNEL_META(kernelName)                                                              \
+    static const ::pto::detail::PtoMetaFunLevelMixCoreType                                                          \
+        PTO_DETAIL_CONCAT(g_pto_tsyncall_aiv_meta_, __COUNTER__)                                                    \
+            __attribute__((used, section(".ascend.meta." #kernelName))) =                                           \
+                {{{::pto::detail::PTO_META_F_TYPE_KTYPE, sizeof(uint32_t)},                                         \
+                  ::pto::detail::PTO_META_K_TYPE_MIX_AIV_MAIN},                                                     \
+                 {{::pto::detail::PTO_META_F_TYPE_MIX_TASK_RATION, sizeof(uint32_t)}, 0, 1}}
+
+#define PTO_A2A3_TSYNCALL_MIX_AIC_KERNEL_META(kernelName, aicRatio, aivRatio)                                      \
+    static const ::pto::detail::PtoMetaFunLevelMixCoreType                                                          \
+        PTO_DETAIL_CONCAT(g_pto_tsyncall_mix_aic_meta_, __COUNTER__)                                                \
+            __attribute__((used, section(".ascend.meta." #kernelName))) =                                           \
+                {{{::pto::detail::PTO_META_F_TYPE_KTYPE, sizeof(uint32_t)},                                         \
+                  ::pto::detail::PTO_META_K_TYPE_MIX_AIC_MAIN},                                                     \
+                 {{::pto::detail::PTO_META_F_TYPE_MIX_TASK_RATION, sizeof(uint32_t)}, aicRatio, aivRatio}}
+
+#endif
+```
+
+### A4.5 `tests/.../tsyncall_soft_kernel.cpp` — THREE barriers back-to-back in one kernel
+
+Proof that the software barrier is re-entrant with no reset and no flag bookkeeping. Note
+`kBlockCount = 48`, `kInt32PerCacheLine = 8`, and that `syncWorkspace` is passed unchanged
+across all three calls:
+
+```cpp
+#include <pto/pto-inst.hpp>
+#include "acl/acl.h"
+
+using namespace pto;
+
+constexpr int32_t kBlockCount = 48;
+constexpr int32_t kInt32PerCacheLine = 8;
+constexpr uint64_t kFlagUbAddr = 0x0;
+constexpr uint64_t kReadUbAddr = 0x1000;
+constexpr uint64_t kOutUbAddr = 0x2000;
+constexpr uint64_t kSoftSyncUbAddr = 0x3000;
+
+PTO_INTERNAL void StoreInt32Line(__gm__ int32_t *dst, int32_t value, uint64_t ubAddr)
+{
+    __ubuf__ int32_t *ub = reinterpret_cast<__ubuf__ int32_t *>(ubAddr);
+    ub[0] = value;
+    pipe_barrier(PIPE_ALL);
+    copy_ubuf_to_gm(static_cast<__gm__ void *>(dst), static_cast<__ubuf__ void *>(ub), 0, 1, 1, 0, 0);
+    pipe_barrier(PIPE_ALL);
+}
+
+PTO_INTERNAL void InvalidateInt32Lines(__gm__ int32_t *addr, int32_t lines)
+{
+    for (int32_t i = 0; i < lines; ++i) {
+        __asm__ __volatile__("");
+        dcci(static_cast<__gm__ void *>(addr + i * kInt32PerCacheLine), SINGLE_CACHE_LINE);
+        __asm__ __volatile__("");
+    }
+    dsb(DSB_DDR);
+}
+
+extern "C" __global__ AICORE void RunSoftTSyncAll(__gm__ int32_t __out__ *out, __gm__ int32_t __out__ *flags,
+                                                  __gm__ int32_t __out__ *syncWorkspace)
+{
+    const int32_t idx = block_idx;
+    StoreInt32Line(flags + idx * kInt32PerCacheLine, idx + 1, kFlagUbAddr);
+
+    __ubuf__ int32_t *syncUb = reinterpret_cast<__ubuf__ int32_t *>(kSoftSyncUbAddr);
+    TSYNCALL<TSyncAllMode::Soft>(syncWorkspace, syncUb, kBlockCount);
+
+    __ubuf__ int32_t *readUb = reinterpret_cast<__ubuf__ int32_t *>(kReadUbAddr);
+    InvalidateInt32Lines(flags, kBlockCount);
+    copy_gm_to_ubuf(static_cast<__ubuf__ void *>(readUb), static_cast<__gm__ void *>(flags), 0, 1, kBlockCount, 0, 0);
+    pipe_barrier(PIPE_ALL);
+
+    int32_t allFirstVisible = 1;
+    for (int32_t i = 0; i < kBlockCount; ++i) {
+        if (readUb[i * kInt32PerCacheLine] != i + 1) {
+            allFirstVisible = 0;
+        }
+    }
+
+    TSYNCALL<TSyncAllMode::Soft>(syncWorkspace, syncUb, kBlockCount);
+
+    StoreInt32Line(flags + idx * kInt32PerCacheLine, (idx + 1) * 2, kFlagUbAddr);
+    TSYNCALL<TSyncAllMode::Soft>(syncWorkspace, syncUb, kBlockCount);
+
+    InvalidateInt32Lines(flags, kBlockCount);
+    copy_gm_to_ubuf(static_cast<__ubuf__ void *>(readUb), static_cast<__gm__ void *>(flags), 0, 1, kBlockCount, 0, 0);
+    pipe_barrier(PIPE_ALL);
+
+    int32_t allSecondVisible = 1;
+    for (int32_t i = 0; i < kBlockCount; ++i) {
+        if (readUb[i * kInt32PerCacheLine] != (i + 1) * 2) {
+            allSecondVisible = 0;
+        }
+    }
+
+    StoreInt32Line(out + idx * kInt32PerCacheLine, allFirstVisible & allSecondVisible, kOutUbAddr);
+}
+
+void LaunchSoftTSyncAll(int32_t *out, int32_t *flags, int32_t *syncWorkspace, void *stream)
+{
+    RunSoftTSyncAll<<<48, nullptr, stream>>>(out, flags, syncWorkspace);
+}
+```
+
+The hardware-path equivalent, showing the `PTO_A2A3_TSYNCALL_AIV_KERNEL_META` requirement and
+the `_mix_aiv` name suffix on the kernel symbol:
+
+```cpp
+PTO_A2A3_TSYNCALL_AIV_KERNEL_META(RunTSyncAll_mix_aiv);
+
+extern "C" __global__ AICORE void RunTSyncAll_mix_aiv(__gm__ uint64_t __in__ *fftsAddr, __gm__ int32_t __out__ *out,
+                                                      __gm__ int32_t __out__ *flags)
+{
+    set_ffts_base_addr(reinterpret_cast<uint64_t>(fftsAddr));
+
+    const int32_t idx = block_idx;
+    StoreInt32Line(flags + idx * kInt32PerCacheLine, idx + 1, kFlagUbAddr);
+
+    TSYNCALL();
+```
+
+And the mix test body, which alternates hard and soft at compile time and runs THREE barriers:
+
+```cpp
+template <int32_t TotalParticipants, bool UseSoft>
+PTO_INTERNAL void RunMixSyncAllBody(__gm__ uint64_t *fftsAddr, __gm__ int32_t *out, __gm__ int32_t *flags,
+                                    __gm__ int32_t *syncWorkspace)
+{
+    set_ffts_base_addr(reinterpret_cast<uint64_t>(fftsAddr));
+
+    const int32_t idx = GetMixLogicalIdx();
+    StoreMixInt32Line(flags + idx * kInt32PerCacheLine, idx + 1, kMixFlagUbAddr, kMixFlagL1Addr);
+
+    if constexpr (UseSoft) {
+        __ubuf__ int32_t *syncUb = reinterpret_cast<__ubuf__ int32_t *>(kMixSoftUbAddr);
+        __cbuf__ int32_t *syncL1 = reinterpret_cast<__cbuf__ int32_t *>(kMixSoftL1Addr);
+        TSYNCALL<TSyncAllMode::Soft, false>(syncWorkspace, syncUb, syncL1, TotalParticipants);
+    } else {
+        TSYNCALL<false>();
+    }
+
+    const int32_t allFirstVisible = CheckMixFlags(flags, TotalParticipants, kMixReadUbAddr, kMixReadL1Addr, 1);
+
+    if constexpr (UseSoft) {
+        __ubuf__ int32_t *syncUb = reinterpret_cast<__ubuf__ int32_t *>(kMixSoftUbAddr);
+        __cbuf__ int32_t *syncL1 = reinterpret_cast<__cbuf__ int32_t *>(kMixSoftL1Addr);
+        TSYNCALL<TSyncAllMode::Soft, false>(syncWorkspace, syncUb, syncL1, TotalParticipants);
+    } else {
+        TSYNCALL<false>();
+    }
+
+    StoreMixInt32Line(flags + idx * kInt32PerCacheLine, (idx + 1) * 2, kMixFlagUbAddr, kMixFlagL1Addr);
+
+    if constexpr (UseSoft) {
+        __ubuf__ int32_t *syncUb = reinterpret_cast<__ubuf__ int32_t *>(kMixSoftUbAddr);
+        __cbuf__ int32_t *syncL1 = reinterpret_cast<__cbuf__ int32_t *>(kMixSoftL1Addr);
+        TSYNCALL<TSyncAllMode::Soft, false>(syncWorkspace, syncUb, syncL1, TotalParticipants);
+    } else {
+        TSYNCALL<false>();
+    }
+
+    const int32_t allSecondVisible = CheckMixFlags(flags, TotalParticipants, kMixReadUbAddr, kMixReadL1Addr, 2);
+    StoreMixInt32Line(out + idx * kInt32PerCacheLine, allFirstVisible & allSecondVisible, kMixOutUbAddr, kMixOutL1Addr);
+}
+```
+
+---
+
+## A5. `cann/graph-autofusion` SuperKernel — device-side source
+
+Repo tree walked via `https://gitcode.com/api/v5/repos/cann/graph-autofusion/git/trees/<sha>`
+on 2026-10-20. Top level is: `.claude`, `.gitcode`, `.opencode`, `autofuse`, `cmake`, `docs`,
+`model_specialization`, `multistream`, `scripts`, `super_kernel`.
+
+The device-side sources live in `super_kernel/kernel/`:
+
+```
+super_kernel/cmake/aot_host.cmake
+super_kernel/docs/developer_guide.md
+super_kernel/docs/images/ICachePreload优化.excalidraw
+super_kernel/docs/images/ICachePreload优化.svg
+super_kernel/docs/images/super_kernel示意图.svg
+super_kernel/docs/images/superkernel示意图.excalidraw
+super_kernel/docs/images/同步事件.excalidraw
+super_kernel/docs/images/同步事件.svg
+super_kernel/docs/images/子kernel拆分.excalidraw
+super_kernel/docs/images/子kernel拆分.svg
+super_kernel/include/super_kernel/super_kernel.h
+super_kernel/kernel/CMakeLists.txt
+super_kernel/kernel/ascendc_compat/bits/floatn.h
+super_kernel/kernel/sk_entry.asc
+super_kernel/kernel/sk_flag_diag.h
+super_kernel/kernel/sk_scope_kernel.asc
+super_kernel/scripts/gen_sk_entry_stub.py
+super_kernel/src/aot/sk_candidate_heap.{cpp,h}
+super_kernel/src/aot/sk_common.{cpp,h}
+super_kernel/src/aot/sk_dfx_exception_handler.{cpp,h}
+super_kernel/src/aot/sk_dump_json.{cpp,h}
+super_kernel/src/aot/sk_event_recorder.{cpp,h}
+super_kernel/src/aot/sk_file_guard.h
+super_kernel/src/aot/sk_graph.{cpp,h}
+super_kernel/src/aot/sk_lock_detector.{cpp,h}
+super_kernel/src/aot/sk_log.{cpp,h}
+super_kernel/src/aot/sk_node.{cpp,h}
+super_kernel/src/aot/common/pattern_common.{cpp,h}
+super_kernel/src/jit/superkernel/*.py
+super_kernel/tests/st/data/test_sk_*/expect_sk_code.cc     (golden generated device code)
+```
+
+### A5.1 `super_kernel/kernel/sk_flag_diag.h` — AUTHORITATIVE on the 15-deep counter; sweeps flagIds 0..10
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/kernel/sk_flag_diag.h
+
+Author: Huawei Technologies Co., Ltd., copyright header 2025. Repo `cann/graph-autofusion`,
+branch `master`. Fetched 2026-10-20.
+
+This file is a hardware diagnostic that deliberately drives every flagId to saturation. The
+loop bounds ARE the documentation: `for (int i = 0; i <= 10; i++)` over flagIds, and
+`for (int j = 0; j < 15; j++)` over outstanding Sets of one flagId. Whole file, verbatim:
+
+```cpp
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Source Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
+ * LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef SK_FLAG_DIAG_H_
+#define SK_FLAG_DIAG_H_
+
+#include "kernel_operator.h"
+
+inline __aicore__ void send_all_flag_aic_aiv(void) {
+  if ASCEND_IS_AIC {
+    for (int i = 0; i <= 10; i++) {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(i);
+      }
+    }
+  }
+}
+
+inline __aicore__ void wait_all_flag_aic_aiv(void) {
+  if ASCEND_IS_AIV {
+    for (int i = 0; i <= 10; i++) {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreWaitFlag(i);
+      }
+    }
+  }
+}
+
+inline __aicore__ void send_all_flag_aiv_aic(void) {
+  if ASCEND_IS_AIV {
+    for (int i = 0; i <= 10; i++) {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(i);
+      }
+    }
+  }
+}
+
+inline __aicore__ void wait_all_flag_aiv_aic(void) {
+  if ASCEND_IS_AIC {
+    for (int i = 0; i <= 10; i++) {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreWaitFlag(i);
+      }
+    }
+  }
+}
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+constexpr int INTRA_FLAG_ID_OFFSET = 16;
+
+template <pipe_t aic_pipe, pipe_t aiv_pipe>
+inline __aicore__ void test_intra_core_sync_flag_pair(int flag_id) {
+  // AIC -> AIV0/AIV1: AIC flag_id and flag_id + 16 map to the same
+  // flag_id on AIV0 and AIV1 respectively.
+  AscendC::SyncAll<false>();
+  if ASCEND_IS_AIC {
+    for (int j = 0; j < 15; j++) {
+      AscendC::CrossCoreSetFlag<0x4, aic_pipe>(flag_id);
+      AscendC::CrossCoreSetFlag<0x4, aic_pipe>(flag_id + INTRA_FLAG_ID_OFFSET);
+    }
+  }
+  AscendC::SyncAll<false>();
+  if ASCEND_IS_AIV {
+    for (int j = 0; j < 15; j++) {
+      AscendC::CrossCoreWaitFlag<0x4, aiv_pipe>(flag_id);
+    }
+  }
+
+  // AIV0/AIV1 -> AIC: each AIV sets flag_id, which maps to the AIC
+  // flag_id and flag_id + 16 wait slots respectively.
+  AscendC::SyncAll<false>();
+  if ASCEND_IS_AIV {
+    for (int j = 0; j < 15; j++) {
+      AscendC::CrossCoreSetFlag<0x4, aiv_pipe>(flag_id);
+    }
+  }
+  AscendC::SyncAll<false>();
+  if ASCEND_IS_AIC {
+    for (int j = 0; j < 15; j++) {
+      AscendC::CrossCoreWaitFlag<0x4, aic_pipe>(flag_id);
+      AscendC::CrossCoreWaitFlag<0x4, aic_pipe>(flag_id + INTRA_FLAG_ID_OFFSET);
+    }
+  }
+}
+
+inline __aicore__ void test_intra_core_sync_flag(int flag_id) {
+  // The eight pairs cover every valid AIC and AIV pipe once as both a
+  // producer and consumer without enumerating redundant pipe pairs.
+  test_intra_core_sync_flag_pair<PIPE_S, PIPE_S>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_M, PIPE_S>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_MTE1, PIPE_S>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_MTE2, PIPE_S>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_FIX, PIPE_S>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_FIX, PIPE_MTE2>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_FIX, PIPE_MTE3>(flag_id);
+  test_intra_core_sync_flag_pair<PIPE_FIX, PIPE_V>(flag_id);
+}
+
+inline __aicore__ void test_intra_core_sync_flags(int flag_id = -1) {
+  if (flag_id >= 0) {
+    if (flag_id <= 10) {
+      test_intra_core_sync_flag(flag_id);
+    }
+    return;
+  }
+
+  for (int i = 0; i <= 10; i++) {
+    test_intra_core_sync_flag(i);
+  }
+}
+#endif
+
+inline __aicore__ void test_cross_core_sync_flags(int flag_id = -1) {
+  if (flag_id >= 0 && flag_id <= 15) {
+    // only diag one single event id
+    // AIC -> AIV diag
+    AscendC::SyncAll<false>();
+    if ASCEND_IS_AIC {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(flag_id);
+      }
+    }
+    AscendC::SyncAll<false>();
+    if ASCEND_IS_AIV {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreWaitFlag(flag_id);
+      }
+    }
+
+    // AIV -> AIC diag
+    AscendC::SyncAll<false>();
+    if ASCEND_IS_AIV {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(flag_id);
+      }
+    }
+    AscendC::SyncAll<false>();
+    if ASCEND_IS_AIC {
+      for (int j = 0; j < 15; j++) {
+        AscendC::CrossCoreWaitFlag(flag_id);
+      }
+    }
+  } else {
+    // AIC -> AIV
+    AscendC::SyncAll<false>();
+    send_all_flag_aic_aiv();
+    AscendC::SyncAll<false>();
+    wait_all_flag_aic_aiv();
+
+    // AIV -> AIC
+    AscendC::SyncAll<false>();
+    send_all_flag_aiv_aic();
+    AscendC::SyncAll<false>();
+    wait_all_flag_aiv_aic();
+  }
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  test_intra_core_sync_flags(flag_id);
+#endif
+}
+
+#endif  // SK_FLAG_DIAG_H_
+```
+
+Four things to take from this file:
+1. flagId domain is `0 <= i <= 10` on both A2/A3 and A5 for cross-core Sets.
+2. Exactly 15 Sets per flagId are legal before a Wait must drain them; the diag saturates the
+   counter and then drains it with exactly 15 Waits.
+3. **A `SyncAll<false>()` is placed between the Set burst and the Wait burst.** The Sets and the
+   Waits are on different cores, so without the barrier the diagnostic would race; this is the
+   same discipline the megakernel uses at stage boundaries.
+4. On A5 (`__NPU_ARCH__ == 3510`) there is a second, *intra*-core flag space with
+   `INTRA_FLAG_ID_OFFSET = 16`: AIC's `flag_id` and `flag_id + 16` map onto AIV0's and AIV1's
+   `flag_id` respectively. That offset-16 trick is exactly what megagdn-pto's
+   `SignalBothVecOnA5` / `WaitBothVecOnA5` implement.
+
+### A5.2 `super_kernel/kernel/sk_entry.asc` — how flags are NOT rotated between fused sub-kernels
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/kernel/sk_entry.asc
+
+Author: Huawei Technologies Co., Ltd. Repo `cann/graph-autofusion`, branch `master`. Fetched 2026-10-20.
+
+The barrier the SuperKernel runs between fused sub-kernels. It uses ONLY the four reserved
+AscendC flag ids — `AscendC::SYNC_AIC_FLAG`, `SYNC_AIV_FLAG`, `SYNC_AIC_AIV_FLAG`,
+`SYNC_AIV_ONLY_ALL` — in strict one-Set/one-Wait pairs. There is no rotation and no modulo:
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void FullCoreSyncImpl() {
+  if constexpr (aic == 1 && aiv == 0) {
+    AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+    AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+  } else if constexpr (aic == 0 && aiv == 1) {
+    AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+    AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+  } else {
+    if ASCEND_IS_AIC {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+      AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+    }
+    if ASCEND_IS_AIV {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+      AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+  }
+}
+```
+
+The finer-grained variant, selected per-task from a GM task descriptor. `SkCoreSyncType`
+decomposes the barrier into separate Set and Wait halves so a producer sub-kernel can Set and
+a later consumer sub-kernel can Wait — the Set and the Wait live in *different* fused stages,
+yet still on the same four reserved flagIds:
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void AutoCoreSyncImpl(SkCoreSyncType syncType) {
+  switch (syncType) {
+    case SkCoreSyncType::CROSS_SYNC_AIC_TO_AIC:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+      }
+      return;
+    case SkCoreSyncType::CROSS_SYNC_AIV_TO_AIV:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_SET_AIC_TO_AIV:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_SET_AIV_TO_AIC:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_WAIT_AIC_TO_AIV:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_WAIT_AIV_TO_AIC:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::ALL_SYNC:
+      FullCoreSyncImpl<aic, aiv>();
+      return;
+    default:
+      AscendC::Trap();
+      return;
+  }
+}
+```
+
+The "early start" overload, which lets a bitmask select which halves to emit. Note
+`SkEarlyStartMask` gives 8 independent Set/Wait halves over the same four flagIds:
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void AutoCoreSyncImpl(SkCoreSyncType syncType, uint8_t numBlocks, uint64_t syncConfig) {
+  if (syncConfig == 0) {
+    AutoCoreSyncImpl<aic, aiv>(syncType);
+    return;
+  }
+
+  if (AscendC::GetBlockIdx() < numBlocks) {
+    return;
+  }
+
+  if ASCEND_IS_AIC {
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIC_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIC_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIV_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIC_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+    }
+  }
+
+  if ASCEND_IS_AIV {
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIV_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIV_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIC_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIV_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+  }
+}
+```
+
+### A5.3 `sk_entry.asc` — `SkMemoryWaitFlag` / GM-counter waits (Notify / Wait / RESET)
+
+This is the second, flag-free synchronisation channel in the SuperKernel: a 64-bit GM word per
+event, written by `NotifyFunc`, spun on by `WaitFunc`, and — crucially for the question of
+"how are flags reset between fused sub-kernels" — **reset by `ResetFunc`**. The reset is of the
+GM counter, not of a hardware flag; the hardware flags are never reset, only balanced.
+
+```cpp
+template <bool aic_flag>
+__aicore__ inline void NotifyFunc(GM_ADDR param, uint64_t value) {
+  if constexpr (aic_flag) {
+    if (get_block_idx() == 0) {
+      __gm__ uint64_t *notifyLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *notifyLock = value;
+      dcci(notifyLock, 0, 2);
+    }
+  } else {
+    if (AscendC::GetBlockIdx() == 0) {
+      __gm__ uint64_t *notifyLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *notifyLock = value;
+      dcci(notifyLock, 0, 2);
+    }
+  }
+}
+
+template <bool aic_flag>
+__aicore__ inline void WaitFunc(GM_ADDR param, uint64_t value, uint32_t flag) {
+  if constexpr (aic_flag) {
+    if (get_block_idx() == 0) {
+      __gm__ volatile uint64_t *waitLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::GEQ)) {
+        dcci(waitLock, 0, 2);
+        while (*waitLock < value) {
+          dcci(waitLock, 0, 2);
+        }
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::EQ)) {
+        dcci(waitLock, 0, 2);
+        while (*waitLock != value) {
+          dcci(waitLock, 0, 2);
+        }
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::AND)) {
+        dcci(waitLock, 0, 2);
+        while ((*waitLock & value) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      } else {
+        dcci(waitLock, 0, 2);
+        while ((~(*waitLock | value)) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      }
+    }
+  } else {
+    if (AscendC::GetBlockIdx() == 0) {
+      __gm__ volatile uint64_t *waitLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::GEQ)) {
+        dcci(waitLock, 0, 2);
+        while (*waitLock < value) {
+          dcci(waitLock, 0, 2);
+        }
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::EQ)) {
+        dcci(waitLock, 0, 2);
+        while (*waitLock != value) {
+          dcci(waitLock, 0, 2);
+        }
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::AND)) {
+        dcci(waitLock, 0, 2);
+        while ((*waitLock & value) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      } else {
+        dcci(waitLock, 0, 2);
+        while ((~(*waitLock | value)) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      }
+    }
+  }
+}
+
+template <bool aic_flag>
+__aicore__ inline void ResetFunc(GM_ADDR param, uint64_t value) {
+  if constexpr (aic_flag) {
+    if (get_block_idx() == 0) {
+      __gm__ uint64_t *resetLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *resetLock = value;
+      dcci(resetLock, 0, 2);
+    }
+  } else {
+    if (AscendC::GetBlockIdx() == 0) {
+      __gm__ uint64_t *resetLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *resetLock = value;
+      dcci(resetLock, 0, 2);
+    }
+  }
+}
+```
+
+### A5.4 `super_kernel/src/aot/sk_common.h` — the task/sync/flag enums
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/src/aot/sk_common.h
+
+Author: Huawei Technologies Co., Ltd. Repo `cann/graph-autofusion`, branch `master`. Fetched 2026-10-20.
+
+```cpp
+enum class SkKernelType : uint8_t {
+  AIC_ONLY = 1,
+  AIV_ONLY = 2,
+  MIX_AIV_1_0 = 3,
+  MIX_AIC_1_0 = 4,
+  MIX_AIC_1_1 = 5,
+  MIX_AIC_1_2 = 6,
+  DEFAULT = 0xFF,
+};
+```
+
+```cpp
+enum class SkTaskType : uint8_t {
+  TYPE_FUNC,
+  TYPE_SYNC,
+  TYPE_PRELOAD,
+  TYPE_EVENT_NOTIFY,
+  TYPE_EVENT_WAIT,
+  TYPE_EVENT_RESET,
+  TYPE_MAX,
+};
+```
+
+```cpp
+enum class SkCoreSyncType : uint8_t {
+  ALL_SYNC = 0,
+  CROSS_SYNC_AIC_TO_AIC,
+  CROSS_SYNC_AIV_TO_AIV,
+  INTER_SYNC_SET_AIC_TO_AIV,
+  INTER_SYNC_SET_AIV_TO_AIC,
+  INTER_SYNC_WAIT_AIC_TO_AIV,
+  INTER_SYNC_WAIT_AIV_TO_AIC,
+  SYNC_NONE,
+};
+```
+
+The `SkMemoryWaitFlag` enum, with the comment that pins its numeric values to the host runtime's
+`aclrtValueWait`:
+
+```cpp
+// Memory wait rule for VALUE_WAIT tasks.
+// The numeric values must stay aligned with runtime's aclrtValueWait flag definition.
+enum class SkMemoryWaitFlag : uint32_t {
+  GEQ = 0x0,  // Wait until *addr >= value
+  EQ = 0x1,   // Wait until *addr == value
+  AND = 0x2,  // Wait until (*addr & value) != 0
+  NOR = 0x3,  // Wait until ~(*addr | value) != 0
+};
+```
+
+```cpp
+constexpr uint64_t SK_DEFAULT_NOTIFY_VALUE = 1;
+constexpr uint64_t SK_DEFAULT_WAIT_VALUE = 1;
+constexpr uint64_t SK_DEFAULT_RESET_VALUE = 0;
+constexpr uint32_t SK_DEFAULT_WRITE_FLAG = 0;
+```
+
+The per-task descriptor, including the `debugOptions` bit map. Bit 16 (`0x10`) is
+`debug_cross_core_sync_check`, which is what triggers `test_cross_core_sync_flags()`:
+
+```cpp
+struct TaskInfo {
+  uint32_t index;
+  SkTaskType type;
+  SkKernelType relatedType = SkKernelType::DEFAULT;
+  uint8_t numBlocks;
+  uint8_t entryCnt;
+  uint64_t entry[4];
+  // 根据bit位确定option选项
+  // 1： dcci_disable_on_kernel
+  // 2： debug_sync_all
+  // 4： dcci_before_kernel_start
+  // 8： dcci_after_kernel_end
+  // 16： debug_cross_core_sync_check
+  // 32： enable_dcci_after_func - 直接指示kernel是否需要在func执行后插入dcci
+  //      该bit由host端根据disableDcci和afterKernelEnd综合计算得出
+  //      kernel侧只需检查此bit即可，无需组合判断
+  uint64_t debugOptions;
+  uint64_t extraInfo;
+  uint64_t args;
+  uint32_t argsSize;
+  uint8_t isSimtKernel;
+  uint8_t reservedList[3];
+};
+
+inline void SetEventTaskArgs(TaskInfo &taskInfo, uint64_t addr, uint64_t value, uint32_t flag) {
+  taskInfo.args = addr;
+  taskInfo.entry[0] = value;
+  taskInfo.extraInfo = static_cast<uint64_t>(flag);
+}
+
+inline uint64_t GetEventTaskAddr(const TaskInfo &taskInfo) {
+  return taskInfo.args;
+}
+
+enum class SkEarlyStartMask : uint32_t {
+  NONE = 0U,
+  AIC_TO_AIC_SET = 1U << 0,
+  AIC_TO_AIC_WAIT = 1U << 1,
+  AIC_TO_AIV_SET = 1U << 2,
+  AIV_TO_AIC_WAIT = 1U << 3,
+  AIV_TO_AIV_SET = 1U << 4,
+  AIV_TO_AIV_WAIT = 1U << 5,
+  AIV_TO_AIC_SET = 1U << 6,
+  AIC_TO_AIV_WAIT = 1U << 7,
+  SPLIT_CORE_CTRL = 1U << 15,
+};
+```
+
+### A5.5 `sk_entry.asc` — the stage-sequencing loop (how hundreds of sub-kernels are driven)
+
+This is the SuperKernel's answer to "sequencing many stages": a GM-resident task queue, walked
+by every core, with four task kinds — FUNC (call a sub-kernel through a function pointer),
+SYNC (emit a barrier), PRELOAD (ICache prefetch of the next sub-kernel), and
+EVENT_NOTIFY/WAIT/RESET (the GM counter channel). The flag usage per task is constant, so the
+queue length is unbounded:
+
+```cpp
+  uint32_t que_offset = 0;
+  if ASCEND_IS_AIC {
+    que_offset = sk_header->aicQueOffset + (((uint8_t)get_coreid()) % 4) * sk_header->aicQueSize;
+    if constexpr (enable_profiling) {
+      if (aic != 0) {
+        skBlockNum = AscendC::GetBlockNum() * aic;
+      }
+    }
+  }
+  if ASCEND_IS_AIV {
+    que_offset = sk_header->aivQueOffset + (((uint8_t)get_coreid()) % 4) * sk_header->aivQueSize;
+    if constexpr (enable_profiling) {
+      if (aiv != 0) {
+        skBlockNum = AscendC::GetBlockNum() * aiv;
+      }
+    }
+  }
+  const __gm__ TaskQue *taskQue = (const __gm__ TaskQue *)((const __gm__ uint8_t *)sk_header + que_offset);
+  for (auto i = 0; i < taskQue->taskCnt; i++) {
+    const __gm__ TaskInfo *task = taskQue->taskInfos + i;
+    if (task->type == SkTaskType::TYPE_PRELOAD) {
+      auto blockId = AscendC::GetBlockIdx();
+      if (blockId < task->numBlocks) {
+        preload((const void *)(task->entry[((uint8_t)get_coreid()) % task->entryCnt]), task->args);
+        dc_preload((__gm__ uint64_t *)(task->extraInfo), 0);
+        dc_preload((__gm__ uint64_t *)(task->extraInfo) + 8, 0);
+        dc_preload((__gm__ uint64_t *)(task + 1), 0);
+      }
+    } else if (task->type == SkTaskType::TYPE_FUNC) {
+      auto blockId = AscendC::GetBlockIdx();
+      if (blockId < task->numBlocks) {
+```
+
+```cpp
+        if ((task->debugOptions & 0x4) != 0) {
+          dcci(nullptr, 1, 2);
+        }
+
+        ((sk_sub_func)(task->entry[((uint8_t)get_coreid()) % task->entryCnt]))((const __gm__ void *)task->args,
+                                                                               &sysArgs);
+```
+
+```cpp
+      if constexpr (enable_op_trace) {
+        constexpr bool is_aic_or_aiv_only = (aic == 1 && aiv == 0) || (aic == 0 && aiv == 1);
+        if constexpr (!is_aic_or_aiv_only) {
+          bool is_mix_kernel =
+              (task->relatedType == SkKernelType::MIX_AIC_1_1) || (task->relatedType == SkKernelType::MIX_AIC_1_2);
+          if (((task->debugOptions & 0x10) != 0) && is_mix_kernel) {
+            test_cross_core_sync_flags();
+          }
+        }
+      }
+    } else if (task->type == SkTaskType::TYPE_SYNC) {
+      if constexpr (enable_debug) {
+        if ((task->debugOptions & 0x2) != 0) {
+          sk::FullCoreSyncImpl<aic, aiv>();
+        } else {
+          if constexpr (enable_early_start) {
+            sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args, task->numBlocks, task->extraInfo);
+          } else {
+            sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args);
+          }
+        }
+      } else {
+        if constexpr (enable_early_start) {
+          sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args, task->numBlocks, task->extraInfo);
+        } else {
+          sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args);
+        }
+      }
+    } else if (task->type == SkTaskType::TYPE_EVENT_NOTIFY) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      if ASCEND_IS_AIC {
+        sk::NotifyFunc<true>(eventAddr, eventValue);
+      }
+      if ASCEND_IS_AIV {
+        sk::NotifyFunc<false>(eventAddr, eventValue);
+      }
+    } else if (task->type == SkTaskType::TYPE_EVENT_WAIT) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      const uint32_t waitFlag = static_cast<uint32_t>(task->extraInfo);
+      if ASCEND_IS_AIC {
+        sk::WaitFunc<true>(eventAddr, eventValue, waitFlag);
+      }
+      if ASCEND_IS_AIV {
+        sk::WaitFunc<false>(eventAddr, eventValue, waitFlag);
+      }
+    } else if (task->type == SkTaskType::TYPE_EVENT_RESET) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      if ASCEND_IS_AIC {
+        sk::ResetFunc<true>(eventAddr, eventValue);
+      }
+      if ASCEND_IS_AIV {
+        sk::ResetFunc<false>(eventAddr, eventValue);
+      }
+    }
+  }
+```
+
+### A5.6 Golden generated SuperKernel device code (the AOT codegen output)
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/tests/st/data/test_sk_1_stream_2_ops_debug_sync_all_1_aic_only/expect_sk_code.cc
+
+Author: Huawei Technologies Co., Ltd. Repo `cann/graph-autofusion`, branch `master`. Fetched 2026-10-20.
+
+Note that the emitted inter-op barrier for 2 fused ops uses the SAME flagId
+(`AscendC::SYNC_AIC_FLAG`) both times, and that the separate "inter ops barrier" uses a
+different primitive pair entirely: `AscendC::SetNextTaskStart()` / `AscendC::WaitPreTaskEndImpl<0>()`:
+
+```cpp
+    // op end debug sync all.
+
+    ffts_cross_core_sync(PIPE_FIX, AscendC::GetffstMsg(0x0, AscendC::SYNC_AIC_FLAG));
+    wait_flag_dev(AscendC::SYNC_AIC_FLAG);
+    //begin func call of sub operator pows__kernel0
+    // begin inter ops barrier
+    if ASCEND_IS_AIC {
+        if (true) {
+            AscendC::SetNextTaskStart();
+        }
+    }
+
+    if ASCEND_IS_AIV {
+        if (true) {
+            // AIC only, no complement early start set flag.
+        }
+    }
+
+    g_super_kernel_early_start_config = 0;
+    if ASCEND_IS_AIC {
+        if (true) {
+            AscendC::WaitPreTaskEndImpl<0>();
+        }
+    }
+
+    if ASCEND_IS_AIV {
+        if (true) {
+            AscendC::WaitPreTaskEndImpl<0>();
+        }
+    }
+```
+
+```cpp
+    // op end debug sync all.
+
+    ffts_cross_core_sync(PIPE_FIX, AscendC::GetffstMsg(0x0, AscendC::SYNC_AIC_FLAG));
+    wait_flag_dev(AscendC::SYNC_AIC_FLAG);
+}
+```
+
+Also from the 2-stream mix golden file, the generated entry showing the `_mix_aic`/`_mix_aiv`
+ELF metadata emitted for `__NPU_ARCH__ == 2201` (i.e. A2/A3 `dav-2201`):
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/tests/st/data/test_sk_2_stream_2_ops_default_aic_1_1/expect_sk_code.cc
+
+```cpp
+extern "C"  __global__ __attribute__((aligned(512))) __aicore__ void auto_gen_te_superkernel_2_stream_2_ops_kernel(void) {
+    GM_ADDR *param_base = (GM_ADDR *)get_para_base();
+    GM_ADDR ffts_addr = param_base[0];
+    if (ffts_addr != nullptr) {
+        set_ffts_base_addr((uint64_t)ffts_addr);
+    }
+
+    if ASCEND_IS_AIC {
+        auto_gen_te_superkernel_2_stream_2_ops_kernel_aic();
+    }
+    if ASCEND_IS_AIV {
+        auto_gen_te_superkernel_2_stream_2_ops_kernel_aiv();
+    }
+}
+
+#if TILING_KEY_VAR == 0UL
+#if (defined(__DAV_CUBE__) && __NPU_ARCH__ == 2201)
+static const struct FunLevelMixCoreType te_superkernel_2_stream_2_ops_mix_aic_section __attribute__ ((used, section (".ascend.meta.te_superkernel_2_stream_2_ops_mix_aic"))) = { {{F_TYPE_KTYPE, sizeof(unsigned int)}, K_TYPE_MIX_AIC_MAIN},    {{F_TYPE_MIX_TASK_RATION, sizeof(unsigned int)}, 1, 1} };
+#endif
+#endif
+
+#if TILING_KEY_VAR == 0UL
+#if (defined(__DAV_VEC__) && __NPU_ARCH__ == 2201)
+static const struct FunLevelMixCoreType te_superkernel_2_stream_2_ops_mix_aiv_section __attribute__ ((used, section (".ascend.meta.te_superkernel_2_stream_2_ops_mix_aiv"))) = { {{F_TYPE_KTYPE, sizeof(unsigned int)}, K_TYPE_MIX_AIC_MAIN},    {{F_TYPE_MIX_TASK_RATION, sizeof(unsigned int)}, 1, 1} };
+#endif
+#endif
+```
+
+### A5.7 Negative result — `super_kernel/docs/developer_guide.md` has nothing on synchronisation
+
+https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/docs/developer_guide.md
+
+Author: Huawei Technologies Co., Ltd. Repo `cann/graph-autofusion`, branch `master`, 6283 bytes.
+Fetched 2026-10-20. Grepped for `同步` / `sync` / `flag` / `barrier` / `dcci` / `事件`: zero hits.
+The file is about the System Test harness (fixtures, golden files, dependency management), not
+kernel design. The one datum worth keeping is the default SoC the SuperKernel tests target:
+
+```
+- `soc_version`（`fixtures/config.py`）：指定默认 SoC 信息，当前默认值为 `Ascend910_9391`；如需使用其他版本，可在场景内覆盖或增加新的 fixture。
+```
+
+The sync design is instead documented only as diagrams — `super_kernel/docs/images/同步事件.svg`
+and `.excalidraw`, plus `子kernel拆分.svg` and `ICachePreload优化.svg` — which are not quotable text.
+
+Negative result for this repo: there is **no** `SkMemoryWaitFlag`-style rotation of
+`CrossCoreSetFlag` flagIds anywhere in `cann/graph-autofusion`, and no per-sub-kernel flagId
+allocator. Searched `super_kernel/kernel/*.asc`, `super_kernel/kernel/*.h`,
+`super_kernel/src/aot/*`, and the golden `expect_sk_code.cc` files: every `CrossCoreSetFlag`
+call site uses one of the four `AscendC::SYNC_*` constants, except `sk_flag_diag.h`, which
+sweeps 0..10 purely as a hardware self-test.
+
+---
+
+## A6. The complete flagId budget of a real 7-stage megakernel (derived, with the grep that proves it)
+
+Every cross-core Set/Wait site in all five stage files of `huawei-csl/megagdn-pto`, extracted on
+2026-10-20 with
+`grep -n 'SetCrossFlag<[^>]*>([^)]*)\|wait_flag_dev([^)]*)\|set_intra_block([^)]*)\|wait_intra_block([^)]*)\|SignalBothVecOnA5<[^>]*>([^)]*)\|WaitBothVecOnA5<[^>]*>([^)]*)\|SyncAll'`
+over the files fetched from `https://raw.githubusercontent.com/huawei-csl/megagdn-pto/main/kernels/pto/`:
+
+```
+##### scaled_dot_kkt.cpp
+316: wait_flag_dev(2 + slot);          # slot = ci & 1  -> flags 2,3
+318: WaitBothVecOnA5<PIPE_MTE2>(2 + slot);
+427: SetCrossFlag<PIPE_FIX>(slot);     # -> flags 0,1
+430: SignalBothVecOnA5<PIPE_FIX>(slot);
+490: SetCrossFlag<PIPE_MTE3>(2);       # prime
+491: SetCrossFlag<PIPE_MTE3>(3);       # prime
+493: set_intra_block(PIPE_MTE3, 2);
+494: set_intra_block(PIPE_MTE3, 3);
+579: wait_flag_dev(slot);              # -> flags 0,1
+581: wait_intra_block(PIPE_MTE3, slot);
+699: SetCrossFlag<PIPE_MTE3>(2 + slot);# -> flags 2,3
+701: set_intra_block(PIPE_MTE3, 2 + slot);
+
+##### wy_fast.cpp
+476: wait_flag_dev(3);
+478: wait_intra_block(PIPE_MTE3, 3);
+496: SetCrossFlag<PIPE_MTE3>(2);
+498: set_intra_block(PIPE_MTE3, 2);
+540: wait_flag_dev(4);
+542: wait_intra_block(PIPE_MTE3, 4);
+560: SetCrossFlag<PIPE_MTE3>(1);
+562: set_intra_block(PIPE_MTE3, 1);
+664: wait_flag_dev(3);
+666: wait_intra_block(PIPE_MTE3, 3);
+684: SetCrossFlag<PIPE_MTE3>(2);
+686: set_intra_block(PIPE_MTE3, 2);
+724: wait_flag_dev(4);
+726: wait_intra_block(PIPE_MTE3, 4);
+744: SetCrossFlag<PIPE_MTE3>(1);
+746: set_intra_block(PIPE_MTE3, 1);
+813: wait_flag_dev(2);
+815: WaitBothVecOnA5<PIPE_MTE2>(2);
+851: SetCrossFlag<PIPE_FIX>(3);
+853: SignalBothVecOnA5<PIPE_FIX>(3);
+859: wait_flag_dev(1);
+861: WaitBothVecOnA5<PIPE_MTE2>(1);
+895: SetCrossFlag<PIPE_FIX>(4);
+897: SignalBothVecOnA5<PIPE_FIX>(4);
+959: wait_flag_dev(2);
+961: WaitBothVecOnA5<PIPE_MTE2>(2);
+993: SetCrossFlag<PIPE_FIX>(3);
+995: SignalBothVecOnA5<PIPE_FIX>(3);
+1001: wait_flag_dev(1);
+1003: WaitBothVecOnA5<PIPE_MTE2>(1);
+1035: SetCrossFlag<PIPE_FIX>(4);
+1037: SignalBothVecOnA5<PIPE_FIX>(4);
+
+##### chunk_h.cpp
+444: wait_flag_dev(3);
+446: WaitBothVecOnA5<PIPE_MTE2>(3);
+497: SetCrossFlag<PIPE_FIX>(0);
+500: SignalBothVecOnA5<PIPE_FIX>(0);
+505: wait_flag_dev(1);
+507: WaitBothVecOnA5<PIPE_MTE2>(1);
+555: SetCrossFlag<PIPE_FIX>(2);
+558: SignalBothVecOnA5<PIPE_FIX>(2);
+643: SetCrossFlag<PIPE_MTE3>(3);
+646: set_intra_block(PIPE_MTE3, 3);
+768: wait_flag_dev(0);
+770: wait_intra_block(PIPE_MTE3, 0);
+824: SetCrossFlag<PIPE_MTE3>(1);
+827: set_intra_block(PIPE_MTE3, 1);
+886: wait_flag_dev(2);
+888: wait_intra_block(PIPE_MTE3, 2);
+943: SetCrossFlag<PIPE_MTE3>(3);
+946: set_intra_block(PIPE_MTE3, 3);
+
+##### chunk_o.cpp
+306: wait_flag_dev(3);
+308: WaitBothVecOnA5<PIPE_MTE2>(3);
+492: SetCrossFlag<PIPE_FIX>(0);
+495: SignalBothVecOnA5<PIPE_FIX>(0);
+500: wait_flag_dev(1);
+502: WaitBothVecOnA5<PIPE_MTE2>(1);
+583: SetCrossFlag<PIPE_FIX>(2);
+586: SignalBothVecOnA5<PIPE_FIX>(2);
+608: wait_flag_dev(3);
+610: WaitBothVecOnA5<PIPE_MTE2>(3);
+752: SetCrossFlag<PIPE_FIX>(0);
+755: SignalBothVecOnA5<PIPE_FIX>(0);
+760: wait_flag_dev(1);
+762: WaitBothVecOnA5<PIPE_MTE2>(1);
+837: SetCrossFlag<PIPE_FIX>(2);
+840: SignalBothVecOnA5<PIPE_FIX>(2);
+976: wait_flag_dev(0);
+978: wait_intra_block(PIPE_MTE3, 0);
+987: SetCrossFlag<PIPE_MTE3>(1);
+988: wait_flag_dev(2);
+989: SetCrossFlag<PIPE_MTE3>(3);
+992: set_intra_block(PIPE_MTE3, 1);
+993: wait_intra_block(PIPE_MTE3, 2);
+994: set_intra_block(PIPE_MTE3, 3);
+1066: SetCrossFlag<PIPE_MTE3>(1);
+1069: set_intra_block(PIPE_MTE3, 1);
+1091: wait_flag_dev(2);
+1093: wait_intra_block(PIPE_MTE3, 2);
+1152: SetCrossFlag<PIPE_MTE3>(3);
+1155: set_intra_block(PIPE_MTE3, 3);
+1232: wait_flag_dev(0);
+1234: wait_intra_block(PIPE_MTE3, 0);
+
+##### chunk_cumsum.cpp   (no cross-core sites at all — Vec only)
+##### tri_inverse.cpp    (no cross-core sites at all — Cube only)
+```
+
+The whole 7-stage megakernel touches flagIds **0, 1, 2, 3, 4** and nothing else. No stage uses
+a flagId above 4; the barrier uses 11-14. Every stage re-uses the same low ids. That is legal
+only because of the three invariants the source enforces:
+1. inside a stage, each flagId alternates Set / Wait strictly (a double-buffer `slot = ci & 1`),
+   so the outstanding count never exceeds 1 — nowhere near 15;
+2. a `SyncAllMegaKernel<false>()` separates every pair of stages;
+3. any Set left outstanding by the last loop iteration is explicitly consumed by a drain block
+   in `mega_kernel.cpp` (the three `wait_flag_dev(2); wait_flag_dev(3);` / `(3); (4);` / `(3);`
+   blocks quoted in A2 above).
+
+For a kernel fusing 78 layers, the implication from this source is: do not look for a rotation
+scheme. Make each layer's flag use balanced and bracketed by a barrier, and the same 11 flagIds
+serve an arbitrary number of layers. Where a dependency must cross a barrier (producer in layer
+*i*, consumer in layer *j*), use the GM-counter channel (A4's `TSYNCALL<Soft>` or A5.3's
+`NotifyFunc`/`WaitFunc`/`ResetFunc` with `SkMemoryWaitFlag::GEQ`), which has no counter limit.
+
+
+---
+
+## A7. Official docs, CATLASS, field reports and real rotation code (Topic A, breadth pass)
+
+Verification note for this section: 102 fenced blocks. 64 were machine-checked as exact literal
+substrings of the locally cached source files. The other 38 come from issue/PR/code-search APIs
+that were not cached to disk; I independently re-fetched and re-confirmed the two most
+load-bearing of those (gitcode `cann/catlass` MR !325 body and `cann/ops-solver` issue #13 body)
+character-for-character, and re-fetched `catlass/include/catlass/arch/cross_core_sync.hpp` whole
+(reproduced at the end of this section). Treat any remaining uncached quote as high-confidence
+but single-sourced.
+
+### A7.1 OFFICIAL CANN DOC — `CrossCoreSetFlag(ISASI)`, older master snapshot (flagId 0-10, "最多设置15次")
+
+This is the CANN `asc-devkit` repo copy of the official hiascend API page. The topic id `ZH-CN_TOPIC_0000001834069637` is the hiascend doc id. Note the A2/A3 range is **0-10** here, and the counter clause.
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/CrossCoreSetFlag(ISASI).md
+(raw mirror used to fetch: https://raw.githubusercontent.com/ckorikov/asc-devkit/master/docs/api/context/CrossCoreSetFlag(ISASI).md )
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit) / doc topic ZH-CN_TOPIC_0000001834069637; file header "Copyright (c) 2026"
+
+````
+## 功能说明<a name="section618mcpsimp"></a>
+
+面向分离模式的核间同步控制接口。
+
+该接口和[CrossCoreWaitFlag](CrossCoreWaitFlag(ISASI).md)接口配合使用。使用时需传入核间同步的标记ID\(flagId\)，每个ID对应一个用于控制同步的计数器。
+
+同步控制分为以下几种模式，如[图1](#fig37581010773)所示：
+
+-   模式0：AI Core核间的同步控制。对于AIC场景，同步所有的AIC核，直到所有的AIC核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行；对于AIV场景，同步所有的AIV核，直到所有的AIV核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行。
+-   模式1：AI Core内部，AIV核之间的同步控制。如果两个AIV核都运行了CrossCoreSetFlag，CrossCoreWaitFlag后续的指令才会执行。
+-   模式2：AI Core内部，AIC与AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后， 两个AIV上CrossCoreWaitFlag后续的指令才会继续执行；两个AIV都执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+-   模式4：AI Core内部，AIC与AIV之间的同步控制。AIV0与AIV1可单独触发AIC等待。比如，在AIC核执行CrossCoreSetFlag之后， AIV0上CrossCoreWaitFlag后续的指令才会继续执行；AIV0执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+
+其中，模式4仅支持Ascend 950PR/Ascend 950DT。
+
+## 函数原型<a name="section620mcpsimp"></a>
+
+```
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId)
+```
+````
+
+flagId range table rows (same file, 表 2, HTML tags stripped for legibility — the Chinese text is verbatim):
+
+```
+flagId
+输入
+核间同步的标记。
+Atlas A2 训练系列产品/Atlas A2 推理系列产品，取值范围是0-10。
+Atlas A3 训练系列产品/Atlas A3 推理系列产品，取值范围是0-10。
+Ascend 950PR/Ascend 950DT，取值范围如下：
+AIV0发起的flagId 0-10的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 0-10的操作。
+AIV1发起的flagId 0-10的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 16-26的操作。
+AIC发起的flagId 0-10的CrossCoreSetFlag操作对应AIV0 CrossCoreWaitFlag中flagId 0-10的操作。
+AIC发起的flagId 16-26的CrossCoreSetFlag操作对应AIV1 CrossCoreWaitFlag中flagId 0-10的操作。
+```
+
+Constraint section of the same file, verbatim:
+
+```
+## 约束说明<a name="section633mcpsimp"></a>
+
+-   使用该同步接口时，需要按照如下规则[设置Kernel类型](设置Kernel类型.md)：
+    -   在纯Vector/Cube场景下，需设置Kernel类型为KERNEL\_TYPE\_MIX\_AIV\_1\_0或KERNEL\_TYPE\_MIX\_AIC\_1\_0。
+    -   对于Vector和Cube混合场景，需根据实际情况灵活配置Kernel类型。
+
+-   因为[Matmul高阶API](矩阵计算-85.md)内部实现中使用了本接口进行核间同步控制，所以不建议开发者同时使用该接口和Matmul高阶API，否则会有flagID冲突的风险。
+-   同一flagId的计数器最多设置15次。
+-   使用该接口模式0时，必须通过[SetScheduleMode](https://www.hiascend.com/document/detail/zh/canncommercial/850/API/basicdataapi/atlasopapi_07_00248.html)使能batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+    -   多流并发场景（≥2条执行流）。
+    -   ≥2个算子并发执行。
+    -   所有并发算子的核数总和超过物理核数。
+    -   ≥2个并发算子使用了核间同步功能。
+```
+
+Call example (same file), verbatim:
+
+```
+// 使用模式0的方式同步所有的AIV核
+if (g_coreType == AscendC::AIV) {
+    AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(0x8);
+    AscendC::CrossCoreWaitFlag(0x8);
+}
+
+// 使用模式1的方式同步当前AICore内的所有AIV子核
+if (g_coreType == AscendC::AIV) {
+    AscendC::CrossCoreSetFlag<0x1, PIPE_MTE3>(0x8);
+    AscendC::CrossCoreWaitFlag(0x8);
+}
+
+// 注意：如果调用高阶API,无需开发者处理AIC和AIV的同步
+// 以Matmul为例：AIC侧做完Matmul计算后通知AIV进行后处理
+if (g_coreType == AscendC::AIC) {
+    // Matmul处理
+    AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0x8);
+}
+
+// AIV侧等待AIC Set消息, 进行Vector后处理
+if (g_coreType == AscendC::AIV) {
+    AscendC::CrossCoreWaitFlag(0x8);
+    // Vector后处理
+}
+```
+
+---
+
+### A7.2 OFFICIAL CANN DOC — `CrossCoreWaitFlag(ISASI)`, older master snapshot (blocking + 15-count)
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/CrossCoreWaitFlag(ISASI).md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit) / unknown date, same snapshot as item 1
+
+```
+-   CrossCoreWaitFlag必须与[CrossCoreSetFlag](CrossCoreSetFlag(ISASI).md)接口配合使用，避免计算核一直处于阻塞阶段。
+-   如果执行CrossCoreWaitFlag时该flagId的计数器的值为0，则CrossCoreWaitFlag之后的所有指令都将被阻塞，直到该flagId的计数器的值不为0。同一个flagId的计数器最多设置15次。
+```
+
+---
+
+### A7.3 OFFICIAL CANN DOC (CURRENT, docs/zh tree) — `CrossCoreSetFlag_ISASI.md`: flagId 0-15, 4-bit truncation, counter overflow is a HARD ERROR, Set order not guaranteed, and the ONLY documented "reset" (drain)
+
+This is the newest official wording. It supersedes the 0-10 range of item 1: range is now 0-15 for modes 0/1/2 on all products, with the 11-14 reservations documented separately (item 5).
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreSetFlag_ISASI.md
+(raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreSetFlag_ISASI.md )
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+## 功能说明<a id="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_block_sync_intf.h"`。
+
+在核间同步场景中，CrossCoreSetFlag接口和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)接口配对工作，使用时需传入核间同步的标记ID（flagId），每个ID对应一个用于控制同步的计数器。
+
+- CrossCoreSetFlag：AI Core中的AIC/AIV在完成本核前置位的pipe流水任务后，调用该接口，向调度模块上报本核任务已完成。调度模块收集所有参与核的上报信息，作为全局完成标志。
+- CrossCoreWaitFlag：用于阻塞本核后续指令的下发（已下发指令可正常执行），直至调度模块确认所有应调用CrossCoreSetFlag的核均已上报完成，随即解除阻塞，允许该核继续下发指令。
+```
+
+```
+### flagId取值范围说明<a id="flagId取值范围说明"></a>
+
+- 核间同步的模式为模式0、1、2时，支持的取值范围为0-15。
+<!-- npu="950" id13 -->
+- 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，支持的取值范围情况如下：
+    - AIV0发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIV1发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 16-31的操作。
+    - AIC发起的flagId 0-15的CrossCoreSetFlag操作对应AIV0 CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIC发起的flagId 16-31的CrossCoreSetFlag操作对应AIV1 CrossCoreWaitFlag中flagId 0-15的操作。
+<!-- end id13 -->
+
+此外，当本接口与Matmul高阶API或SyncAll接口同时使用时，开发者自行使用的flagId还需注意避免与这些接口内部已占用的flagId冲突，详见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+```
+
+```
+- 一个核连续发出的CrossCoreSetFlag，硬件不保证执行顺序。例如AIV依次发射CrossCoreSetFlag<0, PIPE\_V\>\(0\)，CrossCoreSetFlag<0, PIPE\_V\>\(1\)，实际的执行顺序可能是flagId=1的先执行。
+- flagId相关的约束：
+    - 对于模式0、1、2，每个AIC和每个AIV都各自有16个flagId，支持的取值范围为0-15。如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- npu="950" id15 -->
+    - 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，AIC有32个flagId，支持的取值范围为0-31，如果flagId的值超出该范围，则截取低5bit（例如，flagId=35时，截取后为3）；AIV有16个flagId，支持的取值范围为0-15，如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- end id15 -->
+    - 每个flagId都对应一个计数器，当调用[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)时，若计数器值为0则会阻塞后续指令下发，已下发指令可正常执行；当调度模块感知到所有参与同步的核（具体包含哪些核与设置的核间同步模式有关）完成（调用了CrossCoreSetFlag）同步后，会将与设置的flagId对应的计数器的值增加1。此时，计数器值为非0，阻塞解除，并且将对应计数器的值减去1进行还原。具体执行逻辑与细节可以参考[关键特性说明](key_features.md)。每一个计数器计数范围为0-15。如果调用CrossCoreSetFlag的次数超过15次，计数器的值超出该范围，则会异常报错，中断流程。
+- 核间同步的模式为模式0、1、2时，同一个flagId用于不同核间同步模式的约束：
+    - 同一核上，若同一个flagId需用于不同核间同步模式，须在模式切换前完成前一个模式的所有同步操作——即确保该flagId关联的所有CrossCoreSetFlag与配套CrossCoreWaitFlag调用均已执行完毕。
+    - 对于不同的核，可以直接将同一flagId用于不同的核间同步模式，具体包括以下2种场景：
+        - 多个AI Core之间，使用flagId=0同步所有的AIC（模式0）；单个AI Core内，使用flagId=0同步所有AIV（模式1）。
+        - 单个AI Core内，使用flagId=0同步所有AIV（模式1）；另一个AI Core内，使用flagId=0同步AIC与所有AIV（模式2）。
+```
+
+Kernel-type table from the same file (modes vs required `__mix__` qualifier) — needed because a megakernel must pick one:
+
+```
+        | 模式 | 支持的函数执行空间限定符 | 支持的核函数（Kernel）类型配置 |
+        | --- | --- | --- |
+        | 0 | \_\_mix\_\_(0, 1)、\_\_mix\_\_(1, 0)、\_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIV\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 1 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 2 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 4 | \_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+```
+
+Also, pipe constraint (a `PIPE_S` Set is illegal on A3):
+
+```
+| pipe | 标识在哪条流水的前序指令完成后，CrossCoreSetFlag才向调度模块发送通知。支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX，不支持PIPE_S和PIPE_ALL。不同产品对流水类型的支持情况请参见[pipe支持的流水类型说明](#pipe支持的流水类型说明)。 |
+```
+
+---
+
+### A7.4 OFFICIAL CANN DOC (CURRENT) — `CrossCoreWaitFlag_ISASI.md`: on A3 the `pipe` template param of Wait is INEFFECTIVE (blocks all pipes)
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreWaitFlag_ISASI.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+- CrossCoreWaitFlag必须与[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)接口配合使用，避免计算核一直处于阻塞阶段。建议显式配置与配对CrossCoreSetFlag相同的modeId，以便确认Set与Wait使用相同的同步模式。
+```
+
+```
+    - 每个flagId都对应一个计数器，当调用[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)时，若计数器值为0则会阻塞后续指令下发，已下发指令可正常执行；当调度模块感知到核间同步（CrossCoreSetFlag）全部完成后，会将对应CrossCoreWaitFlag的计数器的值增加1。此时，计数器值为非0，阻塞解除，并且将对应计数器的值减去1进行还原。具体执行逻辑与细节可以参考[关键特性说明](key_features.md)。flagId对应的计数器计数范围为0-15。如果计数器的值超出该范围，则会异常报错，中断流程。
+```
+
+From the same doc tree, `key_features.md` note on pipe semantics per arch:
+
+```
+> [!NOTE]说明
+> 模式0、1、2下`CrossCoreWaitFlag`阻塞的流水类型因NPU架构而异：
+> - 在[NPU架构版本2201](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)上，`CrossCoreWaitFlag`传入的`pipe`参数无效，无论取值为何都默认阻塞全部流水的后续指令，建议省略`pipe`参数并使用默认值。
+> - 在[NPU架构版本3510](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)上，`CrossCoreWaitFlag`传入的`pipe`参数生效，阻塞由模板参数`pipe`指定的流水的后续指令。
+```
+
+---
+
+### A7.5 OFFICIAL CANN DOC — `核间同步flagId占用说明` (which flagIds each API eats, per NPU arch). THE answer to "how many flags does each mode consume".
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/key_features.md
+(anchor `#inter_core_sync_flagid_usage`)
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+## 核间同步flagId占用说明<a id="inter_core_sync_flagid_usage"></a>
+
+### 概述
+
+开发者使用[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)接口进行核间同步时，需要传入核间同步标记**flagId**，每个flagId对应一个用于控制同步的计数器。
+
+部分接口的内部实现也会占用一部分flagId。当开发者同时使用这些接口与CrossCoreSetFlag/CrossCoreWaitFlag时，若flagId发生冲突（即相互独立的同步操作复用了同一个flagId），其对应的计数器会被错误地共享和修改，导致核间同步行为异常：可能出现阻塞无法解除而使程序卡死，或同步提前完成、阻塞提前解除而导致计算结果错误。
+
+因此，当开发者同时调用CrossCoreSetFlag/CrossCoreWaitFlag与这些占用flagId的接口时，应**避开各接口内部已占用的flagId**，选用未被占用的flagId。
+
+核间同步分为**模式0、1、2**与**模式4**，两者的底层硬件指令不同，flagId相互独立，因此各接口flagId的占用情况按**所属模式**和**NPU架构版本**分别参见[模式0、1、2的flagId占用](#inter_core_sync_flagid_mode012)和[模式4的flagId占用](#inter_core_sync_flagid_mode4)。
+
+### 模式0、1、2的flagId占用<a id="inter_core_sync_flagid_mode012"></a>
+
+**表1**  模式0、1、2flagId占用情况
+
+| 接口 | 限定条件 | 占用flagId | 各计算核占用情况 | NPU架构版本 |
+| :--- | :--- | :--- | :--- | :--- |
+| [SyncAll](SyncAll.md) | `isAIVOnly=true` | 14 | AIV：14 | 2201、3510 |
+| [SyncAll](SyncAll.md) | `isAIVOnly=false` | 11、12、13 | AIC：11、12、13；AIV：12、13 | 2201、3510 |
+| [SetNextTaskStart](../inter_task_sync/SetNextTaskStart.md) | SuperKernel子核函数（Kernel）中调用 | 11、14 | AIC：11；AIV：14 | 2201、3510 |
+| [WaitPreTaskEnd](../inter_task_sync/WaitPreTaskEnd.md) | SuperKernel子核函数（Kernel）中调用 | 11、12、13、14 | AIC：11、12、13；AIV：12、13、14 | 2201、3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | 定义N个Matmul对象 | `[0, 2N-1]` | AIV/AIC按对象与subBlock分配 | 2201 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | SuperKernel融合场景（[GetTaskRatio](../../tool_interface/system_resources_and_variables/GetTaskRatio.md)返回2，即1:2配比） | 15 | AIV：15 | 2201 |
+
+### 模式4的flagId占用<a id="inter_core_sync_flagid_mode4"></a>
+
+**表2**  模式4flagId占用情况
+
+| 接口 | 限定条件 | 占用flagId | 各计算核占用情况 | NPU架构版本 |
+| :--- | :--- | :--- | :--- | :--- |
+| [SyncAll](SyncAll.md) | `isAIVOnly=false`（核函数（Kernel）使用`__mix__(1, 2)`修饰时） | 12、13、28、29 | AIC：12、13、28、29；AIV：12、13 | 3510 |
+| [WaitPreTaskEnd](../inter_task_sync/WaitPreTaskEnd.md) | SuperKernel子核函数（Kernel）中调用 | 12、13、28、29 | AIC：12、13、28、29；AIV：12、13 | 3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | 定义N个[Matmul对象](../../../adv_api/cube_compute/Matmul_Kernel/REGIST_MATMUL_OBJ.md) | `[0, N+17]` | AIC/AIV按对象、eventType、subBlock分配 | 3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | A矩阵和B矩阵同时开启[IBSHARE](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_usage.md#p84551411817)的场景 | 15 | AIV：15 | 3510 |
+| [TSCM](../../resource_management/TSCM/TSCM.md) | 从UB发起的L1 Buffer（TSCM）队列 | 0~11（从11向下逐个分配） | AIV | 3510 |
+| [DataCopy（GM→L1）](../../cube_compute_ISASI/cube_compute_load/DataCopy_GMToL1_continuous.md) | 无 | 1、17 | AIC：1、17；AIV：1 | 3510 |
+```
+
+Per-interface explanation from the same file (2201 = A3):
+
+```
+#### SyncAll
+
+- **isAIVOnly=true**：纯Vector算子的全核同步，占用模式0、1、2的flagId为14（AIV）。
+- **isAIVOnly=false**：Mix（包含Cube和Vector计算）算子的全核同步，占用情况随NPU架构与核函数（Kernel）类型不同：
+    - **2201架构**：占用模式0、1、2的flagId为11、12、13。
+```
+
+```
+#### Matmul
+
+- 占用flagId的范围与定义的**Matmul对象数目N**相关（N最大为4），并且随NPU架构不同而不同，参见[REGIST_MATMUL_OBJ](../../../adv_api/cube_compute/Matmul_Kernel/REGIST_MATMUL_OBJ.md#约束说明)。
+- **2201架构**：占用模式0、1、2的flagId为[0, 2N-1]（N=4时占用`[0,7]`）；SuperKernel融合（1:2配比，即[GetTaskRatio](../../tool_interface/system_resources_and_variables/GetTaskRatio.md)返回2）场景下还占用flagId为15。
+- **3510架构**：占用模式4的flagId为[0, N+17]（N=4时占用`[0,21]`）；A矩阵和B矩阵同时开启[IBSHARE](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_usage.md#p84551411817)的场景下还占用flagId为15。
+```
+
+Mode-4 semantics from the same file (notably "AIC与单个AIV"):
+
+```
+- 模式4：AI Core内部，AIC与单个AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后，单个AIV上CrossCoreWaitFlag后续的由模板参数pipe指定的流水中的指令才会继续执行；单个AIV执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的由模板参数pipe指定的流水中的指令才能执行。该模式仅在[NPU架构版本3510](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)上支持。
+```
+
+---
+
+### A7.6 OFFICIAL CANN DOC — NPU arch spec 2201 (i.e. A2/A3, dav_c220): "不允许连续设置同一个flagId" and "同一flagId的计数器最多可以设置15次"
+
+This is the arch-specific page for exactly the target chip generation. Rendered at https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.html
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md
+(raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md )
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+    [CrossCoreSetFlag](../../../../../api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreSetFlag_ISASI.md)和[CrossCoreWaitFlag](../../../../../api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreWaitFlag_ISASI.md)接口配合使用。使用时需传入核间同步的标记ID\(flagId\)，即上图中的ID1，每个ID对应一个初始值为0的计数器。执行CrossCoreSetFlag后ID对应的计数器增加1；执行CrossCoreWaitFlag时如果对应的计数器数值为0则阻塞不执行；如果对应的计数器大于0，则计数器减一，同时后续指令开始执行。flagId取值范围请参考[flagId取值范围说明](../../../../../api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreSetFlag_ISASI.md#flagId取值范围说明)。
+
+    需要注意以下几点：
+
+    -   **成对使用与一致性要求**
+
+        CrossCoreSetFlag和CrossCoreWaitFlag必须成对使用，否则可能导致算子超时问题。两个接口的参数一致性要求如下：
+
+        - modeId：本架构版本的硬件指令不使用CrossCoreWaitFlag的modeId，但建议显式配置与CrossCoreSetFlag相同的modeId，以便确认两个接口的同步模式匹配。
+        - pipe：CrossCoreWaitFlag的pipe不生效，无需与CrossCoreSetFlag的pipe保持一致。
+        - flagId：CrossCoreSetFlag与CrossCoreWaitFlag必须使用相同的flagId。
+
+    -   **避免连续设置**
+
+        不允许连续设置同一个flagId，以防止计数器状态混乱。
+
+    -   **与其它接口的flagId冲突**
+
+        部分接口内部实现中使用了CrossCoreSetFlag和CrossCoreWaitFlag，会占用一部分flagId，开发者同时使用这些接口与CrossCoreSetFlag/CrossCoreWaitFlag时，需注意避免flagId使用冲突，各接口flagId占用的完整说明（含各NPU架构版本的差异）参考[核间同步flagId占用说明](../../../../../api/SIMD-API/basic_api/sync_control/inter_core_sync/key_features.md#inter_core_sync_flagid_usage)。
+
+    -   **计数器限制**
+
+        同一flagId的计数器最多可以设置15次。
+
+    -   **默认值**<a id="cross_core_wait_flag_default_values"></a>
+
+        - modeId：默认值为0。建议显式配置与CrossCoreSetFlag相同的modeId。
+        - pipe：默认值为PIPE\_S。CrossCoreWaitFlag接口提供pipe模板参数，但本架构版本的硬件指令不区分等待的流水，因此pipe取值不影响实际执行效果，CrossCoreWaitFlag会阻塞全部流水的后续指令。
+```
+
+Adjacent intra-core rule in the same file (the SetFlag/WaitFlag EventID analogue, and the reserved 6/7):
+
+```
+    -   不允许连续设置同一个EventID，因为这可能导致事件状态混乱或未被正确处理。
+    -   不建议手动插入TEventID，不能手动插入6和7的TEventID，因为它们可能被系统预留或用于特殊用途。
+```
+
+---
+
+### A7.7 CANN SOURCE — `dav_c220` (== `__NPU_ARCH__ 2201`, the A3 target) cross-core sync implementation: `ffts_cross_core_sync` / `wait_flag_dev`, 4-bit flagId mask, 2-bit mode mask, and the four flagIds AscendC reserves for itself (11/12/13/14)
+
+https://gitcode.com/cann/asc-devkit/blob/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+(raw mirror used: https://raw.githubusercontent.com/ckorikov/asc-devkit/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h )
+author/date: Huawei Technologies Co., Ltd. / file header "Copyright (c) 2025 Huawei Technologies Co., Ltd."
+
+```
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+
+
+__aicore__ inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
+{
+    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) + ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+```
+
+The whole `CrossCoreSetFlag`/`CrossCoreWaitFlag` pair on 2201 reduces to exactly two intrinsics — there is no reset/clear intrinsic in this file:
+
+```
+__aicore__ inline void NotifyEventImpl(uint16_t flagId)
+{
+    ffts_cross_core_sync(pipe, GetffstMsg(modeId, flagId));
+}
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void WaitEventImpl(uint16_t flagId)
+{
+    (void)modeId;
+    wait_flag_dev(flagId);
+}
+```
+
+Hard `SyncAll` on 2201 is itself built out of those reserved flagIds (so a megakernel calling `SyncAll<false>()` burns 11/12/13):
+
+```
+template<pipe_t AIV_PIPE = PIPE_MTE3, pipe_t AIC_PIPE = PIPE_FIX>
+__aicore__ inline void SetNextTaskStartImpl()
+{
+    if ASCEND_IS_AIC {
+        ffts_cross_core_sync(AIC_PIPE, AscendC::GetffstMsg(0x0, AscendC::SYNC_AIC_FLAG));
+    }
+    if ASCEND_IS_AIV {
+        ffts_cross_core_sync(AIV_PIPE, AscendC::GetffstMsg(0x0, AscendC::SYNC_AIV_ONLY_ALL));
+    }
+    return;
+}
+```
+
+```
+            wait_flag_dev(AscendC::SYNC_AIC_FLAG);
+            ffts_cross_core_sync(PIPE_MTE3, AscendC::GetffstMsg(0x02, AscendC::SYNC_AIC_AIV_FLAG));
+```
+
+Also present (the only "base address" style config knob in the file):
+
+```
+__aicore__ inline void SetSyncBaseAddrImpl(uint64_t config)
+{
+    set_ffts_base_addr(config);
+}
+```
+
+---
+
+### A7.8 CANN SOURCE — `kernel_operator_block_sync_intf_impl.h`: the arch dispatch (2201 -> dav_c220), and proof that `IBSet`/`IBWait`/soft `SyncAll` do NOT touch the 16-deep hardware counter (they are GM polling loops)
+
+https://gitcode.com/cann/asc-devkit/blob/master/impl/basic_api/kernel_operator_block_sync_intf_impl.h
+author/date: Huawei Technologies Co., Ltd. / file header "Copyright (c) 2026 Huawei Technologies Co., Ltd."
+
+```
+#if __NPU_ARCH__ == 1001
+#include "dav_c100/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 2002
+#include "dav_m200/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 2201
+#include "dav_c220/kernel_operator_sync_impl.h"
+```
+
+```
+template<uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId)
+{
+    NotifyEventImpl<modeId, pipe>(flagId);    
+}
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId)
+{
+    WaitEventImpl<modeId, pipe>(flagId);
+}
+```
+
+`IBSet` is a GM spin on a 32-byte slot, i.e. a different resource entirely:
+
+```
+template <bool isAIVOnly>
+__aicore__ inline void IBSet(const GlobalTensor<int32_t> &gmWorkspace,
+    const LocalTensor<int32_t> &ubWorkspace, int32_t blockIdx, int32_t eventID)
+{
+    int32_t blockNum = GetBlockNum();
+...
+    auto localSyncGM = gmWorkspace[blockNum * 8 * eventID + blockIdx * 8];
+    pipe_barrier(PIPE_ALL);
+
+    while (true) {
+        DataCopy(ubWorkspace, localSyncGM, ONE_BLK_SIZE / sizeof(int32_t));
+        event_t eventIdMte2ToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+        SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        if (ubWorkspace.GetValue(0) == 0) {
+            ubWorkspace.SetValue(0, 1);
+```
+
+Note `NotifyEvent`/`WaitEvent` are thin aliases that silently pick mode 0x02 / mode 0 on 2201:
+
+```
+template <pipe_t pipe>
+__aicore__ inline void NotifyEvent(uint16_t flagId)
+{
+    constexpr uint8_t subBlockSyncMode = 0x02;
+    NotifyEventImpl<subBlockSyncMode, pipe>(flagId);
+}
+
+template <pipe_t pipe=PIPE_S>
+__aicore__ inline void WaitEvent(uint16_t flagId)
+{
+    constexpr uint8_t mode = 0;
+    WaitEventImpl<mode, pipe>(flagId);
+}
+```
+
+---
+
+### A7.9 CANN SOURCE — `dav_c310` for contrast: `SYNC_FLAG_ID_MAX = 16`, `INTRA_NUM = 16`, and mode 4 lowered to `set_intra_block`/`wait_intra_block` instead of FFTS
+
+Shows the 16 constant explicitly, and that mode 4 is a *different hardware mechanism* (so its flag pool is independent, matching item 5's "两者的底层硬件指令不同，flagId相互独立").
+
+https://gitcode.com/cann/asc-devkit/blob/master/impl/basic_api/dav_c310/kernel_operator_sync_impl.h
+author/date: Huawei Technologies Co., Ltd. / "Copyright (c) 2025"
+
+```
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+constexpr uint16_t SYNC_FLAG_ID_MAX = 16;
+constexpr uint16_t INTRA_NUM = 16;
+
+__aicore__ inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
+{
+    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) + ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+
+__aicore__ inline uint8_t GetIntraFlagId(uint8_t instID, uint8_t eventType, uint8_t subBlockId)
+{
+    return (instID + eventType + subBlockId * INTRA_NUM);
+}
+```
+
+```
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void NotifyEventImpl(uint16_t flagId)
+{
+    if constexpr(modeId == 4) {
+        if constexpr (IsSplitVectorPipe<pipe>()) {
+            if ASCEND_IS_AIV {
+                set_intra_block(pipe, flagId);
+            }
+        }
+        if constexpr (IsSplitCubePipe<pipe>()){
+            if ASCEND_IS_AIC {
+                set_intra_block(pipe, flagId);
+            }
+        }
+    } else {
+        if constexpr (IsSplitVectorPipe<pipe>()) {
+            if ASCEND_IS_AIV {
+                ffts_cross_core_sync(pipe, GetffstMsg(modeId, flagId));
+            }
+        }
+```
+
+And the "software sync converted to hardware sync" path showing the `+ SYNC_FLAG_ID_MAX` stride for AIV1:
+
+```
+    // trans software sync to hardware sync
+    if ASCEND_IS_AIC {
+        wait_intra_block(PIPE_S, AscendC::SYNC_AIV_FLAG);
+        wait_intra_block(PIPE_S, AscendC::SYNC_AIV_FLAG + AscendC::SYNC_FLAG_ID_MAX);
+        ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, AscendC::SYNC_AIC_FLAG));
+        wait_flag_dev(PIPE_S, AscendC::SYNC_AIC_FLAG);
+        set_intra_block(PIPE_S, AscendC::SYNC_AIC_AIV_FLAG);
+        set_intra_block(PIPE_S, AscendC::SYNC_AIC_AIV_FLAG + AscendC::SYNC_FLAG_ID_MAX);
+        return;
+    }
+```
+
+---
+
+### A7.10 ★ MOST LOAD-BEARING: CATLASS `cross_core_sync.hpp` — the official CANN library's answer to counter saturation: a reverse-flag credit scheme with `MAX_REVERSE_DEPTH = 15`
+
+This is the canonical rotation/reset mechanism for long sequential chains. Note it does NOT rotate flagIds; it *drains* one flagId by forcing a reverse handshake every 15 Sets.
+
+https://gitcode.com/cann/catlass/blob/master/include/catlass/arch/cross_core_sync.hpp
+(raw: https://raw.gitcode.com/cann/catlass/raw/master/include/catlass/arch/cross_core_sync.hpp ; GitHub mirror https://github.com/hicann/catlass/blob/master/include/catlass/arch/cross_core_sync.hpp )
+author/date: Huawei Technologies Co., Ltd. / "Copyright (c) 2025"; `MAX_REVERSE_DEPTH = 15` landed 2025-12-18 (see item 11)
+
+```
+namespace Catlass::Arch {
+
+// A certain cross core flag can be continuously set up to 15 times without waiting. In scenarios where there is only
+// one-way synchronization between cores and the synchronization operation is executed multiple times, if the core
+// performing the set operation runs faster, it may result in the flag being set more than 15 times consecutively,
+// leading to a system freeze. To prevent such a freeze, we need to wait for the waiting cores to perform a reverse
+// synchronization operation after executing the set operation MAX_REVERSE_DEPTH times.
+constexpr uint32_t MAX_REVERSE_DEPTH = 15;
+
+using FlagID = uint16_t;
+constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+constexpr FlagID AIC_INTER_BLOCK_BARRIER = 9;
+constexpr FlagID AIV_INTER_SUBBLOCK_BARRIER = 10;
+constexpr FlagID FFTS_MAX_FLAG = 7;
+
+struct CrossCoreFlag {
+    CATLASS_DEVICE
+    CrossCoreFlag() : id(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlag(FlagID id) : id(id)
+    {}
+
+    FlagID id;
+};
+
+template <uint32_t REVERSE_DEPTH_ = MAX_REVERSE_DEPTH>
+struct CrossCoreFlagWithReverse {
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse() : id(0), reverseId(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse(FlagID id, FlagID reverseId) : id(id), reverseId(reverseId)
+    {}
+
+    FlagID id;
+    FlagID reverseId;
+    uint32_t count{0};
+};
+```
+
+The barrier flag allocation (modes 0x0/0x1 get dedicated ids 8/9/10, leaving 0-7 for users — hence `FFTS_MAX_FLAG = 7`):
+
+```
+template <>
+struct BarrierFlag<0x0, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIC> {
+    static constexpr FlagID ID = AIC_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x1, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_SUBBLOCK_BARRIER;
+};
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreBarrier()
+{
+    constexpr FlagID flagId = BarrierFlag<MODE, g_coreType>::ID;
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flagId);
+    AscendC::CrossCoreWaitFlag(flagId);
+}
+```
+
+The actual counter-drain primitives:
+
+```
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreSetFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreWaitFlag(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreWaitFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.reverseId);
+        flag.count = 0;
+    }
+}
+```
+
+---
+
+### A7.11 ★ THE OFFICIAL BUGFIX — CANN catlass MR !325 "fix: 更改默认的MAX_REVERSE_DEPTH": the original 16 "会导致卡死"
+
+The off-by-one proof: depth 16 means the 16th Set lands before any Wait, which hangs. Merged 2025-12-18.
+
+https://gitcode.com/cann/catlass/merge_requests/325
+(API: https://api.gitcode.com/api/v5/repos/cann/catlass/pulls/325 ; GitHub mirror commit https://github.com/hicann/catlass/commit/f457683a841c )
+author/date: triwooder <zhangyunsong3@huawei.com>, created 2025-10-23, merged 2025-12-18 by cann-robot
+
+```
+## 描述
+更改默认的MAX_REVERSE_DEPTH为15，原设置会导致卡死
+
+## 类型标签
+- [x] Bug修复
+- [ ] 新特性
+- [ ] 性能优化
+- [ ] 文档更新
+```
+
+The diff itself:
+
+```
+@@ -15,7 +15,12 @@
+ 
+ namespace Catlass::Arch {
+ 
+-constexpr uint32_t MAX_REVERSE_DEPTH = 16;
++// A certain cross core flag can be continuously set up to 15 times without waiting. In scenarios where there is only
++// one-way synchronization between cores and the synchronization operation is executed multiple times, if the core 
++// performing the set operation runs faster, it may result in the flag being set more than 15 times consecutively,
++// leading to a system freeze. To prevent such a freeze, we need to wait for the waiting cores to perform a reverse 
++// synchronization operation after executing the set operation MAX_REVERSE_DEPTH times.
++constexpr uint32_t MAX_REVERSE_DEPTH = 15;
+ 
+ using FlagID = uint16_t;
+ constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+```
+
+Commit list for that file (shows how rarely it is touched):
+
+```
+5f10a480a107 2026-07-16T06:36:36Z yuantao_ :: 用pre-commit刷新主要文件的格式
+376fc7caec04 2026-06-09T07:29:40Z li_wei21 :: add a declarative post-processing framework, EVG.
+f457683a841c 2025-12-18T12:44:02Z triwooder :: fix: 更改默认的MAX_REVERSE_DEPTH
+83e7d141b8a5 2025-12-18T09:38:45Z yuantao_ :: 【task】更新license
+8ceefb5c735d 2025-11-06T11:46:44Z init__zhb__ :: Safety check. 
+2cdcd3ad71d1 2025-09-30T02:38:14Z init__zhb__ :: 更新许可证到CANN2.0版本
+ef8be58db449 2025-05-16T09:39:12Z 黄鑫 :: !96 change name to catlass
+```
+
+---
+
+### A7.12 PRE-FIX FORM STILL IN THE WILD — vendored ACT/catlass copies with the unsafe `MAX_REVERSE_DEPTH = 16` and no comment
+
+Anyone copy-pasting a vendored `act/arch/cross_core_sync.hpp` inherits the hang. These are live as of fetch date.
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/deepep/ops/utils/op_kernel/operator/catlass/act/arch/cross_core_sync.hpp
+author/date: vendored Huawei ACT header inside sgl-kernel-npu / fetched 2026-10-20
+
+```
+namespace Act::Arch {
+
+constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+
+using FlagID = uint16_t;
+constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+constexpr FlagID AIC_INTER_BLOCK_BARRIER = 9;
+constexpr FlagID AIV_INTER_SUBBLOCK_BARRIER = 10;
+constexpr FlagID FFTS_MAX_FLAG = 7;
+```
+
+Other repos carrying `MAX_REVERSE_DEPTH = 16` (same unsafe value), from `gh search code 'MAX_REVERSE_DEPTH'`:
+
+```
+vllm-project/vllm-ascend:csrc/attention/sparse_attention_score/op_kernel/attn_infra/arch/cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+sgl-project/sgl-kernel-npu:csrc/sparse_attention_score/op_kernel/attn_infra/arch/cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+Ascend/AscendNPU-IR:bishengir/lib/Template/lib/RegBase/Cube/include/catlass/arch/cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+vllm-project/afd-plugin:csrc/npu/ascend_kernels/grouped_matmul_layered/op_kernel/gmm_infra/arch/cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+hicann/ops-transformer:gmm/grouped_matmul/op_kernel/gmm_infra/arch/gmm_cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+Ascend/MindIE-SD:csrc/ops/eagle_block_sparse_attention/op_kernel/attn_infra/arch/bsa_cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+repo-mirror-test/catlass:include/catlass/arch/cross_core_sync.hpp: constexpr uint32_t MAX_REVERSE_DEPTH = 16;
+```
+
+---
+
+### A7.13 REAL CALL SITE — catlass `matmul_epilogue.hpp`: an unbounded `coreLoops` producer/consumer chain carried by ONE flagId + ONE reverse flagId
+
+This is the shape a megakernel wants: 2 flagIds total regardless of how many stages, because the reverse handshake drains the counter.
+
+https://gitcode.com/cann/catlass/blob/master/include/catlass/gemm/kernel/matmul_epilogue.hpp
+(raw mirror: https://raw.githubusercontent.com/hicann/catlass/master/include/catlass/gemm/kernel/matmul_epilogue.hpp )
+author/date: Huawei Technologies Co., Ltd. (CANN catlass) / fetched 2026-10-20
+
+```
+        for (uint32_t loopIdx = AscendC::GetBlockIdx(); loopIdx < coreLoops; loopIdx += AscendC::GetBlockNum()) {
+            ...
+            // Compute block-scoped matrix multiply-add
+            blockMmad(
+                gmA[gmOffsetA], params.layoutA, gmB[gmOffsetB], params.layoutB, gmC[gmOffsetC], layoutC,
+                actualBlockShape);
+
+            Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagAicFinishStore);
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+```
+
+```
+        for (uint32_t loopIdx = aicoreIndex; loopIdx < coreLoops; loopIdx += aicoreNum) {
+            ...
+            // Synchronize cross core
+            Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE3>(flagAicFinishStore);
+            // Actual calculatioin logic for performing block-scoped epilogue
+            blockEpilogue(blockShape, blockCoord, actualBlockShape, gmBlockC, layoutBlockC);
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+private:
+    // ID used for inter-core synchronization
+    static constexpr Arch::FlagID FLAG_AIC_FINISH_STORE = 0;
+    static constexpr Arch::FlagID RV_FLAG_AIC_FINISH_STORE = 1;
+    Arch::CrossCoreFlagWithReverse<> flagAicFinishStore{FLAG_AIC_FINISH_STORE, RV_FLAG_AIC_FINISH_STORE};
+    Arch::Resource<ArchTag> resource;
+```
+
+Other real call sites of the same pattern (from `gh search code 'Arch::CrossCoreSetFlagWithReverse'`), showing it is the standard across CANN libraries:
+
+```
+Ascend/AscendNPU-IR:bishengir/lib/Template/lib/RegBase/Cube/include/catlass/gemm/kernel/gemm.hpp: Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagAicFinishStore);
+Ascend/AscendNPU-IR:bishengir/lib/Template/lib/RegBase/Cube/include/catlass/gemm/kernel/quant_matmul.hpp: Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(ptr->flagAicFinishStore);
+Ascend/AscendNPU-IR:bishengir/lib/Template/lib/RegBase/Cube/include/catlass/gemm/kernel/group_gemm.hpp: Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagAicFinishStore);
+Ascend/AscendNPU-IR:bishengir/lib/Template/lib/RegBase/Cube/include/catlass/gemv/kernel/kernel_gemv_aic.hpp: Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagAicFinishStore);
+vllm-project/vllm-ascend:csrc/attention/msa_index_score/op_kernel/arch35/msa_index_score_kernel.h: Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagSReady);
+vllm-project/vllm-ascend:csrc/attention/msa_index_score/op_kernel/arch22/msa_index_score_kernel.h: Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(flagSReady);
+sgl-project/sgl-kernel-npu:csrc/chunk_kda_fwd/op_kernel/chunk_kda_fwd_prepare.h: Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(mchSyncDoneFlag_);
+flashserve/flash-linear-attention-npu:fla/ops/ascendc/gdn/chunk_gdn_fwd/solve_tri/op_kernel/solve_tri_fp32.h: Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(aicToAiv_);
+flashserve/flash-linear-attention-npu:fla/ops/ascendc/gdn/chunk_gdn_fwd/solve_tri/op_kernel/solve_tri_fp32.h: Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(aivToAic_);
+```
+
+---
+
+### A7.14 ★ ACTUAL flagId ROTATION IN PRODUCTION CODE — `#define MAKE_ID ((++idCounterNum) % 11)` plus the documented A3 AIV0/AIV1 +16 stride
+
+This is the only real "rotate the id across many sequential stages" scheme I found: a `__BLOCK_LOCAL__` monotone counter taken mod 11, with 16 as the sentinel "invalid id".
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/sparse_flash_attention/op_kernel/common/buffer.h
+author/date: sgl-project / sgl-kernel-npu (namespace `fa_base_matmul`) / fetched 2026-10-20. The same file also exists at https://github.com/Ascend/MindIE-SD/blob/master/csrc/ops/common/op_kernel/buffer.h
+
+```
+using namespace AscendC;
+namespace fa_base_matmul {
+__BLOCK_LOCAL__ __inline__ uint32_t idCounterNum;
+#define MAKE_ID ((++idCounterNum) % 11)
+
+// 核间同步中，AIC(flagId 0-10)对应AIV0(flagId 0-10)，对应AIV1(flagId 16-26)
+#define AIV0_AIV1_OFFSET 16
+```
+
+```
+constexpr uint32_t INVALID_CROSS_CORE_EVENT_ID = 16;
+static constexpr uint64_t CROSS_CORE_SYNC_MODE = 4;
+```
+
+```
+            id0_ = MAKE_ID;
+            id1_ = INVALID_CROSS_CORE_EVENT_ID;
+...
+            id0_ = INVALID_CROSS_CORE_EVENT_ID;
+            id1_ = MAKE_ID;
+...
+            id0_ = MAKE_ID;
+            id1_ = MAKE_ID;
+...
+            id0_ = INVALID_CROSS_CORE_EVENT_ID;
+            id1_ = INVALID_CROSS_CORE_EVENT_ID;
+```
+
+How the rotated ids are consumed (note the mirrored `+ AIV0_AIV1_OFFSET` set/wait for the two AIVs):
+
+```
+    __aicore__ inline void WaitCrossCore()
+    {
+...
+                CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(id1_);
+                CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(id1_ + AIV0_AIV1_OFFSET);
+...
+                CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(id1_);
+                CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(id1_ + AIV0_AIV1_OFFSET);
+...
+    __aicore__ inline void SetCrossCore()
+    {
+...
+                CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(id0_);
+                CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(id0_ + AIV0_AIV1_OFFSET);
+```
+
+---
+
+### A7.15 ★ REAL-WORLD ANALYSIS of the freeze, with per-AIV id segmentation and the A2 `0x2` broadcast trap — flash-linear-attention-npu design doc
+
+Long engineering log from a kernel that hit exactly the failure mode in question (sets accumulating on a flag nobody waits on). Quotes the catlass comment as the root cause.
+
+https://github.com/flashserve/flash-linear-attention-npu/blob/main/fla/ops/ascendc/cp/pre_process_bwd_kernel_merged/docs/design.md
+author/date: flashserve / flash-linear-attention-npu contributors / fetched 2026-10-20
+
+```
+1. A2 的 `mode 0x2` 是"AIC : 2*AIV 集合同步"，**没有 subblock 选择语义** ⇒ AIC 的一次 set 会同时落到
+   **两个** AIV 的同一 id 上；而 AIV→AIC 方向是点对点（这也是 fwd_h 能按 `vec1Done[0]/[1]` 分别寻址
+   AIC 侧寄存器的原因）。
+2. 由此得到三条推论：
+   * **共享 id + 每个 AIV 一条独立链**（§17 尝试 1）：AIC 服务 head A 时 set 的 `T1_READY` 会
+     **同时放行**正在等 head B 的另一个 AIV ⇒ 事件与链错配（实测死锁）。
+   * **per-AIV id 段 + 独立链**（§17 尝试 2、§21 尝试 3）：AIC 给 AIV1 的 set 会**顺带**落在 AIV0 的
+     同一 id 寄存器上，而 AIV0 永远不 wait 它 ⇒ 该寄存器上"未被消费的 set"持续累积。catlass 明确写了
+     *"a cross core flag can be continuously set up to 15 times without waiting, leading to a system
+     freeze"*（`MAX_REVERSE_DEPTH = 15`，见 `third_party/catlass/include/catlass/arch/cross_core_sync.hpp:22`）
+     ⇒ 长序列必然冻结。这类"跑一阵子才挂"的症状与之完全吻合。
+   * 只有**两个 AIV 在同一个逻辑点 wait 同一个 id**（集合语义的正确用法，也是 fwd_h 的做法）时，
+     broadcast 才自洽：AIC 一次 set 给两个 AIV 各自 +1，两个 AIV 各 wait 一次 ⇒ 账本平衡；
+     AIV→AIC 方向则由两个 AIV 各 set 一次、AIC 连续 wait 两次构成 rendezvous。
+```
+
+The per-AIV flagId segmentation table they actually used (and the explicit "setter may lead by at most 15" reasoning for dropping a dimension):
+
+```
+* **尝试 2（按 `fwd_h` 的写法给每个 AIV 一段独立 id）**：先确认 910B 的 flag 上限只有 8 个
+  （catlass `FFTS_MAX_FLAG = 7`），因此把 `T1_READY`/`T1BF_READY` 合并成一个 base（方向相反、
+  落在不同核的寄存器上，可共用 id），并**去掉 window 维度**，得到 AIV0 = 0..3、AIV1 = 4..7：
+
+  | base | 方向 | AIV0 id | AIV1 id |
+  | --- | --- | --- | --- |
+  | V0_READY | AIV→AIC | 0 | 4 |
+  | T1_READY / T1BF_READY | AIC→AIV / AIV→AIC | 1 | 5 |
+  | Z_READY | AIC→AIV | 2 | 6 |
+  | STATE_READY | AIV→AIC | 3 | 7 |
+
+  结果：`gva` 档（Hv=32，1 轮）**通过**；`kda` 档（Hv=64，2 轮）仍挂住，原因未定。
+  （`window` 维度去掉是安全的：flag 是计数器、允许 setter 领先最多 15 次，只要两侧按同一
+  chunk 顺序推进，一个 base 一个 id 就够；双 window 只省一次跨核往返，不是正确性前提。）
+```
+
+The A5 id-space convention they adopted (relevant to how to budget ids):
+
+```
+| 4 | ready/free 双向 credit：每个 local slot × 每类数据用**同一个 ID 双向计数**，ready 由真实生产 pipe 发布、free 由最后消费者发布，复用前必须完成上一代 wait；A5 的 AIV 本地 ID 0..10，AIC 侧用 16-ID 步长区分 AIV0/AIV1 | 替换我现在 5 条单向 ready 链（`V0/T1/T1BF/Z/STATE`）；双向 credit 才能让"生产者领先消费者"真正成立 |
+```
+
+Operational warning in the same doc (what happens after a flag deadlock):
+
+```
+**运维注意**：两次挂死后 `run_case` 进程被 `kill -9`，device 停在 AICore 100% 且无进程占用，
+`npu-smi set -t reset -i 0 -c 0` 被拒（AMP + HCCS 模式下会要求重启全部设备且执行失败），
+**必须重启该主机才能恢复**；期间同一台机器上的任何用例都会同样挂住（实测：原本通过的
+`gva_cp64` 在设备卡住后也变成 10 分钟不返回）。因此排查 A2 的 1:2 之前要先确认设备已恢复。
+```
+
+---
+
+### A7.16 ★ REAL DEADLOCK + FIX — flash-linear-attention-npu PR #825: one flagId shared by three consumer stages on different pipes steals credits; 42 runs → 8 hangs, fixed by splitting into three flagIds
+
+Directly on the "flag credit carries no label" problem that bites a many-stage megakernel.
+
+https://github.com/flashserve/flash-linear-attention-npu/pull/825
+author/date: wzzll123 (wzz) / 2026-09-30
+
+```
+## 为什么还要拆分 flag
+
+只做“等待后移”会间歇性死锁。原来 `free[slot]` 被 V0、V3、V6 三个阶段轮流等待；V0/V6 后移并改成 `PIPE_MTE3` 后，同一计数器上同时可能有 `PIPE_MTE3` 和 `PIPE_V` 的阻塞等待。flag 的一次信用不携带“应交给哪个阶段”的标签，跨 pipe 消费顺序不再受原来的 MTE2→V→MTE3 mutex 链保证。例如 V3 抢走本应让 V0 继续的信用，V0 的 workspace 写被卡住，V1 发不出 `ready`；AIC 等不到 `ready`，也就做不了 C2、发不出下一次信用。
+
+修复提交 `8f96f635` 把这三种依赖拆成独立通道：`C7→V0` 用 `free`，`C2→V3` 用 `scoreReady`，`C4→V6` 用 `payloadRepurpose`。每条通道只由预定的阶段和 pipe 消费；末尾清账的 `free` wait 也改为 `PIPE_MTE3`。这保留了提交 `7a88bf27` 的等待后移与重叠计算。
+```
+
+The flagId map before and after (A5 / mode 0x4, with the AIC-side +16 stride for AIV1):
+
+```
+# AIV 本地每个 slot 的 flag 编号；AIV0、AIV1 各自使用一套本地编号。
+ready             = [0, 1] # V1/V3/V6 -> C2/C4/C7
+score_ready       = [2, 3] # C2 -> V3
+free              = [4, 5] # 初始许可或上一轮 C7 -> 下一轮 V0
+payload_repurpose = [6, 7] # C4 -> V6
+```
+
+```
+def aic_one_group(chunk, group_begin, active_heads):
+    # AIC 视角：AIV1 的本地 ID 映射到另一组核间 flag 编号。
+    ready             = [0, 1, 16, 17]
+    score_ready       = [2, 3, 18, 19]
+    free              = [4, 5, 20, 21]
+    payload_repurpose = [6, 7, 22, 23]
+```
+
+The reproduction statistics (so the failure is probabilistic, not deterministic — important for a 78-layer kernel):
+
+```
+| 快速直调复现(修复前) | 42 次挂 8 次(AIC+双 AIV 跨核停等,aicore timeout) |
+| 快速直调复现(修复后,PR 最终树) | **70 次全清**(d4×30+d5×10 + 最终树 d4×20+d5×10;作者场景 BNSD+recompute 另查 10/10) |
+```
+
+Also, the "initial credit" trick worth noting — AIC pre-seeds one Set per slot before the loop:
+
+```
+    for local_head in range(active_heads):
+        if first_use_of_this_local_head(local_head):
+            SET(PIPE_FIX, free[local_head])  # 初始只发一次；后续由 C7 归还
+```
+
+---
+
+### A7.17 PTOAS issue #985 — full functional spec of the three parameters, including the A5 0-31 flag_id address space and per-mode table
+
+Useful as an independent restatement of the contract, and because it quotes the hiascend doc URL for `CrossCoreSetFlag`.
+
+https://github.com/hw-native-sys/PTOAS/issues/985
+author/date: bingmeiyou / 2026-07-23 (comment by W4termy 2026-08-11)
+
+```
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `mode_id` | int | 同步模式，取值 0/1/2/4，控制信号传播范围（跨 block 全核同步 / AIV 间同步 / CV 广播汇聚 / CV 逐子核 1:1） |
+| `pipe` | str | 流水线类型，如 PIPE_FIX / PIPE_MTE3 / PIPE_V / PIPE_M 等，指定信号发射或等待的流水线 |
+| `flag_id` | int 或 PrimExpr | 信号量编号，A5 平台范围 0-31（0-15 对应 AIV0，16-31 对应 AIV1） |
+```
+
+```
+| mode_id | 含义 | 典型场景 |
+|---------|------|---------|
+| 0 | 跨 block 同类型核同步（所有 AIC↔AIC 或所有 AIV↔AIV） | 多个 block 分担计算，需要所有同类型核到达屏障 |
+| 1 | block 内 AIV 子核间同步（AIV0 ↔ AIV1） | 两个 AIV 子核协作处理数据，需要互相通知 |
+| 2 | block 内 AIC↔AIV 同步，广播+汇聚（一次 set 到达两个 AIV，一次 wait 等到两个 AIV 都完成） | AIC 算完 GEMM 一次性通知两个 AIV 来搬数据 |
+| 4 | block 内 AIC↔AIV 同步，1:1 逐子核（AIV0 和 AIV1 可单独触发） | AIC 分别通知 AIV0 和 AIV1，用不同 flag_id 区分目标子核 |
+```
+
+```
+### flag_id 参数
+
+A5 平台上 flag_id 地址空间为 0-31：0-15 对应 AIV0，16-31 对应 AIV1（+16 偏移）。mode 4 场景中，AIC 需要用不同的 flag_id 分别通知两个 AIV 子核。
+```
+
+```
+如果 wait 端 stall 了错误的流水线，需要同步的流水线不会被阻塞，导致读到未就绪数据。
+```
+
+The `SyncAll` lowering request in the comment, confirming SyncAll ≡ mode 0:
+
+```
+该算子运行在 AIV kernel 中，需要所有参与执行的 AIV core 到达同步点后再继续，
+语义上对应本 issue 描述的 mode_id=0 跨 block 同类型核同步。
+```
+
+---
+
+### A7.18 triton-ascend official docs — `al.sync_block_set` / `sync_block_wait`: counter semantics in one paragraph, event_id range `[0,15]`
+
+https://github.com/Ascend/triton-ascend/blob/main/docs/zh/triton_api_extention/al/sync_block_set.md
+author/date: Ascend / triton-ascend / fetched 2026-10-20
+
+```
+# al.sync_block_set 接口文档
+
+## 1. 硬件背景
+
+面向分离模式的核间同步控制接口。
+
+该接口和 sync_block_wait 接口配合使用。使用时需传入核间同步的标记ID(flagId)，每个ID对应一个初始值为0的计数器。执行CrossCoreSetFlag后ID对应的计数器增加1；执行CrossCoreWaitFlag时如果对应的计数器数值为0则阻塞不执行；如果对应的计数器大于0，则计数器减一，同时后续指令开始执行。
+```
+
+```
+    <td>event_id</td>
+    <td>int</td>
+    <td>同步标记ID，取值范围 [0,15]</td>
+```
+
+```
+## 5. 约束说明
+
+- sender != receiver
+```
+
+And the companion overview doc which states "共16个独立事件":
+
+https://github.com/Ascend/triton-ascend/blob/main/docs/zh/triton_api/Extension_Ops/sync_block.md
+author/date: Ascend / triton-ascend / fetched 2026-10-20
+
+```
+#### 2.2.2 特殊限制说明
+
+1. `sender` 和 `receiver` 不能相同，不能自己给自己发信号
+2. `event_id` 必须在 0-15 范围内（共16个独立事件）
+```
+
+```
+#### 3.2.2 特殊限制说明
+
+1. `sender` 和 `receiver` 不能相同
+2. `event_id` 必须与对应 `sync_block_set` 使用的 ID 一致
+```
+
+---
+
+### A7.19 OFFICIAL CANN DOC ISSUE — `asc-devkit` #22 "CrossCoreSetFlag接口描述矛盾": an external developer reports the +1/-1 counter wording contradicts the "all cores must arrive" wording
+
+Confirms the counter is NOT a plain per-core semaphore under mode 0/1/2: the scheduler aggregates. Current master doc was edited to drop the +1/-1 sentence (compare item 1's 功能说明 with the text quoted inside this issue).
+
+https://gitcode.com/cann/asc-devkit/issues/22
+author/date: munanhw / 2025-12-19, state closed
+
+```
+### Document Link（文档链接）
+            
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/CrossCoreSetFlag(ISASI).md
+### Issues Section（问题文档片段）
+            
+![image.png](https://raw.gitcode.com/user-images/assets/8547062/a39f6ddc-2e1d-45fe-a263-e41c89222986/image.png 'image.png')
+### Existing Issues（存在的问题）
+            
+来自外部开发者工单：
+
+这两段话很矛盾
+到了set变1，wait-1，那核心岂不是自顾自走了？ 下面说全部到才会继续，这样才显得合理
+
+该接口和CrossCoreWaitFlag接口配合使用。使用时需传入核间同步的标记ID(flagId)，每个ID对应一个初始值为0的计数器。执行CrossCoreSetFlag后ID对应的计数器增加1；执行CrossCoreWaitFlag时如果对应的计数器数值为0则阻塞不执行；如果对应的计数器大于0，则计数器减一，同时后续指令开始执行。 同步控制分为以下几种模式，如图1所示： 模式0：AI Core核间的同步控制。对于AIC场景，同步所有的AIC核，直到所有的AIC核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行；对于AIV场景，同步所有的AIV核，直到所有的AIV核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行。 模式1：AI Core内部，AIV核之间的同步控制。如果两个AIV核都运行了CrossCoreSetFlag，CrossCoreWaitFlag后续的指令才会执行。 模式2：AI Core内部，AIC与AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后， 两个AIV上CrossCoreWaitFlag后续的指令才会继续执行；两个AIV都执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+```
+
+---
+
+### A7.20 ★ REAL "two consecutive Sets of the same flagId" BUG REPORT in shipped CANN code — `cann/ops-solver` #13
+
+Exactly the illegal pattern described in item 6 ("不允许连续设置同一个flagId"), found in `cgetrf_kernel.cpp`.
+
+https://gitcode.com/cann/ops-solver/issues/13
+author/date: zhanghua145 / 2026-06-29, state closed
+
+```
+## 问题描述
+
+src/cgetrf/cgetrf_kernel.cpp:304-305 连续两次调用 `CrossCoreSetFlag<0x0, PIPE_MTE3>(0x6)` 设置完全相同的标志。同样在第439-440行连续两次 `CrossCoreWaitFlag(0x6)` 等待相同标志。这可能是意图设置/等待两个不同标志但代码错误地使用了相同的0x6，导致同步语义错误。
+
+## 环境信息
+
+- 芯片型号：Ascend 910B3
+- CANN 版本：8.0.0
+- 操作系统：Ubuntu 22.04
+
+## 重现步骤
+
+1. 分析 blockIdx>=8 且 blockM>512 时的核心同步行为
+
+## 预期结果
+
+若需设置两个独立标志，应分别使用不同的 flag 值
+
+## 日志 / 截图
+
+文件：src/cgetrf/cgetrf_kernel.cpp:304
+
+## 备注
+
+严重等级：medium
+```
+
+---
+
+### A7.21 ★ HARDWARE BEHAVIOUR CONFIRMED BY TOOLING — `Ascend/mssanitizer` #166: when an AIV flagId exceeds 15 the HARDWARE TRUNCATES it, so synccheck's deadlock report is a false positive
+
+Independent confirmation of item 3's "截取低4bit".
+
+https://gitcode.com/Ascend/mssanitizer/issues/166
+author/date: gong-siwei / 2026-07-28, state closed
+
+```
+### 🐛 问题描述
+            
+ synccheck检测核间同步mode4场景时，当AIV上flag id超过15时，属于非法范围，synccheck会报告死锁，但是算子实际不会死锁，硬件会截断AIV的flag id，因此建议synccheck不要报告死锁
+```
+
+Title (verbatim):
+
+```
+[Bug]: synccheck检测核间同步mode4场景时，当AIV上flag id超过15时，属于非法范围，synccheck会报告死锁，但是算子实际不会死锁
+```
+
+---
+
+### A7.22 ★ SIMULATOR MODEL EVIDENCE for the 16-ID / 4-bit encoding, and a high-frequency set/wait overflow — `Ascend/msopprof` #175
+
+The reporter disassembled `libpem_davinci.so` and found the ID bound check `cmp $0xf; ja <error>`. Also quotes the `GetffstMsg` 4-bit encoding. Note: the kernel runs FINE on real silicon with 4 fixed ids reused at high frequency — only the simulator's internal pairing pool overflows.
+
+https://gitcode.com/Ascend/msopprof/issues/175
+author/date: chenjiayi_ / 2026-10-19, state open
+
+```
+AscendC Kernel 使用**固定合法 flag ID** 的 `CrossCoreSetFlag` / `CrossCoreWaitFlag` 跨核同步时，在多核（32 AIC）× 高频（kstep 流水反复收发同一 ID）× 长时间仿真的场景下，仿真器报 `set_cross_core flag ID overflows` 错误。**msopprof simulator 与 npusim两个工具均复现**（共用同一仿真模型库 libpem_davinci.so）。
+
+关键事实：
+
+1. **溢出时 kernel 传入的 flagId 恒为 10/11**（npusim 报错自带 `coreId/subcoreId/flagId` 上下文证实），远小于硬件编码的 16 ID 上限（`GetffstMsg` 按 `flagId & 0xf` 编码，4 bit / mode），ID 本身完全合法；
+2. **溢出条数远超 kernel 逻辑 flag 操作数**（10 倍以上）且随仿真周期线性增长——溢出的是仿真器内部为 (core, flag) 维护的状态/配对记录池，而非用户可见的 flag ID 值；
+3. 溢出后 `wait` 立即失败返回，跨核同步语义损坏，流水时序数据不可信；错误累积至约 4.6 万条时仿真器直接崩溃退出，无 trace 落盘；
+4. **同一 kernel 真机上板运行完全正常**（精度 PASS、无死锁），仅仿真受影响。
+```
+
+The kernel's own flag budget (a 2-slot ready/free credit scheme on ids 8..11):
+
+```cpp
+// include/block/quant_matmul_mxfp8_block_mmad_swat_ub.h
+// readyFlag_ = 8, freeFlag_ = 10, slot ∈ {0, 1}
+AscendC::CrossCoreWaitFlag<2, PIPE_FIX>(freeFlag_ + slot);   // ID {10, 11}
+AscendC::CrossCoreSetFlag<2, PIPE_FIX>(readyFlag_ + slot);   // ID {8, 9}
+```
+
+The disassembly note and expected behaviour:
+
+```
+- **定位分析**（供参考）：对 `libpem_davinci.so` 反汇编可见 `Pem::set_flag(unsigned, unsigned)` 入口处含 `cmp $0xf; ja <error>` 检查（拦截 ID>15），但用户 ID 恒为 8-11，不可能触发该分支——报错实际来自内部状态管理路径。库内另有 `Isa::update_flag_id()`、`flag_info` 等符号，推测为 set/wait 配对记录结构，容量固定或未回收，在大规模高频场景下耗尽；
+- **触发条件归纳**：跨核 flag 高频反复收发（32 核 × kstep 流水重叠 × 仿真百万周期级）。小规模（kSteps ≤ 3）不触发；
+```
+
+```
+- 硬件 flag 池每 mode 支持 16 个 ID（`GetffstMsg` 按 `flagId & 0xf` 编码），kernel 固定使用 4 个合法 ID 反复 set/wait 属于正常使用模式，仿真器应正确建模并**正常完成仿真**；
+```
+
+Error text seen (with the legal flagId in context):
+
+```
+[ERROR] pem.cc:1009 set_flag set_cross_core flag ID overflows!
+coreId: 29
+subcoreId: 0
+flagId: 11        ← 用户传入的合法 ID（< 16）
+[ERROR] pem_issque.cc:1029 exec_wait_flag_dev flag ID overflows
+```
+
+---
+
+### A7.23 flagId COLLISION causing intermittent WRONG RESULTS (not a hang) — `cann/ops-transformer` #4882
+
+Short but it is the failure mode that item 5 warns about ("同步提前完成、阻塞提前解除而导致计算结果错误").
+
+https://gitcode.com/cann/ops-transformer/issues/4882
+author/date: wangss21 / 2026-09-02, state closed
+
+```
+### Describe the current behavior / 问题描述 (Mandatory / 必填)
+            
+Mlaprolog 存在核间同步flagId冲突问题，导致OOM版本偶现精度失败
+### Environment / 环境信息 (Mandatory / 必填)
+            
+Ascend950
+### Steps to reproduce the issue / 重现步骤 (Mandatory / 必填)
+            
+OOM版本会出现2/3路输出偶现精度失败
+```
+
+---
+
+### A7.24 flagId SCOPE established as per-combo, but the MEMORY-ORDER contract of CrossCoreSetFlag on A3/mode 2 is UNDEFINED in public docs — `Kurtnirvana/cannbot-knowledge` #9
+
+Relevant because a megakernel handing data between AIC and AIV through GM cannot assume the flag flushes anything.
+
+https://gitcode.com/Kurtnirvana/cannbot-knowledge/issues/9
+author/date: Kurtnirvana / 2026-09-30, state open
+
+```
+## 问题
+
+在 Atlas A3（modeId=2，AI Core 内 AIC↔AIV 同步）下用 CrossCoreSetFlag/WaitFlag 做跨核 GM 数据交接时，两点契约在知识仓中无法查到：
+
+1. **内存序语义**：CrossCoreSetFlag/WaitFlag 是否隐含 GM 写可见性 / 写回（冲刷）保证，还是仅保证「前置 pipe 指令完成 → 后续指令下发」这一指令序？
+2. **正确的跨核 GM 交接方式**：若只是指令序，跨核经 GM 交接 P/S 数据是否需要额外同步原语（DCCI / Scalar.DSB / MEMBAR）或 GM→GM 中转约束？
+
+同族的 flagId 作用域问题（per-AIC / per-AI-Core 分域 vs 全局）已有明确出处，不在本 Issue 范围。
+```
+
+```
+- 知识仓 `cross_core_set_flag_isasi.md` 对 flag 的唯一顺序承诺是「pipe：标识在哪条流水的前序指令完成后，CrossCoreSetFlag 才向调度模块发送通知」，`cross_core_wait_flag_isasi.md` 为「阻塞本核后续指令的下发」；两页均未声明 GM 可见性/写回语义。
+- 知识仓 `memory_consistency.md`「核间内存一致性」给出的通用规则是：硬件不会自动为多个 AI Core 建立全局读写顺序；跨核生产者-消费者流程需 `DCCI data → Scalar.DSB → ARRIVE / WAIT → DCCI → Scalar.DSB → LOAD`；并明确「arrive/wait 类接口只传递同步信号……使用这些接口后，仍需要根据数据访问路径判断是否需要 DCCI 和 DSB」。但该页只点名 `asc_sync_block_arrive/wait`、`asc_sync_inter_arrive/wait`，未把规则落到 CrossCoreSetFlag/WaitFlag。
+```
+
+```
+2. 给出跨核经 GM 交接数据的推荐序列（写端 `DCCI + Scalar.DSB` → `CrossCoreSetFlag`，读端 `CrossCoreWaitFlag` → `DCCI` 失效旧副本后再读），并说明 MTE3 非 DCache 路径下可省略哪些步骤。
+```
+
+Verdict recorded in the same issue (flag domain resolved, memory order not):
+
+```
+已得到的答案：(1) 已回答——flag 域=per-combo，本地文档有出处（inter_core_sync/key_features），且实验 A 用错位 set/wait 探针双向实证（候选①关闭、预案 β 排除）；(2) 未回答——架构师回传「内存序公开契约未定义」，QA 复审还要求核实该「未定义」结论的文档出处真实性。
+```
+
+---
+
+### A7.25 `CrossCoreWaitFlag` mode coverage request in catlass — `cann/catlass` #153 (confirms catlass's wrapper hard-wired `(0x1, PIPE_S)` defaults)
+
+https://gitcode.com/cann/catlass/issues/153
+author/date: lihao_huawei / 2026-04-14, state closed
+
+```
+### Backgroud / 背景信息 (Mandatory / 必填)
+            
+1、CrossCoreWaitFlag AscendC是支持0x4 ,0x2 0x1模式，并且支持插入在不同流水线后面，当前已经实现的CrossCoreWaitFlag使用的默认值(0x1, PIPE_S)
+### Origin / 信息来源 (Mandatory / 必填)
+            
+RecSDK CATLASS HSTU
+```
+
+---
+
+### A7.26 OFFICIAL DOC — `SyncAll`: hard sync is built on CrossCoreSetFlag internally; soft sync is a GM algorithm; and `numBlocks > physical cores` ⇒ "卡死"
+
+Older snapshot:
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/SyncAll.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit) / unknown date
+
+```
+## 功能说明
+当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用该函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬件同步是利用硬件自带的全核同步指令由硬件保证多核同步，软件同步是使用软件算法模拟实现。
+```
+
+```
+-   使用该接口进行多核控制时，算子调用时指定的逻辑numBlocks必须保证不大于实际运行该算子的AI处理器核数，否则框架进行多轮调度时会插入异常同步，导致Kernel“卡死”现象。
+-   在分离模式下，建议使用硬同步接口而非软同步接口。软同步接口仅适用于纯Vector场景，且性能较低。使用硬同步接口时，需根据场景设置Kernel类型：
+```
+
+Current `docs/zh` snapshot (explicit statement that hard SyncAll consumes flagIds via CrossCoreSetFlag, and the 3-step decomposition):
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+    - 纯Vector算子的全核同步，可参考[CrossCoreSetFlag的模式0](key_features.md)。
+    - 融合算子的全核同步，一次性实现三个核间同步能力（参考[CrossCoreSetFlag的关键特性说明](key_features.md)）：首先完成单个AI Core内，AIC与所有AIV同步（AIC等AIV）；接着完成多个AI Core间，所有AIC的同步；最后完成单个AI Core内，所有AIV与AIC同步（AIV等AIC）。
+```
+
+```
+    - SyncAll硬件同步接口内部实现中使用了[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)进行核间同步控制，因此开发者同时使用CrossCoreSetFlag（或CrossCoreWaitFlag）和SyncAll硬件同步接口时，需注意避免flagId冲突，各接口flagId占用的完整说明参见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+```
+
+---
+
+### A7.27 OFFICIAL DOC — `IBSet`: its `eventID` is a GM-slot index, explicitly NOT the hardware event/flag resource. So IBSet/IBWait do NOT share the 16-deep cross-core counter.
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/IBSet.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+| eventID | 输入 | 同步事件的逻辑编号，与`blockIdx`共同确定`gmWorkspace`中的同步标志，用于区分同一对生产者和消费者之间的不同软件同步事件。<br>该参数与[SetFlag/WaitFlag](../intra_core_sync/SetFlag_WaitFlag_ISASI.md)的入参名称相同，但含义不同：本接口的`eventID`用于定位软件同步标志，SetFlag/WaitFlag的`eventID`用于硬件指令中的核内流水同步事件。<br>因此，本接口的`eventID`不适用SetFlag/WaitFlag中0-7的取值限制。取值为非负整数，建议从0开始连续编号。 |
+```
+
+```
+    \text{gmWorkspace空间大小} \geq (\mathrm{eventStride} \times \mathrm{eventID\_max} + \mathrm{blockIdx\_max} + 1) \times 32\text{字节}
+```
+
+```
+    AIVOnly模式下`GetBlockNum() = 4`，核0作为生产者分别通过`IBSet(sync_gm, sync_buf, 0, 0)`和`IBSet(sync_gm, sync_buf, 0, 1)`通知两个不同同步事件，核2作为生产者通过`IBSet(sync_gm, sync_buf, 2, 0)`通知另一个同步事件。对应的IBWait必须分别传入相同的`blockIdx`和`eventID`，例如`IBWait(sync_gm, sync_buf, 0, 1)`只能等待`IBSet(sync_gm, sync_buf, 0, 1)`设置的同步标志；如果误传为`blockIdx = 1`或`eventID = 0`，会访问另一处同步标志并可能卡死。该场景中`blockIdx_max = 2`、`eventID_max = 1`、`eventStride = 4`，因此`gmWorkspace`至少需要`(4 × 1 + 2 + 1) × 32 = 224`字节。
+```
+
+---
+
+### A7.28 OFFICIAL DOC — `同步控制简介` (sync control overview): the SetFlag/WaitFlag intra-core flag is a single BIT (set to 1 / cleared to 0), in contrast to the cross-core COUNTER
+
+Useful contrast: intra-core hardware events are 1-bit, which is why "two consecutive Sets" is also illegal there but for a different reason.
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/同步控制简介.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit) / unknown date
+
+```
+-   多流水同步：通过[TQueSync](TQueSync.md)的SetFlag/WaitFlag或者[SetFlag/WaitFlag\(ISASI\)](SetFlag-WaitFlag(ISASI).md)接口进行不同流水线间的同步控制。
+    -   SetFlag：当前序指令的所有读写操作都完成之后，当前指令开始执行，并将硬件中的对应标志位设置为1。
+    -   WaitFlag：当执行到该指令时，如果发现对应标志位为0，该队列的后续指令将一直被阻塞；如果发现对应标志位为1，则将对应标志位设置为0，同时后续指令开始执行。
+```
+
+Pipe table from the same doc (needed to pick the `pipe` template arg):
+
+```
+PIPE_S
+标量流水线，使用Tensor GetValue函数时为此流水
+PIPE_V
+矢量计算流水及部分硬件架构下的L0C Buffer-&gt;UB数据搬运流水
+PIPE_M
+矩阵计算流水
+PIPE_MTE1
+L1 Buffer -&gt;L0A Buffer、L1 Buffer-&gt;L0B Buffer数据搬运流水
+PIPE_MTE2
+GM-&gt;L1 Buffer、GM-&gt;UB等数据搬运流水
+PIPE_MTE3
+UB-&gt;GM等数据搬运流水
+PIPE_FIX
+L0C Buffer-&gt;GM、L0C Buffer -&gt;L1等数据搬运流水
+```
+
+The `核间同步` chapter index, which enumerates the complete set of inter-core sync APIs (so nothing with "reset" or "clear" exists):
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/api/context/核间同步.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit) / unknown date
+
+```
+# 核间同步<a name="ZH-CN_TOPIC_0000001871607660"></a>
+
+-   **[IBSet](IBSet.md)**  
+
+-   **[IBWait](IBWait.md)**  
+
+-   **[SyncAll](SyncAll.md)**  
+
+-   **[CrossCoreSetFlag\(ISASI\)](CrossCoreSetFlag(ISASI).md)**  
+
+-   **[CrossCoreWaitFlag\(ISASI\)](CrossCoreWaitFlag(ISASI).md)**  
+
+-   **[InitDetermineComputeWorkspace](InitDetermineComputeWorkspace.md)**  
+
+-   **[NotifyNextBlock](NotifyNextBlock.md)**  
+
+-   **[WaitPreBlock](WaitPreBlock.md)**  
+```
+
+---
+
+### A7.29 mssanitizer soft-sync classification doc — explicitly marks `CrossCoreSetFlag`/`CrossCoreWaitFlag` as HARDWARE inter-core sync, not reportable soft sync
+
+Relevant for tooling: racecheck/synccheck already models them; you do not report them via `sanitizer_report.h`.
+
+https://github.com/kali20gakki/msAgent/blob/master/skills/operator/mstx-report-soft-sync/SKILL.md
+author/date: kali20gakki / msAgent skill (mirrors Ascend mssanitizer guidance) / fetched 2026-10-20
+
+```
+- 硬件同步（非软同步）：`SetFlag`/`WaitFlag`/`PipeBarrier`（核内事件同步）、`CrossCoreSetFlag`/`CrossCoreWaitFlag`（硬件核间同步）。
+```
+
+```
+| 核间 barrier | 同卡多个核到达同步点后一起继续 | `MstxCrossCoreBarrier` |
+| 核间 set/wait | 核 A 发信号，核 B 等待后才继续 | `MstxCrossCoreSetFlag` / `MstxCrossCoreWaitFlag` |
+```
+
+https://github.com/kali20gakki/msAgent/blob/master/skills/operator/mstx-report-soft-sync/references/recognition-examples.md
+author/date: kali20gakki / msAgent / fetched 2026-10-20
+
+```
+| `CrossCoreSetFlag` / `CrossCoreWaitFlag` | 否（硬件核间同步） | 不处理 |
+```
+
+---
+
+### A7.30 Community quick-reference (secondary, corroborating) — `FinResect/CANN` Ascend C 核心速查
+
+https://github.com/FinResect/CANN/blob/main/docs/Ascend%20C%E7%AE%97%E5%AD%90%E5%BC%80%E5%8F%91%E6%8C%87%E5%8D%97-%E6%A0%B8%E5%BF%83%E9%80%9F%E6%9F%A5.md
+author/date: FinResect (community compilation of the CANN guide) / fetched 2026-10-20
+
+```
+### 10.3 核间同步优化
+
+- 避免多核同时访问同一 GM 地址（被串行化，性能下降 10-20%）
+- 错峰访问；首次加载到 L2 Cache 后后续访问反而性能提升
+- CrossCoreSetFlag 同一 flagId 计数器上限 15 次
+```
+
+---
+
+### A7.31 OTHER REAL FLAG-BUDGET PATTERNS seen in public kernels (no rotation, fixed small sets) — for comparison
+
+These are the macro-wrapper style: a fixed handful of named ids per direction, re-used every iteration, relying on strict alternation rather than rotation.
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/recurrent_gated_delta_rule/op_kernel/tensorutils.h
+author/date: sgl-project / sgl-kernel-npu / fetched 2026-10-20
+
+```
+#define ALLCUBE_READY(iiii, append_to_pipe) CrossCoreSetFlag<0x0, append_to_pipe>(iiii)
+#define ALLCUBE_WAIT(iiii) CrossCoreWaitFlag(iiii)
+#define ALLVEC_READY(iiii, append_to_pipe) CrossCoreSetFlag<0x0, append_to_pipe>(iiii)
+#define ALLVEC_WAIT(iiii) CrossCoreWaitFlag(iiii)
+#define CUBE_READY(iiii, append_to_pipe) CrossCoreSetFlag<0x2, append_to_pipe>(iiii)
+#define WAIT_CUBE(iiii) CrossCoreWaitFlag(iiii)
+#define VEC_READY(iiii, append_to_pipe) CrossCoreSetFlag<0x2, append_to_pipe>(iiii)
+#define WAIT_VEC(iiii) CrossCoreWaitFlag(iiii)
+```
+
+Further examples found by `gh search code 'CrossCoreSetFlag'` (fixed ids, often a base + db index — a 2-deep rotation):
+
+```
+sgl-project/sgl-kernel-npu:csrc/compressor/op_kernel/arch35/compressor_kernel.h: CrossCoreSetFlag<SYNC_MODE0, PIPE_FIX>(SYNC_C1_FLAG);
+sgl-project/sgl-kernel-npu:csrc/compressor/op_kernel/arch35/compressor_kernel.h: CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_C1_V1_FLAG + info.cubeDbIdx);
+sgl-project/sgl-kernel-npu:csrc/compressor/op_kernel/arch22/compressor_kernel_perf.h: CrossCoreSetFlag<SYNC_MODE0, PIPE_FIX>(SYNC_C1_FLAG);
+sgl-project/sgl-kernel-npu:csrc/compressor/op_kernel/arch22/compressor_kernel_perf.h: CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_C1_V1_FLAG + info.cubeDbIdx);
+sgl-project/sgl-kernel-npu:csrc/deepep/ops/op_kernel/dispatch_ffn_combine_kernel/utils/hccl_shmem.hpp: AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(8);
+sgl-project/sgl-kernel-npu:csrc/deepep/ops/op_kernel/dispatch_ffn_combine_kernel/utils/hccl_shmem.hpp: AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(RECV_SYNC_EVENT_ID);
+sgl-project/sgl-kernel-npu:csrc/deepep/ops/op_kernel/fused_deep_moe.h: Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(gmm1AivFinished);
+XPU-Forces/mojo_opset:native/src/npu_a5/sku_950pr/swa/kernel/runtime.cpp: AscendC::CrossCoreSetFlag<4, PIPE_KIND>(event_id);
+XPU-Forces/mojo_opset:native/src/npu_a5/sku_950pr/swa/kernel/runtime.cpp: AscendC::CrossCoreSetFlag<4, PIPE_KIND>(static_cast<uint16_t>(event_id + 16));
+Just-it/AscendOpGenAgent:archive_tasks/quant_matmul/kernel/workspace_queue.h: AscendC::CrossCoreSetFlag<0x2, PIPE_MTE2>(vecNotifyCubeId_);
+Just-it/AscendOpGenAgent:archive_tasks/quant_matmul/kernel/workspace_queue.h: AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeNotifyVecId_);
+hw-native-sys/pto-isa:kernels/manual/a2a3/dispatch_mega_combine/overview.md: - 每个 localExpert group 全部 srcRank 搬完后 `SYNCALL<AIVOnly>`，再 `CrossCoreSetFlag` 通知 GMM1 该 expert ready。
+```
+
+---
+
+### A7.32 ★ THE ONE PLAUSIBLE "RE-POINT THE FLAG BANK" LEVER — `AscendC::SetSyncBaseAddr(uint64_t)` / `set_ffts_base_addr`: present in the 2201 impl, NO public doc page
+
+Found in the A3 implementation file (item 7). Searching the whole `asc-devkit` doc tree (`docs/api/context/*` and `docs/zh/api/**`) returns no page for `SetSyncBaseAddr`, so it is a non-public interface. Source:
+
+https://gitcode.com/cann/asc-devkit/blob/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+author/date: Huawei Technologies Co., Ltd. / "Copyright (c) 2025"
+
+```
+__aicore__ inline void SetSyncBaseAddrImpl(uint64_t config)
+{
+    set_ffts_base_addr(config);
+}
+
+__aicore__ inline void SetSyncBaseAddr(uint64_t config)
+{
+    SetSyncBaseAddrImpl(config);
+}
+```
+
+Its real host-side pairing — `kernelInfo_.SetHwsyncIdx(0)` + `rtGetC2cCtrlAddr` — is documented only incidentally in this bug report, which also shows the facility is NOT available on Ascend 950 (chip type 15), i.e. it is an A2/A3-era mechanism:
+
+https://gitcode.com/cann/ascend-boost-comm/issues/65
+author/date: demoauguste / 2026-04-20, state closed
+
+```
+### Describe the current behavior / 问题描述 (Mandatory / 必填)
+            
+相关日志打印如下，提示rtGetC2cCtrlAddr不支持Ascend 950芯片：
+[2026-04-20 17:28:38.540372] [debug] [1652661] [kernel_base.cpp:341] kernel param: 5 in/out, 0 const in, 1 workspaces, 1 hwsync
+[WARNING] RUNTIME(1652661,Sample):2026-04-20-17:28:38.540.380 [api_c.cc:2602] 1652661 rtGetC2cCtrlAddr: chip type(15) does not support.
+[WARNING] RUNTIME(1652661,Sample):2026-04-20-17:28:38.540.383 [api_c.cc:2602] 1652661 rtGetC2cCtrlAddr: chip type(15) does not support.
+[2026-04-20 17:28:38.540383] [error] [1652661] [rt_backend_module.cpp:223] rt Get C2cCtrl Addr fail, error:118554637
+[WARNING] RUNTIME(1652661,Sample):2026-04-20-17:28:38.540.387 [api_c.cc:2602] 1652661 rtGetC2cCtrlAddr: chip type(15) does not support.
+[2026-04-20 17:28:38.540390] [error] [1652661] [kernel_base.cpp:123] Mki Get RtC2cCtrlAddr fail
+[2026-04-20 17:28:38.540393] [error] [1652661] [kernel_base.cpp:58] failed to update hwsync args
+[2026-04-20 17:28:38.540397] [error] [1652661] [kernel_base.cpp:349] build args failed, abort running
+```
+
+`````
+在算子InitImpl处，设置：
+```c++
+kernelInfo_.SetHwsyncIdx(0);
+```
+
+算子kernel处设置：
+```
+AscendC::SetSyncBaseAddr((uint64_t)ffts_addr);
+```
+
+执行时日志出现报错。
+`````
+
+---
+
+### A7.33 OFFICIAL DOC — `SetNextTaskStart` (SuperKernel Early-Start): the only CANN-sanctioned "many fused sub-kernels in sequence" mechanism, and it too eats flagIds; a TilingKey branch that skips it "卡住"
+
+Directly relevant: a 78-layer megakernel is the hand-written alternative to SuperKernel, and this page states the per-core call-exactly-once discipline that the counter requires.
+
+https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_task_sync/SetNextTaskStart.md
+author/date: Huawei Technologies Co., Ltd. (CANN asc-devkit, master) / fetched 2026-10-20
+
+```
+## 约束说明<a name="section633mcpsimp"></a>
+
+- 该接口适用于TorchAir图模式开发场景，且需在启用SuperKernel特性后方可生效。具体内容请参考[图内标定SuperKernel范围](https://gitcode.com/Ascend/torchair/blob/master/docs/zh/ascend_ir/features/advanced/super_kernel_scope.md)。
+- 在算子运行过程中，需要保证此接口在每个核上都被调用，且每个核上仅被调用一次。
+- 若子核函数（Kernel）某个TilingKey分支调用了此接口，则开发者需要保证当前算子可能会运行的所有TilingKey均调用了此接口，否则会出现因同步指令数量不匹配而卡住的现象。
+- 本接口内部实现会占用核间同步flagId，若与CrossCoreSetFlag/CrossCoreWaitFlag同时使用需注意避免flagId冲突，详见[核间同步flagId占用说明](../inter_core_sync/key_features.md#inter_core_sync_flagid_usage)。
+```
+
+```cpp
+    template<pipe_t AIV_PIPE = PIPE_MTE3, pipe_t AIC_PIPE = PIPE_FIX, bool FORCE = false>
+    __aicore__ inline void SetNextTaskStart()
+```
+
+```
+| FORCE | 离线编译时是否强制启用Early-Start能力，不影响在线编译。<br>false：离线编译时不强制启用Early-Start能力；<br>true：离线编译时启用Early-Start能力，适用于无在线编译流程的算子（如<<<>>>开发的算子）。 |
+```
+
+And its implementation on 2201 (already quoted in item 7) shows it burns `SYNC_AIC_FLAG = 11` on AIC and `SYNC_AIV_ONLY_ALL = 14` on AIV — matching the occupancy table in item 5.
+
+---
+
+### A7.34 ADDITIONAL NEGATIVE / LEADS
+
+- `SetSyncBaseAddr` / `set_ffts_base_addr`: no page exists under `cann/asc-devkit` `docs/api/context/` or `docs/zh/api/**`. Grepping the full recursive tree for `SetSyncBaseAddr|ffts|SetNextTask|WaitPreTask|super_kernel` returns only `docs/api/context/SetNextTaskStart.md`, `docs/api/context/WaitPreTaskEnd.md`, test files (`tests/api/basic_api/ascendc_case_ascend910b1/ascendc_case_ascend910b1_aiv/test_ffts_debug.cpp`, `tests/api/basic_api/ascendc_case_ascend950pr_9599/.../test_ffts_debug.cpp`), `tests/tools/utils/stub/rt_ffts_stub.cpp`, and the SuperKernel build tooling. So: `nothing relevant` in the public API docs — only the impl header (item 32) and the bug report. The two `test_ffts_debug.cpp` files are a lead for exercising the base-address path per chip.
+- `gitcode` issue search for 「flagId 清零」 returns only unrelated OpenHarmony "告警清零" issues. `nothing relevant` — no public discussion of clearing a cross-core flag counter exists, consistent with there being no such primitive.
+- `gitcode` issue search for `SetSyncBaseAddr` returns only `cann/ascend-boost-comm#65` (item 32) and auto-generated per-file issues in a mirror repo `WinstonSmith/CATCoC_mm_dq_rs` (#27/#28/#30/#13/#46). The latter are file-listing placeholders. `nothing relevant` for those five.
+
+---
+
+## NEGATIVE RESULTS (pages fetched, nothing extractable or nothing relevant)
+
+- https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0011.html — returns a 51 KB SPA shell with zero occurrences of "CrossCore"; content is client-rendered. `nothing relevant` as fetched. The identical content is available as markdown in `cann/asc-devkit` (items 1-6), which is what the SPA renders.
+- https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0273.html — same SPA shell, zero "CrossCore" matches. `nothing relevant` as fetched. (This is the URL cited by PTOAS #985 as the authoritative `CrossCoreSetFlag` page.)
+- https://juejin.cn/post/7684195084155060233 — "CrossCoreSetFlag 实战：昇腾 950 核间同步与硬通道边界". JS-gated; curl returns 2397 bytes and WebFetch returns only "Please wait...". `nothing relevant` as fetched. Search-engine snippets attribute to it: flagId 0-10, same-flagId counter max 15, and a claim that 0-10 is a CANN-API/per-Group allocation convention rather than a hardware limit (STARS2.0 providing 128K single-bit or 4096 32-bit hardware sync flags) — NOT verified against the page body, do not cite.
+- https://blog.csdn.net/zjl1991309/article/details/165717296 — HTTP 521 to both curl and WebFetch. `nothing relevant` as fetched.
+- https://blog.csdn.net/gitblog_00732/article/details/157265908 ("CANN/asc-devkit核间同步SyncAll函数") — HTTP 521. `nothing relevant` as fetched.
+- https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_3510.html — VitePress prerendered page; usable, but its markdown source is item 6's sibling `npu_arch_3510.md`. The 3510 (A5) page is the 950 variant, not the A3 target; the A3 text is item 6.
+- `gh search code 'CrossCoreSetFlag flagId %'` — zero results. No public code does `flagId = stage % N` written that literally; the only modulo rotation found is item 14's `MAKE_ID ((++idCounterNum) % 11)`.
+- `gh search code 'CrossCoreFlagWithReverse flagAicFinish'` / `'... flagAivFinishStore'` — zero results for those exact two-term queries (the identifiers exist, see item 13, but the search index did not pair them).
+- bbs.huaweicloud.com / www.hiascend.com/forum — no on-topic post surfaced for the Chinese queries 「CrossCoreSetFlag 计数器 15 死锁」「跨核同步 flagId 复用」「CrossCoreWaitFlag 挂死」「AscendC 跨核同步 flagId 范围」「CrossCoreSetFlag 连续两次」「ffts 跨核同步 计数器」「SyncAll 原理 AscendC」. All substantive Chinese-language discussion found lives on gitcode.com issues/MRs (items 11, 19-25) and in repo markdown (items 15, 16). `nothing relevant` for the two forum domains.
+- https://gitcode.com/cann/asc-devkit/issues/1773, /1062, /289, /1786, /1613, /1323 — titles indicate doc-wording and sample-request issues around CrossCoreSetFlag/WaitFlag (e.g. "CrossCoreWaitFlag 示例错误", "约束说明中\"情况如不：\"应为\"情况如下：\"", "新增核间同步接口 CrossCoreSetFlag/CrossCoreWaitFlag样例"). Not fetched in full; typo/sample-request class, no new technical content expected.
+- https://gitcode.com/Kurtnirvana/cannbot-knowledge/issues/31 and /33 — titles report that mode 2's documented "all AIV must Set before AIC's wait releases" does not match 950PR measurements (single AIV Set releases AIC). 950-specific, not A3; listed for completeness. Titles verbatim: "[Knowledge-Report|知识问题反馈]: CrossCoreSetFlag/WaitFlag 模式2「所有AIV Set 才释放AIC等待」与 950PR 实测不符（单个AIV Set 后即释放），需补充版本例外与 all-AIV 屏障提示" and "[Knowledge-Report|知识问题反馈]: CrossCore mode2 AIC 等待的 AIV 参与范围条件建议补充 950PR 实测行为与显式屏障要求".
+- https://gitcode.com/cann/pto-isa/issues/729 — "CPU_SIM 中文文档遗漏 A2/A3 FFTS 跨核同步契约". Not fetched in full; flagged as a lead for A2/A3 FFTS contract wording.
+
+---
+
+## SUMMARY OF THE CONTRACT AS ESTABLISHED BY THE ABOVE (pointers only, no new claims)
+
+- Hardware encoding (A3 / 2201): `GetffstMsg(mode, flagId) = 0x1 + ((mode & 0x3) << 4) + ((flagId & 0xf) << 8)` — item 7. So 4 bits of flagId ⇒ 16 ids per core per mode-family; out-of-range ids are truncated to the low 4 bits (items 3, 21).
+- Per-flagId counter depth: 0-15. Exceeding it is documented two different ways: "会异常报错，中断流程" (item 3/4) and empirically "a system freeze" (items 10, 15). Catlass's answer is a forced reverse handshake every 15 Sets (item 10), after the original depth-16 version was found to hang (item 11).
+- No reset/clear primitive exists. The only documented way to return a counter to 0 is to execute the matching Waits — stated as the mode-switch precondition "须在模式切换前完成前一个模式的所有同步操作" (item 3) and implemented as `CrossCoreFlagWithReverse` (item 10). The inter-core sync API index (item 28) contains no clear/reset entry.
+- Usable budget on A3 for modes 0/1/2: 0-15 minus whatever AscendC reserves — SyncAll `isAIVOnly=false` takes 11/12/13, `isAIVOnly=true` takes 14, SuperKernel task sync takes 11-14, Matmul with N objects takes [0, 2N-1] plus 15 in the 1:2 SuperKernel case (item 5, matching the `SYNC_AIC_FLAG=11 / SYNC_AIV_FLAG=12 / SYNC_AIC_AIV_FLAG=13 / SYNC_AIV_ONLY_ALL=14` constants in item 7). Catlass additionally claims 8/9/10 for its barriers and treats 0-7 as user space (`FFTS_MAX_FLAG = 7`, item 10).
+- Mode 4 is a different hardware instruction (`set_intra_block`/`wait_intra_block`, item 9) with an independent flag pool (item 5) and only exists on 950PR/DT — not on A3 (items 1, 3, 5).
+- `IBSet`/`IBWait` and soft `SyncAll` are GM polling loops with unbounded software eventIDs; they do not consume the 16-deep hardware counter (items 8, 27).
+
+
+---
+
+## A8. ★ THE MECHANISM, re-fetched whole and independently verified: CATLASS `cross_core_sync.hpp`
+
+https://raw.gitcode.com/cann/catlass/raw/master/include/catlass/arch/cross_core_sync.hpp
+
+Author: Huawei Technologies Co., Ltd., copyright header 2025. Repo `cann/catlass`, branch
+`master`. Re-fetched whole by me on 2026-10-20 (4037 bytes) to confirm the quotes above.
+
+This is the official CANN library's answer to counter saturation across many sequential stages,
+and it is the most directly applicable thing in this whole dossier to a 78-layer megakernel. The
+comment states the failure mode; `CrossCoreSetFlagWithReverse` states the fix; the cost is
+**two** flagIds per producer/consumer edge, independent of how many stages there are. Whole file:
+
+```cpp
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef CATLASS_ARCH_CROSS_CORE_SYNC_HPP
+#define CATLASS_ARCH_CROSS_CORE_SYNC_HPP
+
+#include "catlass/catlass.hpp"
+
+namespace Catlass::Arch {
+
+// A certain cross core flag can be continuously set up to 15 times without waiting. In scenarios where there is only
+// one-way synchronization between cores and the synchronization operation is executed multiple times, if the core
+// performing the set operation runs faster, it may result in the flag being set more than 15 times consecutively,
+// leading to a system freeze. To prevent such a freeze, we need to wait for the waiting cores to perform a reverse
+// synchronization operation after executing the set operation MAX_REVERSE_DEPTH times.
+constexpr uint32_t MAX_REVERSE_DEPTH = 15;
+
+using FlagID = uint16_t;
+constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+constexpr FlagID AIC_INTER_BLOCK_BARRIER = 9;
+constexpr FlagID AIV_INTER_SUBBLOCK_BARRIER = 10;
+constexpr FlagID FFTS_MAX_FLAG = 7;
+
+struct CrossCoreFlag {
+    CATLASS_DEVICE
+    CrossCoreFlag() : id(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlag(FlagID id) : id(id)
+    {}
+
+    FlagID id;
+};
+
+template <uint32_t REVERSE_DEPTH_ = MAX_REVERSE_DEPTH>
+struct CrossCoreFlagWithReverse {
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse() : id(0), reverseId(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse(FlagID id, FlagID reverseId) : id(id), reverseId(reverseId)
+    {}
+
+    FlagID id;
+    FlagID reverseId;
+    uint32_t count{0};
+};
+
+template <uint8_t MODE, int32_t CORE_TYPE>
+struct BarrierFlag {
+    static_assert(MODE != 255 && MODE == 255, "Unsupported cross core barrier flag, can not find the specialization.");
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIC> {
+    static constexpr FlagID ID = AIC_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x1, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_SUBBLOCK_BARRIER;
+};
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreBarrier()
+{
+    constexpr FlagID flagId = BarrierFlag<MODE, g_coreType>::ID;
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flagId);
+    AscendC::CrossCoreWaitFlag(flagId);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreSetFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+}
+
+CATLASS_DEVICE
+void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag<MODE, PIPE>(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreSetFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreWaitFlag(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreWaitFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+} // namespace Catlass::Arch
+
+#endif // CATLASS_ARCH_CROSS_CORE_SYNC_HPP
+```
+
+## A9. ★ The bugfix that proves the 15 is a real hazard, re-fetched and re-verified
+
+https://gitcode.com/cann/catlass/merge_requests/325
+
+Author: `triwooder` (张云淞). State: merged, `2025-12-18T20:44:03+08:00`. Title:
+`fix: 更改默认的MAX_REVERSE_DEPTH`. Re-fetched by me on 2026-10-20 via
+`https://gitcode.com/api/v5/repos/cann/catlass/pulls/325`. Body, verbatim:
+
+```
+## 描述
+更改默认的MAX_REVERSE_DEPTH为15，原设置会导致卡死
+
+## 类型标签
+- [x] Bug修复
+- [ ] 新特性
+- [ ] 性能优化
+- [ ] 文档更新
+```
+
+i.e. the previous default (16) deadlocked. 15, not 16, is the safe credit depth — one Set must be
+left in hand.
+
+## A10. ★ Field report: two consecutive Sets of one flagId in shipped code, re-fetched and re-verified
+
+https://gitcode.com/cann/ops-solver/issues/13
+
+Author: `zhanghua145`. Created `2026-06-29T17:05:12+08:00`. Title:
+`[Bug-Report|缺陷反馈]: cgetrf_kernel.cpp 中 CrossCoreSetFlag 重复设置相同标志`.
+Re-fetched by me on 2026-10-20 via `https://gitcode.com/api/v5/repos/cann/ops-solver/issues/13`.
+Body, verbatim:
+
+```
+## 问题描述
+
+src/cgetrf/cgetrf_kernel.cpp:304-305 连续两次调用 `CrossCoreSetFlag<0x0, PIPE_MTE3>(0x6)` 设置完全相同的标志。同样在第439-440行连续两次 `CrossCoreWaitFlag(0x6)` 等待相同标志。这可能是意图设置/等待两个不同标志但代码错误地使用了相同的0x6，导致同步语义错误。
+
+## 环境信息
+
+- 芯片型号：Ascend 910B3
+- CANN 版本：8.0.0
+- 操作系统：Ubuntu 22.04
+
+## 重现步骤
+
+1. 分析 blockIdx>=8 且 blockM>512 时的核心同步行为
+
+## 预期结果
+
+若需设置两个独立标志，应分别使用不同的 flag 值
+
+## 日志 / 截图
+
+文件：src/cgetrf/cgetrf_kernel.cpp:304
+
+## 备注
+
+严重等级：medium
+```
+
+
+---
+
+## A11. The `dav-2201` build recipe for a hand-written megakernel
+
+Not asked for, but it is the one thing in `megagdn-pto` that a hand-written A3 megakernel project
+needs and that is nowhere else in this dossier: the exact `bisheng` invocation, including the
+`--npu-arch=dav-2201` mapping and the stack-size / dcci `-mllvm` flags.
+
+https://github.com/huawei-csl/megagdn-pto/blob/main/megagdn_pto/compile.py
+(raw: https://raw.githubusercontent.com/huawei-csl/megagdn-pto/main/megagdn_pto/compile.py)
+
+Author: Huawei Technologies Co., Ltd. (repo `huawei-csl/megagdn-pto`, branch `main`),
+10606 bytes. Fetched 2026-10-20.
+
+The arch mapping, with the comment that states what `dav-2201` expands to and why mix mode
+matters (both `__DAV_*_CUBE__` and `__DAV_*_VEC__` defined — which is what makes the
+`#if defined(__DAV_CUBE__)` / `#elif defined(__DAV_VEC__)` structure in A1/A2 compile):
+
+```python
+# The memory-base backend targets dav-2201 (A2/A3); every other backend targets
+# dav-3510 (A5), matching the SOC_VERSION → arch mapping used by the pto-isa tests.
+# These are the driver-level ``--npu-arch`` names; bisheng expands them to the
+# AI Core archs pto-isa names directly (dav-c220 / dav-c310), keeping mix mode
+# so both __DAV_*_CUBE__ and __DAV_*_VEC__ are defined.
+_IS_MEMORY_BASE = MEMORY_MODEL == "MEMORY_BASE"
+AICORE_ARCH: str = "dav-2201" if _IS_MEMORY_BASE else "dav-3510"
+```
+
+`BLOCK_DIM` is taken from the device's **cube** core count, not the AIV count — which is what
+makes the `bd * 2` / `bd * 4` workspace shapes in B2 line up with `get_block_idx()` on the Cube
+side:
+
+```python
+_npu_dev = os.environ.get("GDN_NPU_DEVICE", "npu:0")
+try:
+    BLOCK_DIM: int = int(
+        getattr(torch.npu.get_device_properties(_npu_dev), "cube_core_num", 20)
+    )
+except (RuntimeError, AssertionError):
+    BLOCK_DIM = 24
+```
+
+The flag list. Note `-cce-aicore-record-overflow=true` and
+`-cce-aicore-dcci-insert-for-scalar=false` — the latter matters because the GM-counter barriers in
+A4/A5.3 rely on *explicit* `dcci`, and letting the compiler insert its own around scalar access
+would be both redundant and a performance cost:
+
+```python
+def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
+    """Return bisheng flags shared by all chunk-GDN kernels."""
+    flags = [
+        "-fPIC", "-shared", "-xcce", f"-D{MEMORY_MODEL}", "-O2", "-std=gnu++17",
+        f"--npu-arch={AICORE_ARCH}",
+        "-mllvm", "-cce-aicore-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-record-overflow=true",
+        "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Wno-macro-redefined", "-Wno-ignored-attributes",
+        f"-I{_KERNEL_INCLUDE}",
+        f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
+        f"-I{ASCEND_TOOLKIT_HOME}/include",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/runtime",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/profiling",
+        f"-DGDN_D={hidden_size}",
+        f"-DGDN_C={chunk_size}",
+        f"-DTRI_INV_DOUBLING_BLOCK={TRI_INV_DOUBLING_BLOCK}",
+    ]
+    if os.path.isdir(_DRIVER_INC):
+        flags.append(f"-I{_DRIVER_INC}")
+    extra = os.environ.get("PTO_DYNAMIC_EXTRA_FLAGS", "").split()
+    flags.extend(extra)
+    return flags
+```
+
+The invocation itself is a bare `bisheng` call producing a `.so` loaded by `ctypes` — no op
+framework, no `.json` registration:
+
+```python
+def _run_bisheng(cmd: list[str], timeout: int) -> None:
+```
+
+```python
+    subprocess.run(cmd, check=True, timeout=timeout)
+```
+
+```python
+    flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
+    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
+```
+
+The environment knobs, from the module docstring:
+
+```python
+    VERBOSE_COMPILE         Set to ``1`` to print the full bisheng command.
+    PTO_DYNAMIC_EXTRA_FLAGS Extra flags appended to every bisheng invocation.
+```
+
+
+---
+
+
+---
+
+## 41. Growing the brick into a per-layer kernel: the Matmul object's lifetime across stages, `SyncAll<false>` as a mid-kernel phase boundary, and `rope_matrix`'s pairing tiling
+
+### 41.1 Can a second cube stage follow a vector stage? The `REGIST_MATMUL_OBJ` lifecycle
+
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0628.html
+CANN Community Edition 9.0, `REGIST_MATMUL_OBJ`. Retrieved 2026-10-20. Verbatim and complete:
+
+```
+REGIST_MATMUL_OBJ
+ 功能说明
+ 初始化Matmul对象。
+ 函数原型
+ REGIST_MATMUL_OBJ(tpipe, workspace, ...)
+ 参数说明
+ tpipe  输入  Tpipe对象。
+ workspace  输入  系统workspace指针。
+ ...  输入  可变参数，传入Matmul对象和与之对应的Tiling结构，要求Tiling结构的数据类型为TCubeTiling结构。
+ Tiling参数可以通过Host侧GetTiling接口获取，并传递到kernel侧使用。
+ 返回值说明
+ 无
+ 约束说明
+ 在分离模式中，本接口必须在InitBuffer接口前调用。
+ 在程序中，最多支持定义4个Matmul对象。
+ 当代码中只有一个Matmul对象时，本接口可以不传入tiling参数，通过Init接口单独传入tiling参数。
+ 当代码中有多个Matmul对象时，必须满足Matmul对象与其tiling参数一一对应，依次传入，具体方式请参考调用示例。
+ 在分离模式中，调用本接口后，AIC核仅会执行下述AIV核发起的接口，其他接口不会在AIC核执行：
+ Matmul Kernel侧接口。
+ 基础数据搬运和随路转换ND2NZ搬运接口，仅支持数据通路为GM -> A1、B1的数据搬运。
+ 调用示例
+ Tpipe pipe;
+// 推荐：初始化单个matmul对象，传入tiling参数
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+// 推荐：初始化多个matmul对象，传入对应的tiling参数
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1, mm1tiling, mm2, mm2tiling, mm3, mm3tiling, mm4, mm4tiling);
+// 初始化单个matmul对象，未传入tiling参数。注意，该场景下需要使用Init接口单独传入tiling参数。这种方式将matmul对象的初始化和tiling的设置分离，比如，Tiling可变的场景，可通过这种方式多次对Tiling进行重新设置
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+mm.Init(&tiling);
+```
+
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0630.html
+`Init`. Retrieved 2026-10-20. Verbatim:
+
+```
+功能说明
+Init主要用于对Matmul对象中的Tiling数据进行初始化，根据Tiling参数进行资源划分，Tiling参数的具体介绍请参考Matmul Tiling侧接口。
+开发者可以先通过REGIST_MATMUL_OBJ不传入Tiling参数对单个Matmul对象进行初始化，后续通过Init接口单独传入Tiling参数，对Matmul对象中的Tiling数据进行调整。比如，Tiling参数可变的场景下，可以通过多次调用Init来重新设置Tiling参数。
+不需要Tiling变更的场景下，推荐使用REGIST_MATMUL_OBJ传入Tiling参数进行初始化。
+函数原型
+Tiling参数传入栈地址
+__aicore__ inline void Init(const TCubeTiling* __restrict cubeTiling, TPipe* tpipe = nullptr)
+Tiling参数传入GM地址
+__aicore__ inline void Init(const __gm__ TCubeTiling* gmCubeTiling, TPipe* tpipe = nullptr)
+约束说明
+Tiling参数传入栈地址的接口：无。
+Tiling参数传入GM地址的接口：仅支持Matmul Tiling参数的部分常量化场景。
+不支持CPU域调试。
+```
+
+and its two call examples, verbatim — note the pure-cube one sets `KERNEL_TYPE_AIC_ONLY`, and the MIX one says
+`Init` is not needed at all:
+
+```cpp
+#define ASCENDC_CUBE_ONLY
+GET_TILING_DATA_PTR_WITH_STRUCT(MatmulCustomTilingData, tilingDataPtr, tiling);
+KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+// ...
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+mm.Init(&(tilingDataPtr->cubeTilingData));
+```
+```cpp
+GET_TILING_DATA_PTR_WITH_STRUCT(MatmulCustomTilingData, tilingDataPtr, tiling);
+KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+// ...
+// MIX模式下，只调用REGIST_MATMUL_OBJ接口，传入Tiling参数的GM地址，不需调用Init接口
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &(tilingDataPtr->cubeTilingData));
+```
+
+`End`, repeated from §31.9 because it is the other half of the answer, verbatim:
+
+```
+End
+功能说明
+多个Matmul对象之间切换计算时，必须调用一次End函数，用于释放Matmul计算资源，防止多个Matmul对象的计算资源冲突。
+调用示例
+mm1.IterateAll(gm_c1);
+mm1.End();
+mm2.IterateAll(gm_c2);
+mm2.End();
+```
+
+### 41.2 How a shipped multi-stage fused MIX kernel actually does cube → vector → cube: Catlass tiled Mmad, not the Matmul high-level API
+
+https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/main/fla/ops/ascendc/kda/chunk_kda_bwd/op_kernel/chunk_kda_bwd_finalize.h
+`flashserve/flash-linear-attention-npu`, branch `main`. Retrieved 2026-10-20. The complete top-level body of the
+fused MIX kernel, verbatim — this is the exact shape the brick is growing into:
+
+```cpp
+template <typename DataT, uint32_t V_DIM, typename BetaT,
+          bool SAFE_GATE, bool VARLEN_TND>
+__aicore__ inline void RunChunkKdaBwdC(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR vNew, GM_ADDR gk,
+    GM_ADDR beta, GM_ADDR akk, GM_ADDR h, GM_ADDR dh, GM_ADDR dvScan,
+    GM_ADDR dqRaw, GM_ADDR dAqk, GM_ADDR cuSeqlens,
+    GM_ADDR chunkIndices, GM_ADDR rawG, GM_ADDR aLog, GM_ADDR dtBias,
+    GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR db, GM_ADDR dg,
+    GM_ADDR dAkk, GM_ADDR dA, GM_ADDR dBias, GM_ADDR workspace,
+    const ChunkKdaBwdCTilingData *tiling, bool active)
+{
+    if ASCEND_IS_AIC {
+        if (active) {
+            ChunkKdaBwdCCubeProcess<DataT, V_DIM, SAFE_GATE> process(
+                v, vNew, akk, h, dh, dvScan, dq, dk, dg, dAkk,
+                cuSeqlens, chunkIndices, workspace);
+            process.Init(*tiling);
+            process.Process();
+        }
+    }
+    if ASCEND_IS_AIV {
+        if (active) {
+            AscendC::TPipe pipe;
+            ChunkKdaBwdCVectorProcess<DataT, V_DIM, BetaT> process(
+                q, k, v, gk, beta, h, dh, dqRaw,
+                dq, dk, dv, db, dg, dAkk, cuSeqlens, chunkIndices,
+                workspace);
+            process.Init(*tiling, &pipe);
+            process.Process();
+        }
+    }
+
+    // WY materializes the base gradients in GM and Intra immediately reads
+    // them back for the local correction.  Complete every WY store before
+    // remapping the same buffers to the Intra owner.
+    AscendC::SyncAll<false>();
+
+    if ASCEND_IS_AIC {
+        if (active) {
+            ChunkKdaBwdCIntraCubeProcess process(
+                cuSeqlens, chunkIndices, workspace);
+            process.Init(*tiling);
+            process.Process();
+        }
+    }
+    if ASCEND_IS_AIV {
+        if (active) {
+            AscendC::TPipe pipe;
+            ChunkKdaBwdCIntraVectorProcess<
+                128, 64, SAFE_GATE, false, VARLEN_TND,
+                DataT, BetaT, DTYPE_RAW_G> process(
+```
+
+then, verbatim, the second and third barriers:
+
+```cpp
+    // Intra writes dg by half rows on both AIV sub-blocks, whereas Gate
+    // remaps the work to complete heads and updates dg in place.  Finish the
+    // whole Intra phase before any core starts the Gate read/scan/write phase.
+    AscendC::SyncAll<false>();
+
+    if ASCEND_IS_AIV {
+        if (active) {
+            AscendC::TPipe pipe;
+            ChunkKdaBwdCGateProcess<SAFE_GATE, DTYPE_RAW_G> process(
+                dg, rawG, aLog, dtBias, dA, dBias,
+                cuSeqlens, chunkIndices);
+            if (tiling->deferGatePost == 0) {
+                process.Init(*tiling, &pipe);
+                process.Process();
+            }
+        }
+    }
+
+    // Gate is the final phase of the fused MIX kernel.  Do not return while
+    // either AIV sub-block still has a queued dg/dA/dbias store: a following
+    // invocation can reuse the same output allocation and observe that late
+    // write as a stale cross-shape generation.
+    bool needsFinalSync =
+        tiling->seqlen < static_cast<int32_t>(kA5SharedGateMinSeqlen);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    needsFinalSync = needsFinalSync ||
+        (tiling->useGateInKernel != 0 &&
+         !CanUseA5SharedGateAnchor(*tiling));
+#endif
+    if (needsFinalSync) {
+        AscendC::SyncAll<false>();
+    }
+```
+
+What the two cube stages use for their matmuls —
+`.../chunk_kda_bwd/op_kernel/chunk_kda_bwd_finalize_intra.h` and `..._wy.h`, retrieved 2026-10-20. Neither contains
+`REGIST_MATMUL_OBJ` or `matmul::Matmul`; both build Catlass tile objects locally, verbatim fragments:
+
+```cpp
+    using ArchTag = Catlass::Arch::Ascend950;
+```
+```cpp
+    using ArchTag = Catlass::Arch::AtlasA2;
+```
+```cpp
+    using RowMajor = Catlass::layout::RowMajor;
+    using Copy = Catlass::Gemm::Tile::PackedTileCopyTla<
+```
+```cpp
+    using TileMmad = Catlass::Gemm::Tile::TileMmadTla<
+```
+```cpp
+    __aicore__ inline explicit CIntraSingleTileMmad(
+        Catlass::Arch::Resource<ArchTag> &resource)
+```
+```cpp
+    explicit WyTileGemmDirect(Catlass::Arch::Resource<ArchTag> &resource)
+```
+with `Catlass::Arch::PositionL1{}`, `PositionL0A{}`, `PositionL0B{}`, `PositionL0C{}` as the staging positions.
+
+### 41.3 `rope_matrix`'s tiling — the pairing arithmetic in one line
+
+https://github.com/hicann/ops-transformer/blob/master/experimental/posembedding/rope_matrix/op_host/rope_matrix_tiling.h
+and `.../inc/rope_matrix_extern.h`. Copyright 2025 Huawei. Retrieved 2026-10-20.
+
+The shared tiling struct, verbatim and complete:
+
+```cpp
+#ifndef ROPE_MATRIX_EXTERN_H
+#define ROPE_MATRIX_EXTERN_H
+
+#include <cstdint>
+
+namespace npu_ops_transformer_ext {
+namespace RopeMatrix {
+// define a struct as TCubeTiling, which can be call by both op_device and op_host
+struct RopeMatrixTiling
+{
+    uint32_t blockDim;
+    uint32_t b;
+    uint32_t n;
+    uint32_t s;
+    uint32_t d;
+};
+} // namespace RopeMatrix
+} //namespace npu_ops_transformer_ext
+
+#endif
+```
+
+`GenerateTiling`, verbatim and complete — **`aicRatio = 2` and the `calSingleCoreM` line are the whole pairing
+constraint**:
+
+```cpp
+uint8_t *GenerateTiling(RopeMatrixTiling *ropeTiling, uint32_t* mmTilingData, uint32_t mmSize)
+{
+    constexpr uint32_t baseSize = 128;
+    uint32_t usedCoreNum = ropeTiling->blockDim;
+    uint32_t B = ropeTiling->b;
+    uint32_t H = ropeTiling->n;
+    uint32_t M = ropeTiling->s;
+    uint32_t N = ropeTiling->d;
+    uint32_t K = ropeTiling->d;
+
+    matmul_tiling::TPosition leftPosition = matmul_tiling::TPosition::GM;
+    matmul_tiling::CubeFormat leftFormat = matmul_tiling::CubeFormat::ND;
+    matmul_tiling::DataType leftDtype = matmul_tiling::DataType::DT_BFLOAT16;
+    bool isTransA = false;
+
+    matmul_tiling::TPosition rightPosition = matmul_tiling::TPosition::GM;
+    matmul_tiling::CubeFormat rightFormat = matmul_tiling::CubeFormat::ND;
+    matmul_tiling::DataType rightDtype = matmul_tiling::DataType::DT_BFLOAT16;
+    bool isTransB = false;
+
+    matmul_tiling::TPosition resultPosition = matmul_tiling::TPosition::GM;
+    matmul_tiling::CubeFormat resultFormat = matmul_tiling::CubeFormat::ND;
+    matmul_tiling::DataType resultDtype = matmul_tiling::DataType::DT_BFLOAT16;
+
+    bool isBias = false;
+    uint32_t aicRatio = 2;
+
+    uint32_t calSingleCoreM = CeilingTiling(M, usedCoreNum * aicRatio) * aicRatio;
+    uint32_t baseM = baseSize;
+    uint32_t baseN = baseSize;
+
+    optiling::TCubeTiling tilingData;
+    const char *socVersion = "Ascend910B3";
+    auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance(socVersion);
+    matmul_tiling::MultiCoreMatmulTiling tilingApi(*ascendcPlatform);
+
+    tilingApi.SetDim(usedCoreNum);
+    tilingApi.SetAType(leftPosition, leftFormat, leftDtype, isTransA);
+    tilingApi.SetBType(rightPosition, rightFormat, rightDtype, isTransB);
+    tilingApi.SetCType(resultPosition, resultFormat, resultDtype);
+
+    tilingApi.SetOrgShape(M, N, K); // 完成的MNK大小，单位为元素个数
+    tilingApi.SetShape(M, N, K); // matmul计算形状的MNK，考虑脏数据
+    tilingApi.SetSingleShape(calSingleCoreM, baseSize, baseSize);
+    tilingApi.SetFixSplit(baseM, baseN, -1);
+    tilingApi.SetBias(isBias);
+    tilingApi.SetBufferSpace(-1, -1, -1);
+
+    int64_t res = tilingApi.GetTiling(tilingData);
+    int64_t checkCode = -1;
+    if (res == checkCode) {
+        std::cout << "gen tiling failed" << B << H << M << N << K << std::endl;
+    }
+    return GetTilingBuf(&tilingData, mmTilingData, mmSize);
+}
+```
+
+and the helper that flattens `TCubeTiling` into the operator's own tiling blob, verbatim — the mechanism by which
+one GM tiling buffer carries both the cube tiling and the vector tiling (see §39.1's `CopyTiling`):
+
+```cpp
+uint8_t *GetTilingBuf(optiling::TCubeTiling *tilingData, uint32_t* mmTilingData, uint32_t mmSize)
+{
+    uint8_t *buf = nullptr;
+    uint32_t tilingSize = tilingData->GetDataSize();
+    if (tilingSize > 0) {
+        buf = (uint8_t *)malloc(tilingSize);
+        tilingData->SaveToBuffer(buf, tilingSize);
+
+        uint32_t num = tilingSize / sizeof(uint32_t);
+        num = (num < mmSize) ? num : mmSize;
+        uint32_t *ptr = mmTilingData;
+        auto mmtiling32 = reinterpret_cast<uint32_t *>(buf);
+        for (uint32_t i = 0; i < num; i++) {
+            *(ptr + i) = *(mmtiling32 + i);
+        }
+
+        free(buf);
+        buf = nullptr;
+    }
+    return reinterpret_cast<uint8_t *>(mmTilingData);
+}
+```
+
+with one compilation gotcha from the same file, verbatim:
+
+```cpp
+#include <iostream>
+// must define this before tiling.h, otherwise will compile error
+typedef uint8_t char_t; 
+#include "tiling/tiling_api.h"
+```
+
+## Relevance
+- **Question 1, the cube→vector→cube chain. Do not construct a second `Matmul` object after a vector stage.** The
+  high-level API forbids it structurally: 「在分离模式中，本接口必须在InitBuffer接口前调用」 — in separated mode
+  `REGIST_MATMUL_OBJ` must be called *before* `InitBuffer`, so every Matmul object has to be registered up front,
+  before the vector half's queues exist. Also 「在程序中，最多支持定义4个Matmul对象」. The two supported spellings
+  are therefore:
+  (a) **register both objects up front, use them in stage order, `End()` between them** — which is exactly the
+  documented 「多个Matmul对象之间切换计算时，必须调用一次End函数」 and the
+  `mm1.IterateAll(); mm1.End(); mm2.IterateAll(); mm2.End();` example. An intervening vector stage changes nothing
+  about that, because the objects were already registered; the registration is not what crosses the stage boundary.
+  `REGIST_MATMUL_OBJ(&pipe, ws, mm1, mm1tiling, mm2, mm2tiling)` is the one-call form.
+  (b) **one object, re-`Init(&newTiling)`** — 「Tiling参数可变的场景下，可以通过多次调用Init来重新设置Tiling参数」.
+  Register without a tiling, then `Init` per stage. Note `Init` is 「不支持CPU域调试」, so this form cannot be
+  validated in CPU twin mode.
+  For the gate/up (6144→128) then down (128→6144) pair, (a) is the better fit: the two shapes are fixed at
+  batch=1, so two objects with two const tilings keeps §12's static-tiling Scalar win on both.
+- **But the shipped precedent does something else, and it is worth knowing before committing.** §41.2's
+  `chunk_kda_bwd_finalize.h` is a fused MIX kernel with cube → vector → barrier → cube → vector → barrier → vector
+  in one function, and neither cube stage uses the Matmul high-level API at all: both build
+  `Catlass::Gemm::Tile::TileMmadTla` with a locally constructed `Catlass::Arch::Resource<ArchTag>`
+  (`ArchTag = Catlass::Arch::AtlasA2` on our arch). Local construction has no registration constraint, no 4-object
+  cap, and no flagId cost — §31.8 shows `catlass` synchronises through `CrossCoreSetFlag` only where the author asks
+  it to. So if the layer kernel ends up wanting more than four cube stages, or cube objects whose lifetime must
+  straddle a barrier, the basic-API route is the one with a working multi-stage precedent on `arch22`.
+- One constraint to check against the brick's AIC half, verbatim and easy to miss:
+  「在分离模式中，调用本接口后，AIC核仅会执行下述AIV核发起的接口，其他接口不会在AIC核执行：Matmul Kernel侧接口。
+  基础数据搬运和随路转换ND2NZ搬运接口，仅支持数据通路为GM -> A1、B1的数据搬运。」 That is written for the
+  message-driven MIX mode, where the AIC runs nothing but AIV-issued Matmul calls and GM→A1/B1 copies. Under
+  `ASCENDC_CUBE_ONLY` with `ASCEND_IS_AIC` the AIC runs its own instruction stream, which is why the brick works —
+  but it means any attempt to put non-Matmul, non-GM→A1/B1 work on the AIC in a *registered MIX* kernel will
+  silently not execute.
+- **Question 2, `SyncAll<false>()` as a mid-kernel phase boundary. Confirmed legal between two Matmul stages, and
+  confirmed it must be at top level.** §41.2 is a shipped fused MIX kernel with three of them, and every one sits
+  outside both `if ASCEND_IS_AIC { }` and `if ASCEND_IS_AIV { }` and outside the `if (active)` guard. The
+  coordinator's prediction from §38's arithmetic is correct and this is the existence proof: `SyncAll<false>` is a
+  collective over all AIC and all AIV, so every core must arrive, including cores whose stage work is skipped.
+  The in-source reasons are quoted verbatim above and generalise directly to our case — the second one
+  (「Intra writes dg by half rows on both AIV sub-blocks, whereas Gate remaps the work to complete heads」) is
+  precisely our situation: the vector stage owns half-rows per subblock and the next stage re-partitions, so the
+  barrier is not optional. The third is a warning we need too: a final barrier before returning, so a queued store
+  cannot leak into the next invocation's reuse of the same allocation — at 78 layers in one kernel that becomes a
+  barrier before the *layer* boundary, not just the kernel's end.
+  The costs, from §35.5 and §40: flagIds 11/12/13 on 2201, `isAIVOnly=false` mandatory (`true` in a MIX kernel
+  silently degrades to a Vector-only barrier), `numBlocks` must not exceed the physical core count, `__schedmode__`
+  strongly recommended, and `SyncAll` is mutually exclusive with the `aclshmem` barriers (Part 7). One shipped
+  kernel quoted in §36 deliberately chose `SyncAll<true>` over `SyncAll<false>` *specifically* to avoid burning
+  12/13 where an earlier AIC→AIV handshake had unspent credits on them — worth knowing once the layer kernel has
+  both a grid barrier and hand-written flags.
+- **Question 4, closed.** §39.1 and §39.2 carry the whole `op_kernel`; §41.3 carries the tiling. The pairing
+  constraint from §37 is two lines of shipped host code:
+  `uint32_t aicRatio = 2;` and `uint32_t calSingleCoreM = CeilingTiling(M, usedCoreNum * aicRatio) * aicRatio;`,
+  then `tilingApi.SetDim(usedCoreNum)` and `tilingApi.SetSingleShape(calSingleCoreM, baseSize, baseSize)`. Read
+  with §39.2's vector side (`aivNum = GetBlockNum() * GetSubBlockNum()`, `sSize = CeilDiv(seqLen, aivNum)`,
+  `startSize = sSize * aivIdx` with `aivIdx = GetBlockIdx()`): the cube's `singleCoreM` is exactly `2 ×` the
+  per-AIV chunk, so AIV `2i` and `2i+1` cover exactly AIC `i`'s output range. That is the general recipe — compute
+  the per-AIV chunk as `ceil(axis / (blockDim * 2))`, give the cube `2 ×` that as `singleCoreM`, and round the
+  *product* rather than either factor so the tail lands on the last pair. `SetDim` takes the AIC count
+  (`ropeTiling->blockDim`), confirming §39.3's AIC-vs-AIV unit distinction from the other direction.
+  Incidental but real: `typedef uint8_t char_t;` must precede `#include "tiling/tiling_api.h"` or the host tiling
+  does not compile, and `GetTilingBuf` is the idiom for packing `TCubeTiling` and an operator-specific tiling
+  struct into one GM blob that both halves decode (§39.1's `CopyTiling` is the device side of it).
+- **Question 3 is open and reported as open.** What exists: the canonical CANN per-token row max is
+  partials-in-workspace plus `SyncAll()` plus a second pass (§36), and two kernels avoid the reduction entirely by
+  **M-split** per-core row ownership. What was not found: any published decode kernel that **N-splits** a gate/up
+  GEMM and still does per-token dynamic quant without a grid reduction. The N-split case is structurally harder —
+  every block holds a column slice of the same token's row, so the row max is inherently cross-block — and the
+  honest reading of §36 is that the published answer for that shape is the two-pass `SyncAll` structure, which
+  §41.2 now shows is legal mid-kernel. That makes the cost estimable rather than unknown: one `SyncAll<false>` plus
+  one float per block in workspace, between the GEMM and the quantise, at the same place the down projection
+  already needs a barrier. Whether it can be folded into *that* barrier instead of adding a second one is the open
+  design question, and it is answerable by construction rather than by more searching.
+
+
 ## Gaps
 
 What was looked for and not found, or found only partially.
