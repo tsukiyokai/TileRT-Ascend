@@ -1007,3 +1007,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      against the operator's 85.048: the vendor is 11 percent faster than a
      plain implementation of the same work. The 22.316 us read is the floor of
      reading, not of attending.
+
+106. Check an item-by-item budget against the whole before trusting it. A
+     complete layer runs in 304.965 us against 317.476 for the sum of its
+     parts -- 3.9 percent of cross-operator overlap, not a factor -- and
+     317.476 over 78 layers is 24.76 ms against the 24.84 the fixed term
+     becomes after the merges, agreeing to a third of a percent. So the round
+     has no unattributed remainder, and the statement that 2.x ms is outside
+     the identified mechanisms stops being an inference and becomes an
+     accounted fact: attention is 30.6 percent of a layer and near its floor,
+     the grouped matmul 19.5 and already the fastest of four implementations,
+     and the remaining six items are operator fixed cost on twelve rows, which
+     is what the boundary merges already collected.
