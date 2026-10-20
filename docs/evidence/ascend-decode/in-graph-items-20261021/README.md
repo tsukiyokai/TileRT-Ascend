@@ -44,3 +44,39 @@ Whether the fold can actually take that cost. The ratios say the room exists;
 they do not say a kernel can do a norm, a quant and three projections inside
 the attention or the grouped matmul without paying the same cost in another
 form. That is the next measurement, and it needs a kernel rather than a timing.
+
+## Completed with the grouped matmul, which changes the ranking
+
+The operator's A8W8 quant path wants scales that `ops/quantized.py` takes from
+a loaded layer; a standalone probe cannot reproduce them. Two argument sets are
+accepted at this shape: INT8 into INT32 without scales, and bf16 by bf16. With
+the first:
+
+| item | eager | graph | ratio |
+|---|---|---|---|
+| attention | 200.78 | 75.11 | 0.374 |
+| grouped matmul | 179.48 | **157.37** | **0.877** |
+| fused input projection | 47.30 | 46.22 | 0.977 |
+| rms_norm | 46.89 | 32.81 | 0.700 |
+| shared down projection | 42.08 | 42.76 | 1.016 |
+| q_b projection | 41.05 | 32.82 | 0.800 |
+| dynamic quant | 40.64 | 30.78 | 0.757 |
+| o projection | 40.20 | 34.68 | 0.863 |
+
+The ratio finding holds -- capture helps the small operators far less than it
+helps attention, 0.70 to 1.02 against 0.374 -- but the ranking it implied does
+not. **In a graph the largest single item is the grouped matmul at 157.37 us**,
+not the six small ones. Capture barely touches it, 0.877.
+
+And the absolute figures drift between runs on the same die: attention 240 then
+201, rms_norm 87 then 47. So only ratios are usable, which is what this page
+already said, and the drift is the reason.
+
+## Which redirects the search
+
+The six small operators in a graph total 219.87 us against the grouped matmul's
+157.37 alone. Both matter, but the grouped matmul is one operator rather than
+six, it is nearly immune to capture, and at twelve rows it is flat in the row
+count -- 16 to 256 costs 2.8 percent more. An operator that costs 157 us to
+process twelve rows and 162 to process two hundred and fifty-six is doing
+almost none of its work on the rows it was given.

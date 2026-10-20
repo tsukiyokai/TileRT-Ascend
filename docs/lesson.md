@@ -1503,3 +1503,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      against 99.35, so the pipelining that exists happens unasked. Within-layer
      overlap is therefore closed: the attention side is a strict chain holding
      four of the six small operators, and the only fork is cube against cube.
+
+150. In a graph the layer's largest single item is the grouped matmul, not the
+     small operators. Completing the per-item table -- the operator accepts
+     INT8 into INT32 without scales, where the A8W8 path wants scales only a
+     loaded layer has -- gives attention 200.78 to 75.11 (0.374) and the
+     grouped matmul 179.48 to 157.37 (0.877). Capture barely touches it. The
+     earlier ratio finding stands, that capture helps the small operators far
+     less than attention, but the ranking it implied was wrong. And absolute
+     figures drift between runs on the same die, attention 240 then 201, so
+     only ratios are usable. An operator costing 157 us for twelve rows and 2.8
+     percent more for two hundred and fifty-six is doing almost none of its
+     work on the rows it was given.
