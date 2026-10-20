@@ -713,3 +713,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     collectable by not setting one variable. It was built to make that operator
     faster and has been active in every engine measurement since, including the
     ones that set the round's budget.
+
+79. CANN's own operator was the fastest all along. The same grouped matmul at
+    the decode shape costs 66.813 us with no custom operator path, 97.362 with
+    the owner overlay, 123.985 with vllm-ascend's own package and 104.929 with
+    both -- and every engine process sets both while every arm prepends a
+    third. That is the whole of the 61.6 against 153.3 us state gap, chased
+    through nine innocent candidates because none of them touched the operator
+    path: a single-die probe does not source activate.sh and the engine does.
+    About 3.0 ms a round, to be collected by letting this one operator fall
+    back rather than by unsetting the variable, since the packages exist for
+    other operators. Three layers of custom packages, each added to make
+    something faster, cost 57 percent together on the operator that dominates
+    the round's largest line item -- and none was measured against CANN's at
+    this shape.
