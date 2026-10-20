@@ -33,6 +33,52 @@ pinned-staging work already took 3.4–3.8 ms of whatever gap there was.
 | the reduction between those casts | 5.644 | 5.418 |
 | AI_VECTOR_CORE, against the bytes it moves | 8.733 / 0.345 | 8.693 / 0.347 |
 
+## The decomposition's own floor eats the budget
+
+No call costs less than the structure its core kind carries, and
+[kernel-floor-20261019](../kernel-floor-20261019/README.md) measured those:
+0.70 µs on AI_VECTOR_CORE, 2.30 on AI_CORE, 12.04 on MIX_AIV, 13.58 on
+MIX_AIC. Apply them to this round's call counts and the decomposition has a
+floor of its own, before any kernel computes anything.
+
+| core | calls | floor ms | spent ms | floor is |
+|---|---:|---:|---:|---:|
+| AI_VECTOR_CORE | 1893 | 1.325 | 9.071 | 15% |
+| MIX_AIC | 505 | 6.858 | 26.190 | 26% |
+| AI_CORE | 306 | 0.704 | 4.197 | 17% |
+| MIX_AIV | 218 | 2.625 | 6.819 | 38% |
+| COMMUNICATION | 86 | — | 10.290 | — |
+| all | 3008 | 11.512 | 56.567 | 20% |
+
+2 ms a token at A=6.959 allows a 13.92 ms round. This decomposition's launch
+floor is 11.512 ms, 83% of that budget, and the second round reads 11.503. So
+the target is unreachable by making kernels faster: it requires launching
+fewer of them. 82% of the floor is on the MIX cores, 505 MIX_AIC calls a
+round, 6.5 a layer — `GroupedMatmul`, `GroupedMatmulSwigluQuantV2`,
+`MlaPrologV3`, `SparseFlashAttention` and about 3.3 `QuantBatchMatmulV3`.
+
+The same capture carries the control. `MlaPrologV3` is one fused operator
+covering several projections, the RoPE and the cache write, and it runs at
+2.950 ms against 2.745 ms of declared bytes — 1.1x, essentially at the
+bandwidth bound. Every unfused neighbour runs at 3x to 91x. Fusion is not a
+launch-count argument here; it is the difference between 1.1x and 5x.
+
+| family | ms | byte floor ms | x |
+|---|---:|---:|---:|
+| SparseFlashAttention | 6.973 | 1.382 | 5.0 |
+| GroupedMatmulSwigluQuantV2 | 6.793 | 2.272 | 3.0 |
+| GroupedMatmul | 5.596 | 1.212 | 4.6 |
+| QuantBatchMatmulV3 | 3.810 | 0.780 | 4.9 |
+| MlaPrologV3 | 2.950 | 2.745 | 1.1 |
+| Cast | 2.300 | 0.076 | 30.3 |
+| ForeachAddList | 1.622 | 0.018 | 91.1 |
+| MoeInitRoutingV3 | 1.368 | 0.030 | 45.8 |
+
+The two grouped matmuls are 12.388 ms against 3.484 ms of W4 weights, 4.023
+GB a round at the teacher's 44.35-expert union. A grouped matmul declares all
+256 experts whatever it reads, so that floor is the declared bytes scaled by
+the union; `DT_INT4` had to be added to the byte table to see it at all.
+
 ## The TP reduction is wholly serial
 
 Every HCCL stream runs 0.000 ms alone: those collectives hide completely. The

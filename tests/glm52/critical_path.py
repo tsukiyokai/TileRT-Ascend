@@ -23,9 +23,20 @@ import statistics
 
 BACKBONE_LAYERS = 78
 MOE_LAYERS = 75
+# Per-call floors measured on one die, kernel-floor-20261019. No call can cost
+# less than the structure its core kind carries, so the decomposition's call
+# counts set a floor on the round independently of what any kernel computes.
+FLOOR_US = {"AI_VECTOR_CORE": 0.70, "AI_CORE": 2.30,
+            "MIX_AIV": 12.04, "MIX_AIC": 13.58}
 BYTES_PER_US = 1.155e6  # a3-hbm-20261017 event median, 1.155 TB/s a die
 ELEMENT_BYTES = {"DT_BF16": 2, "FLOAT": 4, "FLOAT16": 2, "INT8": 1,
-                 "INT32": 4, "INT64": 8, "UINT8": 1, "BOOL": 1}
+                 "INT32": 4, "INT64": 8, "UINT8": 1, "BOOL": 1,
+                 "DT_INT4": 0.5}
+# A grouped matmul declares the whole 256-expert weight tensor whatever it
+# reads, so its declared bytes are an upper bound. Scale them by the layer's
+# activated union to get the floor: 44.35 of 256 at width 8 on the teacher
+# routes. [routes/budget.md]
+ROUTED_EXPERTS = 256
 
 
 def load(root):
@@ -175,6 +186,11 @@ def report(rows, window, hidden):
     print(f"  AI_VECTOR_CORE {spent / 1000:.3f} ms against "
           f"{bound / 1000:.3f} ms of bytes, {spent / bound:.0f}x; "
           f"{gathers / 1000:.3f} ms more in kernels this over-counts")
+    floor = sum(FLOOR_US.get(row["Accelerator Core"], 0.0) for row in inside)
+    mix = sum(FLOOR_US[row["Accelerator Core"]] for row in inside
+              if row["Accelerator Core"].startswith("MIX"))
+    print(f"  launch floor {floor / 1000:.3f} ms over {len(inside)} calls, "
+          f"{mix / floor:.0%} of it on the MIX cores")
 
 
 def main():

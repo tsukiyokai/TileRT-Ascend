@@ -10,6 +10,8 @@ width-8 MTP 是当前计时控制组，单一冻结输入的平均实际提交�
 
 10-20 复核：旧 `chain-w8` 三条轨迹均在输出 offset4 与冻结 teacher 分叉；prompt IDs 相同，hash 差异仅来自序列化。147 轮／A=6.959 只用于旧未验收轨迹的策略筛选。可信 teacher33 的独立 CPU 回放中，width8／16／32均为28轮、新增32个输出，计划验证行数224／448／896；这段窗口加宽无接受收益；相同30个新增输出，冻结MTP4候选为14轮、lookup8为26轮，完整轮价比须低于1.857才由MTP胜出。[短窗口回放](evidence/ascend-decode/lookup-contract-20261019/teacher33/README.md)。同一前缀的完整M32/SFA已通过32个冻结标签；shared-FIA完整对照为30/32，先定位其数值差异及旧链首个分叉，再核33输出的串行／M32／Graph／reset与完整请求。[证据](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md)
 
+2026-10-20 发射地板定调优先级:把实测 per-call 地板(AI_VECTOR_CORE 0.70、AI_CORE 2.30、MIX_AIV 12.04、MIX_AIC 13.58 µs)乘以一轮真实调用数,3008 次调用给出 11.512 ms;而 2 ms/token 在 A=6.959 下只允许 13.92 ms 的轮。地板占预算 83%,所以目标要的是更少的发射而不是更快的 kernel。地板的 82% 是 505 次 MIX_AIC,每层 6.5 个。同一捕获内的对照:MlaPrologV3 作为一个融合算子跑在声明字节的 1.1 倍,所有未融合邻居是 3 到 91 倍。两个 grouped matmul 合计 12.388 ms 对 3.484 ms 的 W4 权重(并集 44.35 时每轮 4.023 GB),3.56 倍。[发射地板与分族预算](evidence/ascend-decode/critical-path-20261020/README.md)
+
 | 顺序 | 路线 | 下一项与通过条件 |
 |---|---|---|
 | 1 | lookup 提议与执行路径 | CPU 状态／串行对照通过；等价增量索引将每请求 CPU 查找约 1.03 s 降至 21 ms。独立开关 shortest2→1 的 width32 重放为 174→147 轮。下一步测 width 8／16／32 的真实接受数和请求 TPOT。该轨迹 A=6.959 对应 2 ms 的轮预算 13.92 ms；设备收益尚未测得。[重放](../tests/glm52/ngram_acceptance.py)、[实现](../tilert/models/glm_5_2_ascend/lookup_draft.py) |

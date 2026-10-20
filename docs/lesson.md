@@ -155,3 +155,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     round in cast launches alone; folding the widen and narrow into a
     rank-ordered reducer is the same association, so it is bit-exact.
     [Evidence](evidence/ascend-decode/critical-path-20261020/README.md).
+
+32. A decomposition has a floor before any kernel computes. Multiply the
+    measured per-call floors by a round's actual call counts: 3008 calls give
+    11.512 ms, and 2 ms a token at A=6.959 allows 13.92 ms. 83% of the budget
+    is gone before arithmetic, so the target needs fewer launches, not faster
+    kernels; 82% of that floor is 505 MIX_AIC calls, 6.5 a layer. The control
+    sits in the same capture: `MlaPrologV3`, one fused operator over several
+    projections, runs at 1.1x its declared bytes while every unfused
+    neighbour runs at 3x to 91x. Price a grouped matmul against the declared
+    weight bytes scaled by the activated union, and put `DT_INT4` in the byte
+    table or the weights vanish from the floor entirely.
+    [Evidence](evidence/ascend-decode/critical-path-20261020/README.md).
