@@ -211,3 +211,31 @@ this probe does not reproduce -- most likely the page view
 Recorded as unmeasurable from a single die rather than pursued further: the
 queued width arms measure the same quantity end to end, which is where the
 answer has to come from anyway.
+
+## Attention is the candidate that fits, from two captures
+
+The engine's sparse attention could not be run on one die -- six argument sets
+rejected, five with a tiling failure and the paged `FusedInferAttentionScore`
+with a shape error. So its row scaling is taken from two captures instead:
+
+    attention-sparsity-20261020, width 8   85.048 us a call
+    profile-rope-20261018, mtp_width 4     37.500 us a call
+
+Two points, 11.9 us a row, which over 78 layers is **0.93 ms a row** against
+the round model's fitted 0.66. The same order, and the only candidate measured
+today that is.
+
+The caveat is real: the two figures come from different captures and different
+configurations, which is exactly the error this project made earlier today when
+it mixed a 52.8 ms round with a 16.6 ms one. So this is a candidate with the
+right magnitude, not a measurement.
+
+What it would mean if it holds: the row cost is attention scoring each query
+row against its selected positions, which is irreducible work rather than
+overhead, and the 0.66 ms a row is physics. Then the copy oracle's floor of
+4.18 ms stands as the floor, and 2.x needs either fewer layers of attention or
+a shorter selection -- and `--index-topk` was measured flat, 103.898 us at 512
+picks against 109.057 at 2048.
+
+The way to settle it is one capture at two widths, which the queued arms
+produce as a side effect: `cap12` and `cap24` both carry `--profile-last`.

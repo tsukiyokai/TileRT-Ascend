@@ -1270,3 +1270,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      cost is withdrawn. A chain is only as closed as its weakest measured link,
      and this one was an extrapolation from five operators to the engine's
      layer.
+
+129. Attention is the only candidate whose magnitude fits the row cost, and it
+     is two points from two captures. The engine's sparse attention rejected
+     six argument sets on one die, so its scaling comes from 85.048 us a call
+     at width 8 and 37.500 at mtp_width 4 -- 11.9 us a row, 0.93 ms a row over
+     78 layers against the fitted 0.66. Right order, wrong provenance: the
+     points are from different captures, which is the error of mixing a 52.8 ms
+     round with a 16.6 ms one, made earlier today. If it holds the row cost is
+     attention's own work rather than overhead, the copy oracle's 4.18 ms is
+     the floor, and the queued cap12 and cap24 arms settle it as a side effect.
