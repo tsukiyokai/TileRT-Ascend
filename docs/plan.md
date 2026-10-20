@@ -35,7 +35,25 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 合计约 53 ms，未归属 2 ms。地板是 HBM 1.011 ms/轮，所以目标不受物理限制，
 问题全在固定开销。[地板](evidence/ascend-decode/round-roofline-20261020/README.md)
 
-## 最大的未动杠杆：checkpoint 自带的 MTP 层
+## 头号待测：每行 0.814 ms 是实现代价还是物理代价
+
+单 die 实测一整层从 8 到 32 token 只多 8.07 µs，即每行 **0.026 ms/轮**，而代价
+模型拟出 **0.814** ——差 31 倍。拟合本身可靠（四宽度、残差几百微秒、w8 到 w32
+相差 19.3 ms），起草器也已排除（宿主侧 0.1–0.3 µs/轮）。所以那笔钱在单 die 碰不到
+的地方：十六卡 TP 规约，或图的静态 token 分桶。
+
+若是后者（可消除），树的节点就不再贵，固定预算树的 14.510 接受变成最优配置：
+
+    边界合并后固定项   25.58 ms
+    64 节点 × 0.026     1.66 ms
+    一轮               27.25 ms
+    接受               14.510
+    TPOT                1.88 ms   ← 落进目标
+
+判别法：宽度 12 对 13。同桶则差约 0.03 ms，跨桶则差一个桶。需整机一对臂。
+[证据](evidence/ascend-decode/row-cost-mismatch-20261021/README.md)
+
+## 已排除的杠杆：checkpoint 自带的 MTP 层
 
 `num_hidden_layers: 78` 而权重索引含 **0..78 共 79 层**，第 78 层就是
 `num_nextn_predict_layers: 1` 那个训练过的草稿头。引擎从未加载它

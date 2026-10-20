@@ -899,3 +899,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     and costs 3688 us to build, 115 times the saving. With attention's cache
     this makes two operators today whose apparent waste is the cheaper choice,
     both of which this project had recorded as opportunities.
+
+96. The round model's row cost is 31 times the operators'. A whole layer goes
+    from 135.190 us at 8 tokens to 143.263 at 32 -- 0.026 ms a row over 78
+    layers -- against the model's fitted 0.814 ms, and the fit is sound with
+    residuals of a few hundred microseconds across a 19.3 ms span. The drafter
+    is excluded at 0.1 to 0.3 us a round on the host. So the money is in the
+    sixteen-rank reduction or the graph's static token buckets, and if it is the
+    buckets then the constraint that shaped every drafting decision today is an
+    artefact: a fixed-budget tree at 64 nodes and 14.510 accepted becomes a
+    TPOT of 1.88 ms instead of being priced out. One number, worth more than
+    every lever measured today together.
