@@ -157,6 +157,8 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
             "ascend_compilation_config": {
                 "enable_static_kernel": super_kernel,
                 "enable_super_kernel": super_kernel,
+                # Preserve BF16 norm rounding before INT8 quantization.
+                "fuse_norm_quant": False,
             },
         },
     ).create_engine_config()

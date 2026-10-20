@@ -14,7 +14,7 @@ from unittest.mock import patch
 def run(args):
     import torch
     import torch_npu
-    from vllm.config import AttentionConfig
+    from vllm.config import AttentionConfig, CompilationMode
     from vllm_ascend.worker import worker as worker_module
 
     if torch_npu.npu._initialized:
@@ -58,6 +58,10 @@ def run(args):
     ):
         engine = candidate.CannModel(args.checkpoint, "npu:12", rank=7)
 
+    compiled = candidate.create_config(
+        args.checkpoint, compile_target=True, super_kernel=True, graph_width=8,
+    )
+    compilation = compiled.additional_config["ascend_compilation_config"]
     checks = [
         {"name": "unregistered_int8_was_rejected",
          "passed": registration_was_needed},
@@ -80,6 +84,13 @@ def run(args):
         {"name": "device_binding_cache_allocation_boundaries",
          "passed": set_device.call_count == bind.call_count
          == tp_sum.call_count == allocate.call_count == 1},
+        {"name": "compiled_target_preserves_norm_quant_boundary",
+         "passed": compilation["fuse_norm_quant"] is False},
+        {"name": "compiled_target_retains_graph_and_super_kernel",
+         "passed": not compiled.model_config.enforce_eager
+         and compiled.compilation_config.mode == CompilationMode.VLLM_COMPILE
+         and compilation["enable_static_kernel"] is True
+         and compilation["enable_super_kernel"] is True},
         {"name": "no_npu_initialization",
          "passed": not torch_npu.npu._initialized},
     ]
