@@ -1029,3 +1029,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      214 us a layer the post-merge round is 16.7 ms and TPOT at width 24 is
      2.98. An agreement between two numbers is not a closed account when both
      were measured in the wrong execution mode.
+
+108. The engine's round is a SuperKernel plus collectives, and its device is
+     saturated. From the project's own capture: 57.27 ms of device-busy a round
+     against a measured round near 52.8 -- the halves run concurrently so
+     durations add past the wall clock -- of which 56 percent is one
+     SuperKernel and 31 percent is HCCL. So the 104 us a layer that graph
+     capture saves on a synthetic eager layer is not available in the engine,
+     and that correction withdraws. It also relocates the largest lever:
+     collectives are 17.56 ms of device time where the one-sided reduce was
+     costed at 6.5 from an operator comparison, so the measurement outstanding
+     that matters most is the one already built.
