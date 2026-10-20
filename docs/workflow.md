@@ -252,3 +252,30 @@ from it belong in any build script: `--npu-arch=dav-2201` rather than
 `--cce-aicore-arch=dav-c220`, because the latter silently drops
 `__schedmode__`; and never grep a compiler log for `error` alone, because the
 warnings carry the answers.
+
+## Pre-flight for a whole-machine queue
+
+Three arms died today on things a single command would have caught, so this is
+a checklist, not advice. Run it against the tree the arms will execute in, not
+against the repository.
+
+```sh
+B=$TREE/tests/glm52/bench_cann_mtp.py
+grep -oE '\-\-[a-z-]+' $B | sort -u          # every flag the tree accepts
+md5sum $TREE/tests/glm52/launch_arm.sh       # against the repository's
+ls $TREE/tilert/models/glm_5_2_ascend/       # every module an arm imports
+```
+
+What each one caught. `--lookup-unigram` is absent from the 10-19 tree and so
+is the `lookup_min_ngram` plumbing behind it, so that arm failed in seven
+seconds and took the queue with it. `onesided_reduce` was absent for the same
+reason and killed fourteen arms behind it. And the tree's `launch_arm.sh` was
+one line behind the repository's — `cd "$tree"` against `cd "$out"` — which
+put the static-kernel cache in the tree instead of each arm's own directory,
+so every arm replayed the first one's compiled package and a paired
+measurement read zero.
+
+Then two ordering rules. `chain.sh` exits on a failing arm, so anything
+unproven goes last. And kill single-die work first: a kernel of ours squatting
+device 1 made rank 1 unable to join HCCL, which reports as
+`EI0015 ... unconnected ranks: "[1,]"` and looks like a network fault.
