@@ -524,3 +524,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     my own integration design. This constrains design where lesson 60
     constrains measurement: read the call chain outward before pricing a
     saving, not just before measuring one.
+
+62. Separate the variables before explaining anything. An aicore exception at
+    ninety-six experts cost ten hypotheses -- slot indices, an over-read group
+    list, scratch addresses, a machine difference, a self-inconsistent probe,
+    the indexing path, a flush buffer, the allocation size, the block count,
+    event ids -- and every one was disproven by an experiment that took a
+    minute. The experiment that settled it changed one variable with the rest
+    held: eighty experts at five rounds a block passed and the same eighty at
+    six rounds faulted, so the limit is the rounds and not the experts. Nine
+    of the ten guesses were arithmetic about how many bytes some buffer was
+    short; none of that arithmetic was checkable in a kernel, which is why
+    each could be made to sound right. The rule: when a threshold is stable,
+    find the one quantity that tracks it by holding the others, and do that
+    before the first explanation rather than after the tenth.
