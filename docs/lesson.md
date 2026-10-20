@@ -563,3 +563,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     79.206 µs, and 1.98x the vendor rather than 0.73x. A fused kernel's cost
     is its synchronisation before it is its arithmetic, and the sparse-slower-
     than-dense inversion is the signature.
+
+65. `down_proj.scale_bias` is `[N][world]`, not `[N][1]`. The down
+    projection's K axis is the intermediate, which TP divides, so each rank
+    computes a partial sum and must add only its own column of the
+    correction -- adding the whole thing on every rank adds it sixteen times.
+    Its sibling `weight_scale` is `[N][1]` because it indexes the output
+    channel, which TP does not divide, and `gate_proj`'s pair are `[N][1]`
+    over the full intermediate so a rank takes rows there. Three shapes, one
+    of them not what it looks like, and `w4a8.py` says so in passing:
+    `torch.empty(num_experts, hidden_sizes, 16 // self.tp_size)`. A single-die
+    probe with random weights cannot see this; it needed the real checkpoint
+    and the real TP.

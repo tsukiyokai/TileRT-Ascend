@@ -39,11 +39,19 @@ BLOCKS = 16
 
 
 def _repack(packed, columns):
-    """From nibbles paired along the output axis to pairs along K.
+    """The checkpoint's packing to the kernel's, through the wide form."""
+    wide = unpack_codes(packed)
+    assert wide.shape[1] == columns, (wide.shape, columns)
+    return pack_along_inner(wide)
 
-    The checkpoint's byte holds outputs `2n` and `2n + 1` for one K; the
-    kernel's holds `k` and `k + 1` for one output. Unpacking to a full byte an
-    element and repacking the other way is one transpose between them.
+
+def unpack_codes(packed):
+    """`[expert][N/2][K]` to `[expert][N][K]`, low nibble first.
+
+    The one place that knows which axis the checkpoint pairs along. The shapes
+    permit the other reading, so a second implementation that gets it wrong
+    runs and agrees with nothing -- which has already happened twice, once in
+    this module and once in the reference written to check it.
     """
     import torch
 
@@ -52,42 +60,44 @@ def _repack(packed, columns):
     high = ((packed >> 4) & 0x0F).to(torch.int8)
     low = torch.where(low > 7, low - 16, low)
     high = torch.where(high > 7, high - 16, high)
-    wide = torch.stack((low, high), dim=2).reshape(experts, 2 * halved, inner)
-    assert wide.shape[1] == columns, (wide.shape, columns)
-    pairs = wide.reshape(experts, columns, inner // 2, 2)
-    return ((pairs[..., 1] & 0x0F) << 4 | (pairs[..., 0] & 0x0F)).to(
+    return torch.stack((low, high), dim=2).reshape(experts, 2 * halved, inner)
+
+
+def pack_along_inner(codes):
+    """`[expert][N][K]` to `[expert][N][K/2]`, which is what the kernel reads."""
+    import torch
+
+    experts, columns, inner = codes.shape
+    pairs = codes.reshape(experts, columns, inner // 2, 2)
+    return (((pairs[..., 1] & 0x0F) << 4) | (pairs[..., 0] & 0x0F)).to(
         torch.int8).contiguous()
 
 
-def prepare_layer(w13, w2, gu_scale, gu_bias, down_scale, down_bias,
-                  rank=0, world=16):
-    """One layer's weights as the kernel reads them.
+def slice_corrections(gu_scale, gu_bias, down_scale, down_bias,
+                      rank=0, world=16):
+    """The scales and corrections a rank owns.
 
-    The one place that knows the checkpoint's conventions, because knowing
-    them in several places has cost the same mistake twice in a day: the
-    packing is along the output axis and the shapes permit either reading, so
-    a second implementation that gets it wrong produces a reference that runs
-    and agrees with nothing.
+    Three different shapes, and only one of them is what it looks like.
+    `gate_proj.weight_scale` and `scale_bias` are `[N][1]` over the full
+    intermediate, so a rank takes its rows. `down_proj.weight_scale` is
+    `[N][1]` over the hidden size, which TP does not divide, so every rank
+    takes all of it. But `down_proj.scale_bias` is `[N][world]`: the down
+    projection's K axis is the intermediate, so TP splits it and each rank
+    computes a partial sum -- adding the whole correction on every rank would
+    add it `world` times. Each rank takes its own column, and the sum over
+    ranks is the correction.
 
-    A rank holds every expert and a slice of each one's intermediate axis, so
-    `w13`'s output axis and `w2`'s K axis are what divide.
+    This is what `w4a8.py` means by `torch.empty(num_experts, hidden_sizes,
+    16 // self.tp_size)`: at TP16 the third dimension is one.
     """
-    import torch
-
-    intermediate = w13.shape[1] * 2 // 2  # packed bytes along N, halved N
-    per_rank = intermediate // world
-    span = slice(rank * per_rank, (rank + 1) * per_rank)
-    outputs = slice(rank * per_rank * 2, (rank + 1) * per_rank * 2)
-    held_13 = torch.cat((w13[:, span], w13[:, span]), dim=1) \
-        if w13.shape[1] == per_rank else w13[:, span]
-    down_span = slice(rank * per_rank * 2, (rank + 1) * per_rank * 2)
+    per_rank = gu_scale.shape[1] // world
+    rows = slice(rank * per_rank, (rank + 1) * per_rank)
+    column = min(rank, down_bias.shape[-1] - 1)
     return {
-        "gate_up": _repack(held_13, held_13.shape[1] * 2),
-        "down": _repack(w2[:, :, down_span], w2.shape[1] * 2),
-        "gu_scale": gu_scale[:, outputs].reshape(gu_scale.shape[0], -1),
-        "gu_bias": gu_bias[:, outputs].reshape(gu_bias.shape[0], -1),
+        "gu_scale": gu_scale[:, rows].reshape(gu_scale.shape[0], -1),
+        "gu_bias": gu_bias[:, rows].reshape(gu_bias.shape[0], -1),
         "down_scale": down_scale.reshape(down_scale.shape[0], -1),
-        "down_bias": down_bias.reshape(down_bias.shape[0], -1),
+        "down_bias": down_bias[..., column].reshape(down_bias.shape[0], -1),
     }
 
 
