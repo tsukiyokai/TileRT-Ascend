@@ -178,3 +178,36 @@ Eight or so super kernels a layer rather than one, grouped by operator type,
 which is why the earlier reading of "78 super kernels at 210 us" was wrong in
 both factors: there are 637 calls a round at 52.7 us average, and the 210 us
 names were the few heavy ones.
+
+## Withdrawn: the profiler cannot tell eager from replay
+
+The profiled run carries `target_graph: true`, `captures: 1` and `replays: 18`
+and `36`. So its forward was replayed from a graph.
+
+A profiler reports device kernels, and a graph replay is a recorded sequence of
+exactly those kernels. So `aclnnFusedInferAttentionScoreV4` appearing 81 times
+says nothing about how it was dispatched -- and during a replay no aclnn host
+path runs at all.
+
+Which withdraws two readings from this page:
+
+- The 1108 "eager calls a round" and their 12.62 ms of dispatch. The count is
+  real; the word eager was an inference from the name prefix, and the prefix is
+  the operator's name whether it was launched or replayed.
+- The 9.4 ms of attention argument handling. 78 calls times 120 us holds only
+  if each one runs the host path, and in a replay none does.
+
+And `sk_*` is a compiler-fused kernel, not "the captured graph" -- so attention
+being absent from every super kernel means it was not fused with its
+neighbours, not that it was outside the graph.
+
+## What survives
+
+The rope refresh lever, because it was measured directly rather than inferred:
+on one die, the same 265-destination refresh costs 7588.89 us eager and 336.63
+replayed, bit-exact. That is a measurement of two paths, not a reading of a
+profile.
+
+And the per-item in-graph ratios from the same kind of direct comparison. What
+does not survive is any claim about which path the engine took, from a profile
+that cannot distinguish them.

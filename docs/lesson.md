@@ -2006,7 +2006,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      225, ForeachAddList 225, DynamicQuant 48 and 48, one aiv_all_reduce 3 --
      and zero naming attention. Each group is 75 to 78 a round, once a layer, so
      the super kernel fuses the MoE side and attention sits outside it. Its 120
-     us of argument handling a call is therefore 9.4 ms a round that capture
-     removes, not an artefact of this capture's width. It also explains the 637:
-     eight super kernels a layer grouped by operator type, which is why "78
-     super kernels at 210 us" was wrong in both factors.
+     us of argument handling a call looked like 9.4 ms a round -- but that is
+     withdrawn: the profiled run carries target_graph true with 18 and 36
+     replays, so its forward was replayed, and a profiler reports device
+     kernels whether they were launched or replayed. During a replay no aclnn
+     host path runs, so neither the 1108 "eager" calls nor attention's argument
+     handling is paid there. `sk_*` is a compiler-fused kernel rather than the
+     graph, so attention's absence from every super kernel means it was not
+     fused with its neighbours. What survives is the rope lever, measured
+     directly as 7588.89 us eager against 336.63 replayed rather than inferred
+     from a profile. A profile cannot tell you which path the host took.
