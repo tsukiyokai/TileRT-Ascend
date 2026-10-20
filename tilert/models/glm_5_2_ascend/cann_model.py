@@ -193,6 +193,24 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
     ).create_engine_config()
 
 
+def _choose_collective_engine(aiv):
+    """Expand collectives on the vector cores rather than the device AI CPU.
+
+    A3 defaults to AI_CPU. At decode sizes the vector path is 1.6 to 1.9 times
+    faster -- sixteen ranks over twelve rows of 6144 bf16: all_reduce 300.56 us
+    to 183.40, reduce_scatter 318.09 to 177.41, all_gather 326.74 to 175.40 --
+    and the gain is the per-call floor rather than transport, since the only
+    case that barely moves is the one actually carrying a large payload.
+
+    The variable is read once when HCCL loads, so this has to run before any
+    communicator exists and cannot be changed afterwards; setting it from
+    inside the process works, measured at 181.50 us against 290.44 unset.
+    """
+    if not aiv:
+        return
+    os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+
+
 class CannModel:
     """One request, TP16, full-P injection and fixed-width target forwards.
 
@@ -208,12 +226,13 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
-        narrow_bank=False,
+        narrow_bank=False, aiv_collectives=True,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
+        _choose_collective_engine(aiv_collectives)
         if capacity < 128:
             raise ValueError("Capacity must be at least one 128-token page")
         if int(os.environ.get("WORLD_SIZE", "16")) != 16:
