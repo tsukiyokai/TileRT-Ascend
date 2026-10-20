@@ -51,3 +51,41 @@ offers 9.66 by recall. The remaining ways are:
 
 Both are open, and this page is the first measurement that says which of the
 two the target actually requires.
+
+## The oracle's own budget curve, and what it implies
+
+    budget   accepted   TPOT ms
+         4      4.414      7.43
+         8      6.872      5.16
+        12      8.393      4.54
+        16      9.660      4.21
+        24     11.011      4.18   <- floor
+        32     11.907      4.31
+        48     12.962      4.77
+        64     13.474      5.37
+        96     13.474      6.94
+
+Acceptance saturates at 13.474 by budget 64 and does not move at 96, so that is
+how long the stream's copyable runs go. The floor is 4.18 ms at budget 24,
+squeezed between saturating acceptance and a row that costs 0.66 ms.
+
+## Which identifies the one path left for copy-based drafting
+
+13.474 accepted is almost exactly what 2.9 ms needs -- but at budget 64, where
+42.2 ms of row cost puts TPOT at 5.37. So the binding constraint is not the
+workload after all; it is the row.
+
+    row cost 0.66 ms, budget 64   TPOT 5.37 ms
+    row cost 0.20 ms, budget 64   TPOT 3.19 ms
+    row cost 0.10 ms, budget 64   TPOT 2.72 ms
+
+So 2.x is reachable by recall alone if a verified row costs about 0.1 ms
+instead of 0.66. And the row cost has been measured today: it is the graph's,
+rising monotonically with the captured width while the same operators are flat
+in rows eagerly. A graph pays for rows that carry nothing.
+
+That makes the question concrete and it is not a modelling question: **why does
+graph replay charge for empty rows, when the operators do not?** The synthetic
+measurement -- eager 568.7 to 554.4 us across a fourfold row range, replay
+527.0 to 582.9 -- says the cost is in capture rather than in execution, which
+is where to look.

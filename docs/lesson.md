@@ -1224,4 +1224,10 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      tree at 6.649 is already 69 percent of the oracle. Reaching the target
      needs prediction on the 42 percent of positions where nothing long enough
      was seen -- and the published MTP figures, 1.85 to 3.9 accepted, are below
-     both.
+     both. Corrected by the oracle's budget curve: acceptance saturates at
+     13.474 by budget 64, which is what 2.9 ms needs, but 64 rows cost 42.2 ms
+     at 0.66 a row and put TPOT at 5.37. So the binding constraint is the row,
+     not the workload -- at 0.1 ms a row the same recall gives 2.72 ms. And the
+     row cost is the graph's: replay rises with the captured width where the
+     operators are flat eagerly, so a graph charges for rows that carry
+     nothing.
