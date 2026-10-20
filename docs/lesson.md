@@ -1280,3 +1280,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      round with a 16.6 ms one, made earlier today. If it holds the row cost is
      attention's own work rather than overhead, the copy oracle's 4.18 ms is
      the floor, and the queued cap12 and cap24 arms settle it as a side effect.
+
+130. An evidence page that does not name its run leaves a number that cannot be
+     used. `attention-sparsity-20261020` reports 85.048 us a call "from this
+     project's own capture, width 8" without naming it; the three captures on
+     the machine are all `mtp_width: 4` and its allGather count of 140 matches
+     none of them. So the figure came from a fourth capture of unknown
+     configuration and cannot be compared against anything -- which turned the
+     attention row-scaling candidate from weakly measured into unmeasured. Name
+     the run.

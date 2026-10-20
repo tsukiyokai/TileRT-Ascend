@@ -225,10 +225,15 @@ Two points, 11.9 us a row, which over 78 layers is **0.93 ms a row** against
 the round model's fitted 0.66. The same order, and the only candidate measured
 today that is.
 
-The caveat is real: the two figures come from different captures and different
-configurations, which is exactly the error this project made earlier today when
-it mixed a 52.8 ms round with a 16.6 ms one. So this is a candidate with the
-right magnitude, not a measurement.
+The caveat is worse than it looked. `attention-sparsity-20261020` does not
+name its capture, and the three on the machine are all `mtp_width: 4` while
+that page reports 140 `hcom_allGather_` calls against `profile-rope`'s 68. So
+its 85.048 us came from a fourth capture of unknown configuration, and the two
+points are not two widths of one thing -- they are one measurement and one
+number whose provenance is lost.
+
+So attention's row scaling is unmeasured, not weakly measured. What stands is
+only that it is the only term large enough to carry the slope.
 
 What it would mean if it holds: the row cost is attention scoring each query
 row against its selected positions, which is irreducible work rather than

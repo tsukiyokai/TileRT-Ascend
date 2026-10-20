@@ -1,6 +1,14 @@
 # The attention operator reads a cache it was told to skip
 
 From this project's own capture, `kernel_details.csv` on rank zero, width 8.
+
+**The capture is not named, so these figures cannot be traced.** Searched
+2026-10-21: the three captures on the machine -- `profile-rope-20261018`,
+`profile-compiled-20261018`, `profile-stacks-20261018` -- all record
+`mtp_width: 4`, and this page's `hcom_allGather_` count of 140 does not match
+`profile-rope`'s 68. So it came from a fourth capture whose configuration is
+unknown, and its 85.048 us a call cannot be compared against anything. An
+evidence page has to name the run it read.
 What `SparseFlashAttention` is handed:
 
 | argument | shape | dtype |
