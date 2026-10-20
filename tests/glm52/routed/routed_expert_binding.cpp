@@ -14,8 +14,9 @@
  *
  * [integration-route-20261020](../../../docs/evidence/ascend-decode/integration-route-20261020/README.md)
  */
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <torch/library.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include <cstdint>
 #include <vector>
@@ -102,21 +103,15 @@ class Resident {
     void* wide_ = nullptr;
 };
 
-/** The current stream, without draining it.
+/** The stream this call is on, asked for without draining it.
  *
- * `_npu_getCurrentRawStream` drains, which costs about a millisecond a call
- * on a busy worker against two microseconds for the accessor that does not,
- * and a cached global pointer has been seen to send kernels onto another
- * thread's stream.
+ * The draining accessor costs about a millisecond a call on a busy worker
+ * against two microseconds for this one, and a cached pointer is worse than
+ * either: it has been seen to send kernels onto another thread's stream.
  */
 void* CurrentStream()
 {
-    static auto accessor = torch::jit::getAllOperatorsFor(
-        c10::Symbol::fromQualString("npu::_npu_getCurrentRawStreamNoWait"));
-    aclrtStream stream = nullptr;
-    TORCH_CHECK(aclrtGetCurrentStream(&stream) == ACL_SUCCESS,
-                "aclrtGetCurrentStream failed");
-    return stream;
+    return c10_npu::getCurrentNPUStreamNoWait();
 }
 
 /** One layer's routed experts.
