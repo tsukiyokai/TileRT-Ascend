@@ -51,3 +51,37 @@ returning to global memory. Three facts bear on whether that is reachable:
 
 That is where the remaining factor of two lives, and it is one structural
 change rather than a search.
+
+## Correction: the fold's mechanism is not the launch count
+
+The launch arithmetic above -- 468 boundaries at 26.4 us each -- assumed the
+per-operator cost is the boundary. Under graph replay it is not: a
+twelve-element multiply costs 1.064 us a kernel replayed against 11.386 eager,
+measured earlier in this project. So folding six kernels into one saves
+5 x 1.064 = 5.3 us a layer, **0.41 ms a round**, not 12.37.
+
+What the 26 us an operator is, then. `rms_norm` reads 147 KB of bf16 and takes
+28.66 us, which is 5 GB/s -- two orders of magnitude under HBM. Neither launch
+nor bandwidth. It is latency on a problem too small to fill the die: twelve
+rows of 6144 gives a vector kernel almost nothing to parallelise, so the cost
+is the kernel's own serial structure.
+
+## Which replaces the mechanism with a better-founded one
+
+Not fewer launches but concurrent ones. The six small operators are vector
+work; the grouped matmul is cube work and is flat in rows from 16 to 256,
+which says the cube is idle at twelve rows. A fold that puts the norm, the
+quant and the projections inside the matmul's kernel does not save their
+launches -- it overlaps their vector time with cube time that is already being
+paid.
+
+That is the same 158.6 us a layer, reached by a different claim: not that six
+boundaries disappear, but that six vector operators run under a cube operator
+that has nothing else to do. And it is checkable on one die, because the
+grouped matmul's flatness in rows is already measured and the small operators'
+vector time is already measured.
+
+The arithmetic the fold now has to beat: 54.5 us a layer of overlap, against
+158.6 us of vector work available to hide and a cube operator whose own cost is
+61.9 us. Hiding 54.5 inside 61.9 is tight but not impossible, and the ratio is
+what the next kernel measures.

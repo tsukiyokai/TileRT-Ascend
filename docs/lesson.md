@@ -1423,7 +1423,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      factor of two but one structural change: fold six operators into two,
      within the layer rather than across it -- the direction the 15.73 ms of
      merges already came from, and the one cross-layer fusion's 6.15x penalty
-     does not speak to.
+     does not speak to. But the launch arithmetic was wrong: under graph replay
+     a kernel's issue is 1.064 us, so folding six into one saves 5.3 us a layer,
+     0.41 ms a round. The 26 us an operator is neither launch nor bandwidth --
+     rms_norm reads 147 KB in 28.66 us, 5 GB/s -- but latency on twelve rows
+     that cannot fill the die. So the fold's mechanism is overlap, not launch
+     count: six vector operators under a cube operator flat in rows from 16 to
+     256, which is idle at twelve.
 
 144. The graph page's 2.98 ms used the copy oracle's acceptance. Its arithmetic
      was right and its acceptance was 10.918, which today's saturation sweep
