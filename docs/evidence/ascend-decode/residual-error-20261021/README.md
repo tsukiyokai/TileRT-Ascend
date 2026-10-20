@@ -37,3 +37,32 @@ the quantisation noise of a W4A8C8 checkpoint, so it does not block the
 engine-side measurement that matters next. It is recorded as an open gap
 rather than chased further -- the cost of one more hypothesis here exceeds
 what it buys.
+
+## The SwiGLU's form is excluded, and absmax cannot see it anyway
+
+The vendor takes `swiglu_limit` and the engine passes 0.0 while the kernel has
+no limit, which made the activation's form a candidate. Computed on the host
+over the constant-weight case's own distribution, against the measured ratio of
+1.0520:
+
+    no limit                   absmax ratio 1.0000
+    gate clamped at 0 above    absmax ratio 0.0002
+    gate clamped at 0 below    absmax ratio 1.0000
+    product clamped at 0       absmax ratio 1.0000
+    silu with beta 1.702       absmax ratio 1.0000
+
+None produces 1.0520. And the four that give exactly 1.0000 show why this
+comparison was weak to begin with: under a constant weight the absmax is set by
+a single row, and every variant agrees on that row's sign, so absmax has almost
+no power to distinguish activation forms. That is lesson 66 again -- a
+criterion has to be able to fail for the reason you care about.
+
+Six candidates are now excluded: the MSD recombination coefficient, the
+intermediate quantisation, a non-contiguous scale tensor, the per-token scale
+slots, matmul reuse across calls, and the activation's form.
+
+The gap stays parked. The kernel's value is the launch merge, measured as a
+ratio with both sides under identical conditions -- 8.54 ms a round cold -- and
+five percent sits inside a W4A8C8 checkpoint's quantisation noise. What blocks
+progress is the absent steady-state capture and the absent end-to-end run, not
+this.
