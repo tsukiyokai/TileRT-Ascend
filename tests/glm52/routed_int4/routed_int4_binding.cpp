@@ -156,14 +156,8 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
                          const at::Tensor& gu_bias, const at::Tensor& gu_scale,
                          const at::Tensor& down, const at::Tensor& down_bias,
                          const at::Tensor& down_scale,
-                         const at::Tensor& token_scale,
-                         const at::Tensor& shared_gate_up,
-                         const at::Tensor& shared_gu_bias,
-                         const at::Tensor& shared_gu_scale,
-                         const at::Tensor& shared_down,
-                         const at::Tensor& shared_down_bias,
-                         const at::Tensor& shared_down_scale,
-                         int64_t experts, int64_t blocks)
+                         const at::Tensor& token_scale, int64_t experts,
+                         int64_t blocks)
 {
     TORCH_CHECK(rows.dtype() == at::kChar, "rows must be INT8");
     TORCH_CHECK(gate_up.dtype() == at::kChar, "gate_up must be packed INT4");
@@ -176,9 +170,6 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
                 " an expert");
     at::Tensor out = at::empty({rows.size(0), HIDDEN},
                                rows.options().dtype(at::kBFloat16));
-    // Separate, because the combine that weights the routed experts and adds
-    // the shared one lives outside and this kernel knows no permutation.
-    at::Tensor shared_out = at::empty_like(out);
     Resident& held = Resident::Instance(experts);
     routed_int4_launch(
         static_cast<uint32_t>(blocks), CurrentStream(), held.sync_base(),
@@ -189,12 +180,8 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
         token_scale.data_ptr<float>(), held.partial(), held.middle(),
         held.middle_scale(), held.wide(), out.data_ptr(),
         held.gate_up_tiling(), held.down_tiling(), held.witness(),
-        shared_gate_up.data_ptr(), shared_gu_bias.data_ptr<float>(),
-        shared_gu_scale.data_ptr<float>(), shared_down.data_ptr(),
-        shared_down_bias.data_ptr<float>(),
-        shared_down_scale.data_ptr<float>(), shared_out.data_ptr(),
         held.workspace(), experts);
-    return at::stack({out, shared_out});
+    return out;
 }
 
 }  // namespace
