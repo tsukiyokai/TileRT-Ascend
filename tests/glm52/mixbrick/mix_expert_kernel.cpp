@@ -360,13 +360,18 @@ __aicore__ void mix_expert_fused(
         const int64_t channel = (GetBlockIdx() / 2) * channels;
         TPipe vector_pipe;
         if (stages & 8) {
-            // A bare `CrossCoreWaitFlag` resolves to mode 0 on `PIPE_S`:
-            // the wrong direction, and a scalar-pipe wait lets the following
-            // MTE2 issue early and read a half-updated buffer.
-            // Mode spelled out, pipe defaulted, as the vendor's own sample
-            // writes it: the set's template arguments and the wait's must
-            // agree or they are different flags.
-            CrossCoreWaitFlag<0x02>(GATE_READY);
+            // Mode and pipe both spelled out. A bare `CrossCoreWaitFlag`
+            // defaults to mode 0 on `PIPE_S`, and `PIPE_S` is listed as
+            // unsupported for every cross-core mode this part has -- so the
+            // default argument is an unsupported value. `PIPE_MTE2` is what
+            // the consumer actually blocks on.
+            //
+            // One set raises the counter of both of a cube's vector
+            // subblocks, and each must wait exactly once or the leftover
+            // count survives into the next launch. So the handshake stays
+            // out of any branch that the two subblocks could take
+            // differently: split the work, never the handshake.
+            CrossCoreWaitFlag<0x02, PIPE_MTE2>(GATE_READY);
         }
         if (stages & 16) {
             CrossCoreSetFlag<0x02, PIPE_MTE3>(VECTOR_ALIVE);

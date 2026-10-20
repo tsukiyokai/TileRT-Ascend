@@ -144,6 +144,25 @@ separate bits, a sentinel in the output, and a probe writing
 `GetBlockIdx`/`GetBlockNum`/`GetSubBlockIdx` from both halves into a buffer.
 [reference](../../reference/ascend-fusion-mechanics.md)
 
+## Hardened against two documented rules it was relying on by luck
+
+`PIPE_S` is listed as unsupported for every cross-core mode this part has, and
+it is the header's default — so a bare `CrossCoreWaitFlag` passes an
+unsupported value. The consumer is now `CrossCoreWaitFlag<0x02, PIPE_MTE2>`,
+which is what it actually blocks on, and the result stays 24 of 24 clean.
+
+One set raises the counter of *both* of a cube's vector subblocks, and each
+must wait exactly once or the leftover count survives into the next launch —
+which is a second mechanism that produces exactly the period-two alternation
+seen here. The handshake therefore stays outside any branch the two subblocks
+could take differently: split the work, never the handshake.
+
+Two corrections to earlier notes in this file and in `lesson.md`: flagIds on
+A3 run 0 to 15, not 0 to 10, each AIC and each AIV has its own sixteen, and an
+out-of-range id is silently truncated to its low four bits — so an id of 16
+aliases onto 0. And consecutive `CrossCoreSetFlag` calls from one core are
+unordered, which a kernel raising a stage flag per layer has to design around.
+
 ## Next
 
 The brick is the shared expert's first half. Its second half is one more

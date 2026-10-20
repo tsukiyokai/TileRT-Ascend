@@ -12265,6 +12265,449 @@ This is the page that explains an alternating failure, and the mechanism is arit
   ordering, which is the §34/§35 story, and also why its state lives outside the kernel's address space.
 
 
+---
+
+## 39. Two complete vendor MIX kernels: a shipped multi-block `ASCENDC_CUBE_ONLY` + flag handoff, and the KFC route where the AIV drives the cube and waits on a `TQue`
+
+§32's `matmul_fused_manual` is `numBlocks = 1` on one tile, which proves nothing about a multi-block handoff. These
+two do better: `rope_matrix` is a shipped, multi-block, `KERNEL_TYPE_MIX_AIC_1_2` operator whose AIV consumes an AIC
+matmul result out of GM, and `matmul_fused` is the alternative structure in which the AIV *drives* the cube and never
+touches a cross-core flag at all.
+
+### 39.1 `rope_matrix` — the shipped multi-block kernel, complete
+
+https://github.com/hicann/ops-transformer/tree/master/experimental/posembedding/rope_matrix/op_kernel
+(mirror of `cann/ops-transformer`; the entry point with the `ASCEND_IS_AIC` / `ASCEND_IS_AIV` split and the flag is
+quoted in §37.1 from the authors' own write-up.) Copyright 2025 Huawei, CANN Open Software License Agreement
+Version 2.0. Retrieved 2026-10-20. Two files: `rope_matrix.h` (266 lines, vector half + `ASCENDC_CUBE_ONLY`) and
+`rope_matrix_cube.h` (114 lines, matrix half).
+
+First: **`ASCENDC_CUBE_ONLY` together with a populated AIV half in the same translation unit is the shipped shape.**
+`rope_matrix.h` opens with it and then defines the whole vector class below, verbatim:
+
+```cpp
+#pragma once
+#ifndef ASCENDC_CUBE_ONLY
+#define ASCENDC_CUBE_ONLY
+#endif
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#include "rope_matrix_cube.h"
+
+namespace npu_ops_transformer_ext {
+namespace RopeMatrix {
+
+constexpr int32_t DOUBLE_BUFFER = 2;
+
+using AscendC::GetBlockIdx;
+using AscendC::TBuf;
+using AscendC::TPipe;
+using AscendC::LocalTensor;
+using AscendC::SetFlag;
+using AscendC::WaitFlag;
+using AscendC::DataCopy;
+using AscendC::Add;
+using AscendC::Mul;
+using AscendC::Cast;
+using AscendC::HardEvent;
+using AscendC::PipeBarrier; // <PIPE_V>();
+```
+
+The cube half, verbatim and complete — note `IterateAll` called `B*H` times in a loop with **one** `End()` at the
+very end, `SetTail` per iteration, and a `Matmul` whose B operand has IBShare enabled (sixth template argument
+`true`):
+
+```cpp
+template <typename A_T, typename B_T, typename C_T>
+class MatmulBatchKernel {
+public:
+    __aicore__ inline MatmulBatchKernel(){};
+    __aicore__ inline void Init(GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace,
+                                const TCubeTiling &tiling, AscendC::TPipe *pipe);
+    __aicore__ inline void Process(AscendC::TPipe *pipe, RopeMatrixTiling *ropeTiling);
+    
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, A_T> aType;
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, B_T, false, LayoutMode::NONE, true> bType;
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T> cType;
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+    Matmul<aType, bType, cType, biasType> matmulObj;
+
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    TCubeTiling tiling;
+
+private:
+    __aicore__ inline void CalcGMOffset(int blockIdx, int &offsetA, int &offsetB, int &offsetC,
+                                        int &tailM, int &tailN, int B, int H, int M, int N,
+                                        int K, int Nindex);
+};
+
+template <typename A_T, typename B_T, typename C_T>
+__aicore__ inline void MatmulBatchKernel<A_T, B_T, C_T>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR c,
+                                                                GM_ADDR workspace, const TCubeTiling &tiling,
+                                                                AscendC::TPipe *pipe)
+{
+    this->tiling = tiling;
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T *>(a), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T *>(b), tiling.Ka * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T *>(c), tiling.M * tiling.N);
+}
+
+template <typename A_T, typename B_T, typename C_T>
+__aicore__ inline void MatmulBatchKernel<A_T, B_T, C_T>::Process(AscendC::TPipe *pipe, RopeMatrixTiling *ropeTiling)
+{
+    REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), matmulObj, &tiling);
+
+    auto B = ropeTiling->b;
+    auto H = ropeTiling->n;
+    auto M = ropeTiling->s;
+    auto N = ropeTiling->d;
+    auto K = ropeTiling->d;
+
+    int total_N = B * H;
+    for (int Nindex = 0; Nindex < total_N; ++Nindex) {
+        int offsetA = 0, offsetB = 0, offsetC = 0;
+        int tailM = 0, tailN = 0;
+        bool isTransA = false, isTransB = false;
+
+        CalcGMOffset(AscendC::GetBlockIdx(), offsetA, offsetB, offsetC,
+                    tailM, tailN, B, H, M, N, K, Nindex);
+
+        matmulObj.SetTensorA(aGlobal[offsetA], isTransA);
+        matmulObj.SetTensorB(bGlobal[offsetB], isTransB);
+        matmulObj.SetTail(tailM, tailN);
+        matmulObj.IterateAll(cGlobal[offsetC]);
+    }
+    matmulObj.End();
+}
+
+template <typename A_T, typename B_T, typename C_T>
+__aicore__ inline void MatmulBatchKernel<A_T, B_T, C_T>::CalcGMOffset(int blockIdx,
+                                                                        int &offsetA, int &offsetB, int &offsetC,
+                                                                        int &tailM, int &tailN, int B, int H,
+                                                                        int M, int N, int K, int Nindex)
+{
+    uint32_t aCoreInaS = tiling.singleCoreM;
+    uint32_t aCoreMBlock = Ceiling(M, aCoreInaS);
+    uint32_t mCoreIndx = blockIdx % aCoreMBlock;
+    uint32_t nCoreIndx = blockIdx / aCoreMBlock;
+
+    offsetA = mCoreIndx * tiling.Ka * aCoreInaS + Nindex * M * tiling.Ka;
+    offsetB = nCoreIndx * tiling.singleCoreN;
+    offsetC = mCoreIndx * tiling.N * aCoreInaS + nCoreIndx * tiling.singleCoreN + Nindex * M * tiling.N;
+
+    tailM = M - mCoreIndx * aCoreInaS;
+    tailM = tailM < aCoreInaS ? tailM : aCoreInaS;
+
+    tailN = N - nCoreIndx * tiling.singleCoreN;
+    tailN = tailN < tiling.singleCoreN ? tailN : tiling.singleCoreN;
+}
+```
+
+### 39.2 The index asymmetry between the two halves, as a comment in shipped code
+
+This is the vector half's `Init`, verbatim. The comment is the finding:
+
+```cpp
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR xNew, GM_ADDR sin, GM_ADDR cos, GM_ADDR out,
+                                RopeMatrixTiling *ropeTiling, TPipe *tpipe)
+    {
+        this->aivIdx = GetBlockIdx();
+        this->aivNum = GetBlockNum();
+        this->subIdx = GetSubBlockIdx();
+        this->subNum = GetSubBlockNum();
+        // doc say aivNum has already mul subNum, by we test are not, thus need this
+        this->aivNum *= this->subNum;
+```
+
+and the partition it drives, verbatim — `aivIdx` is used directly as the **global** AIV index:
+
+```cpp
+        this->sSize = this->CeilDiv(this->seqLen, this->aivNum);
+        this->sdSize = this->sSize * this->d;
+
+        uint32_t remainSize = this->seqLen - this->sSize * this->aivIdx;
+        this->startSize = this->sSize * this->aivIdx;
+        // update sSize for last core, need after this->startSize set
+        this->sSize = (this->sSize < remainSize) ? (this->sSize) : (remainSize);
+        this->sBlockNum = this->CeilDiv(sSize, this->sBlockSize);
+        this->sLastBlockSize = this->sSize % this->sBlockSize;
+        this->sLastBlockSize = (this->sLastBlockSize == 0) ? this->sBlockSize : this->sLastBlockSize;
+        this->sdLastBlockSize = this->sLastBlockSize * this->d;
+
+        uint32_t startNumel = this->startSize * this->d;
+        xGm.SetGlobalBuffer((__gm__ T*) x + startNumel);
+        xNewGm.SetGlobalBuffer((__gm__ T*) xNew + startNumel);
+        yGm.SetGlobalBuffer((__gm__ T*) out + startNumel);
+        cosGm.SetGlobalBuffer((__gm__ T*) cos + startNumel);
+        sinGm.SetGlobalBuffer((__gm__ T*) sin + startNumel);
+```
+
+So in a `__mix__(1, 2)` kernel on A3, as measured by the team that shipped it: on the AIV side `GetBlockIdx()`
+returns the **global AIV index** (range `[0, 2N)`), while `GetBlockNum()` returns the **AIC** count `N`, so the AIV
+count has to be formed by hand as `GetBlockNum() * GetSubBlockNum()`. The comment records that the documentation
+claims otherwise.
+
+The vector half's consumption of the cube result — `xNewGm` is the matmul's `C` — verbatim:
+
+```cpp
+    __aicore__ inline void Process() {
+        uint32_t ubLoop = this->sBlockNum - 1;
+        for (uint32_t progress = 0; progress < ubLoop; progress++) {
+            SingleStepProcess(progress, this->sdBlockSize, this->sdBlockSize);
+        }
+        // last block
+        SingleStepProcess(ubLoop, this->sdLastBlockSize, this->sdLastBlockSize);
+    }
+```
+```cpp
+    __aicore__ inline void CopyInX(uint64_t xStartOffset, uint32_t copyLength) {
+        LocalTensor<T> xLocal = inQueueX.AllocTensor<T>();
+        LocalTensor<T> xNewLocal = inQueueXnew.AllocTensor<T>();
+        DataCopy(xLocal, xGm[xStartOffset], copyLength);
+        DataCopy(xNewLocal, xNewGm[xStartOffset], copyLength);
+        inQueueX.EnQue(xLocal);
+        inQueueXnew.EnQue(xNewLocal);
+    }
+```
+
+No `DataCacheCleanAndInvalid`, no `DataSyncBarrier`, no `PipeBarrier` guards this read: the whole protocol is the
+entry point's `CrossCoreSetFlag<0x2, PIPE_FIX>(0x8)` / `CrossCoreWaitFlag(0x8)` pair from §37.1.
+
+### 39.3 `matmul_fused` — the KFC route, complete: the AIV drives the cube and waits on a `TQue`
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_fused/README.md
+raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_fused/matmul_fused.asc
+Repo `cann/asc-devkit`, branch `master`. Copyright 2025 Huawei. A3 from CANN 9.0.0, acceptance 「test pass!」,
+`cmake -DCMAKE_ASC_ARCHITECTURES=dav-2201`. Retrieved 2026-10-20.
+
+Its self-description, verbatim — note what provides the synchronisation:
+
+```
+## 概述
+
+分核AIC、AIV融合编程实现，主要介绍了Matmul高阶API的MIX模式，Matmul API内部会自动控制AIC、AIV的核间同步。
+
+## 样例描述
+
+- 样例功能：  
+  本样例创建MIX模式的Matmul对象，在AIC核实现Matmul计算，中间结果输出至VECIN(Unified Buffer)。AIC核计算完成后，通过TQue的EnQue/DeQue接口控制同步，继续在AIV核对Unified Buffer上的中间结果进行LeakyRelu的计算。
+
+- 样例规格：  
+  本样例中：M = 1024, N = 640, K = 256
+```
+
+The include block, verbatim — **no `ASCENDC_CUBE_ONLY`**:
+
+```cpp
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#include "tiling/tiling_api.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "data_utils.h"
+#include "kernel_tiling/kernel_tiling.h"
+#include "acl/acl.h"
+
+using namespace matmul;
+using namespace std;
+```
+
+The entry point, verbatim — **`__global__ __aicore__`, not `__mix__`; one function body; no
+`ASCEND_IS_AIC`/`ASCEND_IS_AIV` split; `__kfc_workspace__` on the workspace argument**:
+
+```cpp
+extern "C" __global__ __aicore__ void matmul_fused_custom(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c,
+    __gm__ uint8_t* __kfc_workspace__ workspace, __gm__ uint8_t* tilingGm)
+{
+    AscendC::TPipe pipe;
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+
+    MatmulLeakyKernel<half, half, float, float> matmulLeakyKernel;
+    matmulLeakyKernel.Init(a, b, bias, c, workspace, tiling, &pipe);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulLeakyKernel.matmulObj, &matmulLeakyKernel.tiling);
+    matmulLeakyKernel.Process();
+}
+```
+
+The member declarations, verbatim — C at `TPosition::VECIN`, plus a `workspaceGlobal` and two `TQue`s:
+
+```cpp
+    Matmul<
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BType>,
+        MatmulType<AscendC::TPosition::VECIN, CubeFormat::ND, CType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasType>>
+        matmulObj;
+
+    AscendC::GlobalTensor<AType> aGlobal;
+    AscendC::GlobalTensor<BType> bGlobal;
+    AscendC::GlobalTensor<CType> cGlobal;
+    AscendC::GlobalTensor<BiasType> biasGlobal;
+    AscendC::GlobalTensor<CType> workspaceGlobal;
+    AscendC::LocalTensor<CType> reluInLocal;
+    TCubeTiling tiling;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> reluInQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> reluOutQueue;
+    uint32_t splitRowNums = 0;
+    uint32_t splitRowSize = 0;
+```
+
+`Init`, verbatim — note `GetUserWorkspace(workspace)` and the **per-block** staging offset:
+
+```cpp
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::Init(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c, __gm__ uint8_t* workspace,
+    const TCubeTiling& tiling, AscendC::TPipe* pipe)
+{
+    this->tiling = tiling;
+    splitRowNums = 4;
+    splitRowSize = tiling.baseM / splitRowNums;
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ AType*>(a), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BType*>(b), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(c), tiling.M * tiling.N);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasType*>(bias), tiling.N);
+    workspaceGlobal.SetGlobalBuffer(
+        reinterpret_cast<__gm__ CType*>(AscendC::GetUserWorkspace(workspace)), tiling.M * tiling.N);
+
+    int32_t offsetA, offsetB, offsetC, offsetBias;
+    CalcOffset(
+        AscendC::GetBlockIdx(), tiling, offsetA, offsetB, offsetC,
+        offsetBias); // Calculate the gm offset based on the blockidx.
+    aGlobal = aGlobal[offsetA];
+    bGlobal = bGlobal[offsetB];
+    cGlobal = cGlobal[offsetC];
+    biasGlobal = biasGlobal[offsetBias];
+    workspaceGlobal = workspaceGlobal[GetBlockIdx() * tiling.singleCoreM * tiling.singleCoreN];
+    pipe->InitBuffer(reluInQueue, 1, tiling.baseM * tiling.baseN * sizeof(CType));  // Init relu input queue.
+    pipe->InitBuffer(reluOutQueue, 1, splitRowSize * tiling.baseN * sizeof(CType)); // Init relu output queue.
+}
+```
+
+`Process` and the handoff, verbatim and complete — **the `DeQue` is the wait**:
+
+```cpp
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::Process()
+{
+    matmulObj.SetWorkspace(workspaceGlobal);
+    matmulObj.SetTensorA(aGlobal);
+    matmulObj.SetTensorB(bGlobal);
+    matmulObj.SetBias(biasGlobal);
+    matmulObj.template Iterate<false>(); // Sync is set false means async, this scene will run while(Iterate).
+    for (int i = 0; i < tiling.singleCoreM * tiling.singleCoreN / (tiling.baseM * tiling.baseN); ++i) {
+        MatmulCompute();                          // Get matmul compute result.
+        reluInLocal = reluInQueue.DeQue<CType>(); // wait matmul compute result finish.
+        for (int j = 0; j < splitRowNums; ++j) {
+            LeakyReluCompute(j);           // Compute leakyRelu.
+            CopyOut(i * splitRowNums + j); // Copy leakyRelu out result to GM.
+        }
+        reluInQueue.FreeTensor(reluInLocal);
+    }
+    matmulObj.End();
+}
+
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::MatmulCompute()
+{
+    reluInLocal = reluInQueue.AllocTensor<CType>();
+    matmulObj.template GetTensorC<false>(reluInLocal, false, true);
+    reluInQueue.EnQue(reluInLocal);
+}
+
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::LeakyReluCompute(uint32_t count)
+{
+    auto reluOutLocal = reluOutQueue.AllocTensor<CType>();
+    LeakyRelu(
+        reluOutLocal, reluInLocal[count * splitRowSize * tiling.baseN], (CType)0.001, splitRowSize * tiling.baseN);
+    reluOutQueue.EnQue(reluOutLocal);
+}
+
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::CopyOut(uint32_t count)
+{
+    auto reluOutLocal = reluOutQueue.DeQue<CType>(); // wait relu compute result finish.
+    const uint32_t roundM = tiling.singleCoreM / splitRowSize;
+    uint32_t startOffset = (count % roundM * splitRowSize * tiling.N + count / roundM * tiling.baseN);
+    AscendC::DataCopyParams copyParam = {
+        (uint16_t)splitRowSize, (uint16_t)(tiling.baseN * sizeof(CType) / AscendC::DEFAULT_C0_SIZE), 0,
+        (uint16_t)((tiling.N - tiling.baseN) * sizeof(CType) / AscendC::DEFAULT_C0_SIZE)};
+    DataCopy(cGlobal[startOffset], reluOutLocal, copyParam);
+    reluOutQueue.FreeTensor(reluOutLocal);
+}
+```
+
+and the host side, verbatim — `SetDim` is in **AIV** units while the `<<<>>>` argument is in **AIC** units:
+
+```cpp
+    int usedCoreNum = 2;
+```
+```cpp
+    tilingApi.SetDim(usedCoreNum); // Set the number of cores that participate in multi-core computation is 2.
+```
+```cpp
+    uint32_t numBlocks = 1;
+```
+```cpp
+    matmul_fused_custom<<<numBlocks, 0, stream>>>(
+```
+```cpp
+    ICPU_RUN_KF(matmul_fused_custom, numBlocks, a, b, bias, c, workspace, tiling);
+```
+
+## Relevance
+- **§39.1 settles that `ASCENDC_CUBE_ONLY` plus a populated AIV half is supported and shipped.** `rope_matrix.h`
+  `#define`s it and defines the entire vector class in the same header, and the operator is in
+  `cann/ops-transformer` with a torch binding. So the brick's structure is legal. What it is *not* is the only
+  option — §39.3 is the other one, and in that one the AIV never waits on a flag, which is on its own a complete
+  explanation for "every barrier I add is a no-op" if a build ever resolves to that route.
+- **§39.1 is also the multi-block existence proof asked for**, with the whole function rather than the protocol
+  lines. The cube half loops `IterateAll` over `B*H` batches with a single trailing `End()`, re-pointing A, B and C
+  per iteration and calling `SetTail` each time; the AIV half reads the cube's `C` (`xNewGm`) with a bare `DataCopy`
+  and no cache operation at all. The only synchronisation in the whole operator is the entry point's
+  `CrossCoreSetFlag<0x2, PIPE_FIX>(0x8)` / `CrossCoreWaitFlag(0x8)` from §37.1. Two consequences. First, a bare
+  default-pipe wait is what a shipped multi-block operator uses, which weakens §38.3's `PIPE_S` argument from
+  "certainly a bug" to "contradicts the spec but is current practice" — worth trying `PIPE_MTE2` as a cheap
+  experiment, not worth believing in. Second, the handoff is correct here only because the two tilings are
+  deliberately aligned pairwise (§37): `tiling.singleCoreM` on the cube side is exactly `2 ×` the vector side's
+  `sSize = CeilDiv(seqLen, aivNum)`.
+- **§39.2 is the index trap, confirmed in shipped code against the documentation.** Verbatim:
+  `// doc say aivNum has already mul subNum, by we test are not, thus need this` followed by
+  `this->aivNum *= this->subNum;`. So in a `__mix__(1, 2)` kernel on A3: the AIV's `GetBlockIdx()` is the **global
+  AIV index** in `[0, 2N)` and is used directly as such, while `GetBlockNum()` returns the **AIC** count `N`. The
+  AIC's `GetBlockIdx()` is in `[0, N)`. Any buffer indexed by `GetBlockIdx()` on both sides is therefore indexed
+  with two different strides, and at `numBlocks = 1` the AIV with `GetBlockIdx() == 1` reads a slice no AIC ever
+  wrote. Since the brick's index fix was made before this was known, the check is: print
+  `GetBlockIdx(), GetBlockNum(), GetSubBlockIdx(), GetSubBlockNum()` from both halves on A3 and confirm which of the
+  four the fix assumed. `AscendC::printf` is the documented debug route — `rope_matrix.h` ships a `Debug()` stub for
+  exactly this, verbatim:
+  `// AscendC::printf("... debug %d, %d, %d, %d\n", this->aivIdx, this->aivNum, this->subIdx, this->subNum);`
+- **§39.3 gives the KFC route in full, and it is the structure to consider if the flag protocol stays unreliable.**
+  `__kfc_workspace__` on the workspace parameter plus `REGIST_MATMUL_OBJ` plus a MIX-mode Matmul with
+  `C` at `TPosition::VECIN` means the AIV issues `Iterate<false>()`, the API dispatches the cube work, and
+  `GetTensorC<false>(localTensor, false, true)` plus `reluInQueue.EnQue` / `DeQue` is the entire synchronisation —
+  intra-core pipe sync on the AIV's own queue, because from the AIV's point of view the result lands in its own UB.
+  No `CrossCoreSetFlag`, no flagId budget, no counter residue, no intra-core-group pairing constraint. Given §38's
+  finding that the flag is scheduler state with no documented reset and undefined behaviour when unpaired, this
+  route removes the entire failure class. The cost is that the API owns the pipelining, which is the 13.58 us MIX
+  head overhead we are trying to delete — so the honest reading is: use the KFC route to get a correct baseline and
+  a reference output, then move to the hand-written flag route with a known-good comparison in hand.
+- Two mechanical facts from §39.3 worth keeping regardless. The cube→vector staging buffer is explicit and
+  per-block: `GetUserWorkspace(workspace)` offset by `GetBlockIdx() * singleCoreM * singleCoreN`, which is the same
+  ring-slot arithmetic as §15's `workSpaceOffset` and is what `SetWorkspace()` consumes. And `SetDim(usedCoreNum)`
+  with `usedCoreNum = 2` alongside `numBlocks = 1` confirms that `SetDim` counts AIV while the `<<<>>>` argument
+  counts AIC — a factor of two between the tiling's core count and the launch's.
+- For our numbers: `rope_matrix` is the only shipped A3 MIX operator found whose published motivation is ours in
+  miniature — a vector-heavy op turned into `x @ mat` to put work on the cube, measured at 10% of a network, with
+  the conclusion 「matmul计算和Vector计算理论上都是memory bound」 (§37). Our `Cast` family at 2.300 ms against
+  0.076 ms of bytes is the same disease; §34's Fixpipe `S322S8` / `S322FP16` / `FP322BF16` list is the cure that
+  does not need a vector instruction at all.
+
+
 ## Gaps
 
 What was looked for and not found, or found only partially.
