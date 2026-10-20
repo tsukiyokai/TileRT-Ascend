@@ -26,6 +26,29 @@ the trade is close to even. Which names the next experiment: a smaller width
 should keep most of the acceptance, since the gain comes from matching better
 rather than from drafting longer, and give the round time back.
 
+## The width sweep the decomposition asked for
+
+    arm                     tpot_min  rounds  accepted   round
+    base    chain8   w32     11.2312     194     5.273  63.869 ms
+    automaton        w32     10.8510     169     6.053  72.066 ms
+    automaton        w16      9.6360     183     5.590  58.588 ms
+    automaton         w8     10.6425     225     4.547  52.787 ms
+
+Width 16 is 14.2% better than the baseline, and it works the way the
+decomposition said it would: acceptance stays above the baseline's at 5.590
+where width 32 reached 6.053, and the round becomes cheaper than the
+baseline's own, 58.588 against 63.869. Width 8 overshoots -- acceptance falls
+to 4.547 and the cheaper round does not pay for it.
+
+So the gain is not from drafting longer. It is from matching better, and once
+the match is better the cheapest width that still carries it wins.
+
+## What this does not yet separate
+
+The baseline is `chain8` at width 32, so this pairing confounds the drafter
+with the width. A `chain8` arm at width 16 is the control that splits them,
+and it has not run yet.
+
 ## On the label
 
 The arm reports `drafter lookup`, because the minimal patch to this tree's
