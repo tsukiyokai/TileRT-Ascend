@@ -910,3 +910,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     artefact: a fixed-budget tree at 64 nodes and 14.510 accepted becomes a
     TPOT of 1.88 ms instead of being priced out. One number, worth more than
     every lever measured today together.
+
+97. A cost model fitted across configurations can measure the trajectory
+    instead of the configuration. `round = 45.88 + 0.814 a row` fits four
+    widths with residuals of a few hundred microseconds, and all three
+    mechanisms that could produce the row term are excluded: the engine
+    captures one graph size so there are no buckets, a two-rank all-reduce is
+    flat to negative in the row count, and a whole layer costs 0.336 us a row
+    against the model's 10.4. What is left is that each width ran its own
+    trajectory -- wider drafts accept more, advance further, grow the KV faster
+    and pay more for attention later -- so the fitted slope is mostly context
+    length. Compare at constant trajectory length, not constant round count.

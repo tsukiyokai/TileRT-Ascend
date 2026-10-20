@@ -52,3 +52,33 @@ one bucket differ by the operator figure -- about 0.03 ms -- while two widths
 across a boundary differ by a bucket's worth. If it is the TP reduction, the
 difference is smooth in the width. One pair of arms settles it, and they need
 the whole machine.
+
+## Three candidates excluded, and what is left
+
+- **Graph buckets.** The engine sets `cudagraph_capture_sizes: [graph_width]`,
+  one size, so every width captures its own graph and there is no step to pay
+  at a boundary. Excluded by reading the config.
+- **The TP reduction.** Two ranks, hidden 6144, float32: 111.27 us at 8 rows
+  and 93.24 at 64, an eightfold range in bytes with a negative slope
+  throughout. Not row-sensitive. Sixteen ranks may differ but the direction
+  does not support it.
+- **Per-row operator cost.** The page this corrects attributed 10.4 us a layer
+  a row to scalar and issue pressure. A whole layer measures 0.336 us a row.
+  Excluded, 31 times over.
+
+What remains is trajectory coupling. The four widths each ran their own
+trajectory: a wider draft accepts more, so each round advances further, the KV
+grows faster, and later rounds pay more for attention. `round(width)` then
+mixes the width's own cost with the context length its acceptance produces,
+and the 0.814 ms a row is mostly the second.
+
+If that is right, widening does not cost what the model says, a tree's nodes
+are not expensive, and the fixed-budget tree at 14.510 accepted becomes
+reachable -- the 1.88 ms line above.
+
+## The discriminator, corrected
+
+Not adjacent widths -- buckets are excluded, so that tests nothing. Fix the
+number of tokens generated rather than the number of rounds, and compare
+widths over the same trajectory length. If the round cost is flat in the width
+at constant trajectory, the row term is an artefact of the measurement.
