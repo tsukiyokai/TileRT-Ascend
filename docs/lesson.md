@@ -1839,3 +1839,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      so the capture holds addresses and reads the buffer at replay. And the
      eager figure beats the estimate, 7.59 ms measured against 6.06 from 532
      calls at 11.386 us, so the dispatch model was conservative.
+
+177. A check against a copied subject drifts from the real one. The rope
+     refresh's branch -- capture, reuse, or fall back -- had never executed at
+     all, so four host checks now cover it: a width captures once and then
+     reuses, each width gets its own graph, the flag off runs eager, and a
+     width without hoisted metadata does nothing. But `Refresher` copies the
+     engine's five lines rather than importing them, because importing
+     `cann_model` pulls in torch and vllm. So the checks verify the logic and
+     not the code, and they will keep passing if the two diverge. Written down
+     in the file itself, since a limitation a reader cannot see is worse than
+     the gap it describes.
