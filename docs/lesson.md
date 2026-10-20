@@ -1492,3 +1492,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      read 1.724, because it indexed only one window length and then queried
      shorter tails that had never been stored: a broken index reads exactly
      like a failed mechanism.
+
+149. The MoE fork cannot be overlapped, because both its branches are cube
+     work. The 21 to 40 us a layer priced for it came from a vector-under-cube
+     measurement; the shared expert is matmuls. Measured: routed 44.35 us,
+     shared 55.00, serial on one stream 71.00, concurrent on two 89.49 --
+     concurrency is 18.49 us slower, a third of the shared side. Neither hides
+     inside the other because both need the cube, and the second stream adds
+     only its event and scheduling cost. Serial already beats the sum, 71.00
+     against 99.35, so the pipelining that exists happens unasked. Within-layer
+     overlap is therefore closed: the attention side is a strict chain holding
+     four of the six small operators, and the only fork is cube against cube.
