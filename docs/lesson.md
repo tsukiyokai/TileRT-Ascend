@@ -653,3 +653,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     45.88 ms fixed term is the sum of per-layer taxes paid once each because
     each is a separate launch, and that is the only exit the measurements
     leave open.
+
+73. A vendor baseline is a property of the process. The same grouped matmul at
+    the same shape costs 61.617 us in a clean process and 153.325 us after a
+    communication domain has been built and a custom kernel has run -- 2.5x,
+    with two clocks agreeing within one percent. The engine is the mixed case,
+    so the round's recorded 157.2 us a layer is right, but any clean-probe
+    baseline understates what the engine pays and any mixed-probe baseline
+    overstates what a clean kernel would. Compare only within one state, and
+    record which state it was.
