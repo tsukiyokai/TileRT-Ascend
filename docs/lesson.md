@@ -986,3 +986,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      list built for more rows costs more to replay even where the operators are
      flat. Ten mechanisms were hypothesised for this before a graph was
      captured at two widths, which was always the direct test.
+
+104. Varying two parameters at once produced both of today's drafting wins, and
+     both withdraw. The tree's 14.510 accepted came from budget 64 with a width
+     ceiling of 32; at equal budget the tree matches the automaton to within
+     half a percent -- 9.178 against 9.221 at 16 -- because a suffix match is
+     usually right and branching buys nothing on this corpus. The adaptive
+     budget's win came from a mean width of 12.6 against a fixed 32; at equal
+     budget it loses acceptance for nodes it cannot spend, 7.830 against 9.221,
+     and with the width term now known to be per unit of *captured* width,
+     which the configuration fixes, asking for fewer nodes saves nothing. The
+     configuration to run is the plain automaton at a captured width near 24,
+     TPOT 3.73 ms with the merges.
