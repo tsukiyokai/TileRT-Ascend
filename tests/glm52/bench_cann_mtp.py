@@ -146,6 +146,10 @@ def arguments():
     parser.add_argument("--plain-moe-combine", action="store_true",
                         help="Add the shared and routed MoE outputs directly"
                              " instead of through the multi-tensor kernel")
+    parser.add_argument("--profile-last", action="store_true",
+                        help="Capture the device on the last request only,"
+                             " at the real width and after the caches have"
+                             " settled")
     parser.add_argument("--tree", action="store_true",
                         help="Draft a tree rather than a chain; the round"
                              " verifies it under a per-row attention mask and"
@@ -201,6 +205,28 @@ def drive(backend, first, args):
     try:
         for number in range(args.warmup + args.requests):
             tokens, clocks = [], []
+            # The device capture goes on the last request only. Every capture
+            # this project has taken ran at `max_tokens: 6` and `mtp_width: 4`
+            # and included warmup and prefill, so its per-round figures were
+            # divided by a round count inferred from kernel counts that were
+            # mostly not decode. Here the window is one request at the real
+            # width, after the caches and the trajectory have settled.
+            last = number == args.warmup + args.requests - 1
+            capture = None
+            if args.profile_last and last:
+                import torch_npu
+
+                capture = torch_npu.profiler.profile(
+                    activities=[torch_npu.profiler.ProfilerActivity.NPU],
+                    on_trace_ready=(
+                        torch_npu.profiler.tensorboard_trace_handler(
+                            str(args.output / "capture"))),
+                    experimental_config=(
+                        torch_npu.profiler._ExperimentalConfig(
+                            profiler_level=(
+                                torch_npu.profiler.ProfilerLevel.Level1))))
+                capture.__enter__()
+                report["profiled"] = True
 
             def deliver(token):
                 tokens.append(int(token))
@@ -214,6 +240,9 @@ def drive(backend, first, args):
                     sampling={"temperature": 0.0, "ignore_eos": True},
                     on_token=deliver,
                 )
+                if capture is not None:
+                    capture.__exit__(None, None, None)
+                    capture = None
                 records.append({
                     "warmup": number < args.warmup, "tokens": tokens,
                     "returned_tokens": output, "timestamps_ns": clocks,
@@ -661,6 +690,8 @@ def main():
             "conditioned_graph" if args.conditioned_graph else "eager"),
         "ignore_eos": True, "precision_verified": False,
         "formal_1024_token_run": False, "profiled": False,
+        "capture_scope": ("last request, decode only"
+                          if args.profile_last else None),
     }
     try:
         passed = run(args, report)
