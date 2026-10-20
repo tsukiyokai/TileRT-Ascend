@@ -1047,6 +1047,10 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      assumed to make. The capture says 41 calls a round at 831 us each -- a
      tenth the count at four times the cost -- so the arithmetic was wrong
      twice and landed in the right order of magnitude by cancellation. Forty-one
-     collectives at 830 us is 35.1 ms of device time against a 52.8 ms round,
-     the largest item in the capture, and 21.7 allGathers a round matches no
-     layer structure.
+     collectives at 830 us looked like 35.1 ms of device time -- wrong, because
+     grouping by the type column averaged the one-off domain build into the
+     per-round figure. Of 128 collective records 64 are a repeated AivKernel at
+     858.4 us and the rest appear once each at 2126 to 9343 us. The decode
+     figure is 20.4 calls a round at 858 us, 17.5 ms, which is what an earlier
+     by-type sum had already given. Deduplicate by name before averaging by
+     type.

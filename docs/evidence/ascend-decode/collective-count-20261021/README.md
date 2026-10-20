@@ -2,12 +2,18 @@
 
 From `profile-rope-20261018`, rank 1, 3.13 rounds by attention call count.
 
-    hcom_allGather   68 calls   21.7 a round   882.5 us each   19.18 ms a round
-    hcom_allReduce   60 calls   19.2 a round   831.1 us each   15.94 ms a round
+Grouping by the type column gave allGather 21.7 a round at 882.5 us and
+allReduce 19.2 at 831.1 -- 35.1 ms of device time. That is wrong: of the 128
+collective records, 64 are a repeated `AivKernel` at 858.4 us and every other
+one appears exactly once, at 2126 to 9343 us. The singletons are the domain
+build, not the decode, and averaging them into a per-round figure doubled it.
 
-Forty-one calls a round, 35.1 ms of device time, against a measured round near
-52.8 ms. The halves overlap so not all of it is on the critical path, but it is
-the largest single item in the capture by a wide margin.
+    AivKernel, collective    64 calls   20.4 a round   858.4 us each   17.5 ms
+
+Which agrees with the 17.56 ms a round the earlier by-type sum gave before this
+page inflated it. Twenty of these a round at 858 us is the largest item in the
+decode after the SuperKernel itself, and the name says they are the vector-side
+collectives a super kernel wraps -- which is what the one-sided push replaces.
 
 ## What this overturns
 
