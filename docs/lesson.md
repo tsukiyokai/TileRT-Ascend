@@ -1138,3 +1138,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      warm, and nothing device-side has ever been measured at the configuration
      that matters. The first thing to do with a free machine is that capture,
      before any lever is re-measured.
+
+118. A truncated backbone is four of our own literals away from running. Both
+     reachable machines leave 6.8 and 3.8 GiB against the model's 16.7, so an
+     eight-layer arm was tried: the gate passed and it started, then hit the
+     weight loader walking every tensor the index lists, our cache bind
+     expecting 78 main and 21 indexer layers, our MTP guard requiring
+     num_hidden_layers == 78, and vLLM's MTP completeness check demanding
+     weights for a layer the checkpoint has at 78 and the truncation puts at 8.
+     Four are cleared without touching the untruncated path. The fifth needs
+     the waiver inside vLLM's speculative setup. Hard-coded depths are what
+     make a model un-shrinkable, and shrinking it is what lets a shared machine
+     be used at all.
