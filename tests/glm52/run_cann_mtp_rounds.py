@@ -332,8 +332,15 @@ def source_hashes(target, draft):
              *[Path(__file__).with_name(name) for name in
                ("run_cann_model.py", "run_native_decode.py", "prefix_io.py",
                 "frozen_teacher.py")]}
-    for value in (type(draft), type(draft.model), type(draft.model.model),
-                  type(draft.model.model.layers["78"]), DefaultModelLoader,
+    # The draft engine's own classes, when there is one. A truncated arm has
+    # none, and the layer this reached for is keyed "78" -- one more hard-coded
+    # depth, in a hash collection.
+    drafted = () if draft is None else (
+        type(draft), type(draft.model), type(draft.model.model),
+        type(draft.model.model.layers[
+            str(draft.config.model_config.hf_config.num_hidden_layers)]),
+    )
+    for value in (*drafted, DefaultModelLoader,
                   process_weights_after_loading, MtpRoundExecutor):
         paths.add(Path(inspect.getfile(inspect.unwrap(value))).resolve())
     paths.add(ROOT / "tilert/models/glm_5_2_ascend/mtp_state.py")
