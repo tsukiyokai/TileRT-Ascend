@@ -1040,3 +1040,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      collectives are 17.56 ms of device time where the one-sided reduce was
      costed at 6.5 from an operator comparison, so the measurement outstanding
      that matters most is the one already built.
+
+109. Count the calls before pricing a replacement for them. The one-sided
+     reduce was costed at 6.5 ms a round by multiplying an operator-level
+     saving, 201.995 us against 32.488, by the 156 calls a TP16 decode was
+     assumed to make. The capture says 41 calls a round at 831 us each -- a
+     tenth the count at four times the cost -- so the arithmetic was wrong
+     twice and landed in the right order of magnitude by cancellation. Forty-one
+     collectives at 830 us is 35.1 ms of device time against a 52.8 ms round,
+     the largest item in the capture, and 21.7 allGathers a round matches no
+     layer structure.
