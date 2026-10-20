@@ -1071,7 +1071,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      19 us, the grouped matmul at 62 to 70, attention at 85, a layer at 214 in a
      graph. The engine's 52.7 us a kernel sits nearer the cold figure, as a
      model reading a different weight every layer should. The comparisons
-     survive because both sides were equally warm, so the 21.04 ms of merges
-     holds as a proportion; the absolute projections of 2.98 and 3.73 ms do not,
-     being built on warm sums. Rotate over a bank larger than the cache, or
-     quote only ratios.
+     survive because both sides were equally warm. And the first guess at the
+     direction was wrong: measured cold over eight rotating weight sets, the
+     fused projections save 3.59 ms a round against the warm 2.46, because
+     fusing turns four separate weight pulls into one contiguous pull and that
+     is worth more from memory than from cache. So warm figures understate the
+     merges. What stands is that warm absolutes cannot be summed into a round --
+     the engine's 57.27 ms of device time is the denominator -- and every lever
+     needs its cold figure.

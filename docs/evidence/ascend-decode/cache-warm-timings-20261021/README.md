@@ -38,3 +38,24 @@ suggested.
 So the projections of 2.98 and 3.73 ms, both built on warm sums, are optimistic
 by an unknown factor below two. The end-to-end arms remain the only figures
 worth quoting.
+
+## Cold, the fused projections save more, not less
+
+The expectation above was that cold operators cost more, so a boundary is a
+smaller share and fusing saves proportionally less. Measured over eight
+rotating weight sets, 52 MB each:
+
+    separate   119.119 us   9.29 ms a round
+    fused       73.142 us   5.71 ms a round
+    saving      45.978 us   3.59 ms a round   (warm said 2.46)
+
+Both sides got dearer -- 119 against 68.724, 73 against 37.238 -- and the
+saving grew by half. Fusing reads the same bytes in one contiguous pull instead
+of four separate ones, and that is worth more when the bytes actually come from
+memory than when they come from cache.
+
+So the direction of the correction is the opposite of what this page first
+claimed: the warm figures understate the boundary merges rather than
+overstating them. What stands is that warm absolutes cannot be summed into a
+round -- the engine's own 57.27 ms of device time is the denominator -- and that
+every lever needs its cold figure before the total means anything.
