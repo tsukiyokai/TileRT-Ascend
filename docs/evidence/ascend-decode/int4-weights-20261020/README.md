@@ -303,26 +303,10 @@ this kernel. The INT8 form is unaffected, correct and 3.3 times the vendor, so
 it is what integration should carry.
 
 
-## The defect, found: a store with no guard on the cube half
+## The fix: `DataCopyPad` with an explicit byte count
 
-Every `CastImpl` on this part opens with `if ASCEND_IS_AIV`, so on the cube
-half of a `__mix__` kernel a cast compiles to nothing -- silently and
-correctly, an AI Core has no vector unit. But the plain
-`DataCopy(GlobalTensor, LocalTensor, DataCopyParams)` carries no
-`ASCEND_IS_AIC` guard at all, where `DataCopyPad` has one explicitly. So the
-store after those casts is still issued, on the cube half, with a `__ubuf__`
-pointer, on a core that has no Unified Buffer.
-
-Two uncoordinated writers to one global address: the vector half writing the
-right data, the cube half writing whatever that pointer resolves to, with no
-synchronisation and nothing reported on either side. That is the whole
-elimination list's residue explained -- stable nonsense 6144 bytes into
-`stacked` and the same nonsense again 6144 further on, a write that lands at
-offset zero and never at 12288, and an isolated probe that passes because it
-has one writer.
-
-Replacing every UB-to-global store with `DataCopyPad`, which returns early on
-the cube half by construction, makes the split land where it is addressed and
+Replacing every UB-to-global store with `DataCopyPad`, given a byte count
+rather than an element count, makes the split land where it is addressed and
 the gate-and-up projection exact:
 
 ```
@@ -331,6 +315,23 @@ low halves addressed at nibble 12288, found at 12288
 product, first 4 columns: want 8883 562 -5267 -13984
                            got 8883 562 -5267 -13984
 ```
+
+The effect is measured; the mechanism is not settled, and two candidates
+remain. One does not fit this kernel and is recorded so as not to be
+re-proposed: every `CastImpl` opens with `if ASCEND_IS_AIV` while plain
+`DataCopy` to global memory carries no `ASCEND_IS_AIC` guard, so a store
+after a cast would be issued on the cube half with a UB pointer -- two
+writers on one address. But `ASCEND_IS_AIV` is `constexpr(g_coreType == AIV)`
+and this kernel's stores sit inside such an `if`, so the cube half does not
+reach them.
+
+The candidate that does fit is a byte length computed at one byte an element
+for a sub-byte type, which is a documented two-times trap in this API family:
+a `DataCopy` of 2048 INT4 elements writing 2048 bytes instead of 1024 would
+have each tile's store overrun the next, and the final tile's store spill
+exactly 1024 bytes past the region -- which is precisely the duplicate
+observed at 6144 and again at 12288. `DataCopyPad` took `span / 2` bytes
+explicitly and the duplicate is gone.
 
 ## And a transpose that is dropped without a word
 

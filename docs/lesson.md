@@ -319,15 +319,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `SetFlag` still fires, so a helper that names a `HardEvent` must only be
     called from the half that owns it.
 
-46. A store can be issued on a core that cannot have produced its data. Every
-    `CastImpl` opens with `if ASCEND_IS_AIV`, so on the cube half of a
-    `__mix__` kernel a cast is silently nothing -- but plain `DataCopy` to
-    global memory carries no `ASCEND_IS_AIC` guard, while `DataCopyPad` does.
-    The store goes out anyway, with a UB pointer, on a core with no UB, and
-    two writers race on one address with nothing reported. Six rounds of
-    elimination -- the arithmetic, the write mechanism, the declared length,
-    the cross-pipe events, where the base is computed, the alignment -- and
-    the cause was a missing guard in the library, not anything in the
-    addressing. Use `DataCopyPad` for every UB-to-global store in code both
-    halves can reach, and audit the rest for the same shape: it is silent on
-    both sides.
+46. State a count in the unit the call means, for a type whose `sizeof` lies.
+    Six rounds of elimination on an INT4 store that landed at offset zero and
+    nowhere else -- the arithmetic, the write mechanism, the declared buffer
+    length, the cross-pipe events, where the base was computed, the alignment
+    -- and what fixed it was `DataCopyPad` with an explicit byte count in
+    place of `DataCopy` with an element count. `int4b_t` has a `sizeof` of one
+    and four bits of data, so every length in a sub-byte path is a two-times
+    trap: a store of 2048 elements writing 2048 bytes overruns the next tile
+    and spills 1024 bytes past the region, which is exactly the duplicate that
+    appeared 6144 bytes in and again 6144 further on. Give such calls bytes,
+    not elements, and read back the raw bytes at both candidate offsets before
+    believing any of it -- the readback was the one link this elimination list
+    never checked.
