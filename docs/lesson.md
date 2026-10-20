@@ -445,3 +445,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     kernel can absorb is downstream of the routing: the gather the dispatch
     materialises, and the weighted unpermuted sum the combine performs. Read
     the caller's dataflow before deciding what is adjacent.
+
+56. Debug at the smallest configuration that still reproduces, not at the
+    production one. Eleven sixteen-rank arms returned `aclshmem init returned
+    -4` and nothing else, across four sessions. A two-rank harness with no
+    engine found the cause on its first run -- a `TypeError` in my own device
+    binding, printed plainly -- and a sixteen-rank one then came up correctly
+    while another tenant held two of the dies, which settled that neither the
+    SDK nor the rank count was ever at fault. An arm costs twenty minutes,
+    buries tracebacks in `launch.log`, and collapses several causes into one
+    returned code; the harness costs a minute and prints them. The rule is not
+    "prefer small experiments" but something sharper: a configuration that
+    cannot show you the error is not a place to look for it.
