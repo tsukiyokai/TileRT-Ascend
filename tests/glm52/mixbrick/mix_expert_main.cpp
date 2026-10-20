@@ -27,7 +27,7 @@ constexpr int64_t HIDDEN = 6144;
 constexpr int64_t HALF = 128;
 constexpr int64_t GATE_UP = 2 * HALF;
 constexpr size_t TILING_BYTES = 256;
-constexpr uint32_t BLOCK_DIM = 1;
+constexpr int64_t HALF_CHANNELS = 128;
 
 void Check(aclError status, const char* what)
 {
@@ -65,10 +65,12 @@ int main(int argc, char** argv)
     // tells you nothing unless you can run one side of it.
     const int arm = (argc > 5) ? std::atoi(argv[5]) : 0;
     const int stages = (argc > 6) ? std::atoi(argv[6]) : 7;
+    const uint32_t blocks = (argc > 7) ? std::atoi(argv[7]) : 4;
 
     std::vector<uint8_t> tiling_host(TILING_BYTES, 0);
-    const int tiling_status = mix_build_tiling(static_cast<int>(rows),
-                                               tiling_host.data());
+    const int tiling_status = mix_build_tiling(
+        static_cast<int>(rows),
+        static_cast<int>(HALF_CHANNELS / blocks), tiling_host.data());
     if (tiling_status != 0) {
         std::printf("mix_build_tiling returned %d\n", tiling_status);
         return 1;
@@ -91,7 +93,7 @@ int main(int argc, char** argv)
     std::vector<int8_t> x_host(rows * HIDDEN);
     std::vector<int8_t> weight_host(GATE_UP * HIDDEN);
     std::vector<float> scale_host(GATE_UP);
-    std::vector<float> token_host(rows);
+    std::vector<float> token_host(32, 0.0F);
     for (int64_t index = 0; index < rows * HIDDEN; ++index) {
         x_host[index] = static_cast<int8_t>((index % 37) - 18);
     }
@@ -120,7 +122,7 @@ int main(int argc, char** argv)
                       ACL_MEM_MALLOC_HUGE_FIRST), "partial");
     Check(aclrtMalloc(&scale, GATE_UP * sizeof(float),
                       ACL_MEM_MALLOC_HUGE_FIRST), "scale");
-    Check(aclrtMalloc(&token, rows * sizeof(float),
+    Check(aclrtMalloc(&token, 32 * sizeof(float),
                       ACL_MEM_MALLOC_HUGE_FIRST), "token");
     Check(aclrtMalloc(&fused_out, rows * HALF * sizeof(uint16_t),
                       ACL_MEM_MALLOC_HUGE_FIRST), "fused out");
@@ -137,8 +139,8 @@ int main(int argc, char** argv)
     Check(aclrtMemcpy(scale, GATE_UP * sizeof(float), scale_host.data(),
                       GATE_UP * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE),
           "upload scale");
-    Check(aclrtMemcpy(token, rows * sizeof(float), token_host.data(),
-                      rows * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE),
+    Check(aclrtMemcpy(token, 32 * sizeof(float), token_host.data(),
+                      32 * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE),
           "upload token");
     Check(aclrtMemcpy(tiling, TILING_BYTES, tiling_host.data(), TILING_BYTES,
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload tiling");
@@ -146,7 +148,7 @@ int main(int argc, char** argv)
     if (arm != 2) {
         std::printf("staged launching\n");
         std::fflush(stdout);
-        mix_expert_staged_launch(BLOCK_DIM, stream, sync_base, x, weight,
+        mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                  partial, (float*)scale, (float*)token,
                                  staged_out, tiling, rows);
         Check(aclrtSynchronizeStream(stream), "staged once");
@@ -156,7 +158,7 @@ int main(int argc, char** argv)
     if (arm != 1) {
         std::printf("fused launching\n");
         std::fflush(stdout);
-        mix_expert_fused_launch(BLOCK_DIM, stream, sync_base, x, weight,
+        mix_expert_fused_launch(blocks, stream, sync_base, x, weight,
                                 partial, (float*)scale, (float*)token,
                                 fused_out, tiling, rows, stages);
         Check(aclrtSynchronizeStream(stream), "fused once");
@@ -177,6 +179,37 @@ int main(int argc, char** argv)
                       ACL_MEMCPY_DEVICE_TO_HOST), "download fused");
     Check(aclrtMemcpy(staged_host.data(), out_bytes, staged_out, out_bytes,
                       ACL_MEMCPY_DEVICE_TO_HOST), "download staged");
+
+    // Check the INT32 product itself before the activation reads it: a
+    // matmul that lands in the wrong place and a vector stage that reads the
+    // wrong place look identical in the output.
+    std::vector<int32_t> product_host(rows * GATE_UP);
+    Check(aclrtMemcpy(product_host.data(), rows * GATE_UP * sizeof(int32_t),
+                      partial, rows * GATE_UP * sizeof(int32_t),
+                      ACL_MEMCPY_DEVICE_TO_HOST), "download partial");
+    int64_t wrong_product = 0;
+    int64_t first_wrong_row = -1;
+    int64_t first_wrong_column = -1;
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t column = 0; column < GATE_UP; ++column) {
+            int32_t want = 0;
+            for (int64_t inner = 0; inner < HIDDEN; ++inner) {
+                want += x_host[row * HIDDEN + inner]
+                        * weight_host[column * HIDDEN + inner];
+            }
+            if (product_host[row * GATE_UP + column] != want) {
+                if (first_wrong_row < 0) {
+                    first_wrong_row = row;
+                    first_wrong_column = column;
+                }
+                ++wrong_product;
+            }
+        }
+    }
+    std::printf("INT32 product: %lld of %lld differ, first at row %lld "
+                "column %lld\n", (long long)wrong_product,
+                (long long)(rows * GATE_UP), (long long)first_wrong_row,
+                (long long)first_wrong_column);
 
     int64_t wrong_reference = 0;
     int64_t wrong_arms = 0;
@@ -202,12 +235,18 @@ int main(int argc, char** argv)
             // BF16 is agreement; the INT32 product before it is exact.
             const int32_t slack = static_cast<int32_t>(fused_host[index])
                                   - static_cast<int32_t>(rounded);
-            wrong_reference += (slack > 1 || slack < -1);
+            const bool off = (slack > 1 || slack < -1);
+            if (off && wrong_reference < 6) {
+                std::printf("  wrong at row %lld column %lld: got %u "
+                            "want %u\n", (long long)row, (long long)column,
+                            fused_host[index], rounded);
+            }
+            wrong_reference += off;
             wrong_arms += (fused_host[index] != staged_host[index]);
         }
     }
     std::printf("rows %lld  blocks %u  tiling %d\n", (long long)rows,
-                BLOCK_DIM, tiling_status);
+                blocks, tiling_status);
     std::printf("fused against host reference, 1 ulp allowed: %lld of %lld\n",
                 (long long)wrong_reference, (long long)(rows * HALF));
     std::printf("fused against staged arm, exact:             %lld of %lld\n",
@@ -218,7 +257,7 @@ int main(int argc, char** argv)
         timespec end;
         clock_gettime(CLOCK_MONOTONIC, &begin);
         for (int step = 0; step < repeats; ++step) {
-            mix_expert_fused_launch(BLOCK_DIM, stream, sync_base, x, weight,
+            mix_expert_fused_launch(blocks, stream, sync_base, x, weight,
                                     partial, (float*)scale, (float*)token,
                                     fused_out, tiling, rows, stages);
         }
@@ -228,7 +267,7 @@ int main(int argc, char** argv)
 
         clock_gettime(CLOCK_MONOTONIC, &begin);
         for (int step = 0; step < repeats; ++step) {
-            mix_expert_staged_launch(BLOCK_DIM, stream, sync_base, x, weight,
+            mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                      partial, (float*)scale, (float*)token,
                                      staged_out, tiling, rows);
         }

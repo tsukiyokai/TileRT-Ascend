@@ -15,7 +15,7 @@ constexpr int32_t HIDDEN = 6144;
 
 }  // namespace
 
-extern "C" int mix_build_tiling(int rows, void* buffer)
+extern "C" int mix_build_tiling(int rows, int channels, void* buffer)
 {
     matmul_tiling::MatmulApiTiling tiling;
     tiling.SetAType(matmul_tiling::TPosition::GM,
@@ -27,7 +27,9 @@ extern "C" int mix_build_tiling(int rows, void* buffer)
     tiling.SetCType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
                     matmul_tiling::DataType::DT_INT32);
-    tiling.SetShape(rows, GATE_UP, HIDDEN);
+    // A block projects one contiguous run of channels at a time; the full
+    // 256-wide shape is what the strides are against.
+    tiling.SetShape(rows, channels, HIDDEN);
     tiling.SetOrgShape(rows, GATE_UP, HIDDEN);
     tiling.SetBias(false);
     tiling.SetBufferSpace(-1, -1, -1);

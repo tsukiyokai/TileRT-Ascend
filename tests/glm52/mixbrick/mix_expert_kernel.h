@@ -15,6 +15,6 @@ void mix_expert_staged_launch(uint32_t blocks, void* stream,
                               int64_t rows);
 
 /** Fill a 200-byte buffer with the cube tiling for this row count. */
-extern "C" int mix_build_tiling(int rows, void* buffer);
+extern "C" int mix_build_tiling(int rows, int channels, void* buffer);
 
 #endif

@@ -206,3 +206,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     runtime log's `schemMode` field shows. `synccheck` reports at kernel exit,
     so it is silent on a hang; a stage bitmask on the kernel argument
     localises one in four runs. [debug.md](debug.md).
+
+36. Check the intermediate, not the output. An INT32 product that verifies
+    against a host reference every run while the output is wrong on a
+    different set of rows each time says the producer is right and the
+    consumer reads early -- and it took the product check to see that, because
+    a matmul landing in the wrong place and a vector stage reading the wrong
+    place are indistinguishable downstream. Two defects hid there: a channel
+    range derived from `GetBlockIdx`, which does not mean the same thing on
+    the two halves of a MIX kernel, and a scalar read of global memory from a
+    vector core, which the mixed-core barrier does not cover. And the test
+    that matters for a sync bug is whether removing the sync changes anything:
+    the same error distribution with and without the flag proves it was never
+    ordering. [Evidence](evidence/ascend-decode/mixbrick-20261020/README.md).

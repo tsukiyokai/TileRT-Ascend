@@ -73,6 +73,59 @@ That instrument is cheaper than every tool in [debug.md](../../debug.md) and
 should be reached for first. `synccheck` reports at kernel exit and is silent
 on a hang; `msdebug` segfaults on `breakpoint set --name` followed by `run`.
 
+## The channel split, and a race it exposed
+
+Splitting the 256-wide axis across blocks takes 8 rows from 28.182 µs at one
+block to 14.175 at four and 14.140 at eight — 2x, and at parity with the
+vendor's own two operators for the same work (`QuantBatchMatmulV3` 11.661 plus
+`DequantSwigluQuant` 3.140 = 14.80 µs) while being one kernel instead of two.
+Each block projects its own run of channels twice, once inside each half, so
+SwiGLU's gate `i` and up `i` stay on one core and no weight permutation is
+needed. [raw](split.txt)
+
+Two defects came out of it, both found by checking the INT32 product in
+`partial` directly against a host reference rather than only the output: a
+matmul that lands in the wrong place and a vector stage that reads the wrong
+place are indistinguishable downstream.
+
+`GetBlockIdx` and `GetBlockNum` do not agree across the halves — the cube sees
+`blocks` of them, the vector side two per cube block. A channel range derived
+from either directly gives the two halves different answers, and the columns
+one half wrote the other never read; they read back as zeros in exactly the
+slices the odd blocks owned. `GetBlockIdx() * blocks / GetBlockNum()` maps
+both onto the cube's numbering.
+
+And a scalar read of global memory from a vector core is not covered by the
+mixed-core barrier. `token_scale` read as zero for every row but the first,
+which showed as a zeroed output while the product verified. Staging it into
+UB first fixes the common case.
+
+## The flag orders nothing, and that is where this stops
+
+The brick is not yet reliable. Across identical runs the error count is 0,
+256, 288, 448, 448, 896 of 1024, and the INT32 product in `partial` verifies
+every single time — so the cube writes the right values and the vector half
+reads some of them before they arrive.
+
+One experiment settles what it is not. Running with the cross-core flag
+disabled gives 448, 448, 0; running with it gives 288, 448, 896. **The same
+distribution either way: the flag is establishing no order at all.** It does
+block — a wait with no set hangs — so it is a semaphore that releases without
+publishing.
+
+Already tried and insufficient, in this order: `PipeBarrier<PIPE_ALL>()` after
+the projections and before the set; the same after the wait;
+`DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
+DcciDst::CACHELINE_OUT>` on both sides, which is the spelling
+`distribute_barrier.h` uses and whose implementation is gated on
+`__NPU_ARCH__ == 2201`; and `SetFlag`/`WaitFlag<HardEvent::MTE2_S>` before the
+scalar read.
+
+So the handshake needs to be something other than a bare
+`CrossCoreSetFlag<0x02, PIPE_FIX>` plus `CrossCoreWaitFlag`, and the next
+change is to find out what the working hand-written kernels actually use
+rather than to try a fifth barrier.
+
 ## What it is not yet
 
 `BLOCK_DIM` is 1, so one cube core pulls the whole 1.57 MB of gate-and-up
