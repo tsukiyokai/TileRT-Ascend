@@ -50,3 +50,23 @@ every operator with a tiling meant for 64 rows while only a few carry data --
 and the cost would then be the tiling's, not the rows'. The test is to capture
 at one width and compare against capturing at another with the same data, which
 the queued width arms do end to end and a synthetic graph can do on one die.
+
+## The multi-size capture's memory cost
+
+Eight layers a graph, five sizes captured and held together on one die:
+
+    size   reserved MiB   delta MiB
+       2          116.0         22.0
+       4          136.0         20.0
+       8          156.0         20.0
+      16          176.0         20.0
+      24          196.0         20.0
+
+About 20 MiB a size for eight layers, so roughly 195 MiB a size at 78 -- and
+the increment does not depend on the size, which says the cost is the task list
+rather than any data, consistent with the row cost being capture's.
+
+Five sizes at the engine's depth is about 1 GiB against the 48 GiB a rank holds
+at 0.78 utilisation with the model taking 17. So the lever cannot fail for
+memory, and the configuration caps the list at the requested width -- {2, 4, 8,
+16, 24} at width 24.

@@ -1242,3 +1242,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      accepted by budget 64, exactly what 2.9 ms needs, so the only thing
      between recall and the target is 64 rows at 0.66 ms each. At 0.10 it is
      2.72 ms; at zero, 2.24.
+
+126. Several captured graph sizes cost about 195 MiB each at 78 layers, and the
+     increment does not depend on the size. Five sizes is about 1 GiB against
+     the 48 GiB a rank holds, so capturing a list where the engine captured one
+     cannot fail for memory -- which was the risk that would have killed the
+     arm in the queue without answering anything. That the increment is flat in
+     the size is itself evidence: the cost is the task list, not the data,
+     which is the same thing the row cost turned out to be.
