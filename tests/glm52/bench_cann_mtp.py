@@ -51,6 +51,12 @@ class MeasuredRank(CannRankEngine):
         self.requests = []
         self.current = None
 
+
+    @property
+    def draft_position(self):
+        """The draft engine's position, or None when there is no engine."""
+        return None if self.draft is None else self.draft.position
+
     def inject(self, prefix):
         import torch
         import torch.distributed as distributed
@@ -59,7 +65,7 @@ class MeasuredRank(CannRankEngine):
         torch.npu.synchronize(self.target.device)
         distributed.barrier(group=self.group)
         self.current = {
-            "injected": [self.position, self.draft.position],
+            "injected": [self.position, self.draft_position],
             "first_token": self.first_token_id, "rounds": [],
         }
         self.requests.append(self.current)
@@ -78,18 +84,18 @@ class MeasuredRank(CannRankEngine):
             "matched_drafts": commit.matched_drafts,
             "before": commit.main.before, "written": commit.main.written,
             "retained": commit.main.retained,
-            "draft_retained": self.draft.position,
+            "draft_retained": self.draft_position,
         })
         return result
 
     def finish_mtp(self, retained_position):
         super().finish_mtp(retained_position)
-        self.current["finished"] = [self.position, self.draft.position]
+        self.current["finished"] = [self.position, self.draft_position]
 
     def reset(self):
         super().reset()
         if self.current is not None:
-            self.current["reset"] = [self.position, self.draft.position]
+            self.current["reset"] = [self.position, self.draft_position]
             self.current = None
 
 
