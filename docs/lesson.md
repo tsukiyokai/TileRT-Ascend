@@ -480,3 +480,20 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     ms of host issue, not the 36 ms residual I had assigned to "issue and
     synchronisation". The cost is in the drain, which grows with the launch
     count like a queue rather than sitting still like a fixed cost.
+
+59. On 187 a container is destroyed a few minutes after it starts, and
+    `docker events` is the only thing that says so. Three hours of its event
+    stream show four `destroy` actions: my `trt-asc` twice and the other
+    tenant's `505bvl_omni_c_c0` and `505bvl_omni_d_d0` once each, so the
+    reaper is indiscriminate rather than aimed at me. The arm launched at
+    22:29:29 was killed and destroyed at 22:33:14 -- three minutes
+    forty-five. `docker ps -a` shows nothing afterwards, which is why every
+    earlier instance looked like a mystery: a destroyed container leaves no
+    exit code to read. a3-84's container runs for days, so the reaper is that
+    host's and not the fleet's.
+    It reattributes four failures I had explained otherwise -- an NFS prefetch
+    storm, host memory exhaustion, and my own `docker rm -f` inside a
+    diagnostic (that one was real) -- and it fixes the division of labour:
+    whole-machine arms belong on a3-84, and 187 is for single-die probes that
+    finish inside a minute. Every single-die measurement today ran there
+    without once hitting it.
