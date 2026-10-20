@@ -142,6 +142,12 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
             # 47 GiB a die and waits for the machine to empty.
             **({"num_hidden_layers": layers} if layers else {}),
         },
+        # Random weights, for an arm that measures timing rather than output.
+        # A truncated backbone cannot load the real checkpoint: the loader
+        # walks every tensor the index lists and raises on the first layer the
+        # model does not have, and `is_pp_missing_parameter` does not cover it
+        # at one pipeline stage.
+        load_format="dummy" if layers else "auto",
         kv_cache_dtype="auto", block_size=PAGE_SIZE,
         # AscendCompiler filters static token buckets by this sequence limit.
         max_num_seqs=max(4, graph_width) if super_kernel else 1,
