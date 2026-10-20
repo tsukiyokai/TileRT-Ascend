@@ -43,11 +43,30 @@ to 4.547 and the cheaper round does not pay for it.
 So the gain is not from drafting longer. It is from matching better, and once
 the match is better the cheapest width that still carries it wins.
 
-## What this does not yet separate
+## The control, which moves most of the credit to the width
 
-The baseline is `chain8` at width 32, so this pairing confounds the drafter
-with the width. A `chain8` arm at width 16 is the control that splits them,
-and it has not run yet.
+    arm                     tpot_min  rounds  accepted   round
+    chain8           w32     11.2312     194     5.273  63.869 ms
+    chain8           w16      9.8913     206     4.966  52.742 ms
+    automaton         w8     10.6425     225     4.547  52.787 ms
+    automaton        w12      9.3794     188     5.441  55.424 ms
+    automaton        w16      9.6360     183     5.590  58.588 ms
+    automaton        w32     10.8510     169     6.053  72.066 ms
+
+Narrowing `chain8` from 32 to 16 is worth 11.2312 to 9.8913 on its own. So
+the original baseline's width was simply a bad operating point: going from 16
+to 32 costs 63.869 against 52.742 in round time and buys only 4.966 to 5.273
+in acceptance, which does not pay. Most of the 14.2% I attributed to the
+drafter was the width.
+
+The drafter's own contribution is what is left at equal width: 9.636 against
+9.8913 at width 16, 2.6%. Taken together, 11.2312 to 9.3794 is 16.5%, of
+which about 12 points are the width and about 3 to 5 the drafter.
+
+Width 12 beats 16 for the same reason width 16 beats 32: acceptance 5.441
+against 5.590 is a small loss and 55.424 against 58.588 is a larger gain. The
+optimum is interior -- 8 loses too much acceptance at 4.547, 32 costs too much
+round at 72.066 -- so it is a real extremum rather than an edge.
 
 ## On the label
 
