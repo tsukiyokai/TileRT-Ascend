@@ -1366,3 +1366,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      continuations by frequency where the oracle picks the occurrence that
      extends furthest, and an edit is exactly where a frequent short
      continuation sits beside a rare long one. The dead fallback is reverted.
+
+139. The copy oracle is a bound, not a better drafter. Two attempts to close
+     the tree's 31 percent gap to it both failed, and for one reason: the
+     oracle ranks occurrences by how far the continuation will extend, which is
+     a fact about the future, and the automaton stores the past. Its state
+     `length` is how far the match has already come, so ranking by it measured
+     4.977 against frequency's 5.578 on twelve streams -- ten percent worse.
+     The root fallback failed earlier because a match always exists. So the gap
+     is information unavailable at drafting time, and the oracle's 4.18 ms is a
+     bound to measure against rather than a target to reach.

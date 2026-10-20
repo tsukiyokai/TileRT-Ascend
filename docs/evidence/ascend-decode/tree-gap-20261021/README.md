@@ -64,3 +64,27 @@ pre-edit text is frequent, the post-edit continuation is not.
 The change to test is therefore ranking by extendable length rather than by
 frequency, over the same occurrence set the automaton already holds. The code
 is reverted meanwhile, since an unfired fallback is dead code.
+
+## Ranking by extendable length is worse, and that settles what the oracle is
+
+    ranked by frequency   mean 5.578   min 2.169   max 6.649
+    ranked by length      mean 4.977   min 2.044   max 5.919
+
+Ten percent worse, on all twelve streams. The reason is what `length` means: a
+state's `length` is the longest substring its equivalence class represents --
+how far the match has already come, not how far the continuation will go. The
+automaton stores the past; the oracle's criterion is about the future.
+
+So the oracle's advantage cannot be reproduced from any quantity the automaton
+holds, because it comes from comparing against the answer. It is an upper bound,
+not a better drafter.
+
+That re-characterises the 31 percent: it is not a ranking mistake to fix, it is
+information unavailable at drafting time. Two attempts to close it have now
+failed for the same underlying reason -- the root fallback never fired because a
+match always exists, and length-ranking lost because length is backward-looking.
+
+What remains available on the drafting side is the ordering already measured --
+lookup 4.147, automaton 4.650, tree 5.044 across twelve streams -- and the
+budget optimum of 16 to 24. The copy oracle's 4.18 ms stays a bound rather than
+a target.
