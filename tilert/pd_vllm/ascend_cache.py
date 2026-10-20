@@ -205,6 +205,10 @@ class AscendRankEngine:
         # broadcast.
         self.lookup_prompt = lookup_prompt
         self.lookup_min_ngram = lookup_min_ngram
+        # Set by a caller that wants the round's steps timed; a round measures
+        # 50.7 ms where its super kernels account for 16.4, and the record had
+        # no account of the rest.
+        self.round_phases = None
         self.lookup_automaton = lookup_automaton
         self.lookup_tree = lookup_tree
         self._clear_request()
@@ -277,6 +281,7 @@ class AscendRankEngine:
             drafter.commit((first_token,))
         rounds = MtpRoundExecutor(
             self.target, self.draft, width, max_tokens, eos_tokens, drafter,
+            phases=self.round_phases,
         )
         rounds.start(first_token, self.parent_hidden)
         if rounds.state.finish_reason is not None:

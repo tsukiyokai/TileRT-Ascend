@@ -203,6 +203,8 @@ def arguments():
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0,1]")
     return args
+    parser.add_argument("--round-phases", action="store_true",
+                        help="time each step of a round on the host")
     parser.add_argument("--ai-cpu-collectives", action="store_true",
                         help="expand collectives on the device AI CPU, which "
                              "is A3's default and 1.6 to 1.9x slower at "
@@ -498,6 +500,11 @@ def run(args, report):
                 # computed. The guarantee is untouched: start_mtp still
                 # compares against what inject produced.
                 opening = (engine.first_token_id if args.layers else first)
+                if args.round_phases:
+                    from tilert.models.glm_5_2_ascend.round_phases import (
+                        RoundPhases)
+
+                    engine.round_phases = RoundPhases()
                 engine.start_mtp(opening, args.max_tokens,
                                  args.width, ())
                 engine.advance_mtp()
@@ -683,6 +690,8 @@ def run(args, report):
                     (1 if args.lookup_unigram else 2) if args.lookup else None
                 ),
                 "target_graph": args.target_graph,
+                "round_phases": (engine.round_phases.report()
+                                 if engine.round_phases is not None else None),
                 "draft_graph": args.draft_graph,
                 "conditioned_graph": args.conditioned_graph,
                 "draft_projection_tp": args.draft_projection_tp,

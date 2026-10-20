@@ -37,7 +37,7 @@ class MtpRoundExecutor:
 
     def __init__(
         self, target, draft, width=4, max_new_tokens=1024, eos_tokens=(),
-        drafter=None,
+        drafter=None, phases=None,
     ):
         if width not in (2, 4, 6, 8, 12, 16, 24, 32):
             raise ValueError("MTP rounds require width 2, 4, 8 or 16")
@@ -45,6 +45,8 @@ class MtpRoundExecutor:
             raise ValueError("Main and MTP cache capacities must match")
         self.target = target
         self.draft = draft
+        # None unless a caller wants the round's steps timed.
+        self.phases = phases
         # A host drafter replaces the MTP engine outright: no chain, no
         # conditioned pass, and the MTP cache is never written, so nothing may
         # read it while one is installed.
@@ -97,6 +99,8 @@ class MtpRoundExecutor:
         if self.target.position != self.state.main_length:
             raise ValueError("Engine lengths differ from the MTP state")
         if self.drafter is not None:
+            if self.phases is not None:
+                self.phases.begin()
             return self._advance_drafted(self.state.begin())
         if self.draft.position != self.state.draft_length:
             raise ValueError("Engine lengths differ from the MTP state")
@@ -188,16 +192,27 @@ class MtpRoundExecutor:
             tree = getattr(self.drafter, "propose_tree", None)
             if tree is not None:
                 return self._advance_tree(plan, tree)
+            # A round measures 50.7 ms where its 78 super kernels account for
+            # 16.4, so the step timings are what the record was missing.
+            mark = self.phases.mark if self.phases is not None else None
             proposal = self.drafter.propose(plan.width - 1)
+            if mark:
+                mark("propose")
             candidates = [plan.pending_token, *proposal[:plan.width - 1]]
             candidates += [plan.pending_token] * (plan.width - len(candidates))
             verified = self.target.verify(candidates, full_logits=False)
+            if mark:
+                mark("verify")
             proposals, predictions = self.target.host_tokens(
                 candidates, verified.token_ids,
             )
+            if mark:
+                mark("host_tokens")
             commit = self.state.resolve(plan, proposals, predictions)
             self.target.truncate(commit.main.retained)
             self.drafter.commit(commit.accepted_tokens)
+            if mark:
+                mark("resolve")
             return ExecutedRound(proposals, predictions, commit)
         except Exception:
             self.failed = True
