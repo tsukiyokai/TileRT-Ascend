@@ -423,10 +423,15 @@ class CannModel:
                 raise ValueError(f"Unexpected KV specification: {spec}")
             caches[name] = values
             groups.setdefault((builder_type, spec), []).append(name)
-        if main_layers != set(range(78)) or index_layers != {
-            layer for layer in FULL_INDEX_LAYERS if layer < 78
-        }:
-            raise ValueError("Expected 78 main and 21 indexer cache layers")
+        # Against the backbone's own depth, not a literal 78: a truncated
+        # backbone binds fewer caches and the check's intent is that every
+        # layer the model has is bound, not that the model has 78.
+        depth = self.config.model_config.hf_config.num_hidden_layers
+        wanted_index = {layer for layer in FULL_INDEX_LAYERS if layer < depth}
+        if main_layers != set(range(depth)) or index_layers != wanted_index:
+            raise ValueError(
+                f"Expected {depth} main and {len(wanted_index)} indexer cache "
+                f"layers, found {len(main_layers)} and {len(index_layers)}")
         bind_kv_cache_to_layers(
             caches, self.config.compilation_config.static_forward_context,
         )
