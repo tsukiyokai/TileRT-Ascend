@@ -27,6 +27,8 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "acl/acl.h"
@@ -48,6 +50,9 @@ constexpr int64_t SCALE_STRIDE = (ROWS + BLOCK_FLOATS - 1)
 constexpr int64_t TILE_BYTES = 2048 / 2;
 constexpr size_t TILING_BYTES = 256;
 constexpr size_t MATMUL_WORKSPACE = 16u << 20;
+// What the kernel copies in one go, so what the caller must provide.
+constexpr int64_t MAX_EXPERTS = 256;
+constexpr int64_t MAX_TAKEN = 32 * 8;
 
 /** The sync base, the tilings and the scratch, built once.
  *
@@ -79,6 +84,13 @@ class Resident {
  private:
     explicit Resident(int64_t experts)
     {
+        // A probe switch: allocate for a fixed count whatever is asked, so
+        // that the size and the walked range can be varied independently.
+        // Ninety-six experts fault where eighty do not, at every block count,
+        // and the only quantity that tracks that is the scratch size.
+        if (std::getenv("TILERT_FIXED_SCRATCH") != nullptr) {
+            experts = 256;
+        }
         uint32_t length = 0;
         TORCH_CHECK(rtGetC2cCtrlAddr(&sync_base_, &length) == 0,
                     "rtGetC2cCtrlAddr failed");
@@ -91,7 +103,13 @@ class Resident {
         middle_scale_ = static_cast<float*>(
             Hold(experts * SCALE_STRIDE * sizeof(float)));
         wide_ = Hold(experts * M_TILE * HIDDEN * sizeof(int32_t));
-        witness_ = Hold(experts * TILE_BYTES);
+        // One tile an expert, and one tile of slack. The kernel steps this
+        // by `TILE` INT4 codes an expert, which is `TILE_BYTES`, so the last
+        // expert's write ends exactly at `experts * TILE_BYTES` -- flush
+        // against the allocation. Eighty experts survived that and
+        // ninety-six did not, which is what a write that is only just inside
+        // its mapping looks like.
+        witness_ = Hold((experts + 1) * TILE_BYTES);
         workspace_ = Hold(MATMUL_WORKSPACE);
     }
 
@@ -100,6 +118,10 @@ class Resident {
         void* block = nullptr;
         TORCH_CHECK(aclrtMalloc(&block, bytes, ACL_MEM_MALLOC_HUGE_FIRST)
                     == ACL_SUCCESS, "aclrtMalloc failed for ", bytes);
+        if (std::getenv("TILERT_SHOW_SCRATCH") != nullptr) {
+            std::printf("scratch %12zu bytes at %p\n", bytes, block);
+            std::fflush(stdout);
+        }
         return block;
     }
 
@@ -158,7 +180,9 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
                          const at::Tensor& down_scale,
                          const at::Tensor& token_scale,
                          const at::Tensor& group_count,
-                         const at::Tensor& group_start, int64_t experts,
+                         const at::Tensor& group_start,
+                         const at::Tensor& source_row,
+                         const at::Tensor& row_weight, int64_t experts,
                          int64_t blocks)
 {
     TORCH_CHECK(rows.dtype() == at::kChar, "rows must be INT8");
@@ -169,7 +193,22 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
 
     TORCH_CHECK(group_count.dtype() == at::kInt, "group_count must be INT32");
     TORCH_CHECK(group_start.dtype() == at::kInt, "group_start must be INT32");
-    at::Tensor out = at::empty({rows.size(0), HIDDEN},
+    // The kernel reads the whole list in one copy, so it must be the whole
+    // list. Handing it a shorter one reads past the allocation, and the
+    // over-read only faults once it crosses a block boundary -- eighty
+    // experts passed where ninety-six reported "the GM address accessed by
+    // scalar exceeds 48 bits".
+    TORCH_CHECK(group_count.numel() == MAX_EXPERTS, "group_count must hold ",
+                MAX_EXPERTS, " entries, got ", group_count.numel());
+    TORCH_CHECK(group_start.numel() == MAX_EXPERTS, "group_start must hold ",
+                MAX_EXPERTS, " entries, got ", group_start.numel());
+    TORCH_CHECK(source_row.numel() == MAX_TAKEN, "source_row must hold ",
+                MAX_TAKEN, " entries, got ", source_row.numel());
+    TORCH_CHECK(row_weight.numel() == MAX_TAKEN, "row_weight must hold ",
+                MAX_TAKEN, " entries, got ", row_weight.numel());
+    // One row a token, not one a (expert, row) pair: the kernel adds the
+    // eight experts a token visits into the same row.
+    at::Tensor out = at::zeros({row_weight.size(0) / 8, HIDDEN},
                                rows.options().dtype(at::kBFloat16));
     Resident& held = Resident::Instance(experts);
     routed_int4_launch(
@@ -181,8 +220,9 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
         token_scale.data_ptr<float>(), held.partial(), held.middle(),
         held.middle_scale(), held.wide(), out.data_ptr(),
         held.gate_up_tiling(), held.down_tiling(), held.witness(),
-        group_count.data_ptr(), group_start.data_ptr(), held.workspace(),
-        experts);
+        group_count.data_ptr(), group_start.data_ptr(),
+        source_row.data_ptr(), row_weight.data_ptr<float>(),
+        held.workspace(), experts);
     return out;
 }
 
@@ -194,7 +234,8 @@ TORCH_LIBRARY(tilert, library)
         "routed_experts(Tensor rows, Tensor gate_up, Tensor gu_bias, "
         "Tensor gu_scale, Tensor down, Tensor down_bias, Tensor down_scale, "
         "Tensor token_scale, Tensor group_count, Tensor group_start, "
-        "int experts, int blocks) -> Tensor");
+        "Tensor source_row, Tensor row_weight, int experts, int blocks) "
+        "-> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(tilert, PrivateUse1, library)

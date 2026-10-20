@@ -538,3 +538,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     each could be made to sound right. The rule: when a threshold is stable,
     find the one quantity that tracks it by holding the others, and do that
     before the first explanation rather than after the tenth.
+
+63. The comment in the file was about the half I did not apply it to. `TPipe`
+    hands out buffers cumulatively, and this kernel already said so -- in a
+    comment written after that mistake had cost a debugging session on the
+    vector workspace. The cube half constructs a `Matmul` and calls
+    `Init(&cube, &pipe)` on the same pipe, twice a round, and the sixth round
+    is where ten instantiations become twelve and it runs out: "the GM address
+    accessed by scalar exceeds 48 bits", at any expert count, any block count,
+    on both machines, and unmoved by replacing the cross-core flags with grid
+    barriers. Hoisting the two matmuls to one construction a launch lifts the
+    limit and the engine's own 256 experts over sixteen rounds then runs. Ten
+    hypotheses preceded it, nine of them arithmetic about buffer sizes. When a
+    file carries a hard-won comment about a resource, check every consumer of
+    that resource before looking anywhere else.

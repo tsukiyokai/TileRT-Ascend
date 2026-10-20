@@ -50,11 +50,37 @@ round sets two on each half, and nothing drains them between rounds. A counter
 that saturates after five rounds fits every observation, and nothing else
 tried does.
 
+## Settled: the TPipe, not the flags
+
+Replacing the paired flags with `SyncAll<false>()` grid barriers did not move
+the limit -- six rounds still faulted -- so the counted flags were not it
+either. What lifts it is constructing the two `Matmul` objects once a launch
+instead of once an expert:
+
+    experts  16 blocks 16 (rounds  1):  47.584 us
+    experts  16 blocks  4 (rounds  4): 113.460 us
+    experts  16 blocks  3 (rounds  6): 163.381 us
+    experts  16 blocks  2 (rounds  8): 212.101 us
+    experts  16 blocks  1 (rounds 16): 408.542 us
+    experts 256 blocks 16 (rounds 16): 583.396 us
+
+Every count that faulted now passes, including the engine's own shape: 256
+experts over sixteen blocks, output fully populated.
+
+`Project` constructed a `Matmul` and called `Init(&cube, &pipe)` on every
+call. `TPipe` hands out buffers cumulatively -- this file already says so
+about the vector workspace, in a comment written after that exact mistake --
+and the cube's `Init` takes its scratch from the same pipe. Two a round, so
+the sixth round is the eleventh and twelfth instantiation, and it runs out.
+
+The lesson that was already in the file applied to the half I had not thought
+to apply it to.
+
 ## What it settles
 
-The paired `CrossCoreSetFlag`/`WaitFlag` structure cannot serve 256 experts,
-so it has to be replaced by the grid barrier mixbrick uses -- `SyncAll<false>()`
-on flagIds 11, 12 and 13, outside the manually allocated range. That was
-already the conclusion from the shared-expert fold, which needed a grid
-barrier for the N-split. The two lines meet here, and this time the reason is
-a measured hard limit rather than a design preference.
+The kernel now serves 256 experts. The grid barriers went in anyway and stay:
+they put the synchronisation outside both halves' branches, which makes the
+empty-expert case structural rather than a convention to remember, and the
+shared-expert fold needs them for its N-split. But they were not what the
+round limit was about, and saying so is the point -- the barrier rewrite was
+the right change for the wrong reason.

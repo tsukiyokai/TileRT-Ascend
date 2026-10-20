@@ -45,6 +45,10 @@ constexpr int64_t M_TILE = 16;
 constexpr int64_t STRIDE = M_TILE / 2;
 // Every routed expert a rank holds; the group list carries one count each.
 constexpr int64_t MAX_EXPERTS = 256;
+// The widest round, and every (expert, row) assignment in it: a draft of
+// thirty-two at top eight.
+constexpr int64_t MAX_TOKENS = 32;
+constexpr int64_t MAX_TAKEN = MAX_TOKENS * 8;
 // The two INT4 halves of the activation, stacked.
 constexpr int64_t STACKED = 2 * STRIDE;
 constexpr int64_t SLACK = 64;
@@ -167,15 +171,22 @@ __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* tiling)
 }
 
 /** One INT4 projection at full width, both operands packed. */
-__aicore__ inline void Project(TPipe& pipe, __gm__ int4b_t* rows,
+/** One projection on a matmul that outlives the loop.
+ *
+ * Constructing a `Matmul` and calling `Init` once an expert exhausted
+ * something after five experts a block: the sixth faulted with "the GM
+ * address accessed by scalar exceeds 48 bits" at any expert count, any block
+ * count, on both machines, and with the cross-core flags replaced by grid
+ * barriers. `TPipe` hands out buffers cumulatively -- this file already
+ * records that for the vector workspace -- and `Init` takes the cube's
+ * scratch from the same pipe, so ten instantiations is what ran out.
+ */
+__aicore__ inline void Project(Matmul<APacked, BPacked, CProduct, BiasNone>& mm,
+                               __gm__ int4b_t* rows,
                                __gm__ int4b_t* weight,
                                __gm__ int32_t* product, int64_t columns,
                                int64_t inner, __gm__ uint8_t* tiling)
 {
-    TCubeTiling cube;
-    LoadTiling(cube, tiling);
-    Matmul<APacked, BPacked, CProduct, BiasNone> mm;
-    mm.Init(&cube, &pipe);
     GlobalTensor<int4b_t> a;
     GlobalTensor<int4b_t> b;
     GlobalTensor<int32_t> c;
@@ -221,6 +232,8 @@ struct Workspace {
     TBuf<TPosition::VECCALC> rowmax_buffer;
     TBuf<TPosition::VECCALC> group_buffer;
     TBuf<TPosition::VECCALC> start_buffer;
+    TBuf<TPosition::VECCALC> source_buffer;
+    TBuf<TPosition::VECCALC> weight_buffer;
     LocalTensor<int8_t> narrow;
     LocalTensor<float> value;
     LocalTensor<float> other;
@@ -236,6 +249,8 @@ struct Workspace {
     LocalTensor<float> rowmax;
     LocalTensor<int32_t> group;
     LocalTensor<int32_t> start;
+    LocalTensor<int32_t> source;
+    LocalTensor<float> weight;
 
     __aicore__ inline void Init(TPipe& pipe, int64_t span)
     {
@@ -271,6 +286,10 @@ struct Workspace {
         group = group_buffer.Get<int32_t>();
         pipe.InitBuffer(start_buffer, (MAX_EXPERTS + SLACK) * sizeof(int32_t));
         start = start_buffer.Get<int32_t>();
+        pipe.InitBuffer(source_buffer, (MAX_TAKEN + SLACK) * sizeof(int32_t));
+        source = source_buffer.Get<int32_t>();
+        pipe.InitBuffer(weight_buffer, (MAX_TAKEN + SLACK) * sizeof(float));
+        weight = weight_buffer.Get<float>();
     }
 };
 
@@ -344,13 +363,16 @@ __aicore__ inline void Emit(LocalTensor<half>& staging,
 __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
                              __gm__ int4b_t* stacked,
                              __gm__ int4b_t* stacked_low,
-                             __gm__ int4b_t* witness, int64_t rows_held)
+                             __gm__ int4b_t* witness, int64_t rows_held,
+                             int64_t taken_from)
 {
     GlobalTensor<int8_t> rows_global;
     GlobalTensor<int4b_t> high_global;
     GlobalTensor<int4b_t> low_global;
     GlobalTensor<int4b_t> witness_global;
-    rows_global.SetGlobalBuffer(rows, rows_held * HIDDEN);
+    // Every row of the unpermuted activation is reachable, because this
+    // expert's rows are scattered through it rather than contiguous.
+    rows_global.SetGlobalBuffer(rows, MAX_TOKENS * HIDDEN);
     high_global.SetGlobalBuffer(stacked, STRIDE * HIDDEN);
     // The low region's base comes in already offset. Deriving it here with a
     // cast produced a tensor whose writes never landed, while the identical
@@ -362,7 +384,9 @@ __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
         for (int64_t done = 0; done < HIDDEN; done += TILE) {
             const int64_t count = (HIDDEN - done < TILE) ? HIDDEN - done
                                                          : TILE;
-            DataCopy(held.narrow, rows_global[row * HIDDEN + done], count);
+            const int64_t source = held.source.GetValue(taken_from + row);
+            DataCopy(held.narrow, rows_global[source * HIDDEN + done],
+                     count);
             AfterLoad();
             Cast(held.half_value, held.narrow, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
@@ -521,8 +545,8 @@ __aicore__ inline void Activate(int64_t rows_held, Workspace& held,
 }
 
 /** Recombine and scale one expert's down product into BF16. */
-__aicore__ inline void Narrow(int64_t rows_held, Workspace& held,
-                              __gm__ int32_t* product,
+__aicore__ inline void Narrow(int64_t rows_held, int64_t taken_from,
+                              Workspace& held, __gm__ int32_t* product,
                               __gm__ float* down_bias,
                               __gm__ float* down_scale,
                               __gm__ float* middle_scale,
@@ -544,13 +568,15 @@ __aicore__ inline void Narrow(int64_t rows_held, Workspace& held,
     product_global.SetGlobalBuffer(product, M_TILE * HIDDEN);
     scale_global.SetGlobalBuffer(down_scale, HIDDEN);
     middle_global.SetGlobalBuffer(middle_scale, SCALE_SPAN);
-    out_global.SetGlobalBuffer(out, rows_held * HIDDEN);
+    out_global.SetGlobalBuffer(out, MAX_TOKENS * HIDDEN);
 
     DataCopy(row_scale, middle_global, SCALE_SPAN);
     AfterLoadForScalar();
 
     for (int64_t row = 0; row < rows_held; ++row) {
         const float of_row = row_scale.GetValue(row);
+        const int64_t token = held.source.GetValue(taken_from + row);
+        const float weight = held.weight.GetValue(taken_from + row);
         for (int64_t done = from; done < upto; done += TILE) {
             const int64_t count = (upto - done < TILE) ? upto - done : TILE;
             Combine(held.value, held.work, product_global, staging,
@@ -560,14 +586,19 @@ __aicore__ inline void Narrow(int64_t rows_held, Workspace& held,
             AfterLoad();
             Mul(held.value, held.value, scale, count);
             PipeBarrier<PIPE_V>();
-            Muls(held.value, held.value, of_row, count);
+            Muls(held.value, held.value, of_row * weight, count);
             PipeBarrier<PIPE_V>();
             Cast(narrow, held.value, RoundMode::CAST_RINT, count);
             BeforeStore();
-            DataCopyPad(out_global[row * HIDDEN + done], narrow,
+            // The eight experts a token visits write the same output row from
+            // different blocks, so the sum the combine used to take happens
+            // here instead.
+            SetAtomicAdd<bfloat16_t>();
+            DataCopyPad(out_global[token * HIDDEN + done], narrow,
                         DataCopyExtParams{
                             1, (uint32_t)(count * sizeof(bfloat16_t)), 0, 0,
                             0});
+            SetAtomicNone();
             AfterStore();
         }
     }
@@ -585,7 +616,8 @@ __aicore__ void routed_int4_fused(
     __gm__ float* middle_scale, __gm__ int32_t* wide, __gm__ bfloat16_t* out,
     __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling,
     __gm__ int4b_t* witness, __gm__ int32_t* group_count,
-    __gm__ int32_t* group_start, GM_ADDR workspace, int64_t experts,
+    __gm__ int32_t* group_start, __gm__ int32_t* source_row,
+    __gm__ float* row_weight, GM_ADDR workspace, int64_t experts,
     int64_t blocks)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -600,77 +632,94 @@ __aicore__ void routed_int4_fused(
     const int64_t per_block = (experts + blocks - 1) / blocks;
     TPipe pipe;
 
+    // One loop with the barriers at the top of it, rather than a loop a half
+    // with paired flags inside. The paired form cannot walk more than five
+    // experts a block -- six faults with "the GM address accessed by scalar
+    // exceeds 48 bits", at any expert count, any block count and on both
+    // machines -- because its flags are counted and nothing drains them
+    // between rounds. A rank holds 256 experts, so sixteen blocks walk
+    // sixteen rounds and the paired form cannot serve the engine at all.
+    //
+    // `SyncAll<false>()` is the three-way MIX barrier on flagIds 11 to 13,
+    // outside the manually allocated range, and it does not accumulate. It
+    // has to sit outside both halves' branches: every core must arrive even
+    // where its own stage does nothing, which also makes the empty-expert
+    // case structural rather than a convention to remember.
+    Workspace held;
+    Matmul<APacked, BPacked, CProduct, BiasNone> gate_mm;
+    Matmul<APacked, BPacked, CProduct, BiasNone> down_mm;
+    TCubeTiling gate_cube;
+    TCubeTiling down_cube;
     if ASCEND_IS_AIC {
-        const int64_t first = GetBlockIdx() * per_block;
-        for (int64_t step = 0; step < per_block; ++step) {
-            const int64_t expert = first + step;
-            if (expert >= experts) {
-                break;
-            }
-            CrossCoreWaitFlag<0x03, PIPE_MTE2>(SPLIT_READY);
-            Project(pipe, Nibbles(stacked, expert * M_TILE * HIDDEN),
-                    Nibbles(gate_up, expert * GATE_UP * HIDDEN),
-                    partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
-                    gu_tiling);
-            Publish();
-            CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
-            CrossCoreWaitFlag<0x03, PIPE_MTE2>(MIDDLE_READY);
-            Project(pipe, Nibbles(middle, expert * M_TILE * HALF),
-                    Nibbles(down, expert * HIDDEN * HALF),
-                    wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
-                    down_tiling);
-            Publish();
-            CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
-        }
+        LoadTiling(gate_cube, gu_tiling);
+        LoadTiling(down_cube, down_tiling);
+        gate_mm.Init(&gate_cube, &pipe);
+        down_mm.Init(&down_cube, &pipe);
     }
+    GlobalTensor<int32_t> count_global;
+    GlobalTensor<int32_t> start_global;
+    GlobalTensor<int32_t> source_global;
+    GlobalTensor<float> weight_global;
+    int64_t sub = 0;
+    int64_t from = 0;
+    int64_t share = HIDDEN / 2;
     if ASCEND_IS_AIV {
-        const int64_t first = (GetBlockIdx() / 2) * per_block;
-        const int64_t sub = GetSubBlockIdx();
-        const int64_t share = HIDDEN / 2;
-        const int64_t from = sub * share;
-        Workspace held;
         held.Init(pipe, TILE);
-        GlobalTensor<int32_t> count_global;
-        GlobalTensor<int32_t> start_global;
+        sub = GetSubBlockIdx();
+        from = sub * share;
         count_global.SetGlobalBuffer(group_count, MAX_EXPERTS);
         start_global.SetGlobalBuffer(group_start, MAX_EXPERTS);
+        source_global.SetGlobalBuffer(source_row, MAX_TAKEN);
+        weight_global.SetGlobalBuffer(row_weight, MAX_TAKEN);
         DataCopy(held.group, count_global, MAX_EXPERTS);
         DataCopy(held.start, start_global, MAX_EXPERTS);
+        DataCopy(held.source, source_global, MAX_TAKEN);
+        DataCopy(held.weight, weight_global, MAX_TAKEN);
         AfterLoadForScalar();
-        for (int64_t step = 0; step < per_block; ++step) {
-            const int64_t expert = first + step;
-            if (expert >= experts) {
-                break;
+    }
+
+    for (int64_t step = 0; step < per_block; ++step) {
+        // The halves index blocks differently -- a cube block pairs with two
+        // vector subblocks -- so each works out its own expert and they meet
+        // on the same one. `ASCEND_IS_AIC` is a macro for an `if`, not an
+        // expression, so each half computes its own.
+        int64_t expert = 0;
+        if ASCEND_IS_AIC {
+            expert = GetBlockIdx() * per_block + step;
+        }
+        if ASCEND_IS_AIV {
+            expert = (GetBlockIdx() / 2) * per_block + step;
+        }
+        const bool mine = expert < experts;
+        int64_t rows_held = 0;
+        int64_t taken_from = 0;
+        if ASCEND_IS_AIV {
+            if (mine) {
+                rows_held = held.group.GetValue(expert);
+                taken_from = held.start.GetValue(expert);
             }
-            const int64_t held_rows = held.group.GetValue(expert);
-            const int64_t held_start = held.start.GetValue(expert);
-            if (held_rows == 0) {
-                // The handshake is counted, so an empty expert still has to
-                // arrive at every flag the cube half sets and waits on.
-                if (sub == 0) {
-                    CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
-                }
-                CrossCoreWaitFlag<0x02, PIPE_MTE2>(GATE_READY);
-                if (sub == 0) {
-                    CrossCoreSetFlag<0x03, PIPE_MTE3>(MIDDLE_READY);
-                }
-                CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
-                continue;
-            }
-            // Mode 3 answers the cube whether one subblock sets or both, so
-            // the narrow work stays on subblock zero and the row maximum
-            // stays core-local.
-            if (sub == 0) {
-                Split(held, rows + held_start * HIDDEN,
+            if (mine && rows_held > 0 && sub == 0) {
+                Split(held, rows,
                       Nibbles(stacked, expert * M_TILE * HIDDEN),
                       Nibbles(stacked_low, expert * M_TILE * HIDDEN),
-                      Nibbles(witness, expert * TILE), held_rows);
+                      Nibbles(witness, expert * TILE), rows_held, taken_from);
                 Publish();
-                CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
             }
-            CrossCoreWaitFlag<0x02, PIPE_MTE2>(GATE_READY);
-            if (sub == 0) {
-                Activate(held_rows, held,
+        }
+        SyncAll<false>();
+        if ASCEND_IS_AIC {
+            if (mine) {
+                Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
+                        Nibbles(gate_up, expert * GATE_UP * HIDDEN),
+                        partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
+                        gu_tiling);
+                Publish();
+            }
+        }
+        SyncAll<false>();
+        if ASCEND_IS_AIV {
+            if (mine && rows_held > 0 && sub == 0) {
+                Activate(rows_held, held,
                          partial + expert * M_TILE * GATE_UP,
                          gu_bias + expert * GATE_UP,
                          gu_scale + expert * GATE_UP,
@@ -678,14 +727,32 @@ __aicore__ void routed_int4_fused(
                          Nibbles(middle, expert * M_TILE * HALF),
                          middle_scale + expert * SCALE_SPAN);
                 Publish();
-                CrossCoreSetFlag<0x03, PIPE_MTE3>(MIDDLE_READY);
             }
-            CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
-            Narrow(held_rows, held, wide + expert * M_TILE * HIDDEN,
-                   down_bias + expert * HIDDEN,
-                   down_scale + expert * HIDDEN,
-                   middle_scale + expert * SCALE_SPAN,
-                   out + held_start * HIDDEN, from, from + share);
+        }
+        SyncAll<false>();
+        if ASCEND_IS_AIC {
+            // One matmul a round rather than two, to see whether the limit
+            // counts rounds or `Matmul` instantiations: five rounds of two
+            // is ten, so if the ceiling moves to ten rounds the TPipe is
+            // what runs out.
+            if (mine) {
+                Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
+                        Nibbles(down, expert * HIDDEN * HALF),
+                        wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
+                        down_tiling);
+                Publish();
+            }
+        }
+        SyncAll<false>();
+        if ASCEND_IS_AIV {
+            if (mine && rows_held > 0) {
+                Narrow(rows_held, taken_from, held,
+                       wide + expert * M_TILE * HIDDEN,
+                       down_bias + expert * HIDDEN,
+                       down_scale + expert * HIDDEN,
+                       middle_scale + expert * SCALE_SPAN,
+                       out, from, from + share);
+            }
         }
     }
     PipeBarrier<PIPE_ALL>();
@@ -700,6 +767,7 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         float* middle_scale, void* wide, void* out,
                         void* gu_tiling, void* down_tiling, void* witness,
                         void* group_count, void* group_start,
+                        void* source_row, float* row_weight,
                         void* workspace, int64_t experts)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
@@ -710,5 +778,6 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
         (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)out,
         (__gm__ uint8_t*)gu_tiling, (__gm__ uint8_t*)down_tiling,
         (__gm__ int4b_t*)witness, (__gm__ int32_t*)group_count,
-        (__gm__ int32_t*)group_start, (GM_ADDR)workspace, experts, blocks);
+        (__gm__ int32_t*)group_start, (__gm__ int32_t*)source_row,
+        row_weight, (GM_ADDR)workspace, experts, blocks);
 }
