@@ -723,7 +723,9 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     path: a single-die probe does not source activate.sh and the engine does.
     About 3.0 ms a round, to be collected by letting this one operator fall
     back rather than by unsetting the variable, since the packages exist for
-    other operators. Three layers of custom packages, each added to make
-    something faster, cost 57 percent together on the operator that dominates
-    the round's largest line item -- and none was measured against CANN's at
-    this shape.
+    other operators: measured since, the package is 23 percent faster on the
+    norm with its quantisation and 22 on the gating, so a wholesale unset nets
+    1.4 ms rather than 3.0. There is no systematic conclusion here, only a
+    per-operator fact -- and trimming the grouped matmul out of a copy of the
+    package does not deregister it, leaving 116.376 us and dragging the other
+    two operators between states.
