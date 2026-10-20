@@ -233,3 +233,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     not its retirement -- and on 2201 the DCache is irrelevant to a
     cube-to-vector handoff, which runs entirely through the shared L2.
     [Evidence](evidence/ascend-decode/mixbrick-20261020/README.md).
+
+38. A hung single-die experiment blocks the whole machine, and the symptom
+    names the die. `EI0015 Communication_Error_Ranktable_Detect ... List of
+    unconnected ranks: "[1,]"` meant a kernel of ours had been squatting
+    device 1 for seventeen minutes -- a launch past the physical core count,
+    which hangs -- so rank 1 could never join HCCL. It cost two whole-machine
+    arms on the first free machine of the day. Kill single-die work before
+    arming a whole-machine queue, and read an unconnected-rank list as a
+    device number rather than a network problem. Two scheduling rules follow:
+    `chain.sh` exits on a failing arm, so an unproven arm goes last or it
+    takes the queue with it -- a one-sided-reduce arm referencing a module the
+    experiment tree predates killed fourteen arms behind it -- and an arm must
+    be checked against the tree it will run in, not against the repo.
