@@ -233,6 +233,16 @@ per-kernel json that `binInfo.jsonFilePath` names. The config json is purely a l
 `binInfo.jsonFilePath` is its only link to a binary: a path relative to the `kernel/` root, with
 the `.o` beside the `.json` under the same basename.
 
+**There are three files in the lookup, not two, and `simplifiedKey` must agree across all of them.**
+`cmake/util/ascendc_ops_config.py` writes both `kernel/config/<soc>/<op_snake>.json` (the `binList`
+above, carrying `staticKey`) and `kernel/config/<soc>/binary_info_config.json` (`params` plus
+`binaryList`, keyed on `simplifiedKey`). `/opt/ascend/cann-9.2.0/lib64/libnnopbase.so` — the only
+library containing the string `op_impl/ai_core/tbe/kernel/config/` — reads both, and the per-kernel
+descriptor's `supportInfo` carries a third copy. Ship one without the others and lookup fails with
+nnopbase's "simplifiedKey not found". For an override of an existing operator this costs nothing,
+because `binary_info_config.json` describes parameter *shape* rather than the kernel and is left
+untouched (§4.4); for a new operator all three must be generated together.
+
 ### 3.1 The operator's real signature
 
 `binary_info_config.json`'s `GroupedMatmulSwigluQuantV2` entry is the parameter registry — per
@@ -514,6 +524,26 @@ From `opc --help`, the load-bearing lines verbatim:
 them". `--simplified_key_mode` being an `opc` flag is the direct answer to whether `simplifiedKey`
 must be written by hand: it must not be.
 
+**`opc` needs three things beyond its arguments, and one of them is expensive.** The first
+positional is a generated Python wrapper, not the kernel `.cpp`. In addition:
+
+- `BUILD_KERNEL_SRC=<kernel.cpp>` must be in the environment — parsed from `--kernel-src=` by
+  `cmake/util/const_var.py:43` (`SRC_ENV`).
+- `ASCEND_CUSTOM_OPP_PATH` must point at a tree containing
+  `op_impl/ai_core/tbe/op_tiling/liboptiling.so`, because
+  `/opt/ascend/cann-9.2.0/python/site-packages/tbe/tikcpp/get_op_tiling.py:87` sets `_TILING_SO_PATH`
+  to exactly that, `ctypes.CDLL`s it, and calls `do_op_tiling` **during the compile** to obtain
+  `tiling_data_size`. So a working host tiling library is on the critical path even when all you
+  want is the `.o`. For an override that reuses the vendor's TilingData this is free — the library
+  is already in the package. For a kernel with a *different* TilingData it is not: you must build
+  `liboptiling.so` first, which means the `op_host/` half of a project.
+- `aic-<soc>-ops-info.json` must be staged under `op_impl/ai_core/tbe/config/<soc>/` in the same tree.
+
+And there are two shims, not one. `/opt/ascend/cann-9.2.0/bin/opc` → `opc_tool/opc.py` is the legacy
+driver (called at `fwk_modules/util/ascendc_bin_param_build.py:425`);
+`/opt/ascend/cann-9.2.0/bin/asc_opc` → `asc_opc_tool/opc.py` is the modern one (`:527`). The
+project's build scripts use `opc`; the generators quoted in §3.2-§3.3 live under `asc_opc_tool`.
+
 **A trap worth its own line.** `which opc` in a bare shell resolves to
 `/usr/local/Ascend/cann-9.1.0/bin/opc` — the container has two CANN installs. After
 `source /workspace/environment/activate.sh` it resolves to `/opt/ascend/cann-9.2.0/bin/opc` with
@@ -736,19 +766,76 @@ Verification order on a first build, cheapest first: the per-kernel `.json` must
 sections. Build once with `__mix__(1,2)` retained and once removed, and diff those fields: the
 macro-driven values are identical either way, which is the point.
 
-### 5.2 The keyed form is narrower than the default form
+### 5.2 Both `KERNEL_TASK_TYPE` forms are no-ops outside a project — and the keyed one is narrower
 
-`kernel_info_infer.py:218-238` **rejects anything other than `KERNEL_TYPE_MIX_AIC_1_1` or
-`KERNEL_TYPE_MIX_AIC_1_2`** as the second argument of the two-argument `KERNEL_TASK_TYPE`, and the
-first argument must be a numeric literal because it is recovered by the regex at `:110`. The
-one-argument `KERNEL_TASK_TYPE_DEFAULT` accepts the full enum.
+The macros are in
+`/opt/ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/utils/kernel_utils_macros.h`, reached
+transitively from `kernel_operator.h`:
 
-**What this means for the `KERNEL_TASK_TYPE` question.** The keyed form is documented
-「仅支持在自定义算子工程中使用」, and `KERNEL_TASK_TYPE_DEFAULT` works under a plain `<<<>>>` build —
-`tests/glm52/routed/routed_expert_kernel.cpp:330` already uses it with
-`KERNEL_TYPE_MIX_AIC_1_2`. So moving into an operator project buys **per-tiling-key switching among
-`MIX_AIC_1_1` and `MIX_AIC_1_2`, and nothing else**, at the price of deleting `__mix__(1,2)` and
-`__schedmode__(1)` (§5.1). It does not buy the mix ratio, which we already have.
+```c
+// :89-101, guarded by __PLUGIN__KERNEL_META_TYPE_ENUME_DEFINED__
+enum KernelMetaType : uint8_t { KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY,
+  KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1,
+  KERNEL_TYPE_MIX_AIC_1_2, KERNEL_TYPE_AICORE, KERNEL_TYPE_VECTORCORE,
+  KERNEL_TYPE_MIX_AICORE, KERNEL_TYPE_MIX_VECTOR_CORE, KERNEL_TYPE_MAX, };
+
+// :365-373
+#ifdef __CHECK_FEATURE_AT_PRECOMPILE
+#define ENABLE_FEATURE_FOR_COMPILE(f, val) auto __enable_feature_for_compile_##f = val
+#else
+#define ENABLE_FEATURE_FOR_COMPILE(f, val)
+#endif
+
+// :377-387
+#define KERNEL_TASK_TYPE(key, value)    ENABLE_FEATURE_FOR_COMPILE(key, value)
+#define KERNEL_TASK_TYPE_DEFAULT(value) ENABLE_FEATURE_FOR_COMPILE(default, value)
+```
+
+also `:104-113` `enum KernelType { K_TYPE_AICORE=1, K_TYPE_AIC=2, K_TYPE_AIV=3,
+K_TYPE_MIX_AIC_MAIN=4, K_TYPE_MIX_AIV_MAIN=5, … }` — the value that reaches the ELF — and
+`:156-168` / `:304-318`, `FuncMetaType` with `F_TYPE_MIX_TASK_RATION=3` and
+`struct FunMetaMixCoreType { BaseTlv head; unsigned short taskRation0; unsigned short taskRation1; }`.
+Both macros are defined empty when `__NPU_ARCH__` is 5101/5161/5165/5163.
+
+A second, competing definition sits in the compiler's own resource directory,
+`/opt/ascend/cann-9.2.0/tools/bisheng_compiler/lib/clang/15.0.5/include/__clang_cce_aicore_functions.h:40-58`:
+a **differently numbered** `KernelMetaType` (`MIX_AIC_1_2 = 5` there), `KERNEL_TASK_TYPE_DEFAULT(val)
+→ __builtin_cce_kernel_type_set(val)`, no two-argument form at all, and the whole block gated on
+`__CCE_ENABLE_AUTO_INFER__` (predefined only under `-fcce-auto-infer-kernel-type`, which nothing in
+CANN's shipped build passes). Both files share the `__PLUGIN__*_DEFINED__` guards, so whichever is
+included first wins.
+
+**The project-only restriction is mechanism, not documentation.** Neither header records it; the
+enum's only annotation is the misleading `// define macro for deterministic compile options` at
+`:88`. `ENABLE_FEATURE_FOR_COMPILE` expands to nothing unless `__CHECK_FEATURE_AT_PRECOMPILE` is
+defined, and only the project driver defines it —
+`asc_op_compile_base/asc_op_compiler/kernel_info_infer.py:779-785` runs a preprocess-only pass with
+`["-E", "-D__CHECK_FEATURE_AT_PRECOMPILE", "-includestdio.h", "-DASCENDC_TPL_PRE"]` and then
+recovers the value **by regex from the `.i` text** (`:99-111`,
+`__enable_feature_for_compile_default\s*=\s*([0-9a-zA-Z_]{1,})\s*;`).
+
+So, correcting what this repository has assumed: in a direct `bisheng -xcce` build **both** forms
+expand to literally nothing. `tests/glm52/routed/routed_expert_kernel.cpp:330`'s
+`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)` is a silent no-op today; the kernel's 1:2 ratio
+comes entirely from `__mix__(1, 2)`. The two mechanisms are exactly complementary and neither works
+in the other's world: `__mix__` + `__schedmode__` for `<<<>>>`, `KERNEL_TASK_TYPE*` for a project.
+
+Two further constraints the header does not state, both consequences of the regex: the keyed form's
+first argument must be a **numeric literal**, not a C expression; and `kernel_info_infer.py:218-238`
+**rejects anything other than `KERNEL_TYPE_MIX_AIC_1_1` or `KERNEL_TYPE_MIX_AIC_1_2`** as its second
+argument. `KERNEL_TASK_TYPE_DEFAULT` accepts the full enum.
+
+And the choice between them changes the artifacts. `KERNEL_TASK_TYPE_DEFAULT` alone is sufficient
+and is what `grouped_matmul_swiglu_quant.cpp:71` leads with; per-key types make
+`ascendc_compile_gen_json.py:477` write `"taskRation": "tilingKey"` at top level with a per-key
+`kernelList`, whereas default-only writes a literal `"taskRation": "1:2"`. Downstream,
+`ascendc_ops_config.py:156-170` emits `"multiKernelType": 1` into `binary_info_config.json` only
+when `coreType == 0 && taskRation == "tilingKey"`. Getting this wrong changes the config json.
+
+**What this means for the `KERNEL_TASK_TYPE` question.** Moving into an operator project buys
+**per-tiling-key switching among `MIX_AIC_1_1` and `MIX_AIC_1_2`, and nothing else**, at the price of
+deleting `__mix__(1,2)` and `__schedmode__(1)` (§5.1). It does not buy the mix ratio, which
+`__mix__` already supplies.
 
 This contradicts `README.md` finding 12's premise. That finding reads Huawei's `swiglu_gated_mlp`
 as having "twelve per-tiling-key overrides, nine `AIC_ONLY` and three `AIV_ONLY`", and prices a
@@ -864,9 +951,82 @@ Supporting machinery is in `source/csrc/scripts/`: `opgen/opgen_standalone.py`,
 `package/package.py`, `util/insert_op_info.py`, `util/merge_proto.py`,
 `util/modify_gen_aclnn.py`, `util/build_opp_kernel_static.py`.
 
-`msopgen` exists at `/opt/ascend/cann-9.2.0/bin/msopgen` and the templates it instantiates are at
-`/opt/ascend/cann-9.2.0/tools/op_project_templates/ascendc/customize/`, whose
-`scripts/install.sh:314-332` is the `config.ini` writer quoted in §1.
+### What `msopgen` actually emits
+
+A premise correction first: `msopgen` 9.2.0 with `-lan cpp` does **not** instantiate
+`tools/op_project_templates/ascendc/customize/`.
+`/opt/ascend/cann-9.2.0/python/site-packages/msopgen/interface/const_manager.py:79` sets
+`OP_TEMPLATE_ASCENDC_PATH_LINUX = "./new_op_project_template/custom_op"`, and that tree is thin:
+`CMakeLists.txt`, `CMakePresets.json`, `build.sh`,
+`framework/{onnx_plugin,tf_plugin}/CMakeLists.txt`, `op_host/CMakeLists.txt`,
+`op_kernel/CMakeLists.txt`, and **no `cmake/` directory at all**. Its top-level `CMakeLists.txt` is
+28 lines — `find_package(ASC REQUIRED)`, `npu_op_package(${package_name} TYPE RUN CONFIG
+INSTALL_PATH ${CMAKE_BINARY_DIR}/)`, three conditional `add_subdirectory` — and all the machinery
+lives in the installed package at `/opt/ascend/cann-9.2.0/tools/tikcpp/ascendc_kernel_cmake/`,
+resolved by `asc-config.cmake` as `$ENV{ASCEND_HOME_PATH}/compiler/tikcpp/ascendc_kernel_cmake`
+(`tools/tikcpp` and `compiler/tikcpp` are both symlinks to `aarch64-linux/tikcpp`).
+`ASCEND_HOME_PATH` must be set or `asc-config.cmake` hard-fails.
+
+`tools/op_project_templates/ascendc/customize/` is the full self-contained reference project — what
+the documentation describes and what `-m 1` extension assumes. Its layout, with roles:
+
+| file | lines | role |
+| --- | --- | --- |
+| `CMakeLists.txt` | 76 | includes `cmake/{config,func,intf}.cmake`, conditional `add_subdirectory(framework\|op_host\|op_kernel\|testcases)`, seds `vendor_name=customize` into `scripts/*`, runs `cmake/util/gen_version_info.sh`, CPack with `CPACK_GENERATOR External` + `cmake/makeself.cmake` → `custom_opp_<system>_<arch>.run` |
+| `CMakePresets.json` | — | the only file a user edits. `ASCEND_COMPUTE_UNIT` ships as the literal placeholder `__ASCNED_COMPUTE_UNIT__` (typo included; msopgen substitutes it), plus `vendor_name=customize`, `ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/latest`, `ENABLE_BINARY_PACKAGE=True`, `ENABLE_SOURCE_PACKAGE=True`, `ENABLE_TEST=True`, `ENABLE_CROSS_COMPILE=False`, `ASCEND_PACK_SHARED_LIBRARY=False` |
+| `cmake/config.cmake` | 50 | defaults; `ASCEND_AUTOGEN_PATH=${CMAKE_BINARY_DIR}/autogen`; touches `autogen/custom_compile_options.ini` and `autogen/custom_opc_options.ini` at configure time |
+| `cmake/func.cmake` | 427 | all the logic: `opbuild()`, `add_ops_info_target()`, `add_ops_compile_options()`, `add_simple_kernel_compile()`, `add_kernels_compile()`, `add_kernels_install()` |
+| `cmake/intf.cmake` | 28 | the `intf_pub` INTERFACE target: `-fPIC -fvisibility=hidden -std=c++11`, **`_GLIBCXX_USE_CXX11_ABI=0`**, `-Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack` |
+| `cmake/makeself.cmake`, `cmake/device_task.cmake` | 31, 50 | packaging; tiling-sink `ExternalProject` |
+| `cmake/util/` | 38 files | the generators. Load-bearing: `ascendc_compile_kernel.py`, `ascendc_bin_param_build.py`, `ascendc_impl_build.py`, `insert_simplified_keys.py`, `ascendc_ops_config.py`, `parse_ini_to_json.py`, `opdesc_parser.py`, `ascendc_get_op_name.py`, `ascendc_gen_options.py`, `const_var.py`, `makeself/` |
+| `op_host/CMakeLists.txt` | 221 | `aux_source_directory` + `opbuild()`, then three libraries |
+| `op_kernel/CMakeLists.txt` | 5 | `add_kernels_compile()`, plus an optional `add_ops_compile_options(ALL OPTIONS -g -O0)` under Debug. Nothing else |
+| `framework/CMakeLists.txt` | — | TF/ONNX/Caffe parser plugins, optional |
+| `scripts/` | — | `help.info`, `install.sh` (the `config.ini` writer quoted in §1), `upgrade.sh` |
+
+Note `cmake/intf.cmake`'s `_GLIBCXX_USE_CXX11_ABI=0` against this host's `torch` built with ABI 1
+(§9): an operator project and a torch extension cannot share one compiled object.
+
+Which file holds what, which is the part that decides the cost:
+
+- **Kernel** → `op_kernel/<op_file>.cpp`, and the filename is not free. `cmake/func.cmake:402` is
+  `SRC ${CMAKE_SOURCE_DIR}/op_kernel/${op_file}.cpp`, where `op_file` comes from
+  `ascendc_get_op_name.py --ini-file=autogen/aic-<soc>-ops-info.ini` reading `opFile.value`, which
+  `opbuild` derives by snake-casing the `OpDef` type name. So it must be
+  `op_kernel/<snake(OpType)>.cpp` or the kernel target is never created. Contents:
+  `extern "C" __global__ __aicore__ void <op_file>(…, GM_ADDR workspace, GM_ADDR tiling)`, with
+  `KERNEL_TASK_TYPE_DEFAULT(...)` as the first body statement — and without `__mix__` or
+  `__schedmode__` (§5.1).
+- **Host tiling and the op definition** → the *same single file*, `op_host/<op_file>.cpp`.
+  `op_host/CMakeLists.txt:2` is `aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR} ops_srcs)`, and
+  that identical source list is compiled three times with different macros: plain into
+  `autogen/libascend_all_ops.so` for `opbuild`; with `-DOP_PROTO_LIB` into
+  `libcust_opsproto_rt2.0.so`; with `-DOP_TILING_LIB` into `libcust_opmaster_rt2.0.so`, installed as
+  `op_impl/ai_core/tbe/op_tiling/liboptiling.so`. `OP_ADD` in
+  `/opt/ascend/cann-9.2.0/aarch64-linux/include/register/op_def_registry.h:19/30/54` switches on
+  exactly those two macros — the proto branch registers InferShape / InferShapeRange /
+  InferDataType, the tiling branch registers `impl.Tiling(op.AICore().GetTiling())` plus
+  `TilingParse` and the OpCheckFunc helpers. So one translation unit carries
+  `class MyOp : public OpDef`, `OP_ADD(MyOp)`, `IMPL_OP_OPTILING(MyOp)`, `IMPL_OP_INFERSHAPE(MyOp)`,
+  and the tiling struct via `BEGIN_TILING_DATA_DEF`.
+- **aclnn wrapper** → generated, never written: `autogen/aclnn_*.cpp/.h` from `opbuild`, built into
+  `libcust_opapi.so`, installed to `op_api/lib` and `op_api/include`.
+
+`build.sh` runs, in order: `python3 cmake/util/preset_parse.py CMakePresets.json` (turning the
+preset into `-D` flags for cmake < 3.19); `cmake -S . -B build_out --preset=default`;
+`cmake --build build_out --target binary -j$(nproc)`; `cmake --build build_out --target package
+-j$(nproc)` — or `--target install` when `ASCEND_PACK_SHARED_LIBRARY=True`. With
+`ENABLE_CROSS_COMPILE` and `ENABLE_BINARY_PACKAGE` both set it does a two-phase dance: configure
+with `-DENABLE_CROSS_COMPILE=0`, build `--target cust_optiling`, stash
+`libcust_opmaster_rt2.0.so` into `build_out/host_native_tiling/`, wipe, reconfigure with
+`-DHOST_NATIVE_TILING_LIB=<that path>`, then `binary` and `package`. The reason is §4.1's: the
+binary kernel build dlopens the tiling library on the build host, so it must be a native object
+even for a cross build.
+
+The thin template's `build.sh` instead calls
+`$ASCEND_HOME_PATH/tools/tikcpp/ascendc_kernel_cmake/fwk_modules/util/preset_parse.py`, then
+`cmake -S . -B build_out --preset=default`, then
+`cmake --build build_out --target binary package -j$(nproc)`.
 
 What a project buys over a patch, and what it costs, is §10's subject.
 
@@ -1204,22 +1364,30 @@ Each of these is something this project has held and the material above contradi
    Wrong for an operator that already exists. `opc` alone, against sources that already ship inside
    the package. `msopgen` and `build.sh --pkg` are for a genuinely new operator (§8).
 
-3. **"`simplifiedKey` and `staticKey` must be reproduced by hand."** Wrong. `opc` generates both
+3. **"`KERNEL_TASK_TYPE_DEFAULT` is doing something in our `<<<>>>` build."** It is not.
+   `ENABLE_FEATURE_FOR_COMPILE` expands to nothing unless `__CHECK_FEATURE_AT_PRECOMPILE` is
+   defined, and only the project driver defines it — in a preprocess-only pass whose `.i` output it
+   scrapes by regex (`kernel_info_infer.py:779-785`, `:99-111`). So
+   `routed_expert_kernel.cpp:330` is a silent no-op and the kernel's 1:2 ratio comes entirely from
+   `__mix__(1, 2)`. The corollary for `README.md` finding 12's "With `<<<>>>` only
+   `KERNEL_TASK_TYPE_DEFAULT` applies": under `<<<>>>` *neither* form applies.
+
+4. **"`simplifiedKey` and `staticKey` must be reproduced by hand."** Wrong. `opc` generates both
    from `input-param.json` under `--simplified_key_mode` and `--impl_mode`
    (§3.2, §3.3), and the project's build script *asserts* that it reproduced them rather than
    writing them. Four attempts to recompute `staticKey` by hand in one session all failed; nothing
    needs it.
 
-4. **"`op_proto` must be rebuilt."** Not for a reused prototype. The prototype is
+5. **"`op_proto` must be rebuilt."** Not for a reused prototype. The prototype is
    `ge::TensorType::ALL()` on every parameter and pins only arity and attr names (§6).
 
-5. **"The existing overlay is a precedent someone else set, which I have never used."** The overlay
+6. **"The existing overlay is a precedent someone else set, which I have never used."** The overlay
    at `/workspace/experiments/gmm-fastpath-20261018/prod-kernel/overlay/vendors/custom_transformer`
    is the **output of this repository's own `tests/glm52/build_gmm1_barrier.sh`**, and its
    `inputs.sha256` names the script. The operator it overrides is `GroupedMatmulSwigluQuantV2`, not
    the V1 `GroupedMatmulSwigluQuant` whose files sit beside it untouched.
 
-6. **"Moving to an operator project buys the `KERNEL_TASK_TYPE` form, and so buys more than
+7. **"Moving to an operator project buys the `KERNEL_TASK_TYPE` form, and so buys more than
    dispatch."** Inverted. It buys per-tiling-key switching among exactly two types
    (`MIX_AIC_1_1`, `MIX_AIC_1_2` — `kernel_info_infer.py:218-238` rejects the rest) and it *costs*
    the deletion of `__mix__(1, 2)` and `__schedmode__(1)`, because the op-project build textually
@@ -1230,7 +1398,7 @@ Each of these is something this project has held and the material above contradi
    already uses it to get `MIX_AIC_1_2`; the vendor declares its 1:2 ratio nowhere on the host side
    either (§5). The ratio comes from hardware through `GetTaskRationImpl()`.
 
-7. **"Sixteen experts on sixteen blocks is the per-rank shape at TP16."** Not what the capture
+8. **"Sixteen experts on sixteen blocks is the per-rank shape at TP16."** Not what the capture
    shows. `profiles/width8-20261019/rank-0/kernel_details.csv` has the operator receiving
    `x` of `[8, 6144]` and emitting `y` of `[8, 128]` — **M = 8**, eight permuted rows, with all 256
    experts declared in a 256-slot `group_list`. `tests/glm52/replay_cann_gmm1.py:44` asserts the
@@ -1242,7 +1410,7 @@ Each of these is something this project has held and the material above contradi
    `group_list` is read at the arm's actual width, and `docs/evidence/ascend-decode/int4-weights-20261020/README.md`'s
    "sixteen experts of 2,359,296 elements: 18.9 MB at INT4" rests on the same unchecked assumption.
 
-8. **"A binary override of `GroupedMatmulSwigluQuantV2` can carry this kernel."** It cannot. The
+9. **"A binary override of `GroupedMatmulSwigluQuantV2` can carry this kernel."** It cannot. The
    routed kernel replaces `GroupedMatmulSwigluQuantV2` **and** `GroupedMatmul` and keeps the
    intermediate in UB; an `.o` swap preserves the operator's prototype by construction, so the
    graph still issues the second operator and the GM round trip between them survives. A per-op

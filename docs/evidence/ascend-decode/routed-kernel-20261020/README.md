@@ -200,3 +200,35 @@ With the tiling fixed:
 So 3.93 times the vendor at the per-rank shape, where it was 3.3. Over a
 round: 3.15 ms against 12.39, saving 9.24 ms, which at acceptance 7 is 1.32 ms
 of TPOT.
+
+
+## The 3.93x is not apples to apples, and the capture says so
+
+The vendor figure and this kernel's figure were taken at different shapes, and
+the comparison has been stated as though they were the same. From the capture
+itself:
+
+| op | input shapes | µs |
+|---|---|---|
+| `GroupedMatmulSwigluQuantV2` | `8,6144;8;256;256,4,384,16,64;256,256;256,256` | 98.950 |
+| `GroupedMatmul` | `8,128;256,128,6144;256,6144;256,1,6144;;;;256;8` | 58.226 |
+
+The weight argument declares **256 experts**, and the activation is `8,6144`
+-- eight rows in total across all of them. So the pair costs 157.2 µs for
+eight rows spread over however many of 256 experts the group list activates.
+This kernel's 41.990 µs was measured at sixteen experts of two rows each,
+which is thirty-two rows.
+
+Four times the rows against an unknown activation count is not a ratio. Per
+row it reads 1.31 µs against 19.65, which flatters this kernel and is equally
+not a clean comparison, because what dominates is the weight traffic of the
+experts actually activated and that is in the group list, which has not been
+read.
+
+What is defensible is narrower and stays: at sixteen experts of two rows, one
+MIX kernel with no grid barrier does the whole chain in 41.990 µs, correct at
+0 of 196608, and the expert-axis split makes the wall track experts a block
+rather than experts. The round and TPOT figures derived from the 3.93x --
+3.15 ms and 1.32 ms -- are withdrawn until the activation count is read from a
+capture and both sides are measured at the same shape. One `torch.load` of
+`group_counts` settles it.

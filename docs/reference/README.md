@@ -278,7 +278,11 @@ finding 3.
   holds, finding 12's nine-`AIC_ONLY`-plus-three-`AIV_ONLY` single binary cannot be built on CANN 9.2.0 and the
   4.5x lever needs separate binaries — design three, not design two. Unresolved: the `swiglu_gated_mlp` reading
   came from a public repository, not this installation, so grep that kernel for whether its `AIC_ONLY` sites use
-  the keyed macro or the default one.
+  the keyed macro or the default one. Also retired: finding 12's "With `<<<>>>` only `KERNEL_TASK_TYPE_DEFAULT`
+  applies" — under `<<<>>>` **neither** form applies. `KERNEL_TASK_TYPE*` expands to
+  `ENABLE_FEATURE_FOR_COMPILE`, which is empty unless `__CHECK_FEATURE_AT_PRECOMPILE` is defined, and only the
+  project driver defines it (`kernel_utils_macros.h:365-387`). `routed_expert_kernel.cpp:330` is a silent no-op
+  and the routed kernel's 1:2 comes entirely from `__mix__(1, 2)`.
 
 ## Where to look things up
 
