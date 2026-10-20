@@ -208,30 +208,33 @@ So the chain is still ahead of the vendor's four kernels — 29.180 against
 33.952, 1.16x — but the 2.45x the static scale showed was bought by skipping
 the reduction.
 
-The 15 µs is now attributed, and it is not where it looked. A stage bit that
-runs the two barriers with nothing between or after them prices them apart
-from the work:
+The cost is attributed, by stage bits on one binary rather than by differences
+between code versions — which is how the first attempt went wrong.
 
-| at four blocks, 8 rows | µs |
-|---|---|
-| gate and up projection, dequantisation, SwiGLU, partial maxima | 14.125 |
-| plus the two `SyncAll<false>()` barriers, nothing else | 16.494 |
-| plus the reduction, quantisation, down projection and its dequantisation | 29.180 |
+| at four blocks, 8 rows | cumulative µs | own |
+|---|---|---|
+| gate and up projection, dequantisation, SwiGLU, partial maxima | 14.568 | 14.568 |
+| plus the two `SyncAll<false>()` barriers, nothing else | 16.278 | 1.710 |
+| plus the cross-block reduction, quantisation and down projection | 23.069 | 6.791 |
+| plus the epilogue | 25.724 | 2.632 |
 
-**The two grid barriers cost 2.37 µs, 1.18 each.** The down projection and its
-epilogue cost 1.556 in the static-scale measurement. So the quantisation pass
-alone is about 11 µs, and the reason is its shape, not its arithmetic: per
-block it walks eight rows, and each row does a 32-element global copy, a
-scalar multiply, two casts and a 32-element copy back. Forty operations on
-32 elements each, where one vector repeat is 64 floats — all of it fixed
-overhead.
+The two grid barriers cost 1.71 µs together — they were never the problem.
+The epilogue was, and the reason was its shape: it walked a block's 1536
+columns in three 512-wide passes a row, 24 iterations of seven operations, to
+move 0.26 µs of bytes. One tile wide enough to take the whole span took it
+from 5.393 µs to 2.632.
 
-The fix is to batch the rows: a strided `DataCopy` brings the whole slice in
-at once, the casts run over the whole buffer, and only the per-row scalar
-multiply stays per row. Thirteen operations instead of forty. Two earlier
-guesses were wrong and are recorded as such — the per-row scalar read of the
-reduction's result, and a 32 KiB copy of the whole maxima workspace, each
-changed the total by under 0.3 µs.
+Batching the quantisation pass over rows the same way — one strided
+`DataCopy` in, casts over the whole buffer, one strided copy out, thirteen
+operations instead of forty — was worth only 1 µs, so the earlier attribution
+of 11 µs to that pass was wrong. Recorded as wrong rather than quietly
+dropped: inferring a stage's cost from the difference between two versions of
+the code mixes in every other change between them.
+
+The strides also bound the design. A `DataCopy` moves whole 32-byte data
+blocks, so a block's INT8 slice must be a whole number of them: at eight
+blocks it is 16 bytes and there is no such copy, which is why eight blocks
+fails. At `HALF` 128 the channel split is therefore capped at four blocks.
 
 Two findings from building it. A reduction's destination is written a whole
 32-byte block at a time, so one float a row stamps over the next seven rows'

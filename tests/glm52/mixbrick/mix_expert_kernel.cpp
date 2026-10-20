@@ -35,8 +35,11 @@ constexpr int64_t HALF = 128;
 constexpr int64_t MAX_ROWS = 32;
 // One vector repeat of FP32, in elements.
 constexpr int64_t SLACK = 64;
-// One tile of the 6144-wide output a vector core walks at a time.
-constexpr int64_t TILE = 512;
+// One tile of the 6144-wide output a vector core walks at a time. Wide
+// enough that a block's whole column span is one tile at four blocks: at 512
+// the epilogue made three passes a row and spent 5.393 us moving 0.26 us of
+// bytes.
+constexpr int64_t TILE = 2048;
 // A reduction's destination is written a whole 32-byte block at a time.
 constexpr int64_t REDUCE_ALIGN = 8;
 // Partial maxima are one float a block a row, in a fixed-size workspace.
@@ -425,9 +428,9 @@ __aicore__ inline void Quantise(TPipe& pipe, __gm__ float* hidden,
     TBuf<TPosition::VECCALC> half_buffer;
     TBuf<TPosition::VECCALC> code_buffer;
     TBuf<TPosition::VECCALC> partial_buffer;
-    pipe.InitBuffer(value_buffer, (HALF + SLACK) * sizeof(float));
-    pipe.InitBuffer(half_buffer, (HALF + SLACK) * sizeof(half));
-    pipe.InitBuffer(code_buffer, (HALF + SLACK) * sizeof(int8_t));
+    pipe.InitBuffer(value_buffer, (MAX_ROWS * HALF + SLACK) * sizeof(float));
+    pipe.InitBuffer(half_buffer, (MAX_ROWS * HALF + SLACK) * sizeof(half));
+    pipe.InitBuffer(code_buffer, (MAX_ROWS * HALF + SLACK) * sizeof(int8_t));
     pipe.InitBuffer(partial_buffer,
                     MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN * sizeof(float));
     LocalTensor<float> value = value_buffer.Get<float>();
@@ -454,6 +457,8 @@ __aicore__ inline void Quantise(TPipe& pipe, __gm__ float* hidden,
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::UB>();
 
+    // Every row's scale first, from the partials. One scalar read a block a
+    // row, all on chip.
     for (int64_t row = 0; row < rows; ++row) {
         float largest = 0.0F;
         for (int64_t block = 0; block < blocks; ++block) {
@@ -461,22 +466,39 @@ __aicore__ inline void Quantise(TPipe& pipe, __gm__ float* hidden,
                 (block * MAX_ROWS + row) * REDUCE_ALIGN);
             largest = (one > largest) ? one : largest;
         }
-        const float scale = largest / 127.0F;
-        // Gathered on chip and copied out once, by MTE. A scalar store to
-        // global memory goes through the per-core data cache, which is the
-        // one incoherent cache on this part -- the slots read back as zeros
-        // while the partial maxima that produced them read back correct.
-        scale_row.SetValue(row, scale);
-        DataCopy(value, hidden_global[row * HALF + channel], channels);
-        PipeBarrier<PIPE_ALL>();
-        Muls(value, value, 1.0F / scale, channels);
-        PipeBarrier<PIPE_V>();
-        Cast(half_value, value, RoundMode::CAST_RINT, channels);
-        PipeBarrier<PIPE_V>();
-        Cast(code, half_value, RoundMode::CAST_RINT, channels);
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(middle_global[row * HALF + channel], code, channels);
+        scale_row.SetValue(row, largest / 127.0F);
     }
+
+    // Then the whole slice in one strided copy, cast whole, and out again.
+    // Walking it row by row was forty operations on 32 elements each, where
+    // one vector repeat is 64 floats -- about 11 us of pure fixed cost.
+    //
+    // The strides are in 32-byte data blocks, which is also why the channel
+    // count has to leave a whole number of them: at eight blocks the INT8
+    // slice is 16 bytes and there is no such copy.
+    DataCopyParams gather;
+    gather.blockCount = static_cast<uint16_t>(rows);
+    gather.blockLen = static_cast<uint16_t>(channels * sizeof(float) / 32);
+    gather.srcStride = static_cast<uint16_t>((HALF - channels)
+                                             * sizeof(float) / 32);
+    gather.dstStride = 0;
+    DataCopy(value, hidden_global[channel], gather);
+    PipeBarrier<PIPE_ALL>();
+    for (int64_t row = 0; row < rows; ++row) {
+        Muls(value[row * channels], value[row * channels],
+             1.0F / scale_row.GetValue(row), channels);
+    }
+    PipeBarrier<PIPE_V>();
+    Cast(half_value, value, RoundMode::CAST_RINT, rows * channels);
+    PipeBarrier<PIPE_V>();
+    Cast(code, half_value, RoundMode::CAST_RINT, rows * channels);
+    PipeBarrier<PIPE_ALL>();
+    DataCopyParams scatter;
+    scatter.blockCount = static_cast<uint16_t>(rows);
+    scatter.blockLen = static_cast<uint16_t>(channels / 32);
+    scatter.srcStride = 0;
+    scatter.dstStride = static_cast<uint16_t>((HALF - channels) / 32);
+    DataCopy(middle_global[channel], code, scatter);
     PipeBarrier<PIPE_ALL>();
     DataCopy(scale_global, scale_row, MAX_ROWS);
     DataSyncBarrier<MemDsbT::DDR>();
@@ -633,8 +655,13 @@ __aicore__ void mix_expert_fused(
         }
         if ASCEND_IS_AIV {
             CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
-            Narrow(pipe, wide, down_scale, middle_scale, narrow_out, rows,
-                   (GetBlockIdx() / 2) * columns, columns);
+            // Bit 9 skips the epilogue, which is what prices it: inferring
+            // it from the difference between two code versions is how the
+            // last attribution went wrong.
+            if ((stages & 512) == 0) {
+                Narrow(pipe, wide, down_scale, middle_scale, narrow_out,
+                       rows, (GetBlockIdx() / 2) * columns, columns);
+            }
         }
     }
 }
