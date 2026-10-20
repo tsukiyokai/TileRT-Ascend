@@ -6,9 +6,15 @@ class LookupDrafter:
 
     The context is the prompt plus every committed token, which is what the
     model attends to and therefore what it can copy from.
+
+    The default tail is as long as the tree drafter is allowed to match, so
+    that a comparison between them measures the tree rather than the match
+    length. On a constructed stream the longer tail is worth 29.738 -> 32.076
+    accepted tokens a round at an exact copy and nothing at all from edit
+    rate 0.05 on.
     """
 
-    def __init__(self, prompt, longest=8, shortest=2):
+    def __init__(self, prompt, longest=32, shortest=2):
         if shortest < 1 or longest < shortest:
             raise ValueError("Tail lengths must satisfy 1 <= shortest <= "
                              "longest")
