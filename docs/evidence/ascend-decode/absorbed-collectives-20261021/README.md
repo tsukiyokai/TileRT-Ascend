@@ -68,3 +68,29 @@ the `enable_static_kernel` path and `--super-kernel` is the switch that would
 absorb the rest, in which case the ablation's +1.807 ms is the measurement that
 contradicts the lever and needs explaining. If it was on, the twenty standalone
 calls are what absorption leaves behind and the lever does not exist.
+
+## WITHDRAWN: the capture is width 4 over six tokens
+
+`raw/rank-0.json` records `max_tokens: 6`, `mtp_width: 4`, `target_graph:
+True` -- no `--super-kernel`. So this capture is a profiling run of six output
+tokens at width four, not decode at steady state.
+
+Every figure on this page derived from it is void. The round count came from
+dividing 244 attention calls by 78 layers, which assumed all of them were
+decode; at six output tokens and an acceptance near three there are about two
+rounds, so the 244 includes warmup and prefill and the per-round division is
+meaningless.
+
+What this invalidates, across today's pages: the round's device-time
+breakdown (SuperKernel 32.21 ms, collectives 17.56 ms, attention 2.92 ms, Cast
+1.40 ms), the collective call count of 20.4 a round, the absorbed-versus-
+standalone comparison of 30 us against 858, and the conclusion that collectives
+are the round's second largest item.
+
+The ratio between an absorbed and a standalone collective may still hold within
+the capture, since both were measured in the same run -- but at width four over
+six tokens, with warmup included, even that is a comparison between two
+populations whose composition is unknown.
+
+A capture at the decode configuration is the prerequisite for any of this, and
+it needs the machine.

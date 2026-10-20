@@ -1118,3 +1118,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      ratio survives: absorbed 30 us against standalone 858, measured side by
      side. The 17 ms does not, because it multiplies a per-call difference from
      one configuration by a count from another.
+
+116. Read the source run's configuration before deriving anything from its
+     capture. `profile-rope-20261018` records `max_tokens: 6`, `mtp_width: 4`
+     and no `--super-kernel`: a six-token profiling run at width four, not
+     decode at steady state. Today's whole device-time account came from it --
+     SuperKernel 32.21 ms a round, collectives 17.56, the 20.4 call count, the
+     30 us against 858 absorbed comparison -- and all of it is void, because
+     the round count was obtained by dividing 244 attention calls by 78 layers
+     on the assumption that every call was decode, where six output tokens at
+     an acceptance near three give about two rounds and the rest is warmup and
+     prefill. This was the first thing to check and it was checked last.
