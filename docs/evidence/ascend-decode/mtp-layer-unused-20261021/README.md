@@ -112,3 +112,38 @@ What does stand: with `n_predict 1` the head produces one token a pass, so
 `--mtp-tokens=N` costs N full layers where the automaton produces 32 tokens for
 nothing. The two have different economics per drafted token, and only a
 measured acceptance settles which wins. That is what the queued arms do.
+
+## Published acceptance puts the head an order of magnitude behind the automaton
+
+Measured figures from deployments and from vLLM's own spec-decode counters:
+
+- k=1: acceptance 78 to 85 percent, mean accepted length about 1.85 of a 2.0
+  ceiling. Code-heavy generation reaches the low-to-mid 90s.
+- k=3 to 5: cumulative per-position acceptance 50 to 65 percent, mean accepted
+  length 2.6 to 3.9.
+- vLLM-Ascend's own documentation states that DeepSeek exposes a single MTP
+  layer, so accuracy and performance are not guaranteed for MTP > 1 and
+  especially not at 3 or more.
+
+The adaptive tree over the suffix automaton measures 9.288 accepted a round at
+an edit rate of 0.02 and 4.731 at 0.05. So the head's ceiling is roughly 2 to 4
+where the existing drafter is 5 to 9: **MTP is an order of magnitude behind the
+drafter this project already has**, not a factor-of-two improvement on it.
+
+The reason is structural and was visible in the drafter's own numbers. MTP is a
+general next-token predictor; the automaton exploits a property of the
+workload, that an agentic coding model's output largely copies its input. On a
+distribution where a suffix match is usually right, recall beats prediction.
+
+So the projection of 2.4 ms from "acceptance 15" is withdrawn. 15 was a guess
+and no published measurement of this mechanism approaches it.
+
+## What is still worth measuring
+
+The queued arms, at lower priority: the head may help precisely where the
+automaton is blind, at the first token after an edit, and the two sources are
+not mutually exclusive in principle. But the arms now test a modest effect
+rather than the target, and the first thing they must check is the acceptance
+counter itself -- a published bug report shows a quantisation and
+expert-parallel misconfiguration collapsing acceptance to 0.7 percent silently,
+and this engine is W4A8 at TP16.

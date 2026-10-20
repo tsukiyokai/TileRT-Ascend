@@ -871,3 +871,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     everything behind it. MTP drafts autoregressively against the target's own
     context and has no second drafter to invalidate. The probe measured a
     splice of my own invention.
+
+93. Published measurements beat a guess, and they withdrew the day's largest
+    lever. The checkpoint's MTP head was projected to lift acceptance to 15 and
+    TPOT to 2.4 ms. Deployment figures and vLLM's own spec-decode counters put
+    it at 78 to 85 percent acceptance and a mean accepted length near 1.85 at
+    k=1, and 2.6 to 3.9 at k=3 to 5, with vLLM-Ascend documenting that
+    DeepSeek's single MTP layer does not guarantee accuracy above k=1. The
+    adaptive tree over the suffix automaton already measures 9.288. MTP is an
+    order of magnitude behind it, because it predicts in general where the
+    automaton recalls on a distribution that largely copies its input. The 15
+    was mine and nothing published approaches it.
