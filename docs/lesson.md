@@ -963,3 +963,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      is the only per-query-row operator in a layer and the only one left
      unmeasured, which makes it the leading candidate rather than a cleared
      one.
+
+102. Find the dispatch layer before trying to remove something from it. Three
+     attempts to deregister one operator from a custom CANN package failed in
+     three different ways -- removing its TBE kernel directory, removing its
+     `binary_info_config.json` entry, and localising its symbols with
+     `objcopy`, which edits the static symbol table and not `.dynsym`. The
+     operator is resolved as a dynamic symbol from
+     `op_api/lib/libcust_opapi.so`, and withholding that library drops the
+     grouped matmul from 104.9 to 70.147 us while the norm and gating keep
+     their TBE kernels. Net 2.14 ms a round against 1.4 for unsetting the path
+     wholesale. The third failure is what located the layer; the first two were
+     guesses at it.
