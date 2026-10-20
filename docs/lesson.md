@@ -1376,3 +1376,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      The root fallback failed earlier because a match always exists. So the gap
      is information unavailable at drafting time, and the oracle's 4.18 ms is a
      bound to measure against rather than a target to reach.
+
+140. Under a fixed row budget, depth is the only axis that pays, and the tree
+     already spends the whole budget on it. Three attempts to close its gap to
+     the copy oracle failed the same way: the root fallback assumed no match
+     where one always exists, length-ranking answered a forward-looking
+     question with a backward-looking quantity, and the union of three drafters
+     traded depth for breadth -- 5.028 accepted against the tree's 5.394 at the
+     same fifteen nodes. The branch sweep had said the same thing from another
+     direction, two to eight branches differing by one to two percent. Three
+     failures converging on one reason is a bound, not a shortage of ideas.

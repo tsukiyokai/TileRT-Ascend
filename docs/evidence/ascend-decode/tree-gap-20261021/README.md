@@ -88,3 +88,27 @@ What remains available on the drafting side is the ordering already measured --
 lookup 4.147, automaton 4.650, tree 5.044 across twelve streams -- and the
 budget optimum of 16 to 24. The copy oracle's 4.18 ms stays a bound rather than
 a target.
+
+## The union of three drafters is worse, for the same reason as the rest
+
+Twelve streams, budget 16, the lookup and automaton chains merged with the
+tree's own branches into one verified tree:
+
+    tree    accepted 5.394   nodes 15.0   TPOT 7.43 ms
+    union   accepted 5.028   nodes 15.0   TPOT 7.97 ms
+
+Both fill the budget. The union spends it on three proposals, so the tree's own
+share is a third as deep -- and depth is the only dimension that pays, which
+the branch sweep showed independently: two, four and eight branches differ by
+one to two percent at every budget.
+
+So three attempts to close the gap have failed and all three failed the same
+way. The root fallback assumed no match existed where one always does.
+Length-ranking used a backward-looking quantity for a forward-looking question.
+The union traded depth for breadth. Under a fixed row budget, depth is the only
+axis, and the tree already spends the whole budget on it.
+
+That is a bound on the drafting side from three directions rather than an
+absence of ideas: at budget 16 and the merged fixed term, 5.394 accepted is
+TPOT 7.43 ms, and the copy oracle's 9.660 at the same budget is 4.21 -- a gap
+made of information no drafter has.
