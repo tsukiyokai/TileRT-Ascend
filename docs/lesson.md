@@ -1479,3 +1479,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      independent vector work is not available there. Any further overlap has to
      come from outside the layer -- and the one axis never examined is the
      speculative width, whose rows are independent of each other.
+
+148. Offering several candidate copies at once loses to branching at every
+     node. Eight streams: k parallel verbatim runs from the k most recent
+     occurrences reach 2.807 accepted at one branch and 3.280 at eight by depth
+     32, against the tree's 4.289 -- and sixteen branches move acceptance 15
+     percent while rows go from 8.6 to 55.3. The tree keeps several candidates
+     alive at every depth; this keeps them alive only at the root. So the
+     oracle's advantage is not which occurrence it picks, since offering
+     sixteen reaches 3.216 against its 13.474 -- it is knowing the answer, now
+     the third independent route to that wall. And the first run of this probe
+     read 1.724, because it indexed only one window length and then queried
+     shorter tails that had never been stored: a broken index reads exactly
+     like a failed mechanism.
