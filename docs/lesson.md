@@ -419,3 +419,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     are not the two kernels: replacing the MoE with my fused one takes 19.2 ms
     to 9.9 ms, nine milliseconds off fifty-five. Compute the floor before
     choosing what to optimise.
+
+54. Fit the round against the width before choosing a lever. Four widths at
+    one drafter give `round = 45.88 ms + 0.814 ms a row`, residuals a few
+    hundred microseconds. The fixed term is seventy-eight layers of issue and
+    reduction and does not care how many rows are verified, and it alone
+    decides what is reachable: granting perfect acceptance, it floors TPOT at
+    4.637 ms at width 12 and 2.248 ms at width 32, so 2.x ms is unreachable
+    without moving it however good the drafter becomes. It also explains the
+    width optimum -- 12 beats 16 and 32 because a large fixed cost wants a
+    small width -- and therefore dates the tree: the tree needs budget, budget
+    needs a large width, and a large width needs the fixed cost gone first.
