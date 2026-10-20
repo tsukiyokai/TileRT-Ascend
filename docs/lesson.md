@@ -497,3 +497,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     whole-machine arms belong on a3-84, and 187 is for single-die probes that
     finish inside a minute. Every single-die measurement today ran there
     without once hitting it.
+
+60. Measure the operator the engine calls, not the one you would write. I
+    priced the gating as a torch topk plus a hand-written sigmoid and
+    normalisation, 71 µs a layer, and planned to fuse it. The engine does not
+    do that: `router_factory.py` selects `npu_moe_gating_top_k` and
+    `device_op.py:1228` calls it, one operator for the sigmoid, the group
+    selection, the top k, the renormalisation and the scaling factor, at
+    20.798 µs. So my routing accounting over-counted by 3.56 ms and the lever
+    I was about to build was mostly already there. This is the fourth
+    attribution of mine that measurement overturned today, and the four share
+    a shape: I measured what I assumed the engine does. Read the call site
+    first.
