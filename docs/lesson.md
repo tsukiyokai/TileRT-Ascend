@@ -1451,3 +1451,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      launch, summing to 636.87 eager against the layer account's 317.476; the
      ratios are the finding. An operator a graph cannot speed up is one whose
      cost sits in the kernel, where only a fold reaches it.
+
+146. Vector work hides under cube work and the stream is the only change
+     needed. One die, twelve rows: a matmul is 64.11 us, six of the layer's
+     vector operators are 73.69, their sum is 137.81, and issuing them
+     concurrently costs 94.05 -- 43.75 us hidden, 59 percent of the vector
+     work, against the 54.5 us a layer the target needs. Three details matter
+     more than the headline. A single stream already recovers 32 us, so
+     adjacent operators' AIC and AIV pipelines overlap unaided. A side stream
+     chained behind an event is slower than one stream, 111.59 against 105.45 --
+     making the dependency explicit serialises what the hardware was already
+     overlapping. And the floor is the larger of the two, 73.69, so 20 us of
+     cube time is still exposed at concurrent issue. What this does not settle
+     is dependency: here the vector work is independent of the cube work, and
+     in a real layer the norm feeds the projection.
