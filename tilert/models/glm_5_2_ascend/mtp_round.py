@@ -69,6 +69,7 @@ class MtpRoundExecutor:
         self.state.reset(self.target.position, first_token,
                          draft_prefix_length=(self.draft.position
                                               if self.drafter is None
+                                              and self.draft is not None
                                               else None))
         self.seed_parent_hidden = normalized_parent_hidden
         self.seed = None
