@@ -8492,3 +8492,269 @@ the most favourable end. B7.6 pins the deployment claim (CANN 8.0, production on
 exact kernel paths to read. B7.7's framing — dequant must run on Vector, GEMM on Cube, and the stall is the
 whole problem — is the same A3 Vector/Cube asymmetry our 13.58 us MIX floor and our `Cast` family's
 2.300 ms/round against 0.076 ms of bytes are symptoms of.
+
+## B8. ★★★ The vendor's own measured tuning case for GroupedMatmul + per-token dequant + activation — 218.1 → 128.1 us, −41.3%, with the code for each step; plus pure-Cube mode's −65.6% on Scalar and MTE2 Preload
+
+Sources, all in the shipped devkit on this machine, read 2026-10-20:
+
+- `docs/zh/guide/operator_practice/best_practices/grouped_matmul_tuning.md`
+- `docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_pure_cube.md`
+- `docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_mte2_preload.md`
+
+This matters because the two GroupedMatmul families are the largest block in our round:
+`GroupedMatmulSwigluQuantV2` 6.793 ms spent against 2.272 ms of bytes, plus `GroupedMatmul` 5.596 / 1.212 —
+12.389 ms spent against 3.484 ms of bytes. The first document below is a measured tuning case for *exactly*
+that operator shape: grouped matmul, int8 weights, per-token dequant, activation.
+
+### B8.1 The case, and the operator it is
+
+`grouped_matmul_tuning.md`, 案例介绍, verbatim — note that the Python reference is our expert chain:
+
+> 本案例对分组Matmul即GroupedMatmul算子的per-token量化场景进行性能分析和优化，GroupedMatmul算子计算过程（通过python代码表达）为：
+
+```python
+offset = 0
+for i in range(g):
+    mmOut = x[offset:offset + groupList[i]] * weight[i] + bias[i]
+    y[offset:offset + groupList[i]] = Gelu(mmOut * scale[i] * pertokenScale[offset:offset + groupList[i]])
+    offset += groupList[i]
+```
+
+> 验证平台为Atlas A2 训练系列产品/Atlas A2 推理系列产品。
+
+表1 算子规格, verbatim:
+
+| input | shape | data type | format |
+| --- | --- | --- | --- |
+| x | (1024,1024) | int8 | ND |
+| weight | (8,1024,8192) | int8 | **NZ** |
+| bias | (8,8192) | int32 | ND |
+| groupList | 8 | int64 | ND |
+| scale | (8,8192) | float | ND |
+| pertokenScale | 1024 | float | ND |
+| y | (1024,8192) | float16 | ND |
+
+> 主要介绍以下优化方法：
+> - 对于Vector计算占比较高（Vector Bound）的场景，将AI Core中的AIC核和AIV核启动比例设置为1:2；
+> - 优化CV并行流水，减少Cube和Vector计算间的空闲等待时间；
+> - 优化Vector计算流水，提高Vector并行计算速度。
+>
+> 固定8核测试，即当前性能和后续优化tiling中numBlocks固定设置为8。
+
+The diagnosis, verbatim:
+
+> - Vector计算bound，当前为减少核启动开销设置为1:1；
+> - 实际优化过程中，对上述问题进行优化、Vector计算占比下降后，Cube和Vector计算各自都有间隙，相互之间都有等待耗时；
+> - Vector计算没有开启double buffer，计算和数据搬运部分没有并行。
+
+and the measurement recipe, verbatim:
+
+> 通过msOpProf算子调优工具获取算子性能数据：
+> - 获取真实环境执行的性能数据（指令的cycle占比数据ArithmeticUtilization.csv），包含各个流水的占比情况；
+> - 获取仿真性能数据（指令流水图），包含各个流水的占用区间，可观察流水间依赖情况，从而优化并行效率。
+
+### B8.2 ★ The measured ladder
+
+| step | total | delta |
+| --- | --- | --- |
+| baseline (AIC:AIV 1:1, 8 cores) | **218.1 us** | — |
+| AIC:AIV ratio set to **1:2** | **154.2 us** | −29.3% |
+| workspace count 2 → **4** | **131.8 us** | −14.5% |
+| Vector **double buffer** | **128.1 us** | −2.8% |
+| cumulative | | **−41.3%** |
+
+Verbatim:
+
+> - 将AI Core中的AIC和AIV启动比例设置为1:2后，执行总耗时从218.1us下降为154.2us。指令流水图显示Cube计算间等待变小。
+> - …优化后，总耗时由154.2us下降为131.8us。指令流水图显示Vector、Cube计算各自间隙明显减小。
+> - Vector计算开启double buffer，优化后执行总耗时从131.8us下降为128.1us。
+
+and 总结, verbatim:
+
+> - 在Vector计算为主要瓶颈点时，将AI Core中的AIC核和AIV核启动比例设置为1:2；
+> - Cube、Vector计算时间接近，且两者都有因相互等待导致的间隙时，采用4份workspace优化；
+> - 观察数据搬运是否与计算相互掩盖，多轮计算没有数据依赖，且buffer够大时，开启double buffer，增加并行效率。
+
+### B8.3 Step 1 — AIC:AIV 1:2, with the two-AIV alternation code
+
+> 将AI Core中的AIC核和AIV核启动比例设置为1:2。每次AIC输出的数据，由两个AIV并行计算对应的反量化和激活函数；在Vector侧代码的循环里，AIV0和AIV1交替进行计算（**前提条件，循环次数不为1**）。
+
+```cpp
+uint32_t vecCount = 0;
+uint32_t taskRation = GetTaskRatio();
+for (uint32_t offsetN = 0; offsetN < curCubeSingleN; offsetN += mnConfig.baseN) {
+    if (unlikely(offsetN + mnConfig.baseN >= curCubeSingleN)) {
+        curVecBaseN = curCubeSingleN - offsetN;
+    }
+    uint32_t alignBaseN = Ceil(curVecBaseN, uint32_t(8)) * 8;
+    DataCopyScale(curVecBaseN, alignBaseN, scaleOffset + offsetN);
+    uint32_t curVecBaseM = vecBaseM;
+    uint64_t mmOutOffset = mnConfig.workSpaceOffset + offsetN * mnConfig.baseM;
+    CrossCoreWaitFlag(SYNC_AIC_TO_AIV);
+    for (uint32_t offsetM = 0; offsetM < curCubeSingleM; offsetM += vecBaseM) {
+         vecCount++;
+        if (vecCount % taskRation != subBlockIdx) {
+            continue;  // AIV0和AIV1交替进行计算
+        }
+        if (unlikely(offsetM + vecBaseM >= curCubeSingleM)) {
+            curVecBaseM = curCubeSingleM - offsetM;
+        }
+        // 使用AscendDequant接口做perchannel反量化
+        LocalTensor mmOutLocal = vecInQueue.AllocTensor();
+        DataCopyPad2D(mmOutLocal, mmOutGm[mmOutOffset + offsetM * curVecBaseN],
+                      curVecBaseM, curVecBaseN, curVecBaseN);
+        vecInQueue.EnQue(mmOutLocal);
+        ComputeDequantAndActivate(mnConfig, curVecBaseM, alignBaseN, curVecBaseN, offsetM);
+        LocalTensor yLocal = vecOutQueue.DeQue();
+        DataCopyPad2D(yGm[outOffset + offsetM * tiling->n + offsetN], yLocal,
+                      curVecBaseM, curVecBaseN, alignBaseN, tiling->n);
+        vecOutQueue.FreeTensor(yLocal);
+    }
+    ...
+}
+```
+
+`GetTaskRatio()` returns the AIV-per-AIC ratio, and the whole alternation is one line:
+`if (vecCount % taskRation != subBlockIdx) continue;`. **The stated precondition is that the loop count is
+not 1** — at batch=1 with a single M tile the inner loop may well be 1, which disables the split.
+
+### B8.4 ★★ Step 2 — four workspaces, and the Cube skipping its first four waits
+
+> AIC和AIV启动比例设置为1:2后，出现Cube和Vector计算各自都有间隙、相互之间都有等待耗时的情况。分析原因是因为Vector和Cube计算存在使用一份workspace进行数据传递的场景，通过4份workspace的方案进行优化：**host按4倍baseM * baseN申请workspace，Cube侧代码在计算前可以跳过前4轮的等待。**
+
+```cpp
+if ASCEND_IS_AIC {
+    if (cubeCount >= tiling->parallNum) {  // tiling->parallNum设置为4
+        CrossCoreWaitFlag(SYNC_AIV_TO_AIC);
+    }
+    mm.SetOrgShape(mnConfig.m, tiling->n, tiling->k);
+    mm.SetSingleShape(curSingleM, curSingleN, tiling->k);
+    mm.SetTensorA(xGm[xOffset]);
+    auto weightSlice = weightGm[weightOffset];
+    if (mnConfig.numBlocksM == 1) {
+        weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    }
+    mm.SetTensorB(weightSlice);
+    uint64_t workspaceOffset = mnConfig.workSpaceOffset;
+    while (mm.Iterate()) {
+        mm.GetTensorC(mmOutGm[workspaceOffset], 0, true);
+        CrossCoreSetFlag(SYNC_AIC_TO_AIV);
+        workspaceOffset += (mnConfig.baseM * mnConfig.baseN);
+    }
+}
+cubeCount++;
+```
+
+and the explanation of why two was not enough, verbatim:
+
+> Vector计算在等Cube计算输出的数据，Cube侧需要等Vector计算完释放workspace以存放下一轮的计算结果，当前为了让Cube、Vector计算流水并行，workspace使用了两份空间：… 因为Vector和Cube计算存在使用一份workspace进行数据传递的场景，存在数据依赖，所以会有等待的间隔。可以采用4份workspace进行优化
+
+**Three things to lift from this snippet.** It is a **credit window of depth 4**, implemented as
+`if (cubeCount >= parallNum) CrossCoreWaitFlag(...)` — the producer runs 4 ahead before it ever waits, which is
+the same discipline as `catlass`'s `CrossCoreSetFlagWithReverse` 15-deep window but with the depth set by
+workspace count rather than by the flag counter. The CV handoff is **per `Iterate()`**, not per kernel:
+`while (mm.Iterate()) { mm.GetTensorC(...); CrossCoreSetFlag(SYNC_AIC_TO_AIV); }`. And —
+
+> `if (mnConfig.numBlocksM == 1) { weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE); }`
+
+— **when there is only one M block, the vendor hints the weight OUT of L2.** At one M block each weight tile is
+read exactly once, so caching it only evicts something reused. `numBlocksM == 1` is the decode condition.
+
+### B8.5 Step 3 — Vector double buffer
+
+```cpp
+pipe->InitBuffer(scaleInQueue, 2, tiling->mmTilingData.baseN * sizeof(DTYPE_SCALE));
+pipe->InitBuffer(perTokenScaleInQueue, 2, tiling->mmTilingData.baseM * sizeof(float));
+pipe->InitBuffer(vecInQueue, 2, tiling->ubCalSize * sizeof(cT::T));
+pipe->InitBuffer(vecOutQueue, 2, tiling->ubCalSize * sizeof(DTYPE_Y));
+```
+
+### B8.6 ★★ Pure-Cube mode: the MIX message framework costs 15.02 of 17.85 us, and `ASCENDC_CUBE_ONLY` removes it
+
+`matmul_pure_cube.md`, 案例介绍, verbatim:
+
+> 本案例呈现了在矩阵乘算子场景中，开启Matmul高阶API的纯Cube模式对算子性能的提升效果。如下图所示，**Matmul API默认使用MIX模式，即用户从AIV侧发起消息，通过消息通信框架中转消息后，在AIC侧执行Matmul计算。这套消息处理机制会带来额外的Scalar性能开销。** 相较于MIX模式，纯Cube模式可以直接跳过消息通信框架，完成Matmul计算，提升算子性能。
+>
+> - 开启纯Cube模式的适用场景：非融合算子，只有矩阵计算的场景。即相较于MIX模式（包含矩阵计算和矢量计算），没有矢量计算的场景。
+
+Spec: `a` (128, 64) float16 ND, `b` (64, 30720) float16 ND, M=128 N=30720 K=64, on a 24-core part with 1 AIC
+and 2 AIV per core. The tiling difference between the two modes is the thing to notice, verbatim:
+
+> - 单核shape：
+>     - MIX场景：按**48个AIV核**进行切分，singleCoreM=128，singleCoreN=640，singleCoreK=64。
+>     - 纯Cube场景：按**24个AIC核**进行切分，singleCoreM=128，singleCoreN=1280，singleCoreK=64。
+> - 基本块shape：baseM=128，baseN=256，baseK=64。
+> - L1相关Tiling参数：stepM=1，stepN=1，stepKa=4，stepKb=4，depthA1=8，depthB1=8。
+
+The measurement, verbatim:
+
+> - 优化前的Profiling数据如下，从C列的aic_time数据可以看出，多个核中最大算子执行耗时为 **17.85us**。从G列的aic_scalar_time数据可以看出，Scalar平均耗时为 **15.02us**，性能瓶颈在Scalar流水。
+> - 优化前的流水图如下，由于默认为MIX模式，每次Matmul计算均涉及消息通信框架对消息进行处理，Scalar流水重，性能开销较大。
+> - 优化后的Profiling数据如下，从C列的aic_time数据来看，多个核中最大算子执行耗时为 **11.21us**，较优化前的17.85us有较大提升。从G列的aic_scalar_time数据来看，Scalar平均耗时从优化前的15.02us降低至 **5.17us**。
+> - 优化后的流水图如下。对比优化前的流水图，…Scalar流水明显变稀疏。纯Cube模式相较于MIX模式，减少了对消息通信的处理，优化了整体Scalar性能开销。
+
+> 总结：在只有矩阵计算，没有矢量计算的场景下，可以考虑开启纯Cube模式，优化Matmul计算中的消息通信性能开销，提升算子性能。
+
+So: **`aic_time` 17.85 → 11.21 us (−37.2%), `aic_scalar_time` 15.02 → 5.17 us (−65.6%)**, and the whole
+difference is the KFC message framework that the default MIX-mode `Matmul` high-level API uses to have the AIV
+drive the AIC. The enabling switch is the `#define ASCENDC_CUBE_ONLY` before `#include "lib/matmul_intf.h"`
+(§42.6, §44.2).
+
+### B8.7 MTE2 Preload, with its four hard preconditions
+
+`matmul_mte2_preload.md`, verbatim:
+
+> 通过MatmulConfig中的 **doMTE2Preload** 参数开启矩阵M或N方向的预加载功能，预加载即在MTE2间隙提前加载A矩阵/B矩阵数据，开启预加载功能后，可以减少MTE2间隙，提升算子性能。
+>
+> - 开启MTE2 Preload的适用场景：**MTE2流水间隙较大，且M或N数值较大时。**
+> - 开启MTE2 Preload的约束条件
+>     - 仅在使用 **MDL模板和SpecialMDL模板** 时，MTE2 Preload有效。
+>     - 开启M或N方向预加载功能时，需保证 **K方向数据全载**，且M或N方向开启DoubleBuffer。
+>     - K方向数据全载的条件是 `singleK <= baseK * stepK`。
+>     - M方向开启DoubleBuffer的条件是 `depthA1 = stepM * stepK * 2`。
+>     - N方向开启DoubleBuffer的条件是 `depthB1 = stepN * stepK * 2`。
+
+Spec: `a` (128, 512) float16, `b` (512, 24576) float16, M=128 N=24576 K=512, 24 cores, pure-Cube mode, MDL
+template, singleCoreM=128 singleCoreN=1024 singleCoreK=512, baseM=128 baseN=128 baseK=64, stepM=1 stepN=1
+stepKa=8 stepKb=8 depthA1=8 **depthB1=16**.
+
+> - 优化前的流水图如下，M和K方向全载，因此A矩阵只搬运一次。由于N较大，B矩阵会搬运多次，可以看到单次MTE2间存在间隙。
+> - 优化前的Profiling数据如下，aic_time平均耗时 **30.88us**。
+> - 优化后的流水图如下，Tiling参数不变，可以看到，下一次计算使用的B矩阵数据提前加载，MTE2间的间隙缩短。
+> - 优化后的Profiling数据如下，aic_time平均耗时 **28.50us**，较优化前的30.88us有所下降。
+
+**30.88 → 28.50 us, −7.7%.** Note `depthB1 = stepN * stepK * 2 = 1 * 8 * 2 = 16`, which is the N-direction
+double-buffer precondition satisfied exactly.
+
+## Relevance
+
+B8.2 is a measured −41.3% on the operator our profile calls `GroupedMatmulSwigluQuantV2`, published by the
+vendor with the code for every step, and none of the three steps is a tiling retune — they are a launch-ratio
+change, a workspace-count change and a `InitBuffer` depth change. Against 12.389 ms in the two GroupedMatmul
+families, that ladder is the largest documented win available to us that does not require writing a new kernel.
+
+Two of the three steps carry a precondition that bites at batch=1 and must be checked before counting on them.
+The 1:2 ratio works by alternating two AIVs across the inner loop — `if (vecCount % taskRation != subBlockIdx)
+continue;` — and the document states 「前提条件，循环次数不为1」. With one M tile the inner loop may be 1, in
+which case one AIV does everything and the ratio buys nothing; the fix would be to split along N instead, which
+is what `offsetN` already loops over. The four-workspace step is a **credit window of depth 4** on the CV
+handoff (`if (cubeCount >= parallNum) CrossCoreWaitFlag(...)`, producer runs four ahead before it ever waits),
+which costs 4 × baseM × baseN of workspace and is the same discipline as `catlass`'s 15-deep window — and it is
+worth noting that the handoff is per `Iterate()`, not per kernel, so a per-layer megakernel inherits this
+pattern rather than replacing it.
+
+The single line most directly applicable to us is in B8.4:
+`if (mnConfig.numBlocksM == 1) { weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE); }`. **At one M
+block the vendor hints the weight out of L2**, because a tile read exactly once can only evict something that
+is reused. `numBlocksM == 1` is the decode condition, and this is one call on a `GlobalTensor`.
+
+B8.6 quantifies what `ASCENDC_CUBE_ONLY` is actually buying and it is larger than expected: the default MIX
+`Matmul` has the AIV send a message through the KFC framework to the AIC, and that framework cost
+**15.02 us of 17.85 us total `aic_time` in Scalar**, falling to 5.17 us in pure-Cube mode — `aic_time`
+17.85 → 11.21 us, −37.2%. Two consequences. Any matmul of ours not marked `ASCENDC_CUBE_ONLY` is paying that,
+which is a candidate explanation for part of the measured 13.58 us MIX_AIC floor; and the mode changes the core
+split, 48 AIV-based blocks becoming 24 AIC-based blocks with `singleCoreN` doubling, so the tiling must be
+recomputed rather than carried over. B8.7's `doMTE2Preload` is a smaller, conditional −7.7%, gated on the MDL
+or SpecialMDL template, full K residency (`singleK <= baseK * stepK`) and a double-buffered M or N
+(`depthA1 = stepM * stepK * 2`, `depthB1 = stepN * stepK * 2`) — all four are checkable against our tiling
+without a run.

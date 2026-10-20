@@ -85,6 +85,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [Attention sparsity](evidence/ascend-decode/attention-sparsity-20261020/README.md) | Read `SparseFlashAttention`'s real arguments out of the capture. | It is handed the whole paged cache (`73,128,1,512` =9344 positions, the `--capacity` default) alongside a `1,1,2048` selection. At85.048µs a call,2048 positions would be 55GB/s and9344 would be253 -- so it reads everything and masks after, and the1.382ms recorded as its byte floor was the floor of reading everything. A read that honours the selection is4.6x less traffic. Settle it by timing against `--capacity`. Also unaccounted: `hcom_allGather_` at63554µs over140 calls, largest single13240. |
 
+| 10-20 | [L2 hint on the weight](evidence/ascend-decode/routed-kernel-20261020/README.md) | `SetL2CacheHint(CACHE_MODE_DISABLE)` on both projections' weights, the vendor's own `numBlocksM == 1` practice, at16 experts／16 blocks ×3 processes. | Nothing: 49.238／49.517／49.611µs against49.276／49.725／49.791 unhinted, correctness unchanged. The line is removed. The kernel is at66% of bandwidth and L2 eviction by its own weight stream does not explain the missing third. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

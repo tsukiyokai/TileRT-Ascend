@@ -102,3 +102,24 @@ can take several, and a capacity sized for 32 would pay 62% over the
 measurement above. The group list the routing op already emits gives the
 actual counts, so variable rows cost 47.25 + 1.02 × the busiest block's rows,
 which beats every fixed capacity.
+
+
+## Hinting the weight out of L2 buys nothing here
+
+The vendor's grouped matmul calls
+`weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE)` when
+`numBlocksM == 1`, which is the decode condition and the only condition this
+kernel has. The reasoning is sound and sharper than it looks: a tile read
+exactly once can only evict something that is reused, and an eviction writes
+the old line back to global memory before a new one enters, so an unhinted
+streaming read spends bandwidth displacing what you wanted resident.
+
+Measured on the weight tensors of both projections, sixteen experts on
+sixteen blocks, three separate processes: 49.238, 49.517 and 49.611 µs against
+the unhinted 49.276, 49.725 and 49.791. Inside the noise, and correctness
+unchanged at 0 of 196608.
+
+So the hint is a no-op for this kernel and the line is gone. The negative is
+worth more than the line was: this kernel streams 37.7 MB a layer at 66% of
+the die's bandwidth, and whatever accounts for the missing third, L2
+eviction by its own weight stream is not it.

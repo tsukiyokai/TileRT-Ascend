@@ -11600,6 +11600,4075 @@ accumulations into one cell). And 「signal 超时检测」 is listed as a DFX r
 vendor also expects device-side signal waits to hang and plans for a timeout — cf. §15.6's
 `aclrtSynchronizeStreamWithTimeout`.
 
+## 55. ★★★ WHY `KERNEL_TYPE_AIC_ONLY` CANNOT CARRY CROSS-CORE SYNC — the vendor's own codegen, read first-hand
+
+Repo: https://github.com/hicann/asc-devkit (GitHub mirror of `cann/asc-devkit`)
+Files, fetched 2026-10-20 via `gh api repos/hicann/asc-devkit/contents/<path>`:
+- `cmake/asc/legacy_modules/util/host_stub_util.py` (2,724 B)
+- `cmake/asc/legacy_modules/util/constants.py` (2,707 B)
+- `cmake/asc/legacy_modules/util/extract_host_stub.py` (82,243 B)
+
+Copyright header on all three: `Copyright (c) 2025 Huawei Technologies Co., Ltd.`,
+CANN Open Software License Agreement Version 2.0.
+
+§15.4 asserts 「AIC_ONLY/AIV_ONLY 不开启调度模块、CrossCore 不可用——layer kernel 必须 MIX 类型」
+without a mechanism. §41/§44 report a doc sentence to the same effect. Here is the mechanism, in
+the build system that generates the host stub and the kernel entry.
+
+### 55.1 `CodeMode` — THE AUTHORITATIVE NUMERIC ENUM, verbatim
+
+`host_stub_util.py`, lines 12–36:
+
+```python
+from enum import Enum
+
+
+class CodeMode(Enum):
+    """Code mode."""
+
+    MIX = 0
+    AIV = 1
+    AIC = 2
+    NORMAL = 3
+    MIX_VECTOR_CORE = 4
+    KERNEL_TYPE_AIV_ONLY = 5
+    KERNEL_TYPE_AIC_ONLY = 6
+    KERNEL_TYPE_MIX_AIV_1_0 = 7
+    KERNEL_TYPE_MIX_AIC_1_0 = 8
+    KERNEL_TYPE_MIX_AIC_1_1 = 9
+    KERNEL_TYPE_MIX_AIC_1_2 = 10
+
+
+class FuncMetaType(Enum):
+    """function meta type."""
+
+    F_TYPE_KTYPE = 1
+    F_TYPE_CROSS_CORE_SYNC = 2
+    F_TYPE_MAX = 3
+```
+
+Note `FuncMetaType.F_TYPE_CROSS_CORE_SYNC = 2`: a kernel's ELF metadata has a slot that
+*declares* the function uses cross-core sync, separate from its kernel type.
+
+### 55.2 The string→mode table, per arch — verbatim from `constants.py`
+
+```python
+STR_TO_KERNEL_TYPE_V200 = {
+    "KERNEL_TYPE_AICORE": CodeMode.AIC,
+    "KERNEL_TYPE_VECTORCORE": CodeMode.AIC,
+    "KERNEL_TYPE_MIX_VECTOR_CORE": CodeMode.MIX_VECTOR_CORE,
+}
+
+STR_TO_KERNEL_TYPE_V220 = {
+    "KERNEL_TYPE_AIV_ONLY": CodeMode.KERNEL_TYPE_AIV_ONLY,
+    "KERNEL_TYPE_AIC_ONLY": CodeMode.KERNEL_TYPE_AIC_ONLY,
+    "KERNEL_TYPE_MIX_AIV_1_0": CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_0": CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_1": CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+    "KERNEL_TYPE_MIX_AIC_1_2": CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+}
+
+STR_TO_KERNEL_TYPE_C310 = {
+    "KERNEL_TYPE_AIV_ONLY": CodeMode.KERNEL_TYPE_AIV_ONLY,
+    "KERNEL_TYPE_AIC_ONLY": CodeMode.KERNEL_TYPE_AIC_ONLY,
+    "KERNEL_TYPE_MIX_AIV_1_0": CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_0": CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_1": CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+    "KERNEL_TYPE_MIX_AIC_1_2": CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+}
+
+STR_TO_KERNEL_TYPE_L300 = {"KERNEL_TYPE_AICORE": CodeMode.AIC}
+
+STR_TO_KERNEL_TYPE_L311 = {"KERNEL_TYPE_AICORE": CodeMode.AIC}
+```
+
+V220 is our arch (`__NPU_ARCH__ == 2201` / `__CCE_AICORE__ == 220`). The **complete** legal set of
+`KERNEL_TASK_TYPE` strings on V220 is those six. There is no `MIX_AIV_1_1`, no `MIX_AIV_1_2`, and
+no `KERNEL_TYPE_AICORE` / `KERNEL_TYPE_VECTORCORE` / `KERNEL_TYPE_MIX_VECTOR_CORE` (those are V200
+only). Other constants in the same file:
+
+```python
+MIX_CORE_MACRO = "__MIX_CORE_MACRO__"
+
+FUN_TEMPLATE_HASH_TILING_KEY_BASE = 1000000
+
+FUNC_SIGNATURE = re.compile(
+    r"(?:template\s*<\s*([^>]+?)\s*>\s*\n?\s*)?"
+    r"__attribute__\(\(cce_kernel\)\)\s*"
+    r"(?:\[aicore\]|__attribute__\(\(cce_aicore\)\))\s*"
+    r"(.+?)\s*\{",
+    re.DOTALL,
+)
+
+CCE_GLOBAL = "__attribute__((cce_global))"
+```
+
+### 55.3 `get_kernel_type` — AIC_ONLY gets a DIFFERENT meta struct than MIX, verbatim
+
+`extract_host_stub.py`, lines 1646–1671:
+
+```python
+def get_kernel_type(func_code_mode: CodeMode):
+    """Get kernel type."""
+    mode_to_ktype = {}
+    if is_v220_mode() or is_c310_mode():
+        mode_to_ktype = {
+            CodeMode.AIC: ["FunLevelKType", "K_TYPE_AIC"],
+            CodeMode.AIV: ["FunLevelKType", "K_TYPE_AIV"],
+            CodeMode.MIX: ["FunLevelMixCoreType", "K_TYPE_MIX_AIC_MAIN"],
+            CodeMode.KERNEL_TYPE_AIC_ONLY: ["FunLevelKType", "K_TYPE_AIC"],
+            CodeMode.KERNEL_TYPE_AIV_ONLY: ["FunLevelKType", "K_TYPE_AIV"],
+            CodeMode.KERNEL_TYPE_MIX_AIV_1_0: ["FunLevelMixCoreType", "K_TYPE_MIX_AIV_MAIN"],
+            CodeMode.KERNEL_TYPE_MIX_AIC_1_0: ["FunLevelMixCoreType", "K_TYPE_MIX_AIC_MAIN"],
+            CodeMode.KERNEL_TYPE_MIX_AIC_1_1: ["FunLevelMixCoreType", "K_TYPE_MIX_AIC_MAIN"],
+            CodeMode.KERNEL_TYPE_MIX_AIC_1_2: ["FunLevelMixCoreType", "K_TYPE_MIX_AIC_MAIN"],
+        }
+    else:
+        mode_to_ktype = {
+            CodeMode.AIC: ["FunLevelKType", "K_TYPE_AIC"],
+            CodeMode.AIV: ["FunLevelKType", "K_TYPE_AIV"],
+            CodeMode.MIX: ["FunLevelKType", "K_TYPE_MIX_AIC_MAIN"],
+            CodeMode.NORMAL: ["FunLevelKType", "K_TYPE_AICORE"],
+        }
+    if func_code_mode in CodeMode:
+        return mode_to_ktype[func_code_mode]
+    else:
+        raise ArgumentError(f"Unsupported CodeMode: {func_code_mode}")
+```
+
+`KERNEL_TYPE_AIC_ONLY` → `FunLevelKType` / `K_TYPE_AIC`.
+`KERNEL_TYPE_MIX_AIC_1_0` → `FunLevelMixCoreType` / `K_TYPE_MIX_AIC_MAIN`.
+**Two different struct types, in the ELF metadata the runtime reads to build the task.**
+
+### 55.4 How that metadata is emitted — the `.ascend.meta.<name>` ELF section, verbatim
+
+`extract_host_stub.py`, lines 1686–1750:
+
+```python
+def get_ktype_section_variable(
+    variable_name: str, section_func_name: str, func_meta_type: FuncMetaType, func_code_mode: CodeMode
+):
+    type_struc_name, k_type = get_kernel_type(func_code_mode)
+    section_var = ""
+    if func_code_mode in (
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+        CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+        CodeMode.MIX,
+    ):
+        if "mix_aic" in variable_name:
+            section_var += "#if defined(__DAV_C220_CUBE__) || defined(__DAV_C310_CUBE__)\n"
+        elif "mix_aiv" in variable_name:
+            section_var += "#if defined(__DAV_C220_VEC__) || defined(__DAV_C310_VEC__)\n"
+    section_var += f"static const struct {type_struc_name} {variable_name} __attribute__ "
+    section_var += f'((used, section (".ascend.meta.{section_func_name}"))) = '
+    section_var += f"{{ {{ {{{get_func_meta_type(func_meta_type)}, sizeof(unsigned int)}}, {k_type}}}"
+```
+
+and the per-mode choice of how many sections to emit:
+
+```python
+    if genmode in (CodeMode.MIX, CodeMode.KERNEL_TYPE_MIX_AIC_1_1, CodeMode.KERNEL_TYPE_MIX_AIC_1_2):
+        section += get_ktype_section_variable(
+            f"{func_sign.func_name}_mix_aic_section", f"{cur_kernel_name}_mix_aic", FuncMetaType.F_TYPE_KTYPE, genmode
+        )
+
+        section += get_ktype_section_variable(
+            f"{func_sign.func_name}_mix_aiv_section", f"{cur_kernel_name}_mix_aiv", FuncMetaType.F_TYPE_KTYPE, genmode
+        )
+    elif genmode == CodeMode.KERNEL_TYPE_MIX_AIV_1_0:
+        section += get_ktype_section_variable(
+            f"{func_sign.func_name}_mix_aiv_section", f"{cur_kernel_name}_mix_aiv", FuncMetaType.F_TYPE_KTYPE, genmode
+        )
+    elif genmode == CodeMode.KERNEL_TYPE_MIX_AIC_1_0:
+        section += get_ktype_section_variable(
+            f"{func_sign.func_name}_mix_aic_section", f"{cur_kernel_name}_mix_aic", FuncMetaType.F_TYPE_KTYPE, genmode
+        )
+    else:
+        section += get_ktype_section_variable(
+            f"{func_sign.func_name}_section", f"{cur_kernel_name}", FuncMetaType.F_TYPE_KTYPE, genmode
+        )
+    return section
+```
+
+So a MIX_AIC_1_1 / 1_2 kernel publishes **two** sections, `<name>_mix_aic` and `<name>_mix_aiv`;
+MIX_AIC_1_0 publishes only `<name>_mix_aic`; MIX_AIV_1_0 only `<name>_mix_aiv`; everything else
+(including AIC_ONLY) publishes a single section named plainly `<name>`.
+
+### 55.5 ★ THE MECHANISM: `ffts_addr` is injected and `set_ffts_base_addr` is emitted ONLY FOR MIX
+
+`extract_host_stub.py`, lines 555–567:
+
+```python
+def add_ffts_addr_func_param_by_mode(mode: CodeMode, func_params: Tuple[FuncParam, ...]) -> Iterator[FuncParam]:
+    """Add ffts_addr function parameter by mode."""
+    if mode in (
+        CodeMode.MIX,
+        CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+    ):
+        if not is_c310_mode():
+            yield FuncParam(("void*", "ffts_addr"))
+
+    yield from func_params
+```
+
+lines ~793–801, the host side:
+
+```python
+def generate_get_sync_addr_code() -> str:
+    """Generate GetAscendCoreSyncAddr code."""
+    return r"""// need to get the synchronization address if mix mode (stage 2)
+void *ffts_addr;
+__ascendc_ret = GetAscendCoreSyncAddr(&ffts_addr);
+if (__ascendc_ret != 0) {
+    printf("GetAscendCoreSyncAddr ret %u\n", __ascendc_ret);
+    return __ascendc_ret;
+}
+"""
+```
+
+lines 1753–1760, the device side:
+
+```python
+def _generate_ffts_source(is_mix: bool) -> str:
+    if is_mix and is_v220_mode():
+        source = "    icache_preload(1);\n"
+        source += "    if (ffts_addr != nullptr) {\n"
+        source += "        set_ffts_base_addr((uint64_t)ffts_addr);\n"
+        source += "    }\n"
+        return source
+    return ""
+```
+
+and lines 1933–1939, the definition of `is_mix`:
+
+```python
+        is_mix = (
+            func_group.mode == CodeMode.MIX
+            or func_group.mode == CodeMode.KERNEL_TYPE_MIX_AIV_1_0
+            or func_group.mode == CodeMode.KERNEL_TYPE_MIX_AIC_1_0
+            or func_group.mode == CodeMode.KERNEL_TYPE_MIX_AIC_1_1
+            or func_group.mode == CodeMode.KERNEL_TYPE_MIX_AIC_1_2
+        )
+```
+
+Also, for completeness, the `ffts_addr` parameter is prepended to the kernel signature
+(lines ~1843–1846):
+
+```python
+    if is_mix and is_v220_mode():
+        ...
+                func_params=(FuncParam(("GM_ADDR", "ffts_addr")),) + new_func_sign.func_params
+```
+
+and the compile section records the MIX macro (line 1478):
+
+```python
+                compile_section += f";{MIX_CORE_MACRO}={1}"
+```
+
+with `MIX_CORE_MACRO = "__MIX_CORE_MACRO__"`, and `_generate_matmul_clear_source` gated the same
+way (lines 1785–1787):
+
+```python
+def _generate_matmul_clear_source(is_mix: bool) -> str:
+    if RUN_MODE != "cpu" and is_mix and is_v220_mode():
+        return f"""#if defined(REGIST_MATMUL_OBJ) || defined({MIX_CORE_MACRO})
+```
+
+## Relevance
+
+This closes the `KERNEL_TYPE_AIC_ONLY` question with a mechanism rather than a doc sentence, and
+it names the sanctioned workaround exactly.
+
+**The mechanism.** On V220, `ffts_cross_core_sync(pipe, msg)` writes to a hardware FFTS control
+window whose base address must first be installed by `set_ffts_base_addr()` (§19, §22, and
+MegaGDN's `rtGetC2cCtrlAddr` in §8.6). The build system installs it from a kernel parameter
+`ffts_addr`, which the host obtains with `GetAscendCoreSyncAddr(&ffts_addr)` under the comment
+**"need to get the synchronization address if mix mode (stage 2)"**. Both the parameter injection
+(`add_ffts_addr_func_param_by_mode`) and the device-side `set_ffts_base_addr` emission
+(`_generate_ffts_source`, gated on `is_mix and is_v220_mode()`) are conditioned on a mode set that
+contains **MIX, MIX_AIV_1_0, MIX_AIC_1_0, MIX_AIC_1_1, MIX_AIC_1_2 and nothing else**.
+`KERNEL_TYPE_AIC_ONLY = 6` and `KERNEL_TYPE_AIV_ONLY = 5` are not in it. An AIC_ONLY kernel
+therefore has **no `ffts_addr` parameter, no `GetAscendCoreSyncAddr` call on the host, and no
+`set_ffts_base_addr` on the device** — there is nothing for a cross-core flag to be written to.
+That is the same fact as 「不开启调度模块」 (§15.4), seen from the codegen side. AIC_ONLY also emits a
+`FunLevelKType` / `K_TYPE_AIC` metadata record where MIX emits `FunLevelMixCoreType` /
+`K_TYPE_MIX_AIC_MAIN`, so the runtime builds a structurally different task.
+
+**Correction, after §71.** This section originally read `sqe_type=3, errType=0x20` as the shape of
+that type rejection. That is wrong, and §71's first-hand reading of the open-sourced CANN runtime
+is dispositive: in `src/runtime/core/inc/sqe/v200_base/stars_david.hpp`,
+`RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3` while an AIC kernel SQE is `0`, AIV is `1` and FUSION/MIX is
+`2`; and in `src/runtime/core/inc/stars/stars.hpp`,
+`RT_STARS_CQE_ERR_TYPE_SW_STATUS = (1ULL << 5U)` = `0x20`, which `stars_engine.cc` renders through
+`StarsCqeErrorDesc_[CTZ(errType)]` as **"sq sw status error"**. So `sqe_type=3, errType=0x20` is a
+**PLACE_HOLDER SQE** failing with a **software-status error** — it is not a kernel SQE being
+refused for its declared type. The codegen argument above stands on its own (no `ffts_addr`, no
+`set_ffts_base_addr` ⇒ no working `ffts_cross_core_sync`), but it is **not** what that log line
+says, and §56/§60/§68/§69 show `KERNEL_TYPE_AIC_ONLY` documented as supported on A3 and shipping
+in three independent working codebases. Our rejection needs re-diagnosis against §71 and §72
+before `KERNEL_TYPE_AIC_ONLY` is written off.
+
+**The sanctioned workaround, named.** `KERNEL_TYPE_MIX_AIC_1_0` (= `CodeMode` 8, spelled
+`__global__ __mix__(1, 0)` in the attribute form) is a **MIX kernel with one AIC and zero AIVs**.
+It is in the `is_mix` set, so it gets `ffts_addr`, `GetAscendCoreSyncAddr`, `set_ffts_base_addr`
+and a `FunLevelMixCoreType` / `K_TYPE_MIX_AIC_MAIN` metadata record, and it emits only the
+`<name>_mix_aic` section — i.e. it is cube-only in effect while being MIX in type. That is what to
+write instead of `KERNEL_TYPE_AIC_ONLY` when a cube-only kernel needs `CrossCoreSetFlag` or
+`SyncAll`. The vector mirror is `KERNEL_TYPE_MIX_AIV_1_0` / `__mix__(0, 1)` — note §10.1's
+first-party AIV-only all-reduce uses exactly `[[bisheng::core_ratio(0, 1)]]`, not
+`KERNEL_TYPE_AIV_ONLY`.
+
+**The complete legal V220 set** is the six strings in `STR_TO_KERNEL_TYPE_V220`. Anything else we
+might try — `KERNEL_TYPE_AICORE`, `KERNEL_TYPE_VECTORCORE`, `KERNEL_TYPE_MIX_VECTOR_CORE`,
+`KERNEL_TYPE_MIX_AIV_1_1`, `KERNEL_TYPE_MIX_AIV_1_2` — is either V200-only or does not exist, and
+will fail at the `mode_to_ktype[func_code_mode]` lookup or earlier.
+
+**One loose thread worth pulling.** `FuncMetaType.F_TYPE_CROSS_CORE_SYNC = 2` exists but every
+`get_ktype_section_variable` call site in this file passes `F_TYPE_KTYPE`. So there is a *second*
+metadata record type, reserved for declaring cross-core sync, that this legacy codegen path never
+emits. Whoever does emit it — the non-legacy `cmake/asc` path, or the `ascendc_kernel_cmake` flow —
+is where a hand-written kernel's cross-core-sync declaration would have to come from. That is the
+most likely place a hand-rolled `__mix__` kernel built outside the official flow diverges from one
+built inside it, and it dovetails with §15.6's observation that 「官方流会把核函数再包含一遍并改名成
+inline、并把 `__schedmode__` / `__mix__` 属性判为非法」.
+
+# Topic 4 — AscendC kernel TYPE declarations and the `sqe_type=3, errType=0x20` submission rejection
+
+Collected 2026-10-20. Target: Ascend A3 (910_9392), `__NPU_ARCH__ == 2201` / dav-2201 / `__CCE_AICORE__ == 220`, CANN 9.2.0.
+All material below is VERBATIM. Chinese preserved as published.
+
+## 56. asc.gitcode.com (NEWEST Ascend C API mirror) — 设置核函数（Kernel）类型 / `set_Kernel_type`  ★ DIRECT CONTRADICTION
+
+URL: https://asc.gitcode.com/api/SIMD-API/basic_api/Kernel-Tiling/set_Kernel_type.html
+Author: Huawei / Ascend C documentation (VitePress mirror `asc.gitcode.com`, generator "VitePress v1.6.4"; title "Ascend C", description "Ascend C 算子开发文档")
+Date: fetched 2026-10-20. This mirror is NEWER than doc_center — it carries the `Ascend 950PR&950DT` / `Atlas A3系列产品` product taxonomy and the `SetSimdNumBlocks` / `numBlocks` renaming (CANN 9.x naming), where the 8.0.RC2 doc_center page still says `SetBlockDim` / `blockdim`.
+Discovery path: `https://asc.gitcode.com/sitemap.xml` is 404 (`NoSuchKey`) and `https://asc.gitcode.com/api/` 404s; the real page index is `https://asc.gitcode.com/hashmap.json` (3742 entries, keys lowercased with `/`→`_`) plus `https://asc.gitcode.com/api/README.html` which carries the real-capitalisation hrefs. The page file is `set_Kernel_type.html` with a CAPITAL K — `set_kernel_type.html` 404s.
+
+### Full page, verbatim
+
+```
+设置核函数（Kernel）类型
+产品支持情况​
+Ascend 950PR&950DT系列产品：支持
+
+Atlas A3系列产品：支持
+
+Atlas A2系列产品：支持
+
+Atlas 200I/500 A2推理产品：不支持
+
+Atlas推理系列产品AI Core：支持
+
+Atlas推理系列产品Vector Core：不支持
+
+Atlas训练系列产品：不支持
+
+功能说明​
+头文件路径为："utils/base/sys_macros.h"。
+用于用户自定义设置核函数（Kernel）类型，控制算子执行时只启动该类型的核，避免启动不需要工作的核，缩短核启动开销。
+函数原型​
+设置全局默认的核函数（Kernel）类型，对所有的tiling key生效。
+当前支持在自定义算子工程和核函数（Kernel）直调工程中使用。
+Text
+KERNEL_TASK_TYPE_DEFAULT(value)
+
+设置某一个具体的tiling key对应的核函数（Kernel）类型。
+当前仅支持在自定义算子工程中使用。
+Text
+KERNEL_TASK_TYPE(key, value)
+
+参数说明​
+表1 参数说明
+
+参数
+
+输入/输出
+
+说明
+
+key
+
+输入
+
+tiling key的key值，此参数是正数，表示某个核函数（Kernel）的分支。
+
+value
+
+输入
+
+设置的核函数（Kernel）类型，可选值范围，核函数（Kernel）类型具体说明请参考表2。不同硬件架构支持的参数取值不同，具体支持的参数取值请参考kernel type取值约束。
+enum KernelMetaType {
+ KERNEL_TYPE_AIV_ONLY,
+ KERNEL_TYPE_AIC_ONLY,
+ KERNEL_TYPE_MIX_AIV_1_0,
+ KERNEL_TYPE_MIX_AIC_1_0,
+ KERNEL_TYPE_MIX_AIC_1_1,
+ KERNEL_TYPE_MIX_AIC_1_2,
+ KERNEL_TYPE_AICORE,
+ KERNEL_TYPE_VECTORCORE,
+ KERNEL_TYPE_MIX_AICORE,
+ KERNEL_TYPE_MIX_VECTOR_CORE,
+ KERNEL_TYPE_MAX
+};
+
+表2 核函数（Kernel）类型取值说明
+
+参数
+
+说明
+
+KERNEL_TYPE_AIV_ONLY
+
+算子执行时仅启动AI Core上的Vector核：比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+
+KERNEL_TYPE_AIC_ONLY
+
+算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+
+KERNEL_TYPE_MIX_AIV_1_0
+
+AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数（Kernel）的类型为MIX AIV:AIC 1:0（带有硬同步），算子执行时仅会启动AI Core上的Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+硬同步的概念解释如下：当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用SyncAll()函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬同步是利用硬件自带的全核同步指令由硬件保证多核同步。
+
+KERNEL_TYPE_MIX_AIC_1_0
+
+AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数（Kernel）的类型为MIX AIC:AIV 1:0（带有硬同步），算子执行时仅会启动AI Core上的Cube核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+
+KERNEL_TYPE_MIX_AIC_1_1
+
+AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和10个Vector核。
+
+KERNEL_TYPE_MIX_AIC_1_2
+
+AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和20个Vector核。
+
+KERNEL_TYPE_AICORE 
+
+算子执行时仅会启动AI Core，比如用户在host侧设置numBlocks为5，则会启动5个AI Core。
+
+KERNEL_TYPE_VECTORCORE
+
+该参数为预留参数，当前版本暂不支持。
+
+KERNEL_TYPE_MIX_AICORE
+
+该参数为预留参数，当前版本暂不支持。
+
+KERNEL_TYPE_MIX_VECTOR_CORE
+
+基于Ascend C开发的矢量计算相关的算子可以运行在Vector Core上，调用本接口传入该参数用于启用Vector Core。
+启用Vector Core后，算子执行时会同时启动AI Core和Vector Core，用于并行计算。比如用户在host侧设置numBlocks为10，则会启动总数为10的AI Core和Vector Core。
+需要注意的是，通过SetSimdNumBlocks设置核数时，需要大于AI Core的核数，否则不会启动VectorCore。
+
+约束说明​
+核函数（Kernel）类型取值约束
+Ascend 950PR&950DT系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+
+Atlas A3系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+
+Atlas A2系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+
+Atlas推理系列产品，支持KERNEL_TYPE_AICORE、KERNEL_TYPE_MIX_VECTOR_CORE。
+
+KERNEL_TASK_TYPE优先级高于KERNEL_TASK_TYPE_DEFAULT，同时设置了全局核函数（Kernel）类型和某一个tiling key的核函数（Kernel）类型，该tiling key的核函数（Kernel）类型以KERNEL_TASK_TYPE设置的为准。
+
+没有设置全局默认核函数（Kernel）类型的情况下，如果开发者只为其中的某几个tiling key设置核函数（Kernel）类型，即部分tiling key没有设置核函数（Kernel）类型，会导致算子核函数（Kernel）编译报错。
+
+当设置具体的核函数（Kernel）任务类型时，用户的算子实现需要与核函数（Kernel）类型相匹配。比如用户设置核函数（Kernel）类型为KERNEL_TYPE_MIX_AIC_1_2，则算子内部实现应与核配比AIC:AIV为1:2相对应；若用户设置核函数（Kernel）类型为KERNEL_TYPE_AIC_ONLY，则算子内部实现应该为纯cube逻辑，不应该存在vector部分的逻辑。其他的核函数（Kernel）类型类似。
+
+当纯cube或者纯vec算子强制设定核函数（Kernel）类型为MIX类型时，workspace的大小不能设置为0，需要设置一个大于0的值（比如16、32等）。
+
+使用Tiling模板编程时，需要通过ASCENDC_TPL_KERNEL_TYPE_SEL设置核函数（Kernel）类型即可，无需再通过该接口进行设置，本接口不生效。
+
+调用示例​
+示例一：启用VectorCore样例
+完成算子核函数（Kernel）侧开发时，需要通过本接口启用Vector Core，算子执行时会同时启动AI Core和Vector Core，此时AI Core会当成Vector Core使用。示例如下：
+Text
+extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.numBlocks, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_VECTOR_CORE); // 启用VectorCore
+ if (TILING_KEY_IS(1)) {
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ op.Process2();
+ }
+ // ...
+}
+
+完成算子host侧Tiling开发时，设置的numBlocks代表的是AI Core和Vector Core的总数，比如用户在host侧设置numBlocks为10，则会启动总数为10的AI Core和Vector Core；为保证启动Vector Core，设置数值应大于AI Core的核数。您可以通过GetCoreNumAic接口获取AI Core的核数，GetCoreNumVector接口获取Vector Core的核数。如下代码片段，展示了numBlocks的设置方法，此处设置为AI Core和Vector Core的总和，表示所有AI Core和Vector Core都启动。
+Text
+// 配套的host侧tiling函数示例：
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // 启用VectorCore，将numBlocks置为AI Core中vector核数 + Vector Core中的vector核数
+ auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+ auto totalCoreNum = ascendcPlatform.GetCoreNumAiv();
+ // ASCENDXXX请替换为实际的版本型号
+ if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCENDXXX) {
+ totalCoreNum = totalCoreNum + ascendcPlatform.GetCoreNumVector();
+ }
+ context->SetSimdNumBlocks(totalCoreNum);
+}
+
+示例二：设置某一个具体的tiling key对应的核函数（Kernel）类型。如下代码为伪代码，不可直接运行。
+Text
+extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.numBlocks, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY); // 设置默认的核函数（Kernel）类型为纯AIV类型
+ if (TILING_KEY_IS(1)) {
+ KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIV_1_0); // 设置tiling key=1对应的核函数（Kernel）类型为MIX AIV 1:0
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ KERNEL_TASK_TYPE(2, KERNEL_TYPE_AIV_ONLY); // 设置tiling key=2对应的核函数（Kernel）类型为纯AIV类型
+ op.Process2();
+ }
+ // ...
+}
+// 配套的host侧tiling函数示例：
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // ...
+ if (context->GetInputShape(0) > 10) {
+ context->SetTilingKey(1);
+ } else if (some condition) {
+ context->SetTilingKey(2);
+ }
+}
+```
+
+### The single load-bearing block, isolated
+
+> 产品支持情况​
+> Ascend 950PR&950DT系列产品：支持
+>
+> Atlas A3系列产品：支持
+>
+> Atlas A2系列产品：支持
+>
+> Atlas 200I/500 A2推理产品：不支持
+>
+> Atlas推理系列产品AI Core：支持
+>
+> Atlas推理系列产品Vector Core：不支持
+>
+> Atlas训练系列产品：不支持
+
+> 约束说明​
+> 核函数（Kernel）类型取值约束
+> Ascend 950PR&950DT系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+>
+> **Atlas A3系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。**
+>
+> Atlas A2系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+>
+> Atlas推理系列产品，支持KERNEL_TYPE_AICORE、KERNEL_TYPE_MIX_VECTOR_CORE。
+
+Header file, verbatim:
+
+> 头文件路径为："utils/base/sys_macros.h"。
+
+Project-scope statement, verbatim (NOTE: this is the NEW wording — compare §57):
+
+> 设置全局默认的核函数（Kernel）类型，对所有的tiling key生效。
+> 当前支持在自定义算子工程和核函数（Kernel）直调工程中使用。
+> `KERNEL_TASK_TYPE_DEFAULT(value)`
+>
+> 设置某一个具体的tiling key对应的核函数（Kernel）类型。
+> 当前仅支持在自定义算子工程中使用。
+> `KERNEL_TASK_TYPE(key, value)`
+
+Enum, verbatim:
+
+```c
+enum KernelMetaType {
+    KERNEL_TYPE_AIV_ONLY,
+    KERNEL_TYPE_AIC_ONLY,
+    KERNEL_TYPE_MIX_AIV_1_0,
+    KERNEL_TYPE_MIX_AIC_1_0,
+    KERNEL_TYPE_MIX_AIC_1_1,
+    KERNEL_TYPE_MIX_AIC_1_2,
+    KERNEL_TYPE_AICORE,
+    KERNEL_TYPE_VECTORCORE,
+    KERNEL_TYPE_MIX_AICORE,
+    KERNEL_TYPE_MIX_VECTOR_CORE,
+    KERNEL_TYPE_MAX
+};
+```
+
+(Ordinals therefore are: AIV_ONLY=0, AIC_ONLY=1, MIX_AIV_1_0=2, MIX_AIC_1_0=3, MIX_AIC_1_1=4, MIX_AIC_1_2=5, AICORE=6, VECTORCORE=7, MIX_AICORE=8, MIX_VECTOR_CORE=9, MAX=10.)
+
+`numBlocks` semantics per type, verbatim:
+
+> KERNEL_TYPE_AIV_ONLY — 算子执行时仅启动AI Core上的Vector核：比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+>
+> KERNEL_TYPE_AIC_ONLY — 算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+>
+> KERNEL_TYPE_MIX_AIV_1_0 — AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数（Kernel）的类型为MIX AIV:AIC 1:0（带有硬同步），算子执行时仅会启动AI Core上的Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+> 硬同步的概念解释如下：当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用SyncAll()函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬同步是利用硬件自带的全核同步指令由硬件保证多核同步。
+>
+> KERNEL_TYPE_MIX_AIC_1_0 — AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数（Kernel）的类型为MIX AIC:AIV 1:0（带有硬同步），算子执行时仅会启动AI Core上的Cube核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+>
+> KERNEL_TYPE_MIX_AIC_1_1 — AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和10个Vector核。
+>
+> KERNEL_TYPE_MIX_AIC_1_2 — AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和20个Vector核。
+>
+> KERNEL_TYPE_AICORE — 算子执行时仅会启动AI Core，比如用户在host侧设置numBlocks为5，则会启动5个AI Core。
+>
+> KERNEL_TYPE_VECTORCORE — 该参数为预留参数，当前版本暂不支持。
+>
+> KERNEL_TYPE_MIX_AICORE — 该参数为预留参数，当前版本暂不支持。
+>
+> KERNEL_TYPE_MIX_VECTOR_CORE — 基于Ascend C开发的矢量计算相关的算子可以运行在Vector Core上，调用本接口传入该参数用于启用Vector Core。启用Vector Core后，算子执行时会同时启动AI Core和Vector Core，用于并行计算。比如用户在host侧设置numBlocks为10，则会启动总数为10的AI Core和Vector Core。需要注意的是，通过SetSimdNumBlocks设置核数时，需要大于AI Core的核数，否则不会启动VectorCore。
+
+Implementation-must-match constraint, verbatim:
+
+> 当设置具体的核函数（Kernel）任务类型时，用户的算子实现需要与核函数（Kernel）类型相匹配。比如用户设置核函数（Kernel）类型为KERNEL_TYPE_MIX_AIC_1_2，则算子内部实现应与核配比AIC:AIV为1:2相对应；若用户设置核函数（Kernel）类型为KERNEL_TYPE_AIC_ONLY，则算子内部实现应该为纯cube逻辑，不应该存在vector部分的逻辑。其他的核函数（Kernel）类型类似。
+>
+> 当纯cube或者纯vec算子强制设定核函数（Kernel）类型为MIX类型时，workspace的大小不能设置为0，需要设置一个大于0的值（比如16、32等）。
+>
+> 使用Tiling模板编程时，需要通过ASCENDC_TPL_KERNEL_TYPE_SEL设置核函数（Kernel）类型即可，无需再通过该接口进行设置，本接口不生效。
+
+## Relevance
+★★★ THIS IS THE CONTRADICTION. The newest official doc states flatly that `Atlas A3系列产品` supports `KERNEL_TYPE_AIC_ONLY`, and that `KERNEL_TASK_TYPE_DEFAULT` is usable in 核函数直调工程 (kernel direct-call projects) — exactly our configuration. So an AIC_ONLY kernel being rejected at submission with `sqe_type=3, errType=0x20` is NOT a documented architectural prohibition; it is either (a) a host-side/launch-side mismatch (blockDim, workspace, or the launch API used), or (b) an undocumented restriction in the direct-call path.
+Also actionable: the per-type `numBlocks` semantics are explicit — for AIC_ONLY `numBlocks` counts CUBE cores (not AIV), and for MIX_AIC_1_2 `numBlocks` counts Cube cores with 2x that many AIV started. And "当纯cube...强制设定为MIX类型时，workspace的大小不能设置为0" is a concrete thing to check if we switch to MIX_AIC_1_0.
+
+## 57. hiascend doc_center — CANN 商用版 8.0.RC2, 「设置kernel类型」 (older wording; the `kernel直调工程` restriction)
+
+URL: https://www.hiascend.com/doc_center/source/zh/canncommercial/80RC2/apiref/opdevgapi/atlasascendc_api_07_0212.html
+(the `document/detail/...` form of the same page is https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/apiref/opdevgapi/atlasascendc_api_07_0212.html but that path returns an empty body to a fetcher; use `doc_center/source/...`)
+Author: Huawei 技术有限公司 — CANN 商用版 8.0.RC2 开发文档, 算子开发接口 > Ascend C API > 基础API > 其他 > Kernel Tiling > 设置kernel类型
+Date: CANN 8.0.RC2 (2024). Retrieved 2026-10-20. 父主题： Kernel Tiling
+
+### The two load-bearing differences from the newest doc (§56)
+
+(a) 8.0.RC2 restricts the macro in kernel direct-call projects to Vector Core ONLY — verbatim:
+
+> 设置全局默认的kernel type, 对所有的tiling key生效。
+> **当前支持在自定义算子工程和kernel直调工程中使用，其中kernel直调工程仅支持使用该宏使能Vector Core。**
+>
+> `KERNEL_TASK_TYPE_DEFAULT(value)`
+
+The newest asc.gitcode.com page (§56) has DROPPED the clause `其中kernel直调工程仅支持使用该宏使能Vector Core`, and now reads only `当前支持在自定义算子工程和核函数（Kernel）直调工程中使用。`
+
+(b) 8.0.RC2 `支持的型号` names only:
+
+> 支持的型号
+> Atlas A2训练系列产品/Atlas 800I A2推理产品
+> Atlas推理系列产品AI Core
+
+and per-value support in 8.0.RC2 is written inline in 表2, verbatim:
+
+> KERNEL_TYPE_AIC_ONLY
+> 算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置blockdim为10，则会启动10个Cube核。
+> Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+> Atlas推理系列产品AI Core：不支持该参数
+
+> KERNEL_TYPE_MIX_AIC_1_1
+> AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置blockdim为10，则会启动10个Cube核和10个Vector核。
+> **该参数为预留参数，当前版本暂不支持。**
+
+> KERNEL_TYPE_MIX_AIC_1_2
+> AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置blockdim为10，则会启动10个Cube核和20个Vector核。
+> Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+> Atlas推理系列产品AI Core：不支持该参数
+
+> KERNEL_TYPE_AICORE
+> 算子执行时仅会启动AI Core，比如用户在host侧设置blockdim为5，则会启动5个AI Core。
+> Atlas 推理系列产品：支持该参数
+> **Atlas A2训练系列产品/Atlas 800I A2推理产品：不支持该参数**
+
+> KERNEL_TYPE_MIX_VECTOR_CORE
+> 基于Ascend C开发的矢量计算相关的算子可以运行在Vector Core上，该接口用于使能Vector Core。基于Vector Core架构进行算子编程的详细介绍请参考基于VectorCore编程。
+> 算子执行时会同时启动AI Core和Vector Core， 此时AI Core会当成Vector Core使用，比如用户在host侧设置block_dim为10，则会启动总数为10的AI Core和Vector Core。
+> 通过SetBlockDim设置核数时, 需要大于AI Core的核数，否则不会启动VectorCore。
+> Atlas 推理系列产品：支持该参数
+> **Atlas A2训练系列产品/Atlas 800I A2推理产品：不支持该参数**
+
+Note `KERNEL_TYPE_MIX_AIC_1_1` is 预留/暂不支持 in 8.0.RC2 but listed as SUPPORTED on A2/A3/950 in the newest doc (§56). This is a genuine version-to-version change, not a doc inconsistency.
+
+### Full page, verbatim
+
+```
+设置kernel类型
+
+ 
+ 
+ 函数功能
+
+ 用于用户自定义设置kernel类型，控制算子执行时只启动该类型的核，避免启动不需要工作的核，缩短核启动开销。
+
+ 
+
+ 
+ 函数原型
+
+ 
+ 设置全局默认的kernel type, 对所有的tiling key生效。
+ 当前支持在自定义算子工程和kernel直调工程中使用，其中kernel直调工程仅支持使用该宏使能Vector Core。
+
+ KERNEL_TASK_TYPE_DEFAULT(value)
+
+ 设置某一个具体的tiling key对应的kernel type。
+ 当前仅支持在自定义算子工程中使用。
+
+ KERNEL_TASK_TYPE(key, value)
+
+ 
+ 
+
+ 
+ 参数说明
+
+ 
+ 
+ 
+ 表1 参数说明
+ 
+ 
+ 
+ 
+ 参数
+
+ 
+ 输入/输出
+
+ 
+ 说明
+
+ 
+
+ 
+ 
+ 
+ 
+ key
+
+ 
+ 输入
+
+ 
+ tiling key的key值，此参数是正数，表示某个核函数的分支。
+
+ 
+
+ 
+ 
+ value
+
+ 
+ 输入
+
+ 
+ 设置的kernel类型，可选值范围，kernel类型具体说明请参考表2。
+
+ enum KernelMetaType {
+ KERNEL_TYPE_AIV_ONLY,
+ KERNEL_TYPE_AIC_ONLY,
+ KERNEL_TYPE_MIX_AIV_1_0,
+ KERNEL_TYPE_MIX_AIC_1_0,
+ KERNEL_TYPE_MIX_AIC_1_1,
+ KERNEL_TYPE_MIX_AIC_1_2,
+ KERNEL_TYPE_AICORE,
+ KERNEL_TYPE_VECTORCORE,
+ KERNEL_TYPE_MIX_AICORE,
+ KERNEL_TYPE_MIX_VECTOR_CORE,
+ KERNEL_TYPE_MAX
+};
+
+ 
+
+ 
+ 
+ 
+
+ 
+ 
+ 
+ 
+ 表2 kernel type取值说明
+ 
+ 
+ 
+ 
+ 参数
+
+ 
+ 说明
+
+ 
+
+ 
+ 
+ 
+ 
+ KERNEL_TYPE_AIV_ONLY
+
+ 
+ 算子执行时仅启动AI Core上的Vecor核：比如用户在host侧设置blockdim为10，则会启动10个Vecor核。
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+
+ Atlas推理系列产品AI Core：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_AIC_ONLY
+
+ 
+ 算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置blockdim为10，则会启动10个Cube核。
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+
+ Atlas推理系列产品AI Core：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIV_1_0
+
+ 
+ AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数的类型为MIX AIV:AIC 1:0（带有硬同步），算子执行时仅会启动AI Core上的Vecor核，比如用户在host侧设置blockdim为10，则会启动10个Vecor核。
+
+ 硬同步的概念解释如下：当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用SyncAll()函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬同步是利用硬件自带的全核同步指令由硬件保证多核同步。
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+
+ Atlas推理系列产品AI Core：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_0
+
+ 
+ AIC、AIV混合场景下，使用了多核控制相关指令时，设置核函数的类型为MIX AIC:AIV 1:0（带有硬同步），算子执行时仅会启动AI Core上的Cube核，比如用户在host侧设置blockdim为10，则会启动10个Cube核。
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+
+ Atlas推理系列产品AI Core：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_1
+
+ 
+ AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置blockdim为10，则会启动10个Cube核和10个Vector核。
+
+ 该参数为预留参数，当前版本暂不支持。
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_2
+
+ 
+ AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置blockdim为10，则会启动10个Cube核和20个Vector核。
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：支持该参数
+
+ Atlas推理系列产品AI Core：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_AICORE
+
+ 
+ 算子执行时仅会启动AI Core，比如用户在host侧设置blockdim为5，则会启动5个AI Core。
+
+ Atlas 推理系列产品：支持该参数
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：不支持该参数
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_VECTORCORE
+
+ 
+ 该参数为预留参数，当前版本暂不支持。
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AICORE
+
+ 
+ 该参数为预留参数，当前版本暂不支持。
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_VECTOR_CORE
+
+ 
+ 基于Ascend C开发的矢量计算相关的算子可以运行在Vector Core上，该接口用于使能Vector Core。基于Vector Core架构进行算子编程的详细介绍请参考基于VectorCore编程。
+
+ 
+
+ 算子执行时会同时启动AI Core和Vector Core， 此时AI Core会当成Vector Core使用，比如用户在host侧设置block_dim为10，则会启动总数为10的AI Core和Vector Core。
+
+ 通过SetBlockDim设置核数时, 需要大于AI Core的核数，否则不会启动VectorCore。
+
+ Atlas 推理系列产品：支持该参数
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品：不支持该参数
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+ 支持的型号
+
+ Atlas A2训练系列产品/Atlas 800I A2推理产品
+
+ Atlas推理系列产品AI Core
+
+ 
+
+ 
+ 约束说明
+
+ 
+ KERNEL_TASK_TYPE优先级高于KERNEL_TASK_TYPE_DEFAULT，同时设置了全局kernel type和某一个tiling key的kernel type，该tiling key的kernel type以KERNEL_TASK_TYPE设置的为准。
+
+ 没有设置全局默认kernel type的情况下，如果开发者只为其中的某几个tiling key设置kernel type，即部分tiling key没有设置kernel type，会导致算子kernel编译报错。
+
+ 当设置具体的kernel task type时，用户的算子实现需要与kernel type相匹配。比如用户设置kernel type为KERNEL_TYPE_MIX_AIC_1_2, 则算子内部实现应与核配比AIC:AIV为1:2相对应；若用户设置kernel type为KERNEL_TYPE_AIC_ONLY， 则算子内部实现应该为纯cube逻辑，不应该存在vector部分的逻辑。其他的kernel type类似。
+
+ 当纯cube或者纯vec算子强制设定kernel type为MIX类型时，workspace的大小不能设置为0，需要设置一个大于0的值（比如16、32等）。
+
+ 
+ 
+
+ 
+ 调用示例
+
+ 
+ 示例一：使能VectorCore样例
+ 
+ 完成算子kernel侧开发时，需要通过本接口开启支持Vector Core，算子执行时会同时启动AI Core和Vector Core， 此时AI Core会当成Vector Core使用。如下的代码样例展示了使能Vector Core的方法：
+ extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ SetSysWorkspace(workspace);
+ GM_ADDR usr = GetUserWorkspace(workspace);
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.blockDim, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_VECTOR_CORE); // 使能VectorCore
+ if (TILING_KEY_IS(1)) {
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ op.Process2();
+ }
+ // ...
+}
+
+ 完成算子host侧Tiling开发时，设置的block_dim代表的是AI Core和Vector Core的总数，比如用户在host侧设置blockdim为10，则会启动总数为10的AI Core和Vector Core；为保证启动Vector Core，设置数值应大于AI Core的核数。您可以通过GetCoreNumAic接口获取AI Core的核数，GetCoreNumVector接口获取Vector Core的核数。 如下代码片段，展示了block_dim的设置方法，此处设置为AI Core和Vector Core的总和，表示所有AI Core和Vector Core都启动。
+ // 配套的host侧tiling函数示例：
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // 使能VectorCore，将block_dim置为AI Core中vector核数 + Vector Core中的vector核数
+ auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+ auto totalCoreNum = ascendcPlatform.GetCoreNumAiv();
+ // ASCENDXXX请替换为实际的版本型号
+ if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCENDXXX) {
+ totalCoreNum = totalCoreNum + ascendcPlatform.GetCoreNumVector();
+ }
+ context->SetBlockDim(totalCoreNum);
+}
+
+ 
+
+ 示例二：设置某一个具体的tiling key对应的kernel type。如下代码为伪代码 ，不可直接运行。
+ extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ SetSysWorkspace(workspace);
+ GM_ADDR usr = GetUserWorkspace(workspace);
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.blockDim, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY); // 设置默认的kernel类型为纯AIV类型
+ if (TILING_KEY_IS(1)) {
+ KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIV_1_0); // 设置tiling key=1对应的kernel类型为MIX AIV 1:0
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ KERNEL_TASK_TYPE(2, KERNEL_TYPE_AIV_ONLY); // 设置tiling key=2对应的kernel类型为纯AIV类型
+ op.Process2();
+ }
+ // ...
+}
+配套的host侧tiling函数示例：
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // ...
+ if (context->GetInputShape(0) > 10) {
+ context->SetTilingKey(1);
+ } else if (some condition) {
+ context->SetTilingKey(2);
+ }
+}
+
+ 
+ 
+
+ 
+
+ 
+ 
+ 
+ 父主题： Kernel Tiling
+```
+
+## Relevance
+Establishes the version timeline: as of CANN 8.0.RC2 a 核函数直调 (kernel-direct-call / `<<<>>>`-style launch) project could ONLY use `KERNEL_TASK_TYPE_DEFAULT` to enable Vector Core — implying AIC_ONLY via this macro was out of scope for direct-call back then. CANN 9.x (§56) removed that clause. Since we are on CANN 9.2.0 and hand-writing a direct-call engine, the 9.x wording nominally allows AIC_ONLY; our `sqe_type=3, errType=0x20` rejection is therefore an undocumented behaviour in the direct-call launch path, not a documented product limitation.
+Also: `KERNEL_TYPE_MIX_AIC_1_1` went from 预留参数/暂不支持 (8.0.RC2) to supported (9.x) — so if we need an AIC-dominant launch, 1_1 is now a legal fallback alongside `MIX_AIC_1_0`.
+
+## 58. Gitee `Ascend/samples` Issue #I7U8HV — the ONLY public report of `errType=0x20`, and its decode: `sq sw status error`
+
+URL: https://gitee.com/ascend/samples/issues/I7U8HV?from=project-issue
+Author: Gitee user `unicorn`, in repo `Ascend / samples` (Huawei official samples repo; Star 1.3K / Fork 1.2K)
+Date: 创建于 2023-08-18 14:21. Status: `DONE`. Title: 「500小站A2 yolov5-l 执行om模型推理报错Illegal instruction」
+Software: CANN 6.2.RC1, PyTorch 1.13.1, Python 3.7.5, Ubuntu 22.04, 硬件设备：500小站A2
+
+### The error line, VERBATIM — note the parenthesised decode of errType=0x20
+
+```
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.983.877 [engine.cc:3326]4718 ProcLogicCqReport:[EXEC][DEFAULT]CQE error, device_id=0, stream_id=1, task_id=4, sqe_type=7, errType=0x20(sq sw status error), sqSwStatus=0x10020000
+```
+
+`errType=0x20` is printed by the runtime itself as **`sq sw status error`**. (Compare the much more common `errType=0x1(task exception)`, §59.)
+
+### Full log, verbatim
+
+```
+[INFO] acl init success
+[INFO] open device 0 success
+[INFO] load model yolov5l_bs1.om success
+[INFO] create model description success
+[INFO] try get model batchsize:1
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.983.877 [engine.cc:3326]4718 ProcLogicCqReport:[EXEC][DEFAULT]CQE error, device_id=0, stream_id=1, task_id=4, sqe_type=7, errType=0x20(sq sw status error), sqSwStatus=0x10020000
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.527 [device_error_proc.cc:920]4718 ProcessStarsCoreErrorInfo:[EXEC][DEFAULT]report error module_type=5, module_name=EZ9999
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.603 [device_error_proc.cc:920]4718 ProcessStarsCoreErrorInfo:[EXEC][DEFAULT]The error from device(chipId:0, dieId:0), serial number is 13, there is an aicore error exception, core id is 0, error code = 0x10, dump info: pc start: 0xe80000016000, current: 0xe80000016040, vec error info: 0, mte error info: 0xffbb6faf7f, ifu error info: 0xcddfbefffbfc0, ccu error info: 0x804000002c000003, cube error info: 0, biu error info: 0, aic error mask: 0x65000208d000288, para base: 0xe80000166000.
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.698 [device_error_proc.cc:932]4718 ProcessStarsCoreErrorInfo:[EXEC][DEFAULT]report error module_type=5, module_name=EZ9999
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.729 [device_error_proc.cc:932]4718 ProcessStarsCoreErrorInfo:[EXEC][DEFAULT]The extend info: errcode:(0x10, 0, 0) errorStr: Illegal instruction, which is usually caused by unaligned UUB addresses. fixp_error0 info: 0xb6faf7f, fixp_error1 info: 0xff fsmId:0, tslot:0, thread:0, ctxid:0, blk:0, sublk:0, subErrType:4.
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.819 [task.cc:3724]4718 ReportErrorInfo:[EXEC][DEFAULT]model execute error, retCode=0x91, [the model stream execute failed].
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.857 [task.cc:3701]4718 PrintErrorInfo:[EXEC][DEFAULT]model execute task failed, device_id=0, model stream_id=1, model task_id=3, flip_num=0, model_id=0, first_task_id=0
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.929 [task.cc:1122]4718 PrintErrorInfo:[EXEC][DEFAULT]Aicore kernel execute failed, device_id=0, stream_id=2, report_stream_id=1, task_id=0, flip_num=0, fault kernel_name=230470141334547969-1_0_1_trans_TransData_0, program id=0, hash=16696008396781517327.
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:15.984.967 [callback.cc:91]4718 Notify:[EXEC][DEFAULT]notify [ASCENDCL] task fail start.notify taskid:0 streamid:2 retcode:507011
+[INFO] exception_cb streamId:2 taskId:0 deviceId: 0 opName:trans_TransData_0 inputCnt:1 outputCnt:1
+[INFO] exception_cb hostaddr:0xaaaaf2519460 devaddr:0xe80009a00200 len:2457600 write to filename:exception_cb_index_0_input_0_format_0_dtype_1_shape_1x3x640x640.bin
+[INFO] exception_cb hostaddr:0xaaaaf2771470 devaddr:0xe80007600200 len:13107200 write to filename:exception_cb_index_0_output_0_format_83886083_dtype_1_shape_1x1x640x640x16.bin
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.090 [stream.cc:1129]4718 GetError:[EXEC][DEFAULT]Stream Synchronize failed, stream_id=1, retCode=0x91, [the model stream execute failed].
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.195 [stream.cc:1132]4718 GetError:[EXEC][DEFAULT]report error module_type=5, module_name=EZ9999
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.229 [stream.cc:1132]4718 GetError:[EXEC][DEFAULT]Aicore kernel execute failed, device_id=0, stream_id=2, report_stream_id=1, task_id=0, flip_num=0, fault kernel_name=230470141334547969-1_0_1_trans_TransData_0, program id=0, hash=16696008396781517327.
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.305 [model.cc:590]4718 SynchronizeExecute:[EXEC][DEFAULT]report error module_type=0, module_name=EE9999
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.335 [model.cc:590]4718 SynchronizeExecute:[EXEC][DEFAULT]Fail to synchronize forbbiden stream, retCode=0x7150050!
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.373 [model.cc:630]4718 GetStreamToSyncExecute:[EXEC][DEFAULT]report error module_type=0, module_name=EE9999
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.399 [model.cc:630]4718 GetStreamToSyncExecute:[EXEC][DEFAULT]Model synchronize execute failed, model_id=0!
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.435 [logger.cc:907]4718 ModelExecute:[EXEC][DEFAULT]Execute model failed.
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.480 [api_c.cc:2203]4718 rtModelExecute:[EXEC][DEFAULT]ErrCode=507011, desc=[the model stream execute failed], InnerCode=0x7150050
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.506 [error_message_manage.cc:49]4718 FuncErrorReason:[EXEC][DEFAULT]report error module_type=3, module_name=EE8888
+[ERROR] RUNTIME(4718,python3):2023-08-18-13:49:16.030.535 [error_message_manage.cc:49]4718 FuncErrorReason:[EXEC][DEFAULT]rtModelExecute execute failed, reason=[the model stream execute failed]
+[ERROR] GE(4718,python3):2023-08-18-13:49:16.030.580 [davinci_model.cc:4694]4718 NnExecute: ErrorNo: 1343225859(Failed to call runtime API!) [EXEC][DEFAULT]Call rt api failed, ret: 0x7BC83
+[ERROR] GE(4718,python3):2023-08-18-13:49:16.030.615 [graph_loader.cc:235]4718 ExecuteModel: ErrorNo: 507011() [EXEC][DEFAULT][Execute][Model] failed, model_id:1.
+[ERROR] ASCENDCL(4718,python3):2023-08-18-13:49:16.030.657 [model.cpp:858]4718 ModelExecute: [EXEC][DEFAULT][Exec][Model]Execute model failed, ge result[507011], modelId[1]
+[ERROR] ASCENDCL(4718,python3):2023-08-18-13:49:16.030.699 [model.cpp:1744]4718 aclmdlExecute: [EXEC][DEFAULT][Exec][Model]modelId[1] execute failed, result[507011]
+EZ9999: Inner Error!
+EZ9999 The error from device(chipId:0, dieId:0), serial number is 13, there is an aicore error exception, core id is 0, error code = 0x10, dump info: ... [FUNC:ProcessStarsCoreErrorInfo][FILE:device_error_proc.cc][LINE:920]
+ TraceBack (most recent call last):
+ The extend info: errcode:(0x10, 0, 0) errorStr: Illegal instruction, which is usually caused by unaligned UUB addresses. ... subErrType:4.[FUNC:ProcessStarsCoreErrorInfo][FILE:device_error_proc.cc][LINE:932]
+ Aicore kernel execute failed, device_id=0, stream_id=2, report_stream_id=1, task_id=0, flip_num=0, fault kernel_name=230470141334547969-1_0_1_trans_TransData_0, program id=0, hash=16696008396781517327.[FUNC:GetError][FILE:stream.cc][LINE:1132]
+ Fail to synchronize forbbiden stream, retCode=0x7150050![FUNC:SynchronizeExecute][FILE:model.cc][LINE:590]
+ Model synchronize execute failed, model_id=0![FUNC:GetStreamToSyncExecute][FILE:model.cc][LINE:630]
+ rtModelExecute execute failed, reason=[the model stream execute failed][FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:49]
+```
+
+### Root cause / fix as reported in the thread
+
+The reporter's model had been converted by ATC with the WRONG `--soc_version`. Changing `--soc_version` to `Ascend310B1` (on CANN 6.3.RC2) made the inference run without the error. I.e. `errType=0x20(sq sw status error)` here was the SQ-level symptom of a kernel binary built for an architecture the chip's scheduler would not accept.
+
+## Relevance
+★★ This is the only public occurrence of `errType=0x20` anywhere I could find, and it gives the authoritative decode: **`errType=0x20` = `sq sw status error`** — not an AI Core compute fault (that is `errType=0x1(task exception)`) but a Send-Queue *software status* fault, i.e. the SQ itself went to a bad state. In the one documented case the root cause was an arch/soc_version mismatch between the compiled kernel binary and the chip — structurally the same class of failure as "the declared kernel type is not dispatchable on this arch". The accompanying `sqSwStatus=0x10020000` field is the raw SQ software-status word to compare against ours.
+Note also `sqe_type=7` there vs. our `sqe_type=3`: `sqe_type` is the SQE kind, independent of errType.
+
+## 59. CANN 官方《故障处理》PDF — the `sqe_type` / `errType` field semantics and the SQE-type dump table
+
+URL: https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha001/devguide/maintenref/troubleshooting/CANN%208.0.0.alpha001%20%E6%95%85%E9%9A%9C%E5%A4%84%E7%90%86%2001.pdf
+(same material also published at https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/80RC3alpha003/devguide/maintenref/troubleshooting/CANN%208.0.RC3.alpha003%20%E6%95%85%E9%9A%9C%E5%A4%84%E7%90%86%2001.pdf)
+Author: 华为技术有限公司 — 《CANN 8.0.0.alpha001 故障处理》
+Date: 文档版本 01, 发布日期 2024-11-20. 268 pages. Retrieved 2026-10-20.
+
+### What `sqe_type` means — verbatim (p.49, §2 典型故障专题)
+
+> 2. 在Host应用类日志中${HOME}/err_log_info/log/[run|debug]/plog/plog-pid_*.log中，若存在“Task run failed”关键字，且其为首报错，那么表示CANN内部组件执行任务报错。
+> 此时可以先使用ascend-dmi工具的故障诊断功能压测，提供压测报告以及报错日志，联系技术支持进一步定位问题。若暂时不具备压测环境，也可以在联系技术支持时提供报错日志，由技术支持进一步定位后，再决定是否进行压测。ascend-dmi工具在MindX DL软件包中，该软件与CANN的配套关系请单击Link查询，ascend-dmi工具的安装及详细使用指导请参见Link。
+> **日志报错处的sqe_type表示报错组件或模块，当首错的sqe_type是notify wait时，注意区分是否为模型里的算子报错，在下面plog中查看Error报错，然后再继续搜索“fault kernel_name”找到具体报错的算子。**
+> 报错日志示例如下：
+
+```
+[ERROR]  RUNTIME(2237671,python3) :2024-01-02-11:47:51.222.069 [ engine.CC:4057 ]2479231 ProcLogicCqReport:[EXEC][EXEC]Task run failed, device_id=5,  stream_id=6,  task_id=73, sqe_type=0(ffts), errType=0x1(task exception), sqSwStatus=0
+```
+
+A second instance of the same signature (p.80, §5.2.10 低版本内核使用 asan 导致单算子执行失败), verbatim:
+
+```
+[ERROR] RUNTIME(2082291,python3):2024-07-04-14:14:25.036.721 [stars_engine.cc:1321]2082291 ProcLogicCqReport:[INIT][DEFAULT]Task run failed, device_id=0, stream_id=2, task_id=1, sqe_type=0(ffts), errType=0x1(task exception), sqSwStatus=0
+...
+[ERROR] RUNTIME(2082291,python3):2024-07-04-14:14:25.049.519 [stream.cc:3084]2082291 EnterFailureAbort:[INIT][DEFAULT]stream_id=2 enter failure abort.
+[ERROR] RUNTIME(2082291,python3):2024-07-04-14:14:25.049.558 [davinic_kernel_task.cc:1321]2082291 SetStarsResultForDavinciTask:[INIT][DEFAULT]AIV Kernel happen error, retCode=0x31.
+```
+
+So the two decoded `errType` values appearing in official docs + public reports are:
+- `errType=0x1(task exception)` — AI Core / AIV compute fault inside a dispatched task (official doc, many vllm-ascend issues)
+- `errType=0x20(sq sw status error)` — Send-Queue software-status fault (§58)
+
+### The `sqe_type` VALUE TABLE as dumped by the scheduler (pp.60-61, §2.4.2 进程卡住问题定位)
+
+This is the closest thing to a public `sqe_type` enum: the trace log (`schedule_tracer_*.txt`) dumps every SQE in a stream and *names* the type next to the number. Verbatim dump from the doc:
+
+```
+################################################################
+stream_id=3, rtsq_id=3, sq_fsm=0x9, cur_wait_time=16, head=47, tail=49, is_model=0,
+model_id=65535, exe_times=65535, sq_en=1, swap_in=0, cq_head=10, cq_tail=10, pid=80029, vf_id=0,
+is_mc2_sq=0
+stream_id=3, overflow_en=0, ge_op_tag=4294967295, has_overflow=0
+swapbuff[0] 0x 59080000 0000001f 000d001f 00030201 00000000 0001389d 010007ff 00000000
+swapbuff[8] 0x 3e5c8000 00000007 000107ff 00000000 00000000 0000d555 00000052 00000000
+sqe[0] 0x 00004003 00278003 0000ffff 00fe0000 00000000 00000000 00000000 00000000
+sqe[8] 0x 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+pos=39: stream_id=32771, task_id=39, sqe_type=3, post_p=0
+sqe[0] 0x 00010000 00280003 00001000 00fe0000 40400000 00001241 00000000 00000004
+sqe[8] 0x c00197c0 00001240 8000a000 00001241 00000000 00000000 00000000 00000000
+pos=40: stream_id=3, task_id=40, sqe_type=0, FFTS
+sqe[0] 0x 00000004 00290003 00000008 00fe0000 00000000 00000000 00000000 00000000
+sqe[8] 0x 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+pos=41: stream_id=3, task_id=41, sqe_type=4, Event Record, event_id=8, isSync=0
+sqe[0] 0x 00010000 002a0003 00001000 00fe0000 40400000 00001241 00000000 00000004
+sqe[8] 0x c00197c0 00001240 8000a800 00001241 00000000 00000000 00000000 00000000
+pos=42: stream_id=3, task_id=42, sqe_type=0, FFTS
+sqe[0] 0x 00000005 002b0003 00000009 00ff0000 00000000 0000000a 00000000 00000000
+sqe[8] 0x 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+pos=43: stream_id=3, task_id=43, sqe_type=5, Event Wait, event_id=9
+sqe[0] 0x 00010000 002c0003 00001000 00fe0000 40400000 00001241 00000000 00000004
+sqe[8] 0x c00197c0 00001240 8000b000 00001241 00000000 00000000 00000000 00000000
+pos=44: stream_id=3, task_id=44, sqe_type=0, FFTS
+sqe[0] 0x 00010000 002d0003 00001000 00fe0000 40400000 00001241 00000000 00000004
+sqe[8] 0x c00197c0 00001240 8000b400 00001241 00000000 00000000 00000000 00000000
+pos=45: stream_id=3, task_id=45, sqe_type=0, FFTS
+sqe[0] 0x 00010000 002e0003 00001000 00fe0000 40400000 00001241 00000000 00000004
+sqe[8] 0x c00197c0 00001240 8000b800 00001241 00000000 00000000 00000000 00000000
+pos=46: stream_id=3, task_id=46, sqe_type=0, FFTS
+sqe[0] 0x 00000005 002f0003 0000000b 00ff0000 00000000 0000000a 00000000 00000000
+sqe[8] 0x 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+pos=47: stream_id=3, task_id=47, sqe_type=5, Event Wait, event_id=1
+sqe[0] 0x 00004003 00308003 0000ffff 00fe0000 00000000 00000000 00000000 00000000
+sqe[8] 0x 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+pos=48: stream_id=32771, task_id=48, sqe_type=3, post_p=0
+################################################################
+```
+
+### SQE-type values therefore publicly attested
+
+| sqe_type | printed name | source |
+|---|---|---|
+| 0 | `FFTS` / `(ffts)` | §59 doc dump + `sqe_type=0(ffts)` error line |
+| 1 | `aicpu` | `sqe_type=1(aicpu)` form seen in runtime logs |
+| 3 | *(no name printed — only `post_p=0`)*, and always on `stream_id=32771` (= 0x8003, a logic/model-maintenance stream), bracketing the model body at `pos=39` and `pos=48` | §59 doc dump |
+| 4 | `Event Record`, with `event_id=N, isSync=N` | §59 doc dump |
+| 5 | `Event Wait`, with `event_id=N` | §59 doc dump |
+| 7 | *(no name printed)* — the type carrying `errType=0x20(sq sw status error)` in §58 | §58 |
+| 11 | SDMA — `sqeType:11 cqeErrorCode:9 (sdma move COMPERR ERROR)` | vllm-ascend issue #15194 |
+
+Note the trace dump also names "notify wait" as a possible first-error `sqe_type` in prose but does not give it a number.
+
+### Accompanying failure-path strings in the same doc (useful greps)
+
+> `fftsplus task execute failed, dev_id=0, stream_id=2, task_id=1948, context_id=0, thread_id=0.` [stream.cc:1466]
+> `stars_wait_sqe_is_timeout: Timeout: sq_pid=80029, sq_id=3, is_need_process=1, exe_time=16, time_out=10, stream_id=3, task_id=47, cur_head=47, wait_sqe_head=47.` [TSCH stars_timewheel.c:90]
+> `stars_proc_wait_timeout: wait task timeout, rtsq_id=3, type=5, sq_pid=80029` [TSCH stars_interrupt.c:1221]
+> `SetStarsResultForDavinciTask:[INIT][DEFAULT]AIV Kernel happen error, retCode=0x31.` [davinic_kernel_task.cc:1321]
+> `● 如果栈信息中有“SendTask”关键函数，说明卡在CANN任务下发阶段，需联系技术支持定位任务下发代码逻辑问题。`
+> `● 如果栈信息中有“Synchronize”关键函数，说明卡在任务执行阶段，需跳转到步骤2继续追溯卡住任务。`
+
+## Relevance
+★★ Gives the official meaning of the two fields in our error: `sqe_type` = 「报错组件或模块」(the reporting component/module, i.e. the SQE kind) and the number→name mapping the scheduler itself prints. Our `sqe_type=3` corresponds to the SQE kind the doc dumps with only `post_p=0` on the internal stream 32771 — i.e. NOT the FFTS/AI-Core kernel SQE (that is type 0). That is itself diagnostic: an AIC_ONLY declaration appears to turn our launch into a non-FFTS SQE kind, which is then refused with `sq sw status error`.
+The actionable grep recipe for us: `${HOME}/ascend/log/[run|debug]/plog/plog-pid_*.log` for `Task run failed`, then `fault kernel_name`; and `schedule_tracer_*.txt` for `stream_id=<ours>` to see the raw `sqe[0..15]` words of the rejected SQE.
+
+## 60. `huawei-csl/pto-kernels` PR #241 — WORKING `KERNEL_TYPE_AIC_ONLY` on 220-arch, in a kernel-direct-call (PyTorch extension) project, CANN 9.1.0
+
+URL: https://github.com/huawei-csl/pto-kernels/pull/241 (title `chore(kernels): use KERNEL_TASK_TYPE_DEFAULT`)
+Linked issue: https://github.com/huawei-csl/pto-kernels/issues/240 (title `Mark all kernels to silence AscendC kernel type compilation warning`, opened 2026-09-10T16:25:06Z by `zouzias`, state closed)
+Author: `zouzias` (Collaborator, huawei-csl org)
+Date: commented Sep 10, 2026; merged Oct 16, 2026 into `main` from branch `240-mark-all-kernels-to-silence-ascendc-kernel-type-compilation-warning`; 3 commits, 24 files changed.
+Build env in the PR log: `Current compile soc version is Ascend910B2`, `CANN 9.1.0` (`/home/zouzias/Ascend/cann-9.1.0/...`), `Current base mode is MEMORY`, GNU 11 host compiler.
+
+### PR body, verbatim — the exact compiler warning text
+
+> Label kernels as vector only or mixed mode using KERNEL_TASK_TYPE_DEFAULT to silence compilation warning.
+
+```
+WARNING: kernel type of __global__ func: vabs_fp16 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: vabs_fp32 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: gdn_chunk_cumsum_fp32 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: swiglu_fp16 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: kda_kkt is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: kda_gate_cumsum is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: triv_inv_col_sweep_fp16 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: triv_inv_col_sweep_fp32 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: csr_gather_fp16 is not marked. auto type derivate may be failed.
+WARNING: kernel type of __global__ func: csr_gather_fp32 is not marked. auto type derivate may be failed.
+```
+
+> `make clean build` output, see below `before` and `after`.
+
+### `csrc/kernel/kernel_utils.h`, verbatim diff — the comment is the most informative sentence in the whole PR
+
+```c
++// KERNEL_TASK_TYPE_DEFAULT marks the task type of a __global__ kernel so the
++// compiler does not have to derive it (it warns, and can fail to link, when a
++// kernel is unmarked). The ASC toolchain provides it as a builtin; the legacy
++// ccec toolchain does not, so make it a no-op there.
++// clang-format off
++#ifndef KERNEL_TASK_TYPE_DEFAULT
++#define KERNEL_TASK_TYPE_DEFAULT(kernel_type) ((void)0)
++#endif
++// clang-format on
+```
+
+### `csrc/kernel/kernel_simple_matmul.cpp`, verbatim diff — AIC_ONLY on a pure-cube kernel
+
+```c
+ extern "C" __global__ AICORE void simple_matmul_fp16(__gm__ void* a,
+                                                      __gm__ void* b,
+                                                      __gm__ void* c,
+                                                      uint32_t matrix_size) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+ #if defined(__DAV_CUBE__)
+   run_simple_matmul<half>((__gm__ half*)a, (__gm__ half*)b, (__gm__ float*)c,
+                           matrix_size);
+ ...
+ extern "C" __global__ AICORE void simple_matmul_bf16(...) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+ #if defined(__DAV_CUBE__)
+ ...
+ extern "C" __global__ AICORE void simple_matmul_fp32(...) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+ #if defined(__DAV_CUBE__)
+```
+
+### `csrc/kernel/kernel_batch_matrix_square.cpp`, verbatim diff
+
+```c
+ extern "C" __global__ AICORE void batch_matrix_square_fp16(
+     __gm__ void* z, __gm__ void* x, uint32_t matrix_size) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+ #if defined(__DAV_CUBE__)  // AIC
+   run_batch_matrix_square<half>((__gm__ float*)z, (__gm__ half*)x, matrix_size);
+ #else
+ ...
+ extern "C" __global__ AICORE void batch_matrix_square_fp32(
+     __gm__ void* z, __gm__ void* x, uint32_t matrix_size) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+ #if defined(__DAV_CUBE__)  // AIC
+```
+
+### `csrc/kernel/kernel_tri_inv_ns.cpp`, verbatim diff — note placement is the FIRST statement, before any branch
+
+```c
+ extern "C" __global__ AICORE void tri_inv_ns_fp16(
+     __gm__ void* tensor_out, __gm__ void* tensor_in,
+     __gm__ void* identity_neg_in, __gm__ void* identity_over_n_in,
+     uint32_t matrix_size, uint32_t num_iters, uint32_t num_matrices) {
++  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+   if (num_matrices <= get_block_num()) {
+     run_tri_inv_ns<half, 1>((__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
+                             (__gm__ half*)identity_neg_in,
+```
+
+### Full tally of which type each kernel got (all 24 files, from the diff)
+
+`KERNEL_TYPE_AIC_ONLY` was applied to: `batch_matrix_square_fp16`, `batch_matrix_square_fp32`, `simple_matmul_fp16`, `simple_matmul_bf16`, `simple_matmul_fp32`, `tri_inv_ns_fp16`, plus the `tri_inv_rec_unroll` / `tri_inv_trick` / `tri_inv_col_sweep` cube kernels — 12 occurrences of `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);` total.
+`KERNEL_TYPE_AIV_ONLY` — 11 occurrences (abs, swiglu, csr_gather, gdn_chunk_cumsum, kda_gate_cumsum, scan_ul1, ...).
+`KERNEL_TYPE_MIX_AIC_1_2` — 8 occurrences (flash_attention, gdn_chunk_h, gdn_chunk_o, gdn_scaled_dot_kkt, gdn_wy_fast, kda_chunk_h, kda_chunk_o, kda_kkt).
+No occurrence of `KERNEL_TYPE_MIX_AIC_1_0`, `MIX_AIC_1_1`, `MIX_AIV_1_0`, `AICORE` or `MIX_VECTOR_CORE` anywhere in the PR.
+
+### The launch path — this IS a kernel-direct-call project, and blockDim for AIC_ONLY is the CUBE core count
+
+`csrc/host/utils.h`, verbatim:
+
+```c
+#define EXEC_KERNEL_CMD(kernel_name, blockdim, ...)                     \
+  do {                                                                  \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);     \
+    auto converted_params = pto_isa_ops::ConvertTypes(__VA_ARGS__);     \
+    auto acl_call = [acl_stream, blockdim, converted_params]() -> int { \
+      std::apply(                                                       \
+          [&](auto&&... params) {                                       \
+            pto_launch_##kernel_name(blockdim, acl_stream, params...);  \
+          },                                                            \
+          converted_params);                                            \
+      return 0;                                                         \
+    };                                                                  \
+    at_npu::native::OpCommand::RunOpApi(#kernel_name, acl_call);        \
+  } while (false)
+```
+
+```c
+/**
+ * @brief Returns the number of Cube cores on the specified device.
+ *
+ * Important: aclInit() must be called before this function to initialize the
+ * ACL runtime.
+ *
+ * @param [in] device_id Device ID, default is 0.
+ * @return uint32_t Number of Cube cores on the specified device.
+ */
+uint32_t GetNumCubeCores(int32_t device_id = 0) {
+  int64_t aicoreNum64 = 0;
+  auto ret = aclrtGetDevice(&device_id);
+  TORCH_CHECK(ret == ACL_SUCCESS,
+              "GetNumCubeCores: aclrtGetDevice failed, error ",
+              static_cast<int>(ret));
+  ret =
+      aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &aicoreNum64);
+  TORCH_CHECK(ret == ACL_SUCCESS,
+              "GetNumCubeCores: aclrtGetDeviceInfo failed, error ",
+              static_cast<int>(ret));
+  return static_cast<uint32_t>(aicoreNum64);
+}
+
+/**
+ * @brief Get the number of vector Cores.
+ ...
+  ret = aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM,
+                           &numVectorCores);
+```
+
+`csrc/host/torch_tri_inv_ns.h`, verbatim — an `AIC_ONLY` kernel launched with `blockDim = GetNumCubeCores()`:
+
+```c
+  uint32_t block_dim = GetNumCubeCores();
+  if (num_matrices < block_dim) {
+    block_dim = num_matrices;
+  }
+  ...
+  EXEC_KERNEL_CMD(tri_inv_ns_fp16, block_dim, M_inv, M, I_neg, I_scaled, n,
+                  num_iters, num_matrices);
+```
+
+`csrc/host/torch_simple_matmul.h`, verbatim — an `AIC_ONLY` kernel launched with blockDim literally 1:
+
+```c
+void pto_launch_simple_matmul_bf16(uint32_t blockDim, void* stream, void* a,
+                                   void* b, void* c, uint32_t matrix_size);
+...
+  constexpr uint32_t block_dim = 1;
+...
+  if (dtype == at::kHalf) {
+    EXEC_KERNEL_CMD(simple_matmul_fp16, block_dim, a, b, c, matrix_size);
+  } else if (dtype == at::kBFloat16) {
+    EXEC_KERNEL_CMD(simple_matmul_bf16, block_dim, a, b, c, matrix_size);
+  } else if (dtype == at::kFloat) {
+    EXEC_KERNEL_CMD(simple_matmul_fp32, block_dim, a, b, c, matrix_size);
+  }
+```
+
+## Relevance
+★★★ SECOND, INDEPENDENT CONTRADICTION of our measurement, and the strongest one because it is executed code, not documentation. A Huawei-org repo builds and runs `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)` kernels on Ascend910B2 (the 220 arch / `__CCE_AICORE__ == 220` family, same ISA generation as A3) under CANN 9.1.0, through a *kernel-direct-call* path (`pto_launch_*(blockDim, stream, args...)` wrapped by `OpCommand::RunOpApi`) with NO custom-operator / tiling-key machinery, NO workspace argument, and NO `SetSysWorkspace`. So AIC_ONLY is submittable on 220.
+Three concrete differences from our setup that are the first things to check: (1) placement — the macro is the FIRST statement in the `__global__` function body, before any `if`/branch; (2) the kernel body is guarded by `#if defined(__DAV_CUBE__)` so the AIV half compiles to nothing; (3) blockDim is `ACL_DEV_ATTR_AICORE_CORE_NUM` (cube count) or a small literal, never the AIV count.
+Also note: the macro can silently be a NO-OP. If our build picks up the legacy `ccec` toolchain rather than the ASC/bisheng one, `KERNEL_TASK_TYPE_DEFAULT` may be undefined and we would be declaring nothing at all — while the warning text to grep for is exactly `kernel type of __global__ func: <name> is not marked. auto type derivate may be failed.`
+
+## 61. SGLang official docs — Ascend NPU Troubleshooting & FAQ: a LAUNCH-TIME `reason=kernel type error` rejection on `ascend910_93` (= A3)
+
+URL: https://docs.sglang.io/docs/hardware-platforms/ascend-npus/faq
+Author: SGLang project (`sgl-project`), "Troubleshooting and FAQ" page, Ascend NPUs hardware-platform section
+Date: log timestamps `2026-04-14-12:14:41`; CANN build path `/home/850b160/cann-8.5.8/`, TorchNPU 2.8, Python 3.11. Retrieved 2026-10-20.
+Section title: `2. Graph mode aclnnInplaceFillScalar error`
+
+### Error message, VERBATIM — note `reason=kernel type error` and the `ascend910_93` binary path
+
+```
+(SGLangEngine pid=3872176) [rank0]:[E414 12:14:41.204711510 compiler_depend.ts:444] operator():build/CMakeFiles/torch_npu.dir/compiler_depend.ts:26 NPU function error:
+ call aclnnInplaceFillScalar failed, error code is 507000
+(SGLangEngine pid=3872176) [ERROR] 2026-04-14-12:14:41 (PID:3874122, Device:0, RankID:-1) ERR00100 PTA call acl api failed
+(SGLangEngine pid=3872176) [Error]: An internal error occurs in the runtime module on the host.
+(SGLangEngine pid=3872176) Rectify the fault based on the error information in the ascend log.
+(SGLangEngine pid=3872176) [PID: 3874122] 2026-04-14-12:14:41.897.548 AclNN_Runtime_Error(EZ9903): aclrtLaunchKernelWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176) Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+(SGLangEngine pid=3872176) TraceBack (most recent call last):
+(SGLangEngine pid=3872176) Check kernel task failed, stream_id=2028, task_id=48, retCode=0x7080005.[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]
+(SGLangEngine pid=3872176) rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]
+(SGLangEngine pid=3872176) rtsLaunchKernelWithHostArgs failed, runtime result = 507000.[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]
+(SGLangEngine pid=3872176) aclrtLaunchKernelWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176) Launch kernel failed.
+(SGLangEngine pid=3872176) #### KernelLaunch failed: /home/850b160/cann-8.5.8/opp/built-in/op_impl/ai_core/tbe//kernel/ascend910_93/ops_legacy/fill/Fill_41dadce325bOf810d03359af2a38990b_high_performance.o
+(SGLangEngine pid=3872176) Kernel Run failed. opType: 18, Fill
+(SGLangEngine pid=3872176) launch failed for Fill, errno:361001.
+```
+
+### Cause and Solution as published, verbatim
+
+> Cause
+>
+> Too many captured graphs cause a conflict in the graph mode update stream. Each graph is placed on a separate stream, but the number of streams is limited. If too many graphs are captured, conflicts occur.
+>
+> Solution
+>
+> CANN 8.5 + TorchNPU 2.8 should have resolved this issue.
+>
+> If your versions do not match, reduce the number of captured graphs to 10 or fewer.
+
+### The exact string set to grep for
+
+- `rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error` — emitted from `[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]`
+- `Check kernel task failed, stream_id=<N>, task_id=<N>, retCode=0x7080005.` — emitted from `[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]`
+- `rtsLaunchKernelWithHostArgs failed, runtime result = 507000.` — `[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]`
+- top-level ACL code `507000` ("An internal error occurs in the runtime module on the host."), AclNN tag `EZ9903`, PTA tag `ERR00100`
+- inner `errno:361001`
+
+`ascend910_93` in the binary path is the A3 (910_93xx) kernel directory, i.e. this is a 220-arch / A3 launch.
+
+## Relevance
+★★★ This is the only public instance of a kernel being refused AT LAUNCH with the runtime literally saying `kernel type error`, and it is on A3 (`ascend910_93`). The distinguishing feature versus our report: this path raises `507000` at `rtsLaunchKernelWithHostArgs` / `LaunchKernel` with `retCode=0x7080005` — a HOST-side pre-submission check (`Check kernel task failed`) — whereas our `sqe_type=3, errType=0x20` is a `ProcLogicCqReport` CQE report, which is a DEVICE-side completion-queue report. Two different rejection points. If we see `507000` + `reason=kernel type error` we are hitting the host check; if we see `errType=0x20(sq sw status error)` we got past the host check and the SQ refused it. Worth confirming which one our log actually says — the distinction changes the fix entirely.
+Note also that SGLang's published root cause for THIS instance is stream/graph-count exhaustion, not a genuine kernel-type mismatch — so `reason=kernel type error` is demonstrably emitted for non-type reasons too, i.e. the runtime's message is not trustworthy as a type diagnosis.
+
+## 62. asc.gitcode.com guide — 「设置合适的核数和算子核函数（Kernel）类型」: the AUTO-DERIVATION DEFAULT IS AIC:AIV = 1:2
+
+URL: https://asc.gitcode.com/guide/operator_practice/simd_operator_optimization/overhead_optimization/core_count_kernel_type.html
+Author: Huawei / Ascend C 文档 — 算子实践参考 > SIMD算子优化 > 头开销优化
+Date: retrieved 2026-10-20 (newest mirror)
+
+### Full page, verbatim
+
+```
+设置合适的核数和算子核函数（Kernel）类型
+在算子执行过程中，可能会因为以下几个原因产生额外的启动开销或者头开销：
+核启动：每个核在启动时需要进行初始化操作，加载必要的配置和资源。
+核取址TLB MISS：当核在访问内存时，如果Translation Lookaside Buffer（TLB）中没有对应的页表项，就需要从内存中加载页表项，这会导致额外的延迟。
+同地址访问冲突：由于硬件限制，多个核同时访问相同的内存地址时可能会发生冲突，导致额外的时延。
+变量资源初始化：在算子执行前，需要初始化一些变量和资源，这也可能带来额外的性能开销。
+头开销会随着使用的核数增加而增加。下图展示了这部分头开销随启动核数的变化情况。
+图1 头开销随启动核数的变化
+
+**对于整体耗时在微秒级别且单核计算量耗时较少的算子，可以通过减少启动核数并增加单核计算量的方式来获得性能提升。**这种优化方式的本质是在头开销耗时和单核计算量耗时之间进行权衡。为了达到最佳性能，开发者需要通过实践尝试，找到最合适的核数设置。
+对于自定义算子工程，可以在TilingFunc（算子工程提供的在Host侧计算Tiling的默认函数）中通过SetSimdNumBlocks接口来设置算子使用的核数，具体设置方法请参考SetSimdNumBlocks；对于核函数（Kernel）直调工程，可以在<<<>>>调用时指定算子使用的核数。
+
+此外，算子的核函数（Kernel）类型也会影响算子启动的核数。以纯Vector算子为例，如果以混合启动的方式执行该算子，调度器会同时启动Vector核和Cube核。然而，此时Cube核并没有实际的计算指令，但仍会产生核启动和核初始化的头开销。因此，建议设置合适的核函数（Kernel）类型以最小化头开销。
+通常，算子工程会通过算子使用的指令自动识别算子类型，但该功能无法区分AIC和AIV的配比，默认按照AIC:AIV为1:2的配比下发任务。此外，自动识别功能可能失效，因为其依赖于编译优化的结果。所以推荐用户手动设置算子的核函数（Kernel）类型。具体设置方法请参考设置核函数（Kernel）类型。
+```
+
+### The two sentences that answer the blockDim / ratio question, isolated verbatim
+
+> 对于自定义算子工程，可以在TilingFunc（算子工程提供的在Host侧计算Tiling的默认函数）中通过SetSimdNumBlocks接口来设置算子使用的核数，具体设置方法请参考SetSimdNumBlocks；**对于核函数（Kernel）直调工程，可以在<<<>>>调用时指定算子使用的核数。**
+
+> 此外，算子的核函数（Kernel）类型也会影响算子启动的核数。以纯Vector算子为例，如果以混合启动的方式执行该算子，调度器会同时启动Vector核和Cube核。然而，此时Cube核并没有实际的计算指令，但仍会产生核启动和核初始化的头开销。因此，建议设置合适的核函数（Kernel）类型以最小化头开销。
+
+> **通常，算子工程会通过算子使用的指令自动识别算子类型，但该功能无法区分AIC和AIV的配比，默认按照AIC:AIV为1:2的配比下发任务。此外，自动识别功能可能失效，因为其依赖于编译优化的结果。所以推荐用户手动设置算子的核函数（Kernel）类型。具体设置方法请参考设置核函数（Kernel）类型。**
+
+### Related: the `<<<>>>` / `ACLRT_LAUNCH_KERNEL` blockDim definition
+
+URL: https://asc.gitcode.com/guide/programming_guide/appendix/kernel_direct_call_from_sample.html — verbatim:
+
+> 说明 针对<<<>>>调用方式在核函数（Kernel）章节已有说明，这里仅对ACLRT_LAUNCH_KERNEL调用接口的使用方法介绍如下：
+>
+> `ACLRT_LAUNCH_KERNEL(kernel_name)(numBlocks, stream, argument list);`
+>
+> numBlocks：规定了核函数（Kernel）将会在几个核上执行。每个执行该核函数（Kernel）的核会被分配一个逻辑ID，即block_idx，可以在核函数（Kernel）的实现中调用GetBlockIdx来获取block_idx。
+
+Same page also shows the CPU-twin-debug counterpart, verbatim:
+
+```
+ uint32_t numBlocks = 8;
+ ...
+ // 矢量算子需要设置内核模式为AIV模式
+ AscendC::SetKernelMode(KernelMode::AIV_MODE);
+ ICPU_RUN_KF(add_custom, numBlocks, x, y, z);
+ ...
+ // 用内核调用符<<<>>>调用核函数（Kernel）完成指定的运算,add_custom_do中封装了<<<>>>调用
+ add_custom_do(numBlocks, nullptr, stream, xDevice, yDevice, zDevice);
+ // ACLRT_LAUNCH_KERNEL(add_custom)(numBlocks, stream, xDevice, yDevice, zDevice);
+```
+
+### Related: default NPU arch is `dav-2201` — ours
+
+URL: https://asc.gitcode.com/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.html — verbatim:
+
+```cmake
+# CMAKE_ASC_ARCHITECTURES：指定NPU架构版本，当前默认值为dav-2201，可通过-DCMAKE_ASC_ARCHITECTURES=dav-xxxx覆盖默认值
+set(CMAKE_ASC_ARCHITECTURES "dav-2201" CACHE STRING "NPU architecture")
+find_package(ASC)
+project(kernel_samples LANGUAGES ASC)
+add_executable(demo
+ add_custom.asc
+)
+```
+
+> CMAKE_ASC_ARCHITECTURES — 指定目标NPU架构版本，取值为dav-<arch-version>（如dav-2201、dav-3510）。**NPU运行模式下，CMake会自动将该值以--npu-arch=<value>注入编译命令。**
+
+and the same page shows a 3-way kernel split by type in its library example, verbatim:
+
+```cmake
+# 3、使用CMake接口编译动态库
+add_library(kernel_shared SHARED
+ cube.asc
+ vector.asc
+ mix.asc
+)
+```
+
+## Relevance
+★★ Answers the 1:2 question directly and from the authoritative side: when the kernel type is NOT declared, the toolchain auto-identifies it from the instructions used, **cannot distinguish the AIC:AIV ratio, and defaults to dispatching tasks with AIC:AIV = 1:2** — i.e. an unmarked cube kernel silently becomes a MIX_AIC_1_2 submission. That is the baseline our AIC_ONLY declaration is diverging from, and it means the failing variable in our experiment is exactly "1:2 MIX submission (works) vs AIC_ONLY submission (rejected)".
+Also confirms for a direct-call engine: `numBlocks` is given at `<<<>>>` / `ACLRT_LAUNCH_KERNEL` time and is consumed by `GetBlockIdx()` inside the kernel; `dav-2201` is the toolchain default and is injected as `--npu-arch=dav-2201`.
+
+## 63. GitCode `zhangfeng1133/cann9.2.0.beta-1___error95` — a CANN 9.2.0-beta.1 field investigation where the AIC:AIV CONTRACT ITSELF (1:2 vs 1:1) was the error trigger
+
+URL: https://gitcode.com/zhangfeng1133/cann9.2.0.beta-1___error95
+Raw README: https://raw.gitcode.com/zhangfeng1133/cann9.2.0.beta-1___error95/raw/main/README.md
+Author: GitCode user `zhangfeng1133`
+Date: README dated 2026-08-30 晚 (builds b81-b92); 3 commits; branch `main`. Retrieved 2026-10-20.
+Repo tagline (the project description shown on the repo page), verbatim:
+
+> CANN 9.2.0-beta.1 Atlas950PR AIC error 95 修复方案: 改 KERNEL_TASK_TYPE_DEFAULT 从 MIX_AIC_1_2 到 AIC_ONLY 即可消除 err95
+
+NOTE: the README's final conclusion REVISES that tagline — read both. Full README, verbatim:
+
+```
+# CANN 9.2.0-beta.1 (Atlas 950PR) AIC error 95 / 259 定位与修复
+
+> 最终结论 (2026-08-30 晚, b81-b92): err95 与 err259 根因均在本算子源码层 (AIV→MIX 重构引入),
+> **已全部修复并真机验证** — 全生产通路 MIX_AIC_1_1 设备错误清零 (aicore=0 / aivec=0)。
+> 此前"950PR 环境层缺陷"的预判 (含厂商 FIA 同炸的归因) 已被二分实验推翻。
+
+## 三个根因与修复 (全部源码级)
+
+### 根因 1 (err95): GlobalTensor 只在 AIV 分支初始化, AIC 持野地址
+
+`p8WsGm_.SetGlobalBuffer` 原代码只在 `if ASCEND_IS_AIV` 分支内执行, 而 AIC 在 Stage C
+用它 Nd2Nz 读 P8 → AIC 持默认构造野地址读非法 DDR → err95 "MTE DDR address out of range"。
+
+```cpp
+// 修复 (b87): 移到核型无关区 (Init, 不在 ASCEND_IS_AIV/AIC 分支内)
+p8WsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(workspace), wsBytes);
+p8WsGm_.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+```
+
+**教训**: MIX 核里凡跨核使用的 GlobalTensor 必须核型无关初始化。
+
+### 根因 2 (err259-AIV): modeId=4 在 1:1 契约下非法
+
+CANN 头文件: `CrossCoreSetFlag<4,...>` 走 `set_intra_block` (核内子核配对指令, 依赖第二 AIV);
+1:2→1:1 后核内无兄弟核 → AIV scalar trap 259。
+
+```cpp
+// 修复 (b84): modeId 4→2 (ffts_cross_core_sync 真跨核通路)
+CrossCoreSetFlag<2, PIPE_V>(flagId);
+```
+
+### 根因 3 (err259-AIC): AIC Fixpipe L0C→UB 直写在 1:1 契约下 trap
+
+L0C→UB(VECCALC) 的 Fixpipe 指令族 (dualDstCtl 0/1/2 均试) 在 1:1 下全部 259 —
+该指令族按 1:2 双 AIV 分半语义构建 (CATLASS 官方树普查证实)。
+
+```cpp
+// 修复 (b91/b92): S/O 均改 GM workspace 中转
+//   AIC: FixpipeMmCopyOutToGm(gmView[byteOff/4], sL0C, fixp);   // 注意第一参数非 const 引用, 须具名绑定
+//   AIV: DataCopy(sI32Ub, sGmWsI32_[sGmSOff_/4], br*bc);        // 偏移统一字节语义, /4 取元素
+```
+
+### 契约与拓扑配套 (b77/b84)
+
+- `KERNEL_TYPE_MIX_AIC_1_2` → `MIX_AIC_1_1` (err95 唯一触发契约是 1:2, 且需删 +16 孪生 flag)
+- AIV blockIdx: `GetBlockIdx()>>1` → 直取
+
+## 验证矩阵 (关键轮, 全部可信构建 + 真机 e2e + plog)
+
+| 轮 | 配置 | 结果 |
+|---|---|---|
+| b81 | 最小空内核 (仅 MIX_1_1 契约) | exception=0 → 框架/契约无辜 |
+| b82/83 | Init±同步 (modeId=4) | +同步→AIV 259 / 无→净 → sync 指令为病灶 |
+| b84 | modeId 4→2 | AIV 转净 |
+| b85/b86 | Stage A/C 摘除二分 | 95 元凶锁定 Stage C (p8WsGm_) |
+| b87 | p8WsGm_ 核型无关初始化, 全内核 | **err95 永久消失** |
+| b89a/b89b/b90 | Mmad/FixpipeS 摘除 + dualDstCtl 隔离 | 259 元凶 = Fixpipe L0C→UB 本身 |
+| b91 | S 改 GM 中转 (Mmad ON) | 净 |
+| **b92** | **全生产通路 (Mmad+C ON, S/O GM 中转)** | **exception_count=0** ✅ |
+
+## 方法论教训
+
+1. **dump 残影**: plog 的 mte/l1/mask 字段跨错误码逐字节恒定 = 陈旧寄存器值, 不可作为归因证据。
+2. **开关矩阵核对**: b89c 曾因二分开关未真正复位而误判"已修复" — 每轮验证前必须核对全部开关状态。
+3. **构建新鲜度**: make 的 src_copy 不感知 experimental/ 修改, 必须 cp→diff→删 done 戳→make -j1。
+4. **多版本并存**: `ascend-toolkit/latest` 符号链接与 e2e RUNPATH 必须显式指向同一 CANN 版本。
+
+## 遗留
+
+- matchedRatio=0% (输出全 0): 设备错误已清零, 数据链数值正确性待精度循环 (下一步工作)。
+- CANN 侧建议: modeId 语义与 Fixpipe L0C→UB 的 1:1 支持可在文档中明示; dump 残影问题可反馈日志框架。
+
+```
+
+### The three lines that matter most for kernel-type semantics on 220-class arch, isolated verbatim
+
+> ### 契约与拓扑配套 (b77/b84)
+>
+> - `KERNEL_TYPE_MIX_AIC_1_2` → `MIX_AIC_1_1` (err95 唯一触发契约是 1:2, 且需删 +16 孪生 flag)
+> - AIV blockIdx: `GetBlockIdx()>>1` → 直取
+
+> ### 根因 2 (err259-AIV): modeId=4 在 1:1 契约下非法
+>
+> CANN 头文件: `CrossCoreSetFlag<4,...>` 走 `set_intra_block` (核内子核配对指令, 依赖第二 AIV);
+> 1:2→1:1 后核内无兄弟核 → AIV scalar trap 259。
+>
+> ```cpp
+> // 修复 (b84): modeId 4→2 (ffts_cross_core_sync 真跨核通路)
+> CrossCoreSetFlag<2, PIPE_V>(flagId);
+> ```
+
+> ### 根因 3 (err259-AIC): AIC Fixpipe L0C→UB 直写在 1:1 契约下 trap
+>
+> L0C→UB(VECCALC) 的 Fixpipe 指令族 (dualDstCtl 0/1/2 均试) 在 1:1 下全部 259 —
+> 该指令族按 1:2 双 AIV 分半语义构建 (CATLASS 官方树普查证实)。
+
+> ## 遗留
+> ...
+> - CANN 侧建议: **modeId 语义与 Fixpipe L0C→UB 的 1:1 支持可在文档中明示**; dump 残影问题可反馈日志框架。
+
+## Relevance
+★★★ Independent field evidence that the DECLARED RATIO is a hard contract that reshapes instruction legality, and that `AIC_ONLY` / `MIX_AIC_1_1` are both actually declarable and runnable on CANN 9.2.0-beta.1 (the same CANN line as ours). Three transferable facts: (1) `GetBlockIdx()>>1` is the AIV blockIdx under MIX_AIC_1_2 and becomes a direct read under 1:1 — so blockDim is the AIC count and the AIV index is derived, confirming the doc; (2) `CrossCoreSetFlag<4,...>` compiles to `set_intra_block`, which REQUIRES the paired second AIV and traps (259) once the ratio is not 1:2 — so any AIC-only or 1:1 kernel must use `CrossCoreSetFlag<2, ...>`; (3) `Fixpipe L0C→UB` is built on 1:2 dual-AIV halving semantics and traps under 1:1, so a pure-cube/AIC_ONLY kernel must route L0C results through a GM workspace (`FixpipeMmCopyOutToGm`) rather than direct L0C→UB.
+Methodological warning worth carrying over verbatim: `dump 残影: plog 的 mte/l1/mask 字段跨错误码逐字节恒定 = 陈旧寄存器值, 不可作为归因证据。`
+
+## 64. hiascend doc_center — 「Host侧tiling实现」: the AUTHORITATIVE blockDim ↔ AIC/AIV mapping for 分离架构 (the 220 / A2+A3 family)
+
+URL: https://www.hiascend.com/doc_center/source/zh/canncommercial/81RC1/developmentguide/opdevg/Ascendcopdevg/atlas_ascendc_10_0064.html
+Author: 华为技术有限公司 — CANN 商用版 8.1.RC1 开发文档, 算子开发 > Ascend C算子开发 > 工程化算子开发 > 算子实现 > Host侧tiling实现
+Date: CANN 8.1.RC1. Retrieved 2026-10-20.
+
+### blockDim semantics, VERBATIM — this is the answer to "is blockDim the AIC count or the AIV count"
+
+> blockDim：规定了核函数将会在几个核上执行。例如，需要计算8M的数据，每个核上计算1M的数据，blockDim设置为8，但是为了充分利用硬件资源，一般将blockDim设置为硬件平台的核数，根据核数进行数据切分。
+
+> **blockDim是逻辑核的概念，取值范围为[1,65535]。** 为了充分利用硬件资源，一般设置为物理核的核数或其倍数。对于耦合架构和分离架构，blockDim在运行时的意义和设置规则有一些区别，具体说明如下：
+>
+> **耦合架构**：由于其Vector、Cube单元是集成在一起的，blockDim用于设置启动多个AICore核实例执行，不区分Vector、Cube。AI Core的核数可以通过GetCoreNumAiv或者GetCoreNumAic获取。
+>
+> **分离架构**
+>
+> 针对**仅包含Vector计算的算子**，blockDim用于设置启动多少个Vector（AIV）实例执行，比如某款AI处理器上有40个Vector核，建议设置为40。
+>
+> 针对**仅包含Cube计算的算子**，blockDim用于设置启动多少个Cube（AIC）实例执行，比如某款AI处理器上有20个Cube核，建议设置为20。
+>
+> 针对**Vector/Cube融合计算的算子**，启动时，按照AIV和AIC组合启动，blockDim用于设置启动多少个组合执行，比如某款AI处理器上有40个Vector核和20个Cube核，**一个组合是2个Vector核和1个Cube核**，建议设置为20，此时会启动20个组合，即40个Vector核和20个Cube核。**注意：该场景下，设置的blockDim逻辑核的核数不能超过物理核（2个Vector核和1个Cube核组合为1个物理核）的核数。**
+>
+> AIC/AIV的核数分别通过GetCoreNumAic和GetCoreNumAiv接口获取。
+
+Also, verbatim, the four outputs of a Tiling function and the setter:
+
+> 开发者可以从上下文结构中获取算子的输入、输出以及属性信息，也就是Tiling实现的输入，经过Tiling计算后，获取到TilingData数据结构（切分算法相关参数）、blockDim变量、用于选择不同的kernel实现分支的TilingKey、算子workspace的大小，也就是Tiling实现的输出，并将这些输出设置到上下文结构中。
+
+> 通过SetBlockDim接口设置blockDim。
+
+## Relevance
+★★★ Definitive on the blockDim question. On 分离架构 (A2/A3, the 220 family, where Cube and Vector are separate units): `AIC_ONLY` → blockDim = the AIC/Cube count (`GetCoreNumAic()`); `AIV_ONLY` → blockDim = the AIV count (`GetCoreNumAiv()`); MIX → blockDim = the number of 1-AIC+2-AIV COMBOS, and **blockDim must not exceed the physical (combo) core count** — so passing an AIV-sized blockDim (e.g. 48 on A3) to a MIX or AIC_ONLY kernel is over-range by construction, and `[1,65535]` is the only hard range the runtime enforces at the API level.
+This is the single most likely benign explanation for a submission-time rejection: if our AIC_ONLY launch inherited a blockDim sized for AIV (2x the AIC count), the type declaration changes blockDim's meaning out from under the launch and the SQ sees an out-of-range core request.
+
+## 65. hiascend doc_center (ENGLISH, CANN Community Edition 900) — "Setting Kernel Type": the Applicability table says Atlas A3 = √
+
+URL: https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0218.html
+(the `document/detail/en/...` form of this URL returns only `Please Enable JavaScript and Cookie.` — use `doc_center/source/en/...`)
+Author: Huawei — CANN Community Edition 900 (CANN 9.0.0) docs, Ascend C Operator Development Interfaces > Ascend C API > Basic API > Kernel Tiling > Setting Kernel Type. Parent topic: Kernel Tiling
+Date: CANN 9.0.0 (Community Edition "900"). Retrieved 2026-10-20.
+
+### Applicability table, VERBATIM
+
+> | Product | Supported |
+> |---|---|
+> | Atlas 350 Accelerator Card | √ |
+> | Atlas A3 training product / Atlas A3 inference product | **√** |
+> | Atlas A2 training product / Atlas A2 inference product | √ |
+> | Atlas 200I/500 A2 inference product | x |
+> | Atlas inference product AI Core | √ |
+> | Atlas inference product Vector Core | x |
+> | Atlas training product | x |
+
+### Restrictions on kernel types, VERBATIM
+
+> Restrictions on kernel types
+>
+> Atlas 350 Accelerator Card: KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.
+>
+> **Atlas A3 training product / Atlas A3 inference product: KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.**
+>
+> Atlas A2 training product / Atlas A2 inference product: KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.
+>
+> Atlas inference product: KERNEL_TYPE_AICORE and KERNEL_TYPE_MIX_VECTOR_CORE are supported.
+>
+> The priority of KERNEL_TASK_TYPE is higher than that of KERNEL_TASK_TYPE_DEFAULT. If both the global kernel type and the kernel type of a tiling key are set, the kernel type of the tiling key is subject to the setting of KERNEL_TASK_TYPE.
+>
+> If the global default kernel type is not set and you set the kernel type for only several tiling keys, that is, the kernel type is not set for some tiling keys, an error will be reported during operator kernel compilation.
+>
+> When setting a specific kernel task type, ensure that the operator implementation matches the kernel type. For example, if the kernel type is set to KERNEL_TYPE_MIX_AIC_1_2, the internal implementation of the operator should match the core ratio AIC:AIV of 1:2. **If the kernel type is set to KERNEL_TYPE_AIC_ONLY, the internal implementation of the operator should be pure cube logic and should not contain vector logic.** This setting also applies to other kernel types.
+>
+> **When the kernel type of a pure cube or pure vec operator is forcibly set to MIX, the workspace size cannot be set to 0. Instead, it must be set to a value greater than 0, for example, 16 or 32.**
+>
+> **When using the Tiling template programming, you only need to set the kernel type by using ASCENDC_TPL_KERNEL_TYPE_SEL. This API does not take effect.**
+
+### Prototype scope, VERBATIM
+
+> Sets the global default kernel type, which applies to all tiling keys.
+> **Currently, this function can be used in custom operator projects and kernel launch projects.**
+> `KERNEL_TASK_TYPE_DEFAULT(value)`
+>
+> Sets the kernel type corresponding to a specific tiling key.
+> Currently, this function can be used only in custom operator projects.
+> `KERNEL_TASK_TYPE(key, value)`
+
+### Kernel types, VERBATIM
+
+> KERNEL_TYPE_AIV_ONLY — Only the Vector Cores on the AI Cores are started during operator execution. For example, if numBlocks is set to 10 on the host, 10 Vector Cores are started.
+>
+> KERNEL_TYPE_AIC_ONLY — Only the Cube Cores on the AI Cores are started during operator execution. For example, if numBlocks is set to 10 on the host, 10 Cube Cores are started.
+>
+> KERNEL_TYPE_MIX_AIV_1_0 — In the AIC/AIV hybrid scenario, when commands related to multi-core control are used, set the kernel function type to MIX AIV:AIC 1:0 (with hardware synchronization). When the operator is executed, only the Vector Core on the AI Core is started. For example, if numBlocks is set to 10 on the host, 10 Vector Cores are started.
+> Hardware synchronization: When different Cores operate the same global memory block, SyncAll() can be called to synchronize the cores to avoid data dependency problems such as write-after-read, read-after-write, and write-after-write. Currently, multi-core synchronization is classified into hardware synchronization and software synchronization. Hardware synchronization uses the full-core synchronization instruction of the hardware to ensure multi-core synchronization.
+>
+> KERNEL_TYPE_MIX_AIC_1_0 — In the AIC/AIV hybrid scenario, when commands related to multi-core control are used, set the kernel function type to MIX AIC:AIV 1:0 (with hardware synchronization). When the operator is executed, only the Cube Core on the AI Core is started. For example, if numBlocks is set to 10 on the host, 10 Cube Cores are started.
+>
+> KERNEL_TYPE_MIX_AIC_1_1 — In the AIC and AIV hybrid scenario, set the kernel function type to MIX AIC. AIV 1:1. When the operator is executed, the Cube and Vector Cores on the AI Core are started at the same time. For example, if numBlocks is set to 10 on the host, 10 Cube Cores and 10 Vector Cores are started.
+>
+> KERNEL_TYPE_MIX_AIC_1_2 — In the AIC and AIV hybrid scenario, set the kernel function type to MIX AIC:AIV 1:2. When the operator is executed, the Cube and Vector Cores on the AI Core are started at the same time. For example, if numBlocks is set to 10 on the host, 10 Cube Cores and 20 Vector Cores are started.
+>
+> KERNEL_TYPE_AICORE — When the operator is executed, only the AI Core is started. For example, if numBlocks is set to 5 on the host, 5 AI Cores are started.
+>
+> KERNEL_TYPE_VECTORCORE — This parameter is reserved and is not supported in the current version.
+>
+> KERNEL_TYPE_MIX_AICORE — This parameter is reserved and is not supported in the current version.
+>
+> KERNEL_TYPE_MIX_VECTOR_CORE — Vector computation operators developed based on Ascend C can run on the Vector Core. This API is called to pass this parameter to enable the Vector Core. After the Vector Core is enabled, AI Cores and Vector Cores are started at the same time for parallel computation during operator execution. For example, if numBlocks is set to 10 on the host, a total of 10 AI Cores and Vector Cores are started. Note that when the number of cores is set by using SetBlockDim, the number of cores must be greater than that of AI Cores. Otherwise, the Vector Core will not be started.
+
+### Function Usage, VERBATIM
+
+> Customizes the kernel type. Only cores of this type are started during operator execution. This prevents unnecessary cores from being started and shortens the core startup overhead.
+
+### Full page, verbatim
+
+```
+Setting Kernel Type
+
+ 
+ 
+ Applicability
+
+ 
+ 
+ 
+ 
+ 
+ Product
+
+ 
+ Supported
+
+ 
+
+ 
+ 
+ 
+ 
+ Atlas 350 Accelerator Card
+
+ 
+ √
+
+ 
+
+ 
+ 
+ 
+ Atlas A3 training product
+ /
+ Atlas A3 inference product
+ 
+
+ 
+ √
+
+ 
+
+ 
+ 
+ 
+ Atlas A2 training product
+ /
+ Atlas A2 inference product
+ 
+
+ 
+ √
+
+ 
+
+ 
+ 
+ 
+ Atlas 200I/500 A2 inference product
+ 
+
+ 
+ x
+
+ 
+
+ 
+ 
+ 
+ Atlas inference product
+ AI Core
+
+ 
+ √
+
+ 
+
+ 
+ 
+ 
+ Atlas inference product
+ Vector Core
+
+ 
+ x
+
+ 
+
+ 
+ 
+ 
+ Atlas training product
+ 
+
+ 
+ x
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+ Function Usage
+
+ Customizes the kernel type. Only cores of this type are started during operator execution. This prevents unnecessary cores from being started and shortens the core startup overhead.
+
+ 
+
+ 
+ Prototype
+
+ 
+ Sets the global default kernel type, which applies to all tiling keys.
+ Currently, this function can be used in custom operator projects and kernel launch projects.
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+
+ 
+
+ 
+ 
+ KERNEL_TASK_TYPE_DEFAULT(value)
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ Sets the kernel type corresponding to a specific tiling key.
+ Currently, this function can be used only in custom operator projects.
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+
+ 
+
+ 
+ 
+ KERNEL_TASK_TYPE(key, value)
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+ 
+
+ 
+ Parameters
+
+ 
+ 
+ 
+ Table 1 Parameters
+ 
+ 
+ 
+ 
+ Parameter
+
+ 
+ Input/Output
+
+ 
+ Description
+
+ 
+
+ 
+ 
+ 
+ 
+ key
+
+ 
+ Input
+
+ 
+ Key value of the tiling key. The value is a positive number, indicating a branch of a kernel function.
+
+ 
+
+ 
+ 
+ value
+
+ 
+ Input
+
+ 
+ Kernel type. For details about kernel types, see Table 2. The parameter values vary depending on the hardware architecture. For details about the supported parameter values, see Restrictions on kernel types.
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+13
+
+ 
+
+ 
+ 
+ enum KernelMetaType {
+ KERNEL_TYPE_AIV_ONLY,
+ KERNEL_TYPE_AIC_ONLY,
+ KERNEL_TYPE_MIX_AIV_1_0,
+ KERNEL_TYPE_MIX_AIC_1_0,
+ KERNEL_TYPE_MIX_AIC_1_1,
+ KERNEL_TYPE_MIX_AIC_1_2,
+ KERNEL_TYPE_AICORE,
+ KERNEL_TYPE_VECTORCORE,
+ KERNEL_TYPE_MIX_AICORE,
+ KERNEL_TYPE_MIX_VECTOR_CORE,
+ KERNEL_TYPE_MAX
+};
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+ 
+ 
+ 
+ Table 2 Kernel types
+ 
+ 
+ 
+ 
+ Parameter
+
+ 
+ Description
+
+ 
+
+ 
+ 
+ 
+ 
+ KERNEL_TYPE_AIV_ONLY
+
+ 
+ Only the Vector Cores on the AI Cores are started during operator execution. For example, if numBlocks is set to 10 on the host, 10 Vector Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_AIC_ONLY
+
+ 
+ Only the Cube Cores on the AI Cores are started during operator execution. For example, if numBlocks is set to 10 on the host, 10 Cube Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIV_1_0
+
+ 
+ In the AIC/AIV hybrid scenario, when commands related to multi-core control are used, set the kernel function type to MIX AIV:AIC 1:0 (with hardware synchronization). When the operator is executed, only the Vector Core on the AI Core is started. For example, if numBlocks is set to 10 on the host, 10 Vector Cores are started.
+
+ Hardware synchronization: When different Cores operate the same global memory block, SyncAll() can be called to synchronize the cores to avoid data dependency problems such as write-after-read, read-after-write, and write-after-write. Currently, multi-core synchronization is classified into hardware synchronization and software synchronization. Hardware synchronization uses the full-core synchronization instruction of the hardware to ensure multi-core synchronization.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_0
+
+ 
+ In the AIC/AIV hybrid scenario, when commands related to multi-core control are used, set the kernel function type to MIX AIC:AIV 1:0 (with hardware synchronization). When the operator is executed, only the Cube Core on the AI Core is started. For example, if numBlocks is set to 10 on the host, 10 Cube Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_1
+
+ 
+ In the AIC and AIV hybrid scenario, set the kernel function type to MIX AIC. AIV 1:1. When the operator is executed, the Cube and Vector Cores on the AI Core are started at the same time. For example, if numBlocks is set to 10 on the host, 10 Cube Cores and 10 Vector Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AIC_1_2
+
+ 
+ In the AIC and AIV hybrid scenario, set the kernel function type to MIX AIC:AIV 1:2. When the operator is executed, the Cube and Vector Cores on the AI Core are started at the same time. For example, if numBlocks is set to 10 on the host, 10 Cube Cores and 20 Vector Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_AICORE
+
+ 
+ When the operator is executed, only the AI Core is started. For example, if numBlocks is set to 5 on the host, 5 AI Cores are started.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_VECTORCORE
+
+ 
+ This parameter is reserved and is not supported in the current version.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_AICORE
+
+ 
+ This parameter is reserved and is not supported in the current version.
+
+ 
+
+ 
+ 
+ KERNEL_TYPE_MIX_VECTOR_CORE
+
+ 
+ Vector computation operators developed based on Ascend C can run on the Vector Core. This API is called to pass this parameter to enable the Vector Core.
+
+ After the Vector Core is enabled, AI Cores and Vector Cores are started at the same time for parallel computation during operator execution. For example, if numBlocks is set to 10 on the host, a total of 10 AI Cores and Vector Cores are started.
+
+ Note that when the number of cores is set by using SetBlockDim, the number of cores must be greater than that of AI Cores. Otherwise, the Vector Core will not be started.
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+ Restrictions
+
+ 
+ Restrictions on kernel types
+ 
+ Atlas 350 Accelerator Card: KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.
+
+ 
+ Atlas A3 training product
+ /
+ Atlas A3 inference product
+ : KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.
+
+ 
+ Atlas A2 training product
+ /
+ Atlas A2 inference product
+ : KERNEL_TYPE_AIV_ONLY, KERNEL_TYPE_AIC_ONLY, KERNEL_TYPE_MIX_AIV_1_0, KERNEL_TYPE_MIX_AIC_1_0, KERNEL_TYPE_MIX_AIC_1_1, and KERNEL_TYPE_MIX_AIC_1_2 are supported.
+
+ 
+ Atlas inference product
+ : KERNEL_TYPE_AICORE and KERNEL_TYPE_MIX_VECTOR_CORE are supported.
+
+ 
+
+ The priority of KERNEL_TASK_TYPE is higher than that of KERNEL_TASK_TYPE_DEFAULT. If both the global kernel type and the kernel type of a tiling key are set, the kernel type of the tiling key is subject to the setting of KERNEL_TASK_TYPE.
+
+ If the global default kernel type is not set and you set the kernel type for only several tiling keys, that is, the kernel type is not set for some tiling keys, an error will be reported during operator kernel compilation.
+
+ When setting a specific kernel task type, ensure that the operator implementation matches the kernel type. For example, if the kernel type is set to KERNEL_TYPE_MIX_AIC_1_2, the internal implementation of the operator should match the core ratio AIC:AIV of 1:2. If the kernel type is set to KERNEL_TYPE_AIC_ONLY, the internal implementation of the operator should be pure cube logic and should not contain vector logic. This setting also applies to other kernel types.
+
+ When the kernel type of a pure cube or pure vec operator is forcibly set to MIX, the workspace size cannot be set to 0. Instead, it must be set to a value greater than 0, for example, 16 or 32.
+
+ When using the Tiling template programming, you only need to set the kernel type by using ASCENDC_TPL_KERNEL_TYPE_SEL. This API does not take effect.
+
+ 
+ 
+
+ 
+ Example
+
+ 
+ Example 1: Enabling Vector Core
+ 
+ When an operator is developed on the kernel, you need to use this API to enable the Vector Core. When the operator is executed, the AI Core and Vector Core are started at the same time. In this case, the AI Core is used as the Vector Core. The following is an example:
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+13
+14
+15
+16
+
+ 
+
+ 
+ 
+ extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.numBlocks, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_VECTOR_CORE); // Enable Vector Core.
+ if (TILING_KEY_IS(1)) {
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ op.Process2();
+ }
+ // ...
+}
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ In the operator tiling development on the host, numBlocks indicates the total number of AI Cores and Vector Cores. For example, if it is set to 10 on the host, a total of 10 AI Cores and Vector Cores are started. To ensure that Vector Cores can be started, set numBlocks to a value greater than the number of AI Cores. You can call the GetCoreNumAic API to obtain the number of AI Cores and call the GetCoreNumVector API to obtain the number of Vector Cores. The following code snippet shows how to set numBlocks. In this example, numBlocks is set to the sum of AI Cores and Vector Cores, indicating that all AI Cores and Vector Cores are started.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+
+ 
+
+ 
+ 
+ // Example of a matching tiling function on the host:
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // Enable Vector Cores and set numBlocks to the sum of vector cores in AI Cores and Vector Cores.
+ auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+ auto totalCoreNum = ascendcPlatform.GetCoreNumAiv();
+ // Replace ASCENDXXX with the actual version number.
+ if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCENDXXX) {
+ totalCoreNum = totalCoreNum + ascendcPlatform.GetCoreNumVector();
+ }
+ context->SetBlockDim(totalCoreNum);
+}
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+
+ Example 2: Set the kernel type corresponding to a specific tiling key. The following is pseudo-code and cannot be run directly.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+
+ 
+
+ 
+ 
+ extern "C" __global__ __aicore__ void add_custom(__gm__ uint8_t *x, __gm__ uint8_t *y, __gm__ uint8_t *z, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+{
+ GET_TILING_DATA(tilingData, tiling);
+ if (workspace == nullptr) {
+ return;
+ }
+ KernelAdd op;
+ op.Init(x, y, z, tilingData.numBlocks, tilingData.totalLength, tilingData.tileNum);
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY); // Set the default kernel type to pure AIV.
+ if (TILING_KEY_IS(1)) {
+ KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIV_1_0); // Set the kernel type to MIX AIV 1:0 when the tiling key is 1.
+ op.Process1();
+ } else if (TILING_KEY_IS(2)) {
+ KERNEL_TASK_TYPE(2, KERNEL_TYPE_AIV_ONLY); // Set the kernel type to pure AIV when the tiling key is 2.
+ op.Process2();
+ }
+ // ...
+}
+// Example of a matching tiling function on the host:
+ge::graphStatus TilingFunc(gert::TilingContext* context)
+{	
+ // ...
+ if (context->GetInputShape(0) > 10) {
+ context->SetTilingKey(1);
+ } else if (some condition) {
+ context->SetTilingKey(2);
+ }
+}
+
+ 
+
+ 
+
+ 
+ 
+ 
+
+ 
+
+ 
+ 
+
+ 
+
+ 
+ 
+ 
+ Parent topic: Kernel Tiling
+```
+
+## Relevance
+★★★ The English CANN 9.0.0 doc independently repeats the §56 claim with an explicit tick-box table: Atlas A3 training/inference product = √ for this API, and `KERNEL_TYPE_AIC_ONLY` is explicitly listed among the supported values for A3. It also states `KERNEL_TASK_TYPE_DEFAULT` "can be used in custom operator projects and **kernel launch projects**" with no Vector-Core-only caveat. Two independent language editions of the official docs therefore contradict any reading of our failure as a product limitation.
+Two concrete escape hatches it names: (1) if we force a pure-cube kernel to a MIX type, workspace MUST be > 0 (16 or 32); (2) if the project uses Tiling-template programming, this macro is INERT — the type must be set with `ASCENDC_TPL_KERNEL_TYPE_SEL` instead. The second is a real way for an `AIC_ONLY` declaration to be silently ignored, leaving the auto-derived AIC:AIV 1:2 contract in place.
+
+## 66. asc.gitcode.com — 「模板参数定义」: the `ASCENDC_TPL_*` kernel-type enum, and the macro that SILENTLY OUTRANKS `KERNEL_TASK_TYPE_DEFAULT`
+
+URL: https://asc.gitcode.com/api/Utils-API/Tiling_template_programming/template_params_definition.html
+Author: Huawei / Ascend C API 文档 — Utils-API > Tiling模板编程 > 模板参数定义
+Date: retrieved 2026-10-20 (newest mirror)
+
+### The macro definitions, VERBATIM
+
+```c
+#define ASCENDC_TPL_KERNEL_TYPE_DECL(x, ...) ParamStruct{#x, ASCENDC_TPL_SHARED_KERNEL_TYPE, ASCENDC_TPL_8_BW, {__VA_ARGS__}, "DECL"}
+#define ASCENDC_TPL_KERNEL_TYPE_SEL(...) ParamStruct{"kernel_type", ASCENDC_TPL_KERNEL_TYPE, ASCENDC_TPL_8_BW, {__VA_ARGS__}, "SEL"}
+#define ASCENDC_TPL_SHARED_KERNEL_TYPE_SEL(x, ...) ParamStruct{#x, ASCENDC_TPL_SHARED_KERNEL_TYPE, ASCENDC_TPL_8_BW, {__VA_ARGS__}, "SEL"}
+#define ASCENDC_TPL_DETERMINISTIC_SEL(...) ParamStruct{"deterministic", ASCENDC_TPL_DETERMINISTIC, ASCENDC_TPL_1_BW, {__VA_ARGS__}, "SEL"}
+#define ASCENDC_TPL_ARGS_DECL(x, ...) static TilingDeclareParams g_tilingDeclareParams{ __VA_ARGS__ }
+#define ASCENDC_TPL_ARGS_SEL(...) { __VA_ARGS__}
+#define ASCENDC_TPL_SEL(...) static TilingSelectParams g_tilingSelectParams{ __VA_ARGS__ }
+```
+
+### The TPL kernel-type value list, VERBATIM (quoted twice in the page, once under `_DECL` and once under `_SEL`)
+
+```
+ASCENDC_TPL_AIV_ONLY // 算子执行时仅启动AI Core上的Vector核
+ASCENDC_TPL_AIC_ONLY // 算子执行时仅启动AI Core上的Cube核
+ASCENDC_TPL_MIX_AIV_1_0 // AIC、AIV混合场景下，算子执行时仅会启动AI Core上的Vector核
+ASCENDC_TPL_MIX_AIC_1_0 // AIC、AIV混合场景下，算子执行时仅会启动AI Core上的Cube核
+ASCENDC_TPL_MIX_AIC_1_1 // AIC、AIV混合场景下，算子执行时会同时启动AI Core上的Cube核和Vector核，比例为1：1
+ASCENDC_TPL_MIX_AIC_1_2 // AIC、AIV混合场景下，算子执行时会同时启动AI Core上的Cube核和Vector核，比例为1：2
+ASCENDC_TPL_AICORE // 算子执行时仅会启动AI Core
+ASCENDC_TPL_VECTORCORE // 该参数为预留参数，当前版本暂不支持
+ASCENDC_TPL_MIX_AICORE // 该参数为预留参数，当前版本暂不支持
+ASCENDC_TPL_MIX_VECTOR_CORE // 算子执行时会同时启动AI Core和Vector Core
+```
+
+### The priority and auto-derivation statements, VERBATIM
+
+> ASCENDC_TPL_KERNEL_TYPE_SEL(args0)
+> 用于设置算子模板参数组合的核函数（Kernel）类型，但该参数并不能作为核函数（Kernel）的模板参数传入。
+> args0：该模板参数组合下，算子的核函数（Kernel）类型。**如不选择将走自动推导流程**，ASCENDC_TPL_SEL下的所有算子对于是否选择核函数（Kernel）类型需要保持一致。
+> ...
+> 通过本接口配置核函数（Kernel）类型，核函数（Kernel）类型的取值范围同KERNEL_TASK_TYPE_DEFAULT接口一致，详见设置核函数（Kernel）类型。
+
+> ASCENDC_TPL_SHARED_KERNEL_TYPE_SEL(args0, ...)
+> 设置算子模板参数组合的核函数（Kernel）类型，该参数可以作为核函数（Kernel）的模板参数传入。
+> args0: 参数名
+> args1-argsn: 该模板参数组合下，算子的核函数（Kernel）类型，后续参数为若干核函数（Kernel）类型。该接口不能与ASCENDC_TPL_KERNEL_TYPE_SEL接口同时使用。
+> **若同时使用KERNEL_TASK_TYPE_DEFAULT(value)接口，本接口优先级更高。**
+
+> ASCENDC_TPL_KERNEL_TYPE_DECL(args0, ...)
+> 定义算子模板参数的核函数（Kernel）类型。
+> ...
+> **本接口只允许与ASCENDC_TPL_SHARED_KERNEL_TYPE_SEL(args0, ...)配合使用。**
+
+### Also in the same page: `ASCENDC_TPL_DETERMINISTIC_SEL` names A3 explicitly, VERBATIM
+
+> 该参数仅支持如下型号：
+> Atlas A3系列产品
+> Atlas A2系列产品
+
+### And a hard rebuild constraint, VERBATIM
+
+> 约束说明
+> 对模板参数定义的取值进行修改或新增后，**需要重新编译自定义算子包，不能再继续使用之前的算子二进制。**
+
+## Relevance
+★★ Two distinct silent-override mechanisms for a declared kernel type, both of which would make our `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)` a lie that the runtime then refuses: (1) under Tiling-template programming the `KERNEL_TASK_TYPE_DEFAULT` macro `不生效` entirely (§56/§65) and the type must come from `ASCENDC_TPL_KERNEL_TYPE_SEL`; (2) `ASCENDC_TPL_SHARED_KERNEL_TYPE_SEL` has HIGHER priority than `KERNEL_TASK_TYPE_DEFAULT` outright. And "如不选择将走自动推导流程" confirms the fallback is the auto-derived AIC:AIV 1:2 of §62.
+Also note the kernel type is carried in 8 bits (`ASCENDC_TPL_8_BW`) inside the TilingKey encoding, and that changing the template param set invalidates previously built `.o`/`.json` binaries — so a stale kernel binary can carry an old kernel-type byte while the source declares a new one.
+
+## 67. `hicann/asc-devkit` — THE TOOLCHAIN'S OWN kernel-type → binary-registration → launch mapping  ★ MOST ACTIONABLE
+
+URLs:
+- https://github.com/hicann/asc-devkit/blob/master/cmake/asc/legacy_modules/util/host_stub_util.py  (the numeric `CodeMode` enum)
+- https://github.com/hicann/asc-devkit/blob/master/cmake/asc/legacy_modules/util/constants.py  (string → CodeMode per SoC family)
+- https://github.com/hicann/asc-devkit/blob/master/cmake/asc/legacy_modules/util/extract_host_stub.py  (2156 lines; kernel-type detection + per-mode launch codegen)
+- https://github.com/hicann/asc-devkit/blob/master/cmake/asc/legacy_modules/util/gen_host_stub.py  (8482 bytes; the registration/launch header emitter — reproduced IN FULL below)
+
+Author: Huawei Technologies Co., Ltd. — header on every file: `Copyright (c) 2025 Huawei Technologies Co., Ltd. ... CANN Open Software License Agreement Version 2.0`
+Date: retrieved 2026-10-20. `hicann` is the Huawei CANN GitHub org; `asc-devkit` is the Ascend C (ASC) CMake/toolchain devkit.
+Found via GitHub code search for `KERNEL_TYPE_AIC_ONLY` (591 total hits).
+
+### (a) The NUMERIC enum the host stub carries — `host_stub_util.py`, VERBATIM
+
+```python
+class CodeMode(Enum):
+    """Code mode."""
+
+    MIX = 0
+    AIV = 1
+    AIC = 2
+    NORMAL = 3
+    MIX_VECTOR_CORE = 4
+    KERNEL_TYPE_AIV_ONLY = 5
+    KERNEL_TYPE_AIC_ONLY = 6
+    KERNEL_TYPE_MIX_AIV_1_0 = 7
+    KERNEL_TYPE_MIX_AIC_1_0 = 8
+    KERNEL_TYPE_MIX_AIC_1_1 = 9
+    KERNEL_TYPE_MIX_AIC_1_2 = 10
+
+
+class FuncMetaType(Enum):
+    """function meta type."""
+
+    F_TYPE_KTYPE = 1
+    F_TYPE_CROSS_CORE_SYNC = 2
+    F_TYPE_MAX = 3
+```
+
+### (b) Which macro strings are LEGAL per SoC family — `constants.py`, VERBATIM
+
+```python
+MIX_CORE_MACRO = "__MIX_CORE_MACRO__"
+
+FUN_TEMPLATE_HASH_TILING_KEY_BASE = 1000000
+
+STR_TO_KERNEL_TYPE_V200 = {
+    "KERNEL_TYPE_AICORE": CodeMode.AIC,
+    "KERNEL_TYPE_VECTORCORE": CodeMode.AIC,
+    "KERNEL_TYPE_MIX_VECTOR_CORE": CodeMode.MIX_VECTOR_CORE,
+}
+
+STR_TO_KERNEL_TYPE_V220 = {
+    "KERNEL_TYPE_AIV_ONLY": CodeMode.KERNEL_TYPE_AIV_ONLY,
+    "KERNEL_TYPE_AIC_ONLY": CodeMode.KERNEL_TYPE_AIC_ONLY,
+    "KERNEL_TYPE_MIX_AIV_1_0": CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_0": CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_1": CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+    "KERNEL_TYPE_MIX_AIC_1_2": CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+}
+
+STR_TO_KERNEL_TYPE_C310 = {
+    "KERNEL_TYPE_AIV_ONLY": CodeMode.KERNEL_TYPE_AIV_ONLY,
+    "KERNEL_TYPE_AIC_ONLY": CodeMode.KERNEL_TYPE_AIC_ONLY,
+    "KERNEL_TYPE_MIX_AIV_1_0": CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_0": CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+    "KERNEL_TYPE_MIX_AIC_1_1": CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+    "KERNEL_TYPE_MIX_AIC_1_2": CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+}
+
+STR_TO_KERNEL_TYPE_L300 = {"KERNEL_TYPE_AICORE": CodeMode.AIC}
+
+STR_TO_KERNEL_TYPE_L311 = {"KERNEL_TYPE_AICORE": CodeMode.AIC}
+```
+
+`c220` IS our arch (`__CCE_AICORE__ == 220` / dav-2201). `KERNEL_TYPE_AIC_ONLY` is present in `STR_TO_KERNEL_TYPE_V220`. Conversely `KERNEL_TYPE_AICORE`, `KERNEL_TYPE_VECTORCORE`, `KERNEL_TYPE_MIX_VECTOR_CORE` are NOT in the V220 table at all — declaring any of those on 220 is what trips the unsupported path.
+
+### (c) How the kernel type is EXTRACTED from source — `extract_host_stub.py`, VERBATIM
+
+```python
+def find_kernel_type_by_source(path: str, data: str, build_mode: str) -> CodeMode:
+    is_c310 = build_mode == "c310"
+    is_m200 = build_mode == "m200"
+    is_v220 = build_mode == "c220"
+    match = re.search(r"__enable_feature_for_compile_default\s*=\s*([0-9a-zA-Z_]{1,})\s*;", data)
+    if match:
+        kernel_type = match.group(1)
+        if (kernel_type in STR_TO_KERNEL_TYPE_V200) and is_m200:
+            return STR_TO_KERNEL_TYPE_V200[kernel_type]
+        elif (kernel_type in STR_TO_KERNEL_TYPE_V220) and is_v220:
+            return STR_TO_KERNEL_TYPE_V220[kernel_type]
+        elif (kernel_type in STR_TO_KERNEL_TYPE_C310) and is_c310:
+            return STR_TO_KERNEL_TYPE_C310[kernel_type]
+        else:
+            print(f"[WARNING]: {kernel_type} in path: {path} do not support in soc {build_mode}!")
+            if is_v220 or is_c310:
+                return None
+            else:
+                return CodeMode.AIC
+    else:
+        if is_v220 or is_c310:
+            return None
+        else:
+            return CodeMode.AIC
+```
+
+So `KERNEL_TASK_TYPE_DEFAULT(X)` ultimately appears in the source as a plain assignment `__enable_feature_for_compile_default = X;` and is recovered by REGEX, textually. Two consequences: the macro must expand so that the literal token survives, and on `c220` a miss returns `None`, not a default. The exact warning strings to grep for:
+
+```
+[WARNING]: {kernel_type} in path: {path} do not support in soc {build_mode}!
+[WARNING]: Multiple kernel functions are detected. It is recommended to define only one kernel function per file.
+```
+
+### (d) ★ `ffts_addr` IS PREPENDED TO THE ARG LIST ONLY FOR MIX TYPES — `extract_host_stub.py`, VERBATIM
+
+```python
+def add_ffts_addr_func_param_by_mode(mode: CodeMode, func_params: Tuple[FuncParam, ...]) -> Iterator[FuncParam]:
+    """Add ffts_addr function parameter by mode."""
+    if mode in (
+        CodeMode.MIX,
+        CodeMode.KERNEL_TYPE_MIX_AIV_1_0,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_0,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+    ):
+        if not is_c310_mode():
+            yield FuncParam(("void*", "ffts_addr"))
+
+    yield from func_params
+```
+
+and the value comes from:
+
+```c
+// need to get the synchronization address if mix mode (stage 2)
+void *ffts_addr;
+__ascendc_ret = GetAscendCoreSyncAddr(&ffts_addr);
+if (__ascendc_ret != 0) {
+    printf("GetAscendCoreSyncAddr ret %u\n", __ascendc_ret);
+    return __ascendc_ret;
+}
+```
+
+The arg struct itself (note the BISHENG ABI alignment rule and the trailing overflow pointer):
+
+```python
+def generate_args_declare_code(mode: CodeMode, func_params: Tuple[FuncParam, ...]) -> str:
+    """Generate args declare code."""
+    buff = io.StringIO()
+    buff.write("struct {\n")
+
+    # Match BISHENG ABI format, ptr of args should be aligned to alignof(arg type), minimum 4bytes aligned.
+    for func_param in add_ffts_addr_func_param_by_mode(mode, func_params):
+        param_type = get_func_param_type(func_param)
+        param_name = get_func_param_name(func_param)
+        buff.write(f"    alignas(((alignof({param_type}) + 3) >> 2) << 2) {param_type} {param_name};\n")
+    buff.write("    alignas(((alignof(void*) + 3) >> 2) << 2) void* __ascendc_overflow;\n")
+    buff.write("} __ascendc_args;\n")
+    return buff.getvalue()
+```
+
+### (e) ★ THREE DISTINCT KERNEL HANDLES — `extract_host_stub.py`, VERBATIM
+
+```python
+def generate_launch_kernel_code(mode: CodeMode, func_key: int, block_num: str, stream: str) -> str:
+    """Generate LaunchAscendKernel code."""
+    buff = io.StringIO()
+
+    # The key is the key specified by each kernel entry.
+    # During compilation, the key value of the function is defined based on the kernel sequence.
+    # sample: -Dmy_add=my_add_1. key=1. Different and unique keys must be specified for different kernels.
+    kernel_handle = ""
+    if mode in (
+        CodeMode.MIX,
+        CodeMode.NORMAL,
+        CodeMode.MIX_VECTOR_CORE,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_1,
+        CodeMode.KERNEL_TYPE_MIX_AIC_1_2,
+    ):
+        kernel_handle = "g_kernel_handle"
+        buff.write(r"""if (g_kernel_handle == nullptr) {
+        printf("[ERROR] %s\n", ascendcErrMsg);
+        return 0;
+    }
+""")
+    elif mode in (CodeMode.AIC, CodeMode.KERNEL_TYPE_AIC_ONLY, CodeMode.KERNEL_TYPE_MIX_AIC_1_0):
+        kernel_handle = "g_kernel_handle_aic"
+        buff.write(r"""if (g_kernel_handle_aic == nullptr) {
+        printf("[ERROR] %s\n", ascendcErrMsg);
+        return 0;
+    }
+""")
+    elif mode in (CodeMode.AIV, CodeMode.KERNEL_TYPE_AIV_ONLY, CodeMode.KERNEL_TYPE_MIX_AIV_1_0):
+        kernel_handle = "g_kernel_handle_aiv"
+        buff.write(r"""if (g_kernel_handle_aiv == nullptr) {
+        printf("[ERROR] %s\n", ascendcErrMsg);
+        return 0;
+    }
+""")
+    else:
+        raise ("[ERROR]: mode do not support!")
+
+    buff.write("    uint32_t ret = LaunchAscendKernel(")
+    buff.write(f"{kernel_handle}, func_key, {block_num}, args, size, {stream});\n")
+
+    buff.write(r"""    if (ret != 0) {
+        printf("LaunchAscendKernel ret %u\n", ret);
+    }
+""")
+    return buff.getvalue()
+```
+
+and the handle-grouping predicate:
+
+```python
+    has_mix = (
+        has_mode_func(CodeMode.MIX)
+        or has_mode_func(CodeMode.NORMAL)
+        or has_mode_func(CodeMode.MIX_VECTOR_CORE)
+        or has_mode_func(CodeMode.KERNEL_TYPE_MIX_AIC_1_1)
+        or has_mode_func(CodeMode.KERNEL_TYPE_MIX_AIC_1_2)
+    )
+    has_aic = (
+        has_mode_func(CodeMode.AIC)
+        or has_mode_func(CodeMode.KERNEL_TYPE_AIC_ONLY)
+        or has_mode_func(CodeMode.KERNEL_TYPE_MIX_AIC_1_0)
+    )
+    has_aiv = (
+        has_mode_func(CodeMode.AIV)
+        or has_mode_func(CodeMode.KERNEL_TYPE_AIV_ONLY)
+        or has_mode_func(CodeMode.KERNEL_TYPE_MIX_AIV_1_0)
+    )
+    head_code = generate_host_stub_head_code(has_mix, has_aic, has_aiv)
+```
+
+Note the asymmetry that matters: **`MIX_AIC_1_0` goes to the AIC handle (not the mix handle) but STILL gets the `ffts_addr` first arg.** `AIC_ONLY` goes to the AIC handle and gets NO `ffts_addr`. That is the precise difference between the two candidate declarations for a pure-cube kernel.
+
+CPU-twin mapping of the same modes, VERBATIM:
+
+```python
+    aiv_conditions = [CodeMode.AIV, CodeMode.KERNEL_TYPE_AIV_ONLY, CodeMode.KERNEL_TYPE_MIX_AIV_1_0]
+    aic_conditions = [CodeMode.AIC, CodeMode.KERNEL_TYPE_AIC_ONLY, CodeMode.KERNEL_TYPE_MIX_AIC_1_0]
+    mix_mode_conditions = [CodeMode.MIX, CodeMode.KERNEL_TYPE_MIX_AIC_1_2, CodeMode.NORMAL, CodeMode.MIX_VECTOR_CORE]
+
+    if any(has_mode_func(mode) for mode in aiv_conditions):
+        kernelType = "AIV_MODE"
+    elif any(has_mode_func(mode) for mode in aic_conditions):
+        kernelType = "AIC_MODE"
+    elif has_mode_func(CodeMode.KERNEL_TYPE_MIX_AIC_1_1):
+        kernelType = "MIX_MODE_1_1"
+    elif any(has_mode_func(mode) for mode in mix_mode_conditions):
+        kernelType = "MIX_MODE"
+    else:
+        raise ValueError("[ERROR]: KernelMode does not support!")
+```
+
+and the per-type ELF section naming used to carry the function meta:
+
+```python
+            return "_mix_aic"
+            return "_mix_aiv"
+            f"{func_sign.func_name}_mix_aic_section", f"{cur_kernel_name}_mix_aic", FuncMetaType.F_TYPE_KTYPE, genmode
+            f"{func_sign.func_name}_mix_aiv_section", f"{cur_kernel_name}_mix_aiv", FuncMetaType.F_TYPE_KTYPE, genmode
+```
+
+### (f) ★★ THE BINARY-REGISTRATION TYPE CODE: MIX=0, AIV=1, AIC=2 — `gen_host_stub.py` IN FULL, VERBATIM
+
+```python
+#!/usr/bin/env python3
+# -*- coding: UTF-8 -*-
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+
+import io
+
+
+def generate_host_stub_set_exception_dump_source() -> str:
+    exception_dump_source = r"""
+#if !(defined(ASCENDC_DUMP) && ASCENDC_DUMP == 0)
+static void ascendc_set_exception_dump_info(uint32_t dumpSize)
+{
+    uint32_t atomicIndex = 0U;
+    uint32_t addrNum = 1U;
+    void *exceptionDumpAddr = Adx::AdumpGetSizeInfoAddr(addrNum + ASCENDC_EXCEPTION_DUMP_HEAD, atomicIndex);
+    if (exceptionDumpAddr == nullptr) {
+        printf("Get exceptionDumpAddr is nullptr.\n");
+        return;
+    }
+
+    // atomic index
+    uint64_t *sizeInfoAddr = reinterpret_cast<uint64_t *>(exceptionDumpAddr);
+    *sizeInfoAddr = static_cast<uint64_t>(atomicIndex);
+    sizeInfoAddr++;
+
+    *sizeInfoAddr = static_cast<uint64_t>(1);
+    sizeInfoAddr++;
+
+    *sizeInfoAddr = dumpSize * 75;
+    constexpr uint64_t workspaceOffset = (4ULL << 56ULL);
+    *sizeInfoAddr |= workspaceOffset;
+
+    const rtArgsSizeInfo sizeInfo = {exceptionDumpAddr, atomicIndex};
+    int32_t ret = rtSetExceptionExtInfo(&sizeInfo);
+    if (ret != 0) {
+        printf("rtSetExceptionExtInfo failed, ret = %d.\n", ret);
+    }
+}
+#endif
+"""
+    return exception_dump_source
+
+
+def generate_host_stub_head_code(has_mix: bool, has_aic: bool, has_aiv: bool) -> str:
+    """Generate host_stub.cpp head code."""
+
+    type_nums = 0
+    ascend_kernel_struct = []
+
+    buff = io.StringIO()
+    buff.write(r"""#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <dlfcn.h>
+#include <securec.h>
+""")
+
+    buff.write("\n")
+    buff.write("""static char ascendcErrMsg[1024] = {0};
+""")
+    buff.write("\n")
+    if has_mix:
+        type_nums += 1
+        buff.write("""static void *g_kernel_handle = nullptr;
+""")
+        buff.write("\n")
+
+    if has_aiv:
+        type_nums += 1
+        buff.write("""static void *g_kernel_handle_aiv = nullptr;
+""")
+        buff.write("\n")
+
+    if has_aic:
+        type_nums += 1
+        buff.write("""static void *g_kernel_handle_aic = nullptr;
+""")
+        buff.write("\n")
+
+    buff.write(r"""struct ascend_kernels {
+    uint32_t version;
+    uint32_t type_cnt;
+""")
+
+    # version value
+    ascend_kernel_struct.append(str(1))
+
+    # type_cnt value
+    ascend_kernel_struct.append(str(type_nums))
+
+    if has_mix:
+        buff.write("""    uint32_t mix_type;
+    uint32_t mix_len;
+    uint32_t mix_file_len;
+    uint8_t mix_buf[__replaced_mix_len];
+""")
+        ascend_kernel_struct.append(str(0))
+        ascend_kernel_struct.append("__replaced_mix_len")
+        ascend_kernel_struct.append("__replaced_mix_file_len")
+        ascend_kernel_struct.append(r"{0}")
+
+    if has_aiv:
+        buff.write("""    uint32_t aiv_type;
+    uint32_t aiv_len;
+    uint32_t aiv_file_len;
+    uint8_t aiv_buf[__replaced_aiv_len];
+""")
+        ascend_kernel_struct.append(str(1))
+        ascend_kernel_struct.append("__replaced_aiv_len")
+        ascend_kernel_struct.append("__replaced_aiv_file_len")
+        ascend_kernel_struct.append(r"{0}")
+
+    if has_aic:
+        buff.write("""    uint32_t aic_type;
+    uint32_t aic_len;
+    uint32_t aic_file_len;
+    uint8_t aic_buf[__replaced_aic_len];
+""")
+        ascend_kernel_struct.append(str(2))
+        ascend_kernel_struct.append("__replaced_aic_len")
+        ascend_kernel_struct.append("__replaced_aic_file_len")
+        ascend_kernel_struct.append(r"{0}")
+
+    buff.write('} __replaced_ascend_kernel __attribute__ ((section ("__replaced_ascend_section"))) = {')
+
+    ascend_kernel_str = ",".join(ascend_kernel_struct)
+    buff.write(f"{ascend_kernel_str}")
+
+    buff.write("};\n\n")
+
+    buff.write("""extern "C" {
+uint32_t RegisterAscendBinary(const char *fileBuf, size_t fileSize, uint32_t type, void **handle);
+uint32_t LaunchAscendKernel(void *handle, const uint64_t key, const uint32_t numBlocks, void **args,
+                            uint32_t size, const void *stream);
+uint32_t GetAscendCoreSyncAddr(void **addr);
+int UnregisterAscendBinary(void *hdl);
+void StartAscendProf(const char *name, uint64_t *startTime);
+void ReportAscendProf(const char *name, uint32_t numBlocks, uint32_t taskType, const uint64_t startTime);
+bool GetAscendProfStatus();
+uint32_t AllocAscendMemDevice(void **devMem, uint64_t size);
+uint32_t FreeAscendMemDevice(void *devMem);
+bool AscendCheckSoCVersion(const char *socVersion, char* errMsg);
+void AscendProfRegister();
+uint32_t GetCoreNumForMixVectorCore(uint32_t *aiCoreNum, uint32_t *vectorCoreNum);
+uint32_t LaunchAscendKernelForVectorCore(const char *opType, void *handle, const uint64_t key, void **args, uint32_t size,
+    const void *stream, bool enableProf, uint32_t aicNumBlocks, uint32_t aivNumBlocks, uint32_t aivNumBlocksOffset);
+""")
+
+    buff.write("""}\n\nnamespace Adx {""")
+
+    buff.write("""
+    void AdumpPrintWorkSpace(const void *workSpaceAddr, const size_t dumpWorkSpaceSize,
+                            void *stream, const char *opType);
+}
+""")
+
+    buff.write("""
+    class KernelHandleGradUnregister {
+    private:
+        KernelHandleGradUnregister() {}
+
+    public:
+        KernelHandleGradUnregister(const KernelHandleGradUnregister&) = delete;
+        KernelHandleGradUnregister& operator=(const KernelHandleGradUnregister&) = delete;
+
+        static KernelHandleGradUnregister& GetInstance() {
+            static KernelHandleGradUnregister instance;
+            return instance;
+        }
+        ~KernelHandleGradUnregister(){
+""")
+
+    if has_mix:
+        buff.write("""            if (g_kernel_handle) {
+                UnregisterAscendBinary(g_kernel_handle);
+                g_kernel_handle = nullptr;
+            }
+""")
+
+    if has_aiv:
+        buff.write("""            if (g_kernel_handle_aiv) {
+                UnregisterAscendBinary(g_kernel_handle_aiv);
+                g_kernel_handle_aiv = nullptr;
+            }
+""")
+
+    if has_aic:
+        buff.write("""            if (g_kernel_handle_aic) {
+                UnregisterAscendBinary(g_kernel_handle_aic);
+                g_kernel_handle_aic = nullptr;
+            }
+""")
+    buff.write("""        }
+    };
+""")
+    buff.write("\n")
+
+    buff.write(r"""static void __register_kernels(void) __attribute__((constructor));
+void __register_kernels(void)
+{
+    const char* compileSocVersion = "__replaced_ascend_compile_soc_version";
+    uint32_t ret;
+""")
+    buff.write("\n")
+
+    buff.write(r"""    bool checkSocVersion = AscendCheckSoCVersion(compileSocVersion, ascendcErrMsg);
+    if (!checkSocVersion) {
+        return;
+    }
+""")
+
+    if has_mix:
+        buff.write(r"""    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.mix_buf,
+        __replaced_ascend_kernel.mix_file_len,
+        0,
+        &g_kernel_handle);
+    if (ret != 0) {
+        printf("RegisterAscendBinary mix ret %u \n", ret);
+    }
+""")
+        buff.write("\n")
+
+    if has_aiv:
+        buff.write(r"""    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.aiv_buf,
+        __replaced_ascend_kernel.aiv_file_len,
+        1,
+        &g_kernel_handle_aiv);
+    if (ret != 0) {
+        printf("RegisterAscendBinary aiv ret %u \n", ret);
+    }
+""")
+        buff.write("\n")
+
+    if has_aic:
+        buff.write(r"""    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.aic_buf,
+        __replaced_ascend_kernel.aic_file_len,
+        2,
+        &g_kernel_handle_aic);
+    if (ret != 0) {
+        printf("RegisterAscendBinary aic ret %u \n", ret);
+    }
+""")
+        buff.write("\n")
+
+    buff.write("""    AscendProfRegister();
+}
+""")
+
+    return buff.getvalue()
+
+```
+
+### The distilled runtime contract for a hand-written engine
+
+```c
+extern "C" {
+uint32_t RegisterAscendBinary(const char *fileBuf, size_t fileSize, uint32_t type, void **handle);
+uint32_t LaunchAscendKernel(void *handle, const uint64_t key, const uint32_t numBlocks, void **args,
+                            uint32_t size, const void *stream);
+uint32_t GetAscendCoreSyncAddr(void **addr);
+int UnregisterAscendBinary(void *hdl);
+void StartAscendProf(const char *name, uint64_t *startTime);
+void ReportAscendProf(const char *name, uint32_t numBlocks, uint32_t taskType, const uint64_t startTime);
+bool GetAscendProfStatus();
+uint32_t AllocAscendMemDevice(void **devMem, uint64_t size);
+uint32_t FreeAscendMemDevice(void *devMem);
+bool AscendCheckSoCVersion(const char *socVersion, char* errMsg);
+void AscendProfRegister();
+uint32_t GetCoreNumForMixVectorCore(uint32_t *aiCoreNum, uint32_t *vectorCoreNum);
+uint32_t LaunchAscendKernelForVectorCore(const char *opType, void *handle, const uint64_t key, void **args, uint32_t size,
+    const void *stream, bool enableProf, uint32_t aicNumBlocks, uint32_t aivNumBlocks, uint32_t aivNumBlocksOffset);
+}
+```
+
+`RegisterAscendBinary(..., type, &handle)` — the `type` argument is literally `0` for mix, `1` for aiv, `2` for aic, as emitted:
+
+```c
+    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.mix_buf,
+        __replaced_ascend_kernel.mix_file_len,
+        0,
+        &g_kernel_handle);
+...
+    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.aiv_buf,
+        __replaced_ascend_kernel.aiv_file_len,
+        1,
+        &g_kernel_handle_aiv);
+...
+    ret = RegisterAscendBinary(
+        (const char *)__replaced_ascend_kernel.aic_buf,
+        __replaced_ascend_kernel.aic_file_len,
+        2,
+        &g_kernel_handle_aic);
+```
+
+with the embedded binary container (note the `__replaced_ascend_section` ELF section):
+
+```c
+struct ascend_kernels {
+    uint32_t version;       // = 1
+    uint32_t type_cnt;      // = number of present types
+    uint32_t mix_type;      // = 0
+    uint32_t mix_len;
+    uint32_t mix_file_len;
+    uint8_t mix_buf[__replaced_mix_len];
+    uint32_t aiv_type;      // = 1
+    uint32_t aiv_len;
+    uint32_t aiv_file_len;
+    uint8_t aiv_buf[__replaced_aiv_len];
+    uint32_t aic_type;      // = 2
+    uint32_t aic_len;
+    uint32_t aic_file_len;
+    uint8_t aic_buf[__replaced_aic_len];
+} __replaced_ascend_kernel __attribute__ ((section ("__replaced_ascend_section"))) = {...};
+```
+
+and a mandatory SoC-version gate before any registration:
+
+```c
+static void __register_kernels(void) __attribute__((constructor));
+void __register_kernels(void)
+{
+    const char* compileSocVersion = "__replaced_ascend_compile_soc_version";
+    uint32_t ret;
+
+    bool checkSocVersion = AscendCheckSoCVersion(compileSocVersion, ascendcErrMsg);
+    if (!checkSocVersion) {
+        return;
+    }
+    ...
+}
+```
+
+Error strings this path can emit, verbatim: `RegisterAscendBinary mix ret %u`, `RegisterAscendBinary aiv ret %u`, `RegisterAscendBinary aic ret %u`, `LaunchAscendKernel ret %u`, `GetAscendCoreSyncAddr ret %u`, `rtSetExceptionExtInfo failed, ret = %d.`, and from the launch guard `[ERROR] %s` with the 1024-byte `ascendcErrMsg` filled by `AscendCheckSoCVersion`.
+
+## Relevance
+★★★★ The single most actionable artifact here, and it explains how an `AIC_ONLY` declaration can be rejected AT SUBMISSION even though the docs say A3 supports it. Declaring `KERNEL_TYPE_AIC_ONLY` is not a flag on an otherwise-identical launch — it changes THREE things at once: (1) the kernel binary must be registered with `RegisterAscendBinary(..., type=2, ...)` into a SEPARATE handle `g_kernel_handle_aic`; (2) the `void* ffts_addr` leading argument is DROPPED from the arg struct; (3) the ELF section / func-meta carries `_mix_aic` with `F_TYPE_KTYPE`. A hand-written engine that keeps the mix handle (type 0) or keeps the leading `ffts_addr` while declaring `AIC_ONLY` has a malformed submission by construction — exactly the shape of `errType=0x20 (sq sw status error)`.
+Second actionable fact: on `c220`, if the regex `__enable_feature_for_compile_default\s*=\s*(...)\s*;` does not match, `find_kernel_type_by_source` returns **None** — not a default. An engine whose macro expansion does not leave that literal assignment in the translation unit gets no kernel type at all.
+Third: `MIX_AIC_1_0` is the sanctioned middle ground for pure-cube code — it uses the AIC handle (so only Cube cores start, blockDim = Cube count) but KEEPS the `ffts_addr` arg and the hard-sync machinery, so it is launch-compatible with a MIX-style arg layout. If an `AIC_ONLY` submission is refused, `MIX_AIC_1_0` is the change that keeps "only Cube cores start" while restoring the MIX submission shape.
+
+## 68. `tilesim/vTriton` A.1 calibration microbenchmarks — minimal WORKING `KERNEL_TYPE_AIC_ONLY` on 220, plus the DUAL-DECLARATION form
+
+URL: https://github.com/tilesim/vTriton/tree/master/perfbound/calibration/microbench
+Files quoted: `cube_peak_fp16.cce`, `mte_l0c_to_gm.cce`, `mandatory_handoff.cce`, `vt_microbench_common.h`, `bench_launcher.cpp`, `CMakeLists.txt`
+Author: `tilesim/vTriton` (vTriton perfbound calibration suite)
+Date: retrieved 2026-10-20. Build config pins `SOC_VERSION "Ascend910B1"` and `ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/8.2.RC1.alpha003"`.
+
+### `cube_peak_fp16.cce`, VERBATIM IN FULL — the minimal AIC_ONLY kernel
+
+```c
+/*
+ * Cube Peak FP16 Microbenchmark
+ *
+ * Measures sustained Cube work using 30 repeats of 128x128x4096-equivalent
+ * Mmad tiles. Kernel name is kept stable for msprof extraction.
+ */
+#include "vt_microbench_common.h"
+
+extern "C" __global__ __aicore__ void cube_peak_fp16(GM_ADDR a, GM_ADDR b, GM_ADDR c)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    VTCalib::CubePeakFp16Kernel op;
+    op.Init(a, b, c);
+    op.Process();
+}
+```
+
+### `mte_l0c_to_gm.cce`, VERBATIM IN FULL — AIC_ONLY driving the Fixpipe L0C→GM path
+
+```c
+/*
+ * MTE L0C to GM (FixPipe) Bandwidth Microbenchmark
+ *
+ * Measures sustained FixPipe bandwidth: L0C→GM transfer rate.
+ * This is the Cube output path (Fixpipe) that drains matmul results
+ * from the L0C accumulator to Global Memory.
+ *
+ * P0 constant: BW_l0c_to_gm_sustained
+ */
+#include "vt_microbench_common.h"
+
+extern "C" __global__ __aicore__ void mte_l0c_to_gm(
+    GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t startIter, uint32_t iterCount)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    VTCalib::MteFixpipeKernel op;
+    op.Init(a, b, c, startIter, iterCount);
+    op.Process();
+}
+```
+
+### ★ `mandatory_handoff.cce`, VERBATIM IN FULL — the DUAL declaration: file-scope `__enable_feature_for_compile_default` AND the in-function macro
+
+```c
+/*
+ * Mandatory Cube to Vector Handoff Microbenchmark
+ *
+ * Runs Cube work on AIC, synchronizes with AIV in the same mixed kernel, then
+ * runs Vector work that consumes the GM result.
+ */
+#include "vt_microbench_common.h"
+
+static constexpr int __enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_1;
+
+extern "C" __global__ __aicore__ void mandatory_handoff(GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t K)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+    VTCalib::MandatoryHandoffKernel op;
+    op.Init(a, b, c, K);
+    op.Process();
+}
+```
+
+This is the exact symbol that `asc-devkit`'s `find_kernel_type_by_source` regexes for (§67c): `__enable_feature_for_compile_default\s*=\s*([0-9a-zA-Z_]{1,})\s*;`. Declaring it at file scope as `static constexpr int` makes the type visible to the host-stub extractor independently of macro expansion.
+
+### The launch side — `bench_launcher.cpp`, VERBATIM excerpts
+
+```c
+#include "acl/acl.h"
+#include "aclrtlaunch_cube_peak_bf16.h"
+#include "aclrtlaunch_cube_peak_fp16.h"
+#include "aclrtlaunch_cube_peak_int8.h"
+#include "aclrtlaunch_mandatory_handoff.h"
+#include "aclrtlaunch_mte_l0c_to_gm.h"
+...
+constexpr size_t kBufferBytes = 512 * 1024 * 1024;
+constexpr uint32_t kCubeBlockDim = 1;
+constexpr uint32_t kVectorBlockDim = 1;
+...
+    if (kernel == "cube_peak_fp16") {
+        ACLRT_LAUNCH_KERNEL(cube_peak_fp16)(kCubeBlockDim, stream, buffers.a, buffers.b, buffers.c);
+    } else if (kernel == "cube_peak_int8") {
+        ACLRT_LAUNCH_KERNEL(cube_peak_int8)(kCubeBlockDim, stream, buffers.a, buffers.b, buffers.c);
+    } else if (kernel == "cube_peak_bf16") {
+        ACLRT_LAUNCH_KERNEL(cube_peak_bf16)(kCubeBlockDim, stream, buffers.a, buffers.b, buffers.c);
+    } else if (kernel == "vector_peak_elemwise_add") {
+        ACLRT_LAUNCH_KERNEL(vector_peak_elemwise_add)(kVectorBlockDim, stream, buffers.a, buffers.b, buffers.c);
+```
+
+Note: the generated per-kernel header is named `aclrtlaunch_<kernel_name>.h` — that header is what the `asc-devkit` host-stub generator of §67 emits, including the `g_kernel_handle_aic` registration.
+
+### Build config, VERBATIM excerpt from `CMakeLists.txt`
+
+```cmake
+set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")
+set(SOC_VERSION "Ascend910B1" CACHE STRING "system on chip type")
+set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/8.2.RC1.alpha003"
+    CACHE STRING "ASCEND CANN package installation directory"
+)
+...
+file(GLOB CCE_KERNEL_FILES ${CMAKE_CURRENT_SOURCE_DIR}/*.cce)
+...
+include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
+ascendc_library(ascendc_kernels_${RUN_MODE} SHARED ${KERNEL_FILES})
+add_executable(vt_a1_bench_launcher ${CMAKE_CURRENT_SOURCE_DIR}/bench_launcher.cpp)
+```
+
+Kernel-side header is `kernel_operator.h` with the comment, verbatim:
+
+> These helpers intentionally use the current CANN AscendC surface (`kernel_operator.h`) rather than the legacy CCE API.
+
+And the kernel guards work to a single block, verbatim:
+
+```c
+    __aicore__ inline void Process()
+    {
+        if (AscendC::GetBlockIdx() != 0) {
+            return;
+        }
+```
+
+## Relevance
+★★★ A minimal, complete, buildable `KERNEL_TYPE_AIC_ONLY` example on `Ascend910B1` (220 arch) launched through `ACLRT_LAUNCH_KERNEL(...)(blockDim=1, stream, args...)` with no tiling, no workspace and no custom-op project — i.e. a kernel-direct-call engine, exactly our situation. This is a third independent contradiction of "AIC_ONLY is not submittable on 220".
+The single most portable trick in this section: `mandatory_handoff.cce` writes the kernel type TWICE — `static constexpr int __enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_1;` at file scope PLUS `KERNEL_TASK_TYPE_DEFAULT(...)` inside the function. Given that the host-stub extractor finds the type by regexing for that exact assignment (§67c), a hand-written engine should emit the file-scope form as well; if only the in-function macro is present and the macro does not leave that literal text behind, the extractor returns `None` on `c220` and the launch carries no kernel type.
+
+## 69. `sgl-project/sgl-kernel-npu` — a PRODUCTION `KERNEL_TYPE_AIC_ONLY` matmul on 910_93xx (A3), with `blockDim = GetCoreNumAic()`
+
+URLs:
+- kernel: https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+- host launch: https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/batch_matmul_transpose/op_host/batch_matmul_transpose.cpp
+- tiling: https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp and `.../tiling_data.h`
+- platform: https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/utils/common_tiling.h
+Author: `sgl-project` (SGLang) NPU kernel library
+Date: retrieved 2026-10-20.
+
+### Kernel declaration, VERBATIM
+
+```c
+extern "C" __global__ __aicore__ void batch_matmul_transpose(GM_ADDR gm_a, GM_ADDR gm_b, GM_ADDR gm_c,
+                                                             GM_ADDR gm_tiling_data)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    PpMatmulEinSum<0, false, false, half, half, DataFormat::ND>
+        einsum_0_n_fp16_nd;  // swizzleDir[0] transA[0] transB[0] DtypeA[001] DtypeB[001] DtypeC[001] DataFormatA[0]
+                             // DataFormatB[0]
+    PpMatmulEinSum<1, false, false, half, half, DataFormat::ND>
+        einsum_1_n_fp16_nd;  // swizzleDir[1] ...
+    PpMatmulEinSum<0, false, true, half, half, DataFormat::ND>
+        einsum_0_t_fp16_nd;
+    PpMatmulEinSum<1, false, true, half, half, DataFormat::ND>
+        einsum_1_t_fp16_nd;
+    PpMatmulEinSum<0, false, false, __bf16, __bf16, DataFormat::ND>
+        einsum_0_n_bf16_nd;
+    ...
+```
+
+Again: `KERNEL_TASK_TYPE_DEFAULT` is the FIRST statement of the `__global__` function, before any object construction or branch.
+
+### Platform detection — this repo targets A3 explicitly, VERBATIM from `csrc/utils/common_tiling.h`
+
+```c
+    PlatformType socType;
+    uint32_t coreNum;
+    uint32_t coreNumAic;
+    uint32_t coreNumAiv;
+    uint64_t ubSize;
+    uint64_t l1Size;
+    uint64_t l2Size;
+    uint64_t l0aSize;
+    uint64_t l0bSize;
+    uint64_t l0cSize;
+
+private:
+    PlatformInfo()
+    {
+        auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
+        // TODO Hard coding set to 910_93xx, parse using aclrtGetSocName is better
+        socType = PlatformType::ASCEND_910C;
+        coreNum = ascendcPlatform->GetCoreNum();
+        coreNumAic = ascendcPlatform->GetCoreNumAic();
+        coreNumAiv = ascendcPlatform->GetCoreNumAiv();
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::L2, l2Size);
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0aSize);
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0bSize);
+        ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
+    }
+```
+
+`910_93xx` is the A3 SoC family (our 910_9392).
+
+### ★ `blockDim` for the AIC_ONLY kernel IS the AIC core count — VERBATIM from `tiling_data.cpp`
+
+```c
+HardwareInfo::HardwareInfo()
+{
+    auto &platform = PlatformInfo::Instance();
+    coreNum = platform.coreNumAic;
+    l2Size = platform.l2Size;
+    l1Size = platform.l1Size;
+    l0aSize = platform.l0aSize;
+    l0bSize = platform.l0bSize;
+    l0cSize = platform.l0cSize;
+    hbmBandWidth = 1;
+    l2BandWidth = 5;  // 5x faster than hbm.
+}
+```
+
+i.e. `HardwareInfo::coreNum` is deliberately seeded from `GetCoreNumAic()`, NOT `GetCoreNumAiv()`, and then:
+
+```c
+    blockDim = std::min(coreLoop, coreNum);
+```
+
+```c
+void GetPpMatmulTiling(const MatMulInfo &mmInfo, const HardwareInfo &hwInfo, uint32_t &blockDim,
+                       PpMatmulTilingData &tilingData)
+{
+    ...
+    uint32_t direct = Swizzl<PpMatmulTilingData>(tilingData);
+    blockDim = tilingData.End(mmInfo);
+    tilingData.SetTilingKey(mmInfo, direct, 0);
+```
+
+and the host side, VERBATIM:
+
+```c
+    uint32_t block_dim;
+    HardwareInfo hwInfo;
+    ...
+    GetPpMatmulTiling(mmInfo, hwInfo, block_dim, matmulTilingData);
+    host_utils::PpMatmulTilingCheck(matmulTilingData);
+    ...
+    EXEC_KERNEL_CMD(batch_matmul_transpose, block_dim, tensor_a, tensor_b, tensor_c, tiling_tensor);
+```
+
+with the tiling struct carrying `uint32_t blockDim{1};` (default 1) inside a `#pragma pack(push, 1)` block:
+
+```c
+#pragma pack(push, 1)
+struct PpMatmulTilingData {
+    OpShape opShape{};
+    uint32_t mLoop{1};
+    uint32_t kLoop{1};
+    uint32_t nLoop{1};
+    uint32_t coreLoop{1};
+    uint32_t swizzlCount{1};
+    uint32_t tilingKey{0};
+    uint32_t blockDim{1};
+    uint32_t swizzlDirect{0};
+    uint32_t splitk{0};
+    uint32_t enShuffleK{0};
+    uint32_t quantMode{0};
+```
+
+## Relevance
+★★★ Fourth independent contradiction, and the one with the most production weight: SGLang's NPU kernel library ships a `KERNEL_TYPE_AIC_ONLY` batch-matmul for `910_93xx` (A3) and it is exercised by `tests/python/sgl_kernel_npu/test_batch_matmul_transpose.py` plus a `.github/workflows/pr-test-kernels.yml` CI job. So AIC_ONLY is both submittable and CI-tested on A3.
+It also closes the blockDim question from the usage side: the AIC_ONLY matmul's `blockDim` is seeded from `GetCoreNumAic()` and then clamped with `std::min(coreLoop, coreNum)`. Nothing in this path ever passes an AIV-sized blockDim to an AIC_ONLY kernel.
+
+## 70. asc.gitcode.com — `SetSysWorkSpace` / `SetSysWorkspace` and the `HAVE_WORKSPACE` compile option for KERNEL-DIRECT-CALL projects
+
+URLs:
+- https://asc.gitcode.com/api/SIMD-API/basic_api/resource_management/workspace/SetSysWorkSpace.html
+- https://asc.gitcode.com/guide/programming_guide/appendix/common_operations/how_to_use_workspace.html
+- (siblings: `.../workspace/GetSysWorkSpacePtr.html`, `.../workspace/GetUserWorkspace.html`, `.../workspace/workspace.html`)
+Author: Huawei / Ascend C API 文档 — SIMD-API > basic_api > resource_management > workspace
+Date: retrieved 2026-10-20 (newest mirror)
+
+NOTE on the name: there is NO public `SetSysWorkspaceForce` in the Ascend C API index. The documented kernel-side API is `SetSysWorkspace` (declared with that exact spelling) living on a page titled `SetSysWorkSpace`; the getter is `GetSysWorkSpacePtr()`; the user-side getter is `GetUserWorkspace()`. Searching the API hashmap (3742 pages) for `syswork|workspace|setsys` returns only: `resource_management_workspace_getsysworkspaceptr`, `resource_management_workspace_getuserworkspace`, `resource_management_workspace_setsysworkspace`, `resource_management_workspace_workspace` — no `force` variant.
+
+### Product support block, VERBATIM
+
+> 产品支持情况
+> Ascend 950PR&950DT系列产品：支持
+>
+> Atlas A3系列产品：支持
+>
+> Atlas A2系列产品：支持
+>
+> Atlas 200I/500 A2推理产品：不支持
+>
+> Atlas推理系列产品AI Core：支持
+>
+> Atlas推理系列产品Vector Core：不支持
+>
+> Atlas训练系列产品：支持
+>
+> Kirin X90处理器系列产品：支持
+>
+> Kirin 9030处理器系列产品：支持
+
+### Function description, VERBATIM
+
+> 框架需要使用的workspace称之为系统workspace。Matmul核函数（Kernel）侧接口等高阶API需要系统workspace，所以在使用该类API时，需要调用该接口，设置系统workspace的指针。**采用工程化算子开发方式或者核函数（Kernel）直调方式（开启HAVE_WORKSPACE编译选项）时，不需要开发者手动设置，框架会自动设置。其他场景下，需要开发者调用SetSysWorkSpace进行设置。**
+
+### Prototype, VERBATIM
+
+```c
+__aicore__ inline void SetSysWorkspace(GM_ADDR workspace)
+```
+
+> 表1 接口参数说明
+> workspace — 输入 — 核函数（Kernel）传入的workspace的指针，包括系统workspace和用户使用的workspace。
+>
+> 约束说明
+> 无
+
+### Host-side sizing, VERBATIM
+
+```c
+// 用户自定义的tiling函数
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+ AddApiTiling tiling;
+ ...
+ size_t usrSize = 256; // 设置用户需要使用的workspace大小。
+ // 如需要使用系统workspace需要调用GetLibApiWorkSpaceSize获取系统workspace的大小。
+ auto ascendcPlatform = platform_ascendc:: PlatformAscendC(context->GetPlatformInfo());
+ uint32_t sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+ size_t *currentWorkspace = context->GetWorkspaceSizes(1); // 通过框架获取workspace的指针，GetWorkspaceSizes入参为所需workspace的块数。当前限制使用一块。
+ currentWorkspace[0] = usrSize + sysWorkspaceSize; // 设置总的workspace的数值大小，总的workspace空间由框架来申请并管理。
+ ...
+}
+```
+
+### Kernel-side call example, VERBATIM
+
+```c
+template<typename aType, typename bType, typename cType, typename biasType>
+__aicore__ inline void MatmulLeakyKernel<aType, bType, cType, biasType>::Init(
+ GM_ADDR a, GM_ADDR b, GM_ADDR bias, GM_ADDR c, GM_ADDR workspace, const TCubeTiling& tiling, float alpha)
+{
+ // 融合算子的初始化操作
+ // ...
+ // workspace为核函数（Kernel）传入的GM指针，用于设置系统workspace
+ AscendC::SetSysWorkspace(workspace);
+ if (GetSysWorkSpacePtr() == nullptr) {
+ return;
+ }
+ // 后续Matmul指令
+ ...
+}
+```
+
+### ★ The kernel-direct-call workspace contract, VERBATIM from 「如何使用workspace」
+
+> 核函数（Kernel）直调算子开发场景
+> **需要使用workspace空间时，建议开启编译选项HAVE_WORKSPACE。host侧开发者仍需要自行申请workspace的空间，并传入。** 在使用Matmul核函数（Kernel）侧接口等需要系统workspace的高阶API时，设置的workspace空间大小为系统workspace和用户workspace之和。系统workspace大小可以通过PlatformAscendCManager的GetLibApiWorkSpaceSize接口获取。**开启HAVE_WORKSPACE后，开发者在核函数（Kernel）侧入参处获取的workspace为偏移了系统workspace后的用户workspace。**
+
+and the general definition, VERBATIM:
+
+> workspace是设备侧Global Memory上的一块内存。workspace内存分为两部分：系统workspace和用户workspace。
+> 系统workspace：Ascend C API需要预留的workspace内存
+> API在计算过程需要一些workspace内存作为缓存，因此算子需要为API预留workspace内存，预留内存大小通过GetLibApiWorkSpaceSize接口获取。
+> 用户workspace：算子实现使用到的workspace内存
+> 算子内部需要通过额外的device内存进行数据交换或者缓存的时候才需要分配，根据实际情况自行分配。使用场景如下：
+> 需要使用Unified Buffer（UB）和L1 Buffer上的空间且空间不够用时，可以将数据暂存至workspace上。
+> **调用SyncAll等API接口时，需要workspace作为入参。**
+> 其他需要使用Global Memory上内存空间的场景。
+
+> // 用户写的核函数（Kernel），核函数（Kernel）必须包括GM_ADDR workspace入参，位置需要放在tiling之前
+> `extern "C" __global__ __aicore__ void add_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)`
+
+### Guard against `GetLibApiWorkSpaceSize` failure, VERBATIM
+
+```c
+ uint32_t sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+ if (sysWorkspaceSize == std::numeric_limits<uint32_t>::max()) {
+ return ge::GRAPH_FAILED;
+ }
+```
+
+## Relevance
+★★ Closes the `SetSysWorkspaceForce` question: no such symbol is published; the real API is `AscendC::SetSysWorkspace(GM_ADDR)` + `GetSysWorkSpacePtr()`, and for a kernel-direct-call project the sanctioned mechanism is the **`HAVE_WORKSPACE` compile option**, after which the framework sets the system workspace itself and the kernel's `workspace` parameter is already offset past it. It also connects to the kernel-type question in a hard way: `SyncAll` — the very API that the MIX_* types exist to support via hardware synchronization — REQUIRES workspace as an input, and §56/§65 say a pure-cube kernel forced to a MIX type must have workspace > 0. So the triple (kernel type, `HAVE_WORKSPACE`, workspace size) must be consistent, and `AIC_ONLY` with workspace 0 is legal only if no high-order API and no `SyncAll` is used.
+
+## 71. `cann/runtime` (OPEN-SOURCED CANN RUNTIME on GitCode) — ★★★★★ THE AUTHORITATIVE `sqe_type` ENUM AND `errType` TABLE
+
+URL: https://gitcode.com/cann/runtime  (raw files under `https://raw.gitcode.com/cann/runtime/raw/master/<path>`; directory listing via `https://api.gitcode.com/api/v5/repos/cann/runtime/contents/<path>?ref=master`)
+Author: Huawei Technologies Co., Ltd. — every file below carries `Copyright (c) 2025 Huawei Technologies Co., Ltd. ... CANN Open Software License Agreement Version 2.0`
+Date: retrieved 2026-10-20, branch `master`. This is the OPEN-SOURCED CANN runtime (the component that prints our error), so these are not reconstructions — they are the shipping definitions.
+
+### (a) ★★★ `sqe_type=3` IS `RT_DAVID_SQE_TYPE_PLACE_HOLDER`
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/sqe/v200_base/stars_david.hpp
+(`v200_base` is the 220-family / "david" SQE layer — our arch)
+
+VERBATIM:
+
+```c
+enum rtDavidStarsSqeType {
+    RT_DAVID_SQE_TYPE_AIC = 0,           // AIC
+    RT_DAVID_SQE_TYPE_AIV = 1,           // AIV
+    RT_DAVID_SQE_TYPE_FUSION = 2,        // FUSION
+    RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3,  // PLACE_HOLDER
+    RT_DAVID_SQE_TYPE_AICPU_H = 4,       // AICPU_H
+    RT_DAVID_SQE_TYPE_AICPU_D = 5,       // AICPU_D
+    RT_DAVID_SQE_TYPE_NOTIFY_RECORD = 6, // NOTIFY_RECORD
+    RT_DAVID_SQE_TYPE_NOTIFY_WAIT = 7,   // NOTIFY_WAIT
+    RT_DAVID_SQE_TYPE_WRITE_VALUE = 8,   // WRITE_VALUE
+    RT_DAVID_SQE_TYPE_UBDMA = 9,         // UBDMA
+    RT_DAVID_SQE_TYPE_ASYNCDMA = 10,     // ASYNCDMA
+    RT_DAVID_SQE_TYPE_SDMA = 11,         // SDMA
+    RT_DAVID_SQE_TYPE_VPC = 12,          // VPC
+    RT_DAVID_SQE_TYPE_JPEGE = 13,        // JPEGE
+    RT_DAVID_SQE_TYPE_JPEGD = 14,        // JPEGD
+    RT_DAVID_SQE_TYPE_CMO = 15,          // CMO
+    RT_DAVID_SQE_TYPE_CCU = 16,          // CCU
+    RT_DAVID_SQE_TYPE_NSC = 18,          // NSC
+    RT_DAVID_SQE_TYPE_DSS = 19,          // DSS
+    RT_DAVID_SQE_TYPE_COND = 20,         // condition
+    RT_DAVID_SQE_TYPE_END = 21,
+    RT_DAVID_SQE_TYPE_INVALID = 63,      // invalid type
+};
+```
+
+This resolves the gap in the official troubleshooting PDF (§59): the Gitee issue's `sqe_type=7` is `NOTIFY_WAIT` (matching the PDF prose "当首错的sqe_type是notify wait时"), the `sqeType:11` in the vllm-ascend SDMA issue is `SDMA`, and **our `sqe_type=3` is `PLACE_HOLDER` — NOT a kernel SQE.** An AIC kernel launch is `sqe_type=0 (AIC)`; an AIV kernel launch is `sqe_type=1 (AIV)`; a MIX/FFTS kernel is `sqe_type=2 (FUSION)` (printed `(ffts)` in older builds).
+
+Companion enum in the same file, VERBATIM:
+
+```c
+enum rtDavidNotifySubType {
+    NOTIFY_SUB_TYPE_SINGLE_NOTIFY_RECORD = 0U,
+    NOTIFY_SUB_TYPE_SINGLE_NOTIFY_WAIT = 1U,
+    NOTIFY_SUB_TYPE_COUNT_NOTIFY_RECORD = 2U,
+    NOTIFY_SUB_TYPE_COUNT_NOTIFY_WAIT = 3U,
+    NOTIFY_SUB_TYPE_EVENT_USE_SINGLE_NOTIFY_RECORD = 4U,
+    NOTIFY_SUB_TYPE_EVENT_USE_SINGLE_NOTIFY_WAIT = 5U,
+    NOTIFY_SUB_TYPE_EVENT_USE_COUNT_NOTIFY_RECORD = 6U,
+    NOTIFY_SUB_TYPE_EVENT_USE_COUNT_NOTIFY_WAIT = 7U,
+    NOTIFY_SUB_TYPE_EVENT_RESET_USE_SINGLE_NOTIFY = 8U,
+    NOTIFY_SUB_TYPE_EVENT_RESET_USE_COUNT_NOTIFY = 9U,
+    NOTIFY_SUB_TYPE_MODEL_SERIAL_SCHED_NOTIFY_WAIT = 10U,
+    NOTIFY_SUB_TYPE_MAX = 11U
+};
+```
+
+### (b) ★★★ `errType=0x20` IS `RT_STARS_CQE_ERR_TYPE_SW_STATUS` = bit 5, and the full bit table
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/stars/stars.hpp
+
+VERBATIM:
+
+```c
+constexpr uint8_t RT_STARS_AS31XM1X_DEFAULT_KERNEL_CREDIT = 3U;         // The TS reference time is 33.5 ms.
+constexpr float32_t RT_STARS_AS31XM1X_TASK_KERNEL_CREDIT_SCALE = 33.5F; // 2^24 / 500M *1000(ms)
+constexpr uint8_t RT_STARS_FFTSPLUS_SUBTYPE_MIX = 0x1U;
+constexpr uint8_t RT_STARS_FFTSPLUS_HCCL_WITHOUT_AICAIV_FLAG = 0x5AU;
+constexpr uint8_t RT_STARS_FFTSPLUS_HCCL_WITH_AICAIV_FLAG = 0x5BU;
+
+constexpr uint16_t TS_FFTS_TYPE_AIC_ONLY = 0U;
+constexpr uint16_t TS_FFTS_TYPE_AIV_ONLY = 1U;
+constexpr uint16_t TS_FFTS_TYPE_AIC_AIV_MIX = 5U;
+constexpr uint8_t RT_STARS_DCACHE_LOCK_OP = 0x0AU;
+constexpr uint8_t RT_STARS_SQE_LEN = 64U;
+
+enum rtStarsCqeErrorCodeType {
+    RT_STARS_CQE_ERR_TYPE_EXCEPTION = (1ULL << 0U),
+    RT_STARS_CQE_ERR_TYPE_TRAP = (1ULL << 1U),
+    RT_STARS_CQE_ERR_TYPE_TASK_TIMEOUT = (1ULL << 2U),
+    RT_STARS_CQE_ERR_TYPE_SQE_ERROR = (1ULL << 3U),
+    RT_STARS_CQE_ERR_TYPE_RES_CONFLICT = (1ULL << 4U),
+    RT_STARS_CQE_ERR_TYPE_SW_STATUS = (1ULL << 5U)
+};
+```
+
+Note also `TS_FFTS_TYPE_AIC_ONLY = 0U`, `TS_FFTS_TYPE_AIV_ONLY = 1U`, `TS_FFTS_TYPE_AIC_AIV_MIX = 5U` — a THIRD numbering of "AIC only / AIV only / mix", distinct from `CodeMode` (§67a) and from `rtDavidStarsSqeType`.
+
+### (c) ★★ The string table that produces `(sq sw status error)` and `(task exception)`
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/src/engine/stars/stars_engine.cc (1905 lines)
+
+VERBATIM:
+
+```c
+const std::vector<std::string> StarsEngine::StarsCqeErrorDesc_ = {
+    "task exception",          "task trap",          "task timeout", "sqe error",
+    "resource conflict error", "sq sw status error", "warning"};
+```
+
+Index = count-trailing-zeros of `errType`. So the complete decode is:
+
+| errType | bit | enum | printed string |
+|---|---|---|---|
+| 0x01 | 0 | `RT_STARS_CQE_ERR_TYPE_EXCEPTION` | `task exception` |
+| 0x02 | 1 | `RT_STARS_CQE_ERR_TYPE_TRAP` | `task trap` |
+| 0x04 | 2 | `RT_STARS_CQE_ERR_TYPE_TASK_TIMEOUT` | `task timeout` |
+| 0x08 | 3 | `RT_STARS_CQE_ERR_TYPE_SQE_ERROR` | `sqe error` |
+| 0x10 | 4 | `RT_STARS_CQE_ERR_TYPE_RES_CONFLICT` | `resource conflict error` |
+| **0x20** | **5** | **`RT_STARS_CQE_ERR_TYPE_SW_STATUS`** | **`sq sw status error`** |
+| 0x40 | 6 | — | `warning` |
+
+### (d) The exact emission site of our error message
+
+URL: same `stars_engine.cc`, `StarsEngine::ProcLogicCqReport`, VERBATIM:
+
+```c
+void StarsEngine::ProcLogicCqReport(const rtCqReport_t& logicCq, const bool isStreamSync, TaskInfo* reportTask)
+{
+    UNUSED(isStreamSync);
+    const uint16_t streamId = (logicCq.streamId & 0x7FFFU); // bit15 is the flag of sync task
+    const uint16_t taskId = logicCq.taskId;
+    const uint16_t sqId = logicCq.sqId;
+    const uint16_t sqHead = logicCq.sqHead;
+    const uint8_t errType = logicCq.errorType;
+    const uint32_t errBit = (errType == 0U) ? UINT32_BIT_NUM : static_cast<uint32_t>(CTZ(errType));
+    const char_t* const errMsg = static_cast<size_t>(errBit) < StarsCqeErrorDesc_.size() ?
+                                     StarsCqeErrorDesc_[static_cast<size_t>(errBit)].c_str() :
+                                     "unknown";
+    ...
+    if (ProcReportIsException(logicCq, reportTask)) {
+        RT_LOG(
+            RT_LOG_ERROR,
+            "Task run failed, device_id=%u, stream_id=%hu, task_id=%hu, sqe_type=%u(%s), "
+            "errType=%#x(%s), sqSwStatus=%#x",
+            GetDevice()->Id_(), streamId, taskId, static_cast<uint32_t>(logicCq.sqeType),
+            GetSqeDescByType(logicCq.sqeType), errType, errMsg, logicCq.errorCode);
+        const uint32_t swStatus = logicCq.errorCode;
+        isExceptionFlag = true;
+        (void)GetDevice()->PrintStreamTimeoutSnapshotInfo();
+        if (reportTask != nullptr) {
+            faultTaskPtr = GetRealReportFaultTask(reportTask, static_cast<const void*>(&swStatus));
+            (void)GetDevice()->ProcDeviceErrorInfo(faultTaskPtr);
+            if (faultTaskPtr != nullptr && (faultTaskPtr->isRingbufferGet == 0U) &&
+                faultTaskPtr->type != TS_TASK_TYPE_KERNEL_AICPU) { // Try to get ringbuffer for N-seconds fast recovery.
+                (void)GetDevice()->ProcDeviceErrorInfo(faultTaskPtr);
+            }
+            if (!reportTask->stream->IsSeparateSendAndRecycle()) {
+                reportTask->stream->EnterFailureAbort();
+            }
+        } else {
+            (void)GetDevice()->ProcDeviceErrorInfo();
+        }
+    } else if ((errType & (RT_STARS_EXIST_ERROR | RT_STARS_EXIST_WARNING)) != static_cast<uint8_t>(0U)) {
+        // error bit indicates overflow of debug model or endofsquence here
+        RT_LOG(
+            RT_LOG_WARNING,
+            "CQE warning, device_id=%u, stream_id=%hu, task_id=%hu, sqe_type=%u(%s), errType=%#x(%s), sqSwStatus=%#x",
+            GetDevice()->Id_(), streamId, taskId, static_cast<uint32_t>(logicCq.sqeType),
+            GetSqeDescByType(logicCq.sqeType), errType, errMsg, logicCq.errorCode);
+    } else {
+        // no operation
+    }
+
+    if (unlikely(reportTask == nullptr)) {
+        RT_LOG(
+            RT_LOG_WARNING, "task or task stream is null, stream_id=%hu, task_id=%hu, sq_id=%hu, sqHead=%hu", streamId,
+            taskId, sqId, sqHead);
+        return;
+    }
+```
+
+Two more format strings from the same function, verbatim:
+
+```c
+                "Receive capture model CQE, device_id=%u, model_id=%u, stream_id=%d, task_id=%hu, task_type=%u, "
+                "sq_head=%hu, sqe_type=%u, err_type=%#x, err_code=%#x."
+```
+```c
+                RT_LOG_INFO, "Notify: cnt=%u, idx=%u, stream_id=%hu, task_id=%u, sqeType=%u, retCode=%#x, errType=%#x."
+```
+```c
+            " sqeType=%u, sqeHead=%u, retCode=%#x, errType=%#x, taskType=%d."
+```
+
+So `sqSwStatus` is literally `logicCq.errorCode`, and the "task_type" field appears in a sibling message, which is where to look for the kernel/task type.
+
+### (e) ★★ `sqSwStatus` DECODE — it is a packed struct, not an opaque number
+
+URL: same `stars.hpp`, VERBATIM:
+
+```c
+struct rtStarsModelExecuteError_t {
+    uint16_t task_id;
+    uint16_t stream_id : 12; /* 0~4096 for stream_id */
+    uint16_t result : 4;
+};
+
+/* used for stream expand spec */
+struct rtStarsModelExecuteErrorEx_t {
+    uint16_t task_id;
+    uint16_t sq_id : 12; /* sq_id */
+    uint16_t result : 4;
+};
+
+union rtStarsCqeSwStatus_t {
+    rtStarsModelExecuteError_t model_exec;
+    rtStarsModelExecuteErrorEx_t model_exec_ex;
+    uint32_t value;
+};
+
+struct rtStarsCqeErrorInfo_t {
+    uint8_t error_code;
+    uint8_t drop_flag; /* software define, means drop hw cqe and no dispatch to logic cq */
+    uint8_t res0 : 1;
+    uint8_t sqe_type : 6;
+    uint16_t sqe_index;
+    rtStarsCqeSwStatus_t sq_sw_status;
+};
+
+union rtStarsCqeStatus_t {
+    rtStarsCqeSysCnt_t sysCnt;
+    rtStarsCqeErrorInfo_t errorInfo;
+};
+
+struct rtStarsCqe_t {
+    uint16_t phase : 1;
+    uint16_t warn : 1; /* process warning */
+    uint16_t evt : 1;  /* event record flag */
+    uint16_t place_hold : 1;
+    uint16_t SQ_id : 11;
+    uint16_t error_bit : 1;
+    uint16_t SQ_head;
+
+    uint16_t streamID;
+    uint16_t taskID;
+
+    rtStarsCqeStatus_t cqe_status;
+};
+```
+
+`sqe_type` is a **6-bit field** (hence `RT_DAVID_SQE_TYPE_INVALID = 63`), and `sq_sw_status` decodes as `{ task_id = value & 0xFFFF, stream_id = (value >> 16) & 0xFFF, result = value >> 28 }`. Worked example on the published §58 value `sqSwStatus=0x10020000`: `task_id = 0x0000`, `stream_id = 0x002`, `result = 0x1`.
+
+### (f) ★★★ `blockDim` IS RANGE-CHECKED AGAINST THE CORE COUNT OF THE DECLARED SQE TYPE
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/inc/sqe/aic_aiv_sqe_common.hpp
+
+VERBATIM:
+
+```c
+inline void CheckBlockDim(const Stream* const stm, const uint16_t sqeType, const uint16_t blockDim)
+{
+    rtDevResLimitType_t coreType = RT_DEV_RES_TYPE_MAX;
+    if (sqeType == RT_DAVID_SQE_TYPE_AIC) {
+        coreType = RT_DEV_RES_CUBE_CORE;
+    } else if (sqeType == RT_DAVID_SQE_TYPE_AIV) {
+        coreType = RT_DEV_RES_VECTOR_CORE;
+    } else {
+        return;
+    }
+
+    const uint32_t coreNum = stm->Device_()->GetResInitValue(coreType);
+    COND_RETURN_VOID_WARN(
+        blockDim > coreNum, "blockDim exceeds coreNum, drv deviceId=%u, coreType=%d, blockDim=%hu, coreNum=%u",
+        stm->Device_()->Id_(), coreType, blockDim, coreNum);
+}
+```
+
+The exact warning string to grep for: `blockDim exceeds coreNum, drv deviceId=%u, coreType=%d, blockDim=%hu, coreNum=%u`. Note it is a WARN, not a hard failure — so an over-range blockDim on an AIC SQE is only a log line here, and whatever breaks downstream breaks silently from this function's point of view.
+
+Also in the same header, the AIC:AIV group machinery and the 1:2 derivation, VERBATIM:
+
+```c
+inline Kernel* GetKernelByTaskType(const TaskInfo* const taskInfo)
+{
+    Kernel* kernelPtr = nullptr;
+    if ((taskInfo->type == TS_TASK_TYPE_KERNEL_AICORE) || (taskInfo->type == TS_TASK_TYPE_KERNEL_AIVEC)) {
+        kernelPtr = taskInfo->u.aicTaskInfo.kernel;
+    } else {
+        kernelPtr = taskInfo->u.fusionKernelTask.aicPart.kernel;
+    }
+    return kernelPtr;
+}
+
+template <typename SqeType>
+inline void ConfigDieFriendly(const TaskInfo* const taskInfo, SqeType* const sqe, const Stream* const stm)
+{
+    sqe->dieFriendly = 1U;
+    ConfigSqeDieFriendly(sqe, stm);
+    const bool aicTask =
+        (taskInfo->type == TS_TASK_TYPE_KERNEL_AICORE) || (taskInfo->type == TS_TASK_TYPE_KERNEL_AIVEC);
+    uint16_t blkDim = 0U;
+    uint16_t groupDim = 0U;
+    uint16_t groupBlockDim = 0U;
+    if (aicTask) {
+        blkDim = taskInfo->u.aicTaskInfo.comm.dim;
+        groupDim = taskInfo->u.aicTaskInfo.groupDim;
+        groupBlockDim = taskInfo->u.aicTaskInfo.groupBlockDim;
+    } else {
+        blkDim = taskInfo->u.fusionKernelTask.aicPart.dim;
+        groupDim = taskInfo->u.fusionKernelTask.aicPart.groupDim;
+        groupBlockDim = taskInfo->u.fusionKernelTask.aicPart.groupBlockDim;
+    }
+
+    if (groupDim != 0U) {
+        sqe->groupDim = groupDim;
+        sqe->groupBlockdim = groupBlockDim;
+        sqe->header.blockDim = groupDim * groupBlockDim;
+        return;
+    }
+
+    sqe->groupDim = static_cast<uint16_t>(sqe->header.blockDim <= 1U ? 1U : 2U);
+    const uint16_t value = static_cast<uint16_t>(blkDim / sqe->groupDim);
+    sqe->groupBlockdim = (static_cast<uint16_t>(sqe->header.blockDim % sqe->groupDim) == 0U) ? value : (value + 1U);
+}
+
+template <typename T, typename SqeType>
+inline void ConstructAivSqePart(const T* const kernelInfo, SqeType* const sqe, uint64_t addr, const Stream* const stm)
+{
+    ...
+    sqe->header.type = RT_DAVID_SQE_TYPE_AIV;
+```
+
+i.e. `sqe->header.type` is set to `RT_DAVID_SQE_TYPE_AIV` / `RT_DAVID_SQE_TYPE_AIC` explicitly per part, and `TS_TASK_TYPE_KERNEL_AICORE` / `TS_TASK_TYPE_KERNEL_AIVEC` are the two non-fusion task types; everything else goes down the `fusionKernelTask.aicPart` path.
+
+### (g) What a `PLACE_HOLDER` SQE actually carries — so `sqe_type=3` is a RUNTIME-MAINTENANCE SQE, not a kernel
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/sqe/v200_base/place_holder_sqe.h
+
+VERBATIM (the SQE and the two payload structs that reference kernel type / blockDim):
+
+```c
+struct RtDavidPlaceHolderSqe {
+    rtDavidStarsSqeHeader_t header;
+    /* word2-3 */
+    uint32_t res1;
+    uint16_t taskType;
+    uint8_t kernelCredit;
+    uint8_t timeoutType; // use for timeout cqe in david
+
+    /* use reserved field */
+    /* The struct in the union must be 48 bytes */
+    union {
+        DavidStarsMaintaince maintainceInfo;
+        DavidDataDumpLoadInfo dataDumpLoadInfo;
+        DavidDynamicProf dynamicProfilingInfo;
+        DavidProfilerTraceEx profileTraceInfo;
+        DavidModelDebugRegister modelDebugRegisterInfo;
+        DavidStreamDebugRegister streamDebugRegisterInfo;
+        DavidStarsModelMaintaince modelMaintainceInfo;
+        DavidRingBufferControl ringBufferControlInfo;
+        DavidMemCpyAsyncWithoutSdma memcpyAsyncWithoutSdmaInfo;
+        DavidStreamOverflowSwitch streamOverflowSwitchInfo;
+        DavidGetDevMsg getDevMsgInfo;
+        DavidStreamSetTag streamSetTagInfo;
+        DavidDebugStatus debugStatusInfo;
+        DavidFlipTaskTag flipTaskInfo;
+        DavidMdlTaskUpdate mdlTaskUpdateInfo;
+        DavidAicpuInfoLoad aiCpuLoadInfo;
+        DavidCallBackTask callBackInfo;
+        uint32_t resv[12];
+    } u;
+};
+```
+
+```c
+struct DavidDataDumpLoadInfo {
+    uint64_t dumpinfoPtr;
+    uint32_t length;
+    uint16_t streamId;
+    uint16_t taskId;
+    uint16_t kernelType;
+    uint16_t reserved;
+};
+```
+
+```c
+struct DavidMdlTaskUpdate {
+    uint64_t tilingKeyOffset;
+    uint64_t blockDimOffset;
+    uint64_t tilingTabOffset;
+    uint16_t tilingTabLen;
+    uint16_t desStreamId;
+    uint32_t destaskId;
+    uint16_t exeStreamId;
+    uint16_t resv;
+};
+```
+
+```c
+struct DavidStarsMaintaince {
+    uint8_t subType; // force recycle
+    uint8_t rsv;
+    uint16_t targetId;
+    uint8_t reserved[44];
+};
+
+struct DavidStarsModelMaintaince {
+    uint16_t modelId;
+    uint16_t streamId;
+    uint16_t operation;
+    uint16_t streamType;
+    uint16_t firstTaskId;
+    uint16_t endgraphNotifyId;
+    uint32_t executorFlag;
+    uint64_t streamExecTimesAddr;
+    uint32_t opSqId;
+    uint32_t sqId;
+    uint8_t notifyIdExpandFlag;
+    uint8_t enableCqe : 1;
+    uint8_t reserved0 : 7;
+    uint8_t rev[2];
+    uint32_t endgraphNotifyIdExpand; // endgraphNotifyId may exceed 64K on A5/A6.
+    uint32_t reserved[2];
+};
+```
+
+Only TWO of the seventeen `PLACE_HOLDER` payloads carry anything kernel-shaped: `DavidDataDumpLoadInfo` (which has an explicit `uint16_t kernelType;`) and `DavidMdlTaskUpdate` (`tilingKeyOffset` / `blockDimOffset`). The `RtDavidPlaceHolderSqe` itself also has a top-level `uint16_t taskType;`.
+This matters because `gen_host_stub.py` (§67f) emits, guarded by `#if !(defined(ASCENDC_DUMP) && ASCENDC_DUMP == 0)`:
+
+```c
+    const rtArgsSizeInfo sizeInfo = {exceptionDumpAddr, atomicIndex};
+    int32_t ret = rtSetExceptionExtInfo(&sizeInfo);
+    if (ret != 0) {
+        printf("rtSetExceptionExtInfo failed, ret = %d.\n", ret);
+    }
+```
+i.e. the Ascend C host stub routinely submits an exception-dump-info load alongside the kernel, and that is a `PLACE_HOLDER` (`sqe_type=3`) SQE whose payload carries `kernelType`.
+
+### (h) Kernel-type enum on the AICPU side, for completeness
+
+URL: https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/src/kernel/program_common.cc, VERBATIM:
+
+```c
+void SetCpuKernelAttr(Kernel* kernel, const CpuKernelInfo& kernelInfo, const std::string& opType)
+{
+    rtKernelType_t kernelType = KERNEL_TYPE_RESERVED;
+    kernel->SetKernelRegisterType(RT_KERNEL_REG_TYPE_CPU);
+    kernel->SetCpuFuncName(kernelInfo.funcName);
+    kernel->SetCpuKernelSo(kernelInfo.kernelSo);
+    kernel->SetCpuOpType(opType);
+    kernel->SetSystemParaNum(0U);
+    kernel->SetUserParaNum(USER_ARGS_MAX_NUM);
+    kernel->SetIsNeedSetFftsAddrInArg(false);
+    kernel->SetIsSupportOverFlow(false);
+    kernel->SetAicpuKernelType_(static_cast<uint32_t>(kernelType));
+    kernel->SetKernelAttrType(RT_KERNEL_ATTR_TYPE_AICPU);
+    if (!kernelInfo.hasOpKernelLib) {
+        RT_LOG(RT_LOG_ERROR, "opKernelLib does not exist, return");
+        return;
+    }
+
+    const std::string opKernelLib = kernelInfo.opKernelLib;
+    if ((opKernelLib == "CUSTAICPUKernel")) {
+        kernelType = KERNEL_TYPE_AICPU_CUSTOM;
+    } else if (opKernelLib == "AICPUKernel") {
+        kernelType = kernelInfo.isUserDefined ? KERNEL_TYPE_AICPU_CUSTOM : KERNEL_TYPE_AICPU;
+    } else if (opKernelLib == "TFKernel") {
+        kernelType = KERNEL_TYPE_FWK;
+    } else if (opKernelLib == "KFCKernel") {
+        kernelType = KERNEL_TYPE_AICPU_KFC;
+    } else if (opKernelLib == "CUSTKFCKernel") {
+        kernelType = KERNEL_TYPE_CUSTOM_KFC;
+    } else {
+        // skip, no operation
+        RT_LOG(RT_LOG_ERROR, "opKernelLib does not exist, default KERNEL_TYPE_RESERVED");
+    }
+
+    kernel->SetAicpuKernelType_(static_cast<uint32_t>(kernelType));
+    return;
+}
+```
+
+`rtKernelType_t` values seen: `KERNEL_TYPE_RESERVED`, `KERNEL_TYPE_AICPU`, `KERNEL_TYPE_AICPU_CUSTOM`, `KERNEL_TYPE_FWK`, `KERNEL_TYPE_AICPU_KFC`, `KERNEL_TYPE_CUSTOM_KFC`. Note the setter named `SetIsNeedSetFftsAddrInArg(false)` — the runtime-side counterpart of `add_ffts_addr_func_param_by_mode` in §67d. Error strings here: `opKernelLib does not exist, return` and `opKernelLib does not exist, default KERNEL_TYPE_RESERVED`.
+
+### How to reproduce this lookup yourself
+
+```bash
+curl -s 'https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/sqe/v200_base/stars_david.hpp'   # sqe_type enum
+curl -s 'https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/stars/stars.hpp'                  # errType enum + CQE structs
+curl -s 'https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/src/engine/stars/stars_engine.cc'      # StarsCqeErrorDesc_ + the log format string
+curl -s 'https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/inc/sqe/aic_aiv_sqe_common.hpp'             # CheckBlockDim + AIC/AIV SQE construction
+curl -s 'https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/sqe/v200_base/place_holder_sqe.h'  # what sqe_type=3 carries
+# directory listing:
+curl -s 'https://api.gitcode.com/api/v5/repos/cann/runtime/contents/<path>?ref=master'
+```
+
+## Relevance
+★★★★★ This is the decisive evidence and it changes the reading of our measurement entirely. From the runtime's own source: `errType=0x20` is `RT_STARS_CQE_ERR_TYPE_SW_STATUS` ("sq sw status error"), and `sqe_type=3` is `RT_DAVID_SQE_TYPE_PLACE_HOLDER` — a runtime MAINTENANCE SQE. A rejected AIC kernel would have reported `sqe_type=0 (AIC)`; a rejected AIV kernel `sqe_type=1`; a rejected MIX/FFTS kernel `sqe_type=2 (FUSION)`. So the thing that failed when we declared `KERNEL_TYPE_AIC_ONLY` was NOT the kernel SQE — it was a place-holder SQE on the same stream. Of the seventeen place-holder payloads only `DavidDataDumpLoadInfo` carries a `uint16_t kernelType` and only `DavidMdlTaskUpdate` carries `blockDimOffset`/`tilingKeyOffset`; the Ascend C host stub submits the former via `rtSetExceptionExtInfo` unless `ASCENDC_DUMP == 0`. That is a concrete, testable next step: build with `-DASCENDC_DUMP=0` (or otherwise suppress the exception-dump-info load) and re-run the AIC_ONLY kernel.
+Second decisive fact: `CheckBlockDim` in `aic_aiv_sqe_common.hpp` proves the runtime interprets blockDim against `RT_DEV_RES_CUBE_CORE` when `sqeType == RT_DAVID_SQE_TYPE_AIC` and against `RT_DEV_RES_VECTOR_CORE` when `sqeType == RT_DAVID_SQE_TYPE_AIV` — the declared type literally reinterprets blockDim — but it only WARNs (`blockDim exceeds coreNum, ...`), so an over-range blockDim will not surface as this error.
+Third: `sqSwStatus` is not opaque. Decode it as `{task_id = v & 0xFFFF, stream_id = (v >> 16) & 0xFFF, result = v >> 28}` to find which task and stream the SQ was choking on.
+
+## 72. Disambiguation addendum — THREE different numeric "type" fields all print as `..._type=3` in Ascend logs
+
+URLs (all already quoted above, collected here because confusing them is the single easiest way to misread our error):
+- `sqe_type` → https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/sqe/v200_base/stars_david.hpp
+- `task_type` / `tsTaskType_t` → seen in https://github.com/Ascend/pytorch/issues/43 (an "hccl fftsplus task timeout" report printing `task_type=3` decoded as `EVENT_WAIT`) and in the `stars_engine.cc` format string `"task_type=%hu(%s)."`
+- Ascend C `CodeMode` → https://github.com/hicann/asc-devkit/blob/master/cmake/asc/legacy_modules/util/host_stub_util.py
+- `TS_FFTS_TYPE_*` → https://raw.gitcode.com/cann/runtime/raw/master/src/runtime/core/inc/stars/stars.hpp
+Author: compiled from the sources named above (Huawei Technologies Co., Ltd. for all CANN sources; `Ascend/pytorch` issue #43 reporter for the log sample).
+Date: retrieved 2026-10-20.
+
+### The four independent numberings, VERBATIM side by side
+
+`sqe_type` (hardware Send-Queue-Entry kind, 6 bits, printed by `ProcLogicCqReport`):
+
+```c
+RT_DAVID_SQE_TYPE_AIC = 0, RT_DAVID_SQE_TYPE_AIV = 1, RT_DAVID_SQE_TYPE_FUSION = 2,
+RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3, RT_DAVID_SQE_TYPE_AICPU_H = 4, RT_DAVID_SQE_TYPE_AICPU_D = 5,
+RT_DAVID_SQE_TYPE_NOTIFY_RECORD = 6, RT_DAVID_SQE_TYPE_NOTIFY_WAIT = 7, ... RT_DAVID_SQE_TYPE_INVALID = 63
+```
+
+Ascend C host-stub `CodeMode` (what the kernel-type macro becomes in the build system):
+
+```python
+MIX = 0; AIV = 1; AIC = 2; NORMAL = 3; MIX_VECTOR_CORE = 4
+KERNEL_TYPE_AIV_ONLY = 5; KERNEL_TYPE_AIC_ONLY = 6
+KERNEL_TYPE_MIX_AIV_1_0 = 7; KERNEL_TYPE_MIX_AIC_1_0 = 8
+KERNEL_TYPE_MIX_AIC_1_1 = 9; KERNEL_TYPE_MIX_AIC_1_2 = 10
+```
+
+`KernelMetaType` ordinals (what the documented enum implies, by declaration order):
+
+```c
+KERNEL_TYPE_AIV_ONLY = 0, KERNEL_TYPE_AIC_ONLY = 1, KERNEL_TYPE_MIX_AIV_1_0 = 2,
+KERNEL_TYPE_MIX_AIC_1_0 = 3, KERNEL_TYPE_MIX_AIC_1_1 = 4, KERNEL_TYPE_MIX_AIC_1_2 = 5,
+KERNEL_TYPE_AICORE = 6, KERNEL_TYPE_VECTORCORE = 7, KERNEL_TYPE_MIX_AICORE = 8,
+KERNEL_TYPE_MIX_VECTOR_CORE = 9, KERNEL_TYPE_MAX = 10
+```
+
+`TS_FFTS_TYPE_*` (the FFTS-plus sub-type on the TS side):
+
+```c
+constexpr uint16_t TS_FFTS_TYPE_AIC_ONLY = 0U;
+constexpr uint16_t TS_FFTS_TYPE_AIV_ONLY = 1U;
+constexpr uint16_t TS_FFTS_TYPE_AIC_AIV_MIX = 5U;
+constexpr uint8_t RT_STARS_FFTSPLUS_SUBTYPE_MIX = 0x1U;
+```
+
+And `tsTaskType_t`, whose value 3 is reported in the wild as `EVENT_WAIT` (from the `Ascend/pytorch` issue #43 log, where an hccl fftsplus task timeout prints `task_type=3` and the thread identifies it as EVENT_WAIT); the runtime's own `TS_TASK_TYPE_*` names seen in source are `TS_TASK_TYPE_KERNEL_AICORE`, `TS_TASK_TYPE_KERNEL_AIVEC`, `TS_TASK_TYPE_KERNEL_AICPU`.
+
+### The collision table for the value 3
+
+| field | value 3 means |
+|---|---|
+| `sqe_type` (`rtDavidStarsSqeType`) | `RT_DAVID_SQE_TYPE_PLACE_HOLDER` |
+| `task_type` (`tsTaskType_t`) | reported as `EVENT_WAIT` |
+| `CodeMode` (asc-devkit host stub) | `NORMAL` |
+| `KernelMetaType` ordinal | `KERNEL_TYPE_MIX_AIC_1_0` |
+
+## Relevance
+★★ Guard rail for reading our own measurement. `sqe_type=3, errType=0x20` is unambiguous ONLY because the string `sqe_type=` pins the field to `rtDavidStarsSqeType` (printed by `StarsEngine::ProcLogicCqReport`), so it is `PLACE_HOLDER`. If the log we actually captured says `task_type=3` rather than `sqe_type=3` it is `EVENT_WAIT` and the whole reading changes; and `KernelMetaType` ordinal 3 happens to be `KERNEL_TYPE_MIX_AIC_1_0`, which makes a tempting but WRONG coincidence. Verify the exact field name in the plog line before acting.
+
 
 ---
 
@@ -11655,3 +15724,97 @@ Looked for and did not find:
 - **PTO-ISA itself.** `gitcode.com/cann/pto-isa` is the virtual tile ISA MegaGDN is written
   against, and `CANN/pypto` / `CANN/pto-isa` appear in the GitCode CANN org listing. Whether
   hand-written AscendC or PTO-ISA is the better substrate for our kernel was not evaluated.
+
+---
+
+## Gaps — second pass (§9–§72, deposited 2026-10-20)
+
+### Resolved by this pass
+
+- **In-kernel cross-rank communication on Ascend: found, first-party, open source.** §9–§12
+  (`gitcode.com/cann/shmem`, SHMEM v1.7.0, 2026/10) and §13–§14 (`AscendC::Hccl`,
+  `asc.gitcode.com`, built 2026/10/20). The `aclshmem` device headers, a working TP all-reduce
+  (§10), and a whole MoE forward pass as one device pipeline with a hand-rolled epoch-tagged
+  cross-rank barrier (§11) are all public.
+- **The epoch-tagged flag protocol: code found, three independent implementations.** MegaMoE's
+  `SynchronizeRanks` + `WaitForRankGeneration` (§11.2), LCCL's `SET_MAGIC` / `sync_collectives.h`
+  (§34–§35), and the vendor's own `SoftSyncAllImpl` (§52.3). All three use a never-reset monotone
+  counter and `>=`.
+- **`CrossCoreSetFlag`/`WaitFlag` authoritative spec: found and read first-hand.** §16–§33 plus
+  §52. Modes on A3 are the closed set {0, 1, 2}; mode 4 is 950-only and silently becomes mode 0 on
+  A3 via `mode & 0x3`; `wait_flag_dev(flagId)` takes one argument and is mode-blind; 16 flagIds
+  per core with a 4-bit saturating counter; reserved 11/12/13/14.
+- **`KERNEL_TYPE_AIC_ONLY`: documented as SUPPORTED on A3, and shipping in three codebases.**
+  §56 (official `set_Kernel_type` page, verified first-hand 2026-10-20), §60
+  (`huawei-csl/pto-kernels` PR #241), §68 (`tilesim/vTriton`), §69 (`sgl-project/sgl-kernel-npu`).
+- **`sqe_type=3, errType=0x20` decoded.** §71: `RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3` and
+  `RT_STARS_CQE_ERR_TYPE_SW_STATUS = 1<<5` → `"sq sw status error"`, both verified first-hand in
+  `gitcode.com/cann/runtime`. §72 disambiguates the three different `*_type=3` fields.
+- **Other whole-layer Ascend kernels: three found.** §15 (`ascend_mega_kernel`, per-layer
+  megakernel on 950PR with real probe results), §8 (MegaGDN), §4/§4b (CANN SuperKernel), plus §53
+  (measured A3 + CANN 9.2.0 SuperKernel numbers) and §54 (HyperParallel's `moe_ffn_fwd/bwd` Mega
+  Kernel layer).
+
+### Open, and worth the next pass
+
+- **Re-diagnose our own `sqe_type=3, errType=0x20`.** Given §71, the log line we have does not say
+  "kernel type rejected". Three concrete leads, in order of cheapness: (a) §56's constraint
+  「当纯cube或者纯vec算子强制设定核函数（Kernel）类型为MIX类型时，workspace的大小不能设置为0，需要
+  设置一个大于0的值（比如16、32等）」 — check our workspace size; (b) §70's `HAVE_WORKSPACE` compile
+  option for kernel-direct-call projects; (c) §71's observation that of the PLACE_HOLDER SQE
+  payloads only `DavidDataDumpLoadInfo` carries a `kernelType` field and it is submitted via
+  `rtSetExceptionExtInfo` unless `ASCENDC_DUMP == 0` — so rebuild with `-DASCENDC_DUMP=0` and
+  re-run. Also check whether we are actually hitting §61's different message
+  (`rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error`, `retCode=0x7080005` /
+  `507000`).
+- **Re-test reverse mode 2 with the right pipe and the right cardinality.** §52.2 shows Huawei's
+  own `SyncAllImpl<false>` issuing a V→C mode-2 set on `PIPE_MTE3` with flagId 12, so reverse
+  mode 2 works on 2201. §32 says a mode-2 flag cannot cross an AI Core boundary at blockDim>1, and
+  §31 gives the pairing arithmetic: **both** AIVs of an AI Core must set before the AIC's wait is
+  satisfied. If only one sub-block has work, the AIC waits forever. That, not the mode number, is
+  the likely cause of what we saw. Also note §15.5's `IsSplitCubePipe` restriction is dav-3510
+  and does **not** hold on 2201.
+- **`__schedmode__(1)` on our kernel.** §15.6 fact 3 states cross-core sync *requires* batch mode,
+  because FFTS otherwise dispatches a task's cores in batches and the all-arrived count never
+  completes; the failure presents as a launch that never returns at 250–360 W and 0% util. Not
+  mentioned anywhere else in this file, not verified on 2201, and it would be a silent landmine.
+  §15.6 also records that the official `ascendc_kernel_cmake` flow rejects `__schedmode__` /
+  `__mix__` attributes outright (`error: ... needs to appear with kernel func.`), so this
+  interacts with our build flow.
+- **`FuncMetaType.F_TYPE_CROSS_CORE_SYNC = 2` is never emitted** by the legacy codegen path read in
+  §55. Some other path must emit it. Finding that path would tell us whether a hand-written
+  `__mix__` kernel built outside the official flow is missing a required metadata record.
+- **★ `task type 105`.** §54.3 states the HyperParallel Mega Kernel layer reaches `aclshmem`
+  「直接通过 CANN 算子内部 task type 105 调用」. Not decoded. `gitcode.com/cann/runtime` is open
+  source (§71) and should contain the task-type table; this is the obvious next grep.
+- **`aclshmemx_mte_atomic_add` cost on 910C.** §12.3 says it is supported on
+  Ascend910B/Ascend910C for int8/int16/half/bfloat16/int32/float and 「On Ascend910B/Ascend910C: The
+  atomic add is performed by MTE2 unit」. Nothing public gives its latency, its bandwidth, or what
+  happens when 16 ranks atomically add into the same cache line. §54.2's 「低精度通信高精累加」
+  requirement also warns that 16 sequential bf16 accumulations into one cell is numerically poor.
+  This needs measuring, not reading.
+- **`aclshmem` on A3 specifically.** §9.1's communication-path figure is drawn 「以910A3为例」 and
+  §12.3's atomic table covers 910B/910C, but the two most relevant examples are A5-only:
+  `tp_allreduce_udma` 「当前仅支持 Ascend 950PR&950DT系列产品」 (§10.5) and `shmem_mega_moe`
+  「仅支持 Ascend950」 (§11.1). What the A3 build of SHMEM actually supports — which engines, which
+  examples, what `aclshmem_barrier_all` costs — is not in the public docs read here. `docs/`
+  in `cann/shmem` has `principles/`, `debug/profiling.md` and `api/env_vars_intro.md` unread.
+- **`Hccl::Wait` internal flagId usage.** §13's own advice is to combine `SyncAll`,
+  `CrossCoreSetFlag` and `CrossCoreWaitFlag` with an `Hccl` object in one kernel. If `Hccl`
+  internally consumes flagIds on top of `SyncAll`'s 11–14 and Matmul's 0–7 (§18), the budget does
+  not close. Not documented anywhere found.
+- **`cann/shmem` src/, not just include/.** §9 quotes the public headers; the implementations
+  (`src/device/gm2gm/*.hpp`, `src/device/gm2gm/engine/shmem_device_mte.hpp`) would give the actual
+  instruction sequences — in particular what `aclshmem_barrier_all` costs on A3 and how
+  `aclshmemx_mte_atomic_add` lowers on 910C.
+- **Perseus (arXiv:2605.00686, Byungsoo Oh & Rachee Singh, submitted 2026-05-01).** "Eliminating
+  Hidden Serialization in Multi-Node Megakernel Communication" — MoE megakernels regress up to 10x
+  on 8 nodes because the transfer→completion-signal ordering forces a fence that drains the NIC
+  pipeline; fixed with per-destination fence batching (8x fewer fences) and NIC-side ordering, for
+  up to 10.3x. Entirely GPU/RDMA, no Ascend content, but the *failure mode* — a fence per
+  signalled transfer serialising a one-sided collective — is exactly what §9.3's
+  `aclshmem_quiet`-per-put would do to us. The paper was not read beyond its abstract.
+- **`sk_raw_project`** (https://gitcode.com/sjtulxh/sk_raw_project) — the only public example of
+  hand-driving the SuperKernel entry from a PyTorch NPU extension. Not read.
+- **hiascend forum thread `0297204111998064411`** (2026-01, 910B + MindSpore + DLBlas MegaKernel,
+  Qwen3-Next AttentionProlog) is behind a cookie wall; only a secondhand quote was obtained (§53.6).

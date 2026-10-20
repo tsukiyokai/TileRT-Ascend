@@ -1710,3 +1710,1201 @@ What was looked for and not found.
   `attention/sparse_flash_mla` and `attention/quant_sparse_flash_mla` exist with docs, but
   nothing states when the runtime picks one over the other, or whether `sparse_flash_mla` is
   A3-capable (`flash_mla` itself is 950-only).
+
+---
+
+## 8. `SparseFlashAttention` on A3: the host tiling never splits KV or G, and at batch=1 decode it runs on ONE cube core
+
+Clone, not raw-URL fetch (`raw.gitcode.com` answers `429 Limited account:unregisteredUser`):
+
+```
+git clone https://gitcode.com/cann/ops-transformer.git
+commit 3efc65dad2a97a4fea856c3be319da596a42fb8a
+author L_Euler
+date   Tue Oct 20 16:03:55 2026 +0800
+subject 【BSA】aclnnBlockSparseAttentionV2 文档函数原型 qDequantScale/kDequantScale/vDequantScale 与头文件参数名不一致
+```
+
+Read 2026-10-20. All paths below are relative to the repo root; the browsable form is
+`https://gitcode.com/cann/ops-transformer/blob/master/<path>`.
+
+### 8.1 `FLASH_DECODE` is a declared template parameter that is NEVER instantiated
+
+`attention/sparse_flash_attention/op_kernel/sparse_flash_attention_template_tiling_key.h` declares
+the parameter with both values:
+
+```cpp
+ASCENDC_TPL_ARGS_DECL(SparseFlashAttention, // 算子OpType
+                      ASCENDC_TPL_BOOL_DECL(FLASH_DECODE, 0, 1), ASCENDC_TPL_BOOL_DECL(PAGE_ATTENTION, 0, 1),
+```
+
+but every one of the eight entries in the `ASCENDC_TPL_SEL` combination list — the list the comment
+says is what `GET_TPL_TILING_KEY` validates against — pins it to `0`:
+
+```cpp
+// 支持的模板参数组合
+// 用于调用GET_TPL_TILING_KEY获取TilingKey时，接口内部校验TilingKey是否合法
+ASCENDC_TPL_SEL(
+    ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_BOOL_SEL(FLASH_DECODE, 0), ASCENDC_TPL_BOOL_SEL(PAGE_ATTENTION, 0),
+                         ASCENDC_TPL_UINT_SEL(LAYOUT_T, ASCENDC_TPL_UI_LIST, SFA_LAYOUT_BSND),
+                         ASCENDC_TPL_UINT_SEL(KV_LAYOUT_T, ASCENDC_TPL_UI_LIST, SFA_LAYOUT_BSND, SFA_LAYOUT_PA_BSND),
+                         ASCENDC_TPL_UINT_SEL(TEMPLATE_MODE, ASCENDC_TPL_UI_LIST, C_TEMPLATE),
+                         ASCENDC_TPL_BOOL_SEL(IS_SPLIT_G, 0, 1), ASCENDC_TPL_BOOL_SEL(HAS_ROPE, 0, 1), ),
+    ...
+    ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_BOOL_SEL(FLASH_DECODE, 0), ASCENDC_TPL_BOOL_SEL(PAGE_ATTENTION, 1),
+                         ASCENDC_TPL_UINT_SEL(LAYOUT_T, ASCENDC_TPL_UI_LIST, SFA_LAYOUT_TND),
+                         ASCENDC_TPL_UINT_SEL(KV_LAYOUT_T, ASCENDC_TPL_UI_LIST, SFA_LAYOUT_TND, SFA_LAYOUT_PA_BSND),
+                         ASCENDC_TPL_UINT_SEL(TEMPLATE_MODE, ASCENDC_TPL_UI_LIST, V_TEMPLATE),
+                         ASCENDC_TPL_BOOL_SEL(IS_SPLIT_G, 0, 1), ASCENDC_TPL_BOOL_SEL(HAS_ROPE, 0, 1), ), );
+```
+
+(Eight `ASCENDC_TPL_ARGS_SEL` entries = {`PAGE_ATTENTION` 0,1} x {`LAYOUT_T` BSND,TND} x
+{`TEMPLATE_MODE` C,V}. `FLASH_DECODE` is `0` in all eight; `1` appears nowhere.)
+
+The host side closes the door with a literal. `op_host/sparse_flash_attention_tiling.cpp`,
+`SFAMlaTiling::GenTilingKey()`:
+
+```cpp
+void SFAMlaTiling::GenTilingKey()
+{
+    uint32_t inputQType = static_cast<uint32_t>(sfaInfo_->inputQType);
+    uint32_t inputKvType = static_cast<uint32_t>(sfaInfo_->inputKvType);
+    uint32_t outputType = static_cast<uint32_t>(sfaInfo_->outputType);
+    uint32_t layoutQuery = static_cast<uint32_t>(sfaInfo_->qLayout);
+    uint32_t layoutKV = static_cast<uint32_t>(sfaInfo_->kvLayout);
+    uint32_t pageAttention = 0U;
+    if (sfaInfo_->kvLayout == SFALayout::PA_BSND) {
+        pageAttention = 1U;
+    }
+
+    tilingKey_ = GET_TPL_TILING_KEY(
+        0U, pageAttention, layoutQuery, layoutKV, perfMode_ == SFAPerfMode::V_TEMPLATE_MODE,
+        static_cast<uint32_t>(sfaInfo_->gSize > 64),
+        static_cast<uint32_t>(sfaInfo_->ropeHeadDim != 0)); // N1 > 64时核间切G; rope 用独立 tiling key 避免污染原路径
+
+    OP_LOGI(sfaInfo_->opName, "SFA tilingKey_: %lu.", tilingKey_);
+}
+```
+
+The first argument — the `FLASH_DECODE` slot — is the literal `0U`.
+
+And the companion host flag is declared `false` and assigned nowhere in the entire operator
+directory. `op_host/sparse_flash_attention_tiling.h:342`:
+
+```cpp
+    bool splitKVFlag_ = false;
+```
+
+`grep -rn 'splitKVFlag_ *=' attention/sparse_flash_attention/` returns exactly one line — that
+declaration. Consequently in `FillTilingSplitKVMla()` the split count is always zeroed:
+
+```cpp
+// for flash decode
+void SFAMlaTiling::FillTilingSplitKVMla()
+{
+    tilingData_.splitKVParams.set_s2(kvSplitPart_);
+
+    tilingData_.splitKVParams.set_accumOutSize(aicNum_ * 2U * sfaInfo_->n2Size * mBaseSize_ *
+                                               headDimAlign_); // 2:每个核可能有头规约和尾规约，一共两份规约信息
+    tilingData_.splitKVParams.set_logSumExpSize(2 * aicNum_ * 2 * sfaInfo_->n2Size *
+                                                mBaseSize_ * // 2:每个核可能有头规约和尾规约，一共两份规约信息;sum + max
+                                                (BYTE_BLOCK / BLOCK_TABLE_ELEM_BYTE));
+
+    if (!splitKVFlag_) {
+        tilingData_.splitKVParams.set_s2(0);
+    }
+}
+```
+
+and the `CalcInnerSize` branch that would halve the S2 base block for decode is unreachable:
+
+```cpp
+void SFAMlaTiling::CalcInnerSize(uint32_t sfaS2Size)
+{
+    sInnerSize_ = 512; // 512:s2默认切分大小
+    // FlashDecode时，如果S2的计算量>=256(确保切分后不小于128)但又不足以分2次计算时，则修改sInnerSize_，均分为2份进行计算，确保Nbuffer=2
+    if (splitKVFlag_ && sfaInfo_->qLayout != SFALayout::TND) {
+        if (sfaS2Size == 256) { // 256:s2Size的阈值，判断sInnerSize_是否切分
+            sInnerSize_ = 128;  // 128:sInnerSize_值为s2Size的一半，均分为2份进行计算，
+        } else if (sfaS2Size > 256 && sfaS2Size <= sInnerSize_) { // 256:s2Size的阈值，判断sInnerSize_是否切分
+            sInnerSize_ = (sInnerSize_ + 1) / 2;                  // 2:减半
+        }
+    }
+
+    sInnerLoopTimes_ = (sfaS2Size + sInnerSize_ - 1) / sInnerSize_;
+    sInnerSizeTail_ = sfaS2Size - (sInnerLoopTimes_ - 1) * sInnerSize_;
+```
+
+So `sInnerSize_` is **always 512** on A3: a 512-token S2 base block, the prefill-shaped choice.
+
+### 8.2 The host "split" is not a split: it assigns no work and claims every core
+
+`op_host/sparse_flash_attention_tiling.cpp`:
+
+```cpp
+void SFAMlaTiling::SplitBalanced()
+{
+    CalcInnerSize(sfaInfo_->s2Size);
+
+    InnerSplitParams sfaInnerSplitParams;
+    sfaInnerSplitParams.s1GBaseSize = sfaInfo_->gSize;
+    sfaInnerSplitParams.s2BaseSize = sInnerSize_;
+    tilingData_.innerSplitParams.set_mBaseSize(sfaInnerSplitParams.s1GBaseSize);
+    tilingData_.innerSplitParams.set_s2BaseSize(sfaInnerSplitParams.s2BaseSize);
+
+    usedCoreNum_ = aicNum_;
+}
+
+void SFAMlaTiling::Split()
+{
+    SplitBalanced();
+}
+```
+
+`mBaseSize` is set to the whole `gSize`, i.e. one base block covers all Q heads of the group.
+`usedCoreNum_ = aicNum_` unconditionally. The real distribution is deferred to the kernel.
+
+Core counts and the MIX ratio, from `GetPlatformInfo()` / `CalcBlockDim()`:
+
+```cpp
+    aivNum_ = sfaAscendcPlatform.GetCoreNumAiv();
+    aicNum_ = sfaAscendcPlatform.GetCoreNumAic();
+```
+
+```cpp
+void SFAMlaTiling::InitParams()
+{
+    if (sfaInfo_->s2Size != 0 && sfaInfo_->sparseBlockSize <= 4) { // 4:当前支持范围
+        perfMode_ = SFAPerfMode::V_TEMPLATE_MODE;
+    } else {
+        perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
+    }
+
+    coreNum_ = aicNum_;
+```
+
+```cpp
+void SFAMlaTiling::CalcBlockDim()
+{
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(sfaInfo_->platformInfo);
+    auto aicNum = usedCoreNum_;
+    auto aivNum = 2 * usedCoreNum_;
+
+    blockDim_ = ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum);
+    OP_LOGI(sfaInfo_->opName, "SFA block dim: %u aiv Num: %u aic Num: %u.", blockDim_, aivNum, aicNum);
+}
+```
+
+```cpp
+ge::graphStatus SFAMlaTiling::SetTilingKey(uint64_t tilingKey) const
+{
+    context_->SetTilingKey(tilingKey);
+    context_->SetScheduleMode(1); // 1: batchmode模式
+    return ge::GRAPH_SUCCESS;
+}
+```
+
+The AIC core-count ceiling, `op_host/sparse_flash_attention_tiling.h`:
+
+```cpp
+const uint32_t SFA_MAX_AIC_CORE_NUM = 26; // 25 + 1 保证数组8字节对齐
+```
+
+and the fixed M base:
+
+```cpp
+    uint32_t mBaseSize_ = 128;
+```
+
+The kernel is declared MIX 1 AIC : 2 AIV, `op_kernel/sparse_flash_attention.cpp`:
+
+```cpp
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+```
+
+with the matching index arithmetic in `op_kernel/arch22/sparse_flash_attention_kernel_mla.h`:
+
+```cpp
+    if ASCEND_IS_AIV {
+        tmpBlockIdx = GetBlockIdx(); // vec:0-47
+        aiCoreIdx = tmpBlockIdx / 2;
+    } else {
+        tmpBlockIdx = GetBlockIdx(); // cube:0-23
+        aiCoreIdx = tmpBlockIdx;
+    }
+```
+
+The comments name the A3 shape exactly: **cube 0-23, vec 0-47**.
+
+### 8.3 `InitCalcParamsEach` — the base block is (batch x kv-head x q-token), so batch=1 decode = 1 core
+
+`op_kernel/arch22/sparse_flash_attention_kernel_mla.h`, verbatim:
+
+```cpp
+template <typename SFAT>
+__aicore__ inline void SparseFlashAttentionMla<SFAT>::InitCalcParamsEach()
+{
+    // 计算总的基本块
+    uint32_t actBatchS2 = 1;
+    uint32_t totalBaseNum = 0;
+    uint32_t s1GBaseSize = sfaKernelConstInfo.gSize;
+    uint32_t coreNum = GetBlockNum();
+    uint32_t currCoreIdx = aiCoreIdx;
+    uint32_t actBatchS1 = 1;
+    for (uint32_t bIdx = 0; bIdx < sfaKernelConstInfo.batchSize; bIdx++) {
+        uint32_t actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx);
+        if (actBatchS1 < sfaKernelConstInfo.qSeqSize) {
+            sfaKernelConstInfo.needInit = true;
+        }
+        totalBaseNum += actBatchS1 * actBatchS2;
+    }
+    uint32_t avgBaseNum = 1;
+    if (totalBaseNum > coreNum) {
+        avgBaseNum = (totalBaseNum + coreNum - 1) / coreNum;
+    } else {
+        usedCoreNum = totalBaseNum;
+    }
+    if (aiCoreIdx >= usedCoreNum) {
+        return;
+    }
+    // 计算当前核的基本块
+    uint32_t accumBaseNum = 0; // 当前累积的基本块数
+    uint32_t targetBaseNum = 0;
+    uint32_t lastValidBIdx = 0;
+    uint32_t lastValidactBatchS1 = 0;
+    bool setStart = false;
+    targetBaseNum = (currCoreIdx + 1) * avgBaseNum; // 计算当前的目标权重
+    uint32_t targetStartBaseNum = targetBaseNum - avgBaseNum;
+    for (uint32_t bN2Idx = 0; bN2Idx < sfaKernelConstInfo.batchSize * sfaKernelConstInfo.kvHeadNum; bN2Idx++) {
+        uint32_t bIdx = bN2Idx / sfaKernelConstInfo.kvHeadNum;
+        actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx);
+        for (uint32_t s1GIdx = 0; s1GIdx < actBatchS1; s1GIdx++) {
+            accumBaseNum += 1;
+            if (!setStart && accumBaseNum >= targetStartBaseNum) {
+                sfaKernelConstInfo.bN2Start = bN2Idx;
+                sfaKernelConstInfo.gS1Start = s1GIdx;
+                setStart = true;
+            }
+            if (accumBaseNum >= targetBaseNum) {
+                // 更新当前核的End分核信息
+                sfaKernelConstInfo.bN2End = bN2Idx;
+                sfaKernelConstInfo.gS1End = s1GIdx;
+                sfaKernelConstInfo.s2End = 0;
+                sfaKernelConstInfo.coreStartKVSplitPos = 0;
+                if (aiCoreIdx != 0) {
+                    GetAxisStartIdx(sfaKernelConstInfo.bN2Start, sfaKernelConstInfo.gS1Start, 0);
+                }
+                return;
+            }
+        }
+```
+
+Three literals decide everything here:
+
+- `uint32_t actBatchS2 = 1;` — the S2 (KV) axis contributes a factor of exactly one to
+  `totalBaseNum`. KV length is not a parallel axis.
+- `totalBaseNum += actBatchS1 * actBatchS2;` over `bIdx < batchSize` — so
+  `totalBaseNum = sum_b (q_tokens_in_batch_b)`.
+- `else { usedCoreNum = totalBaseNum; }` followed by `if (aiCoreIdx >= usedCoreNum) { return; }`
+  — when `totalBaseNum <= coreNum`, `usedCoreNum` is *lowered* to `totalBaseNum` and every core
+  above that index returns before doing any work.
+
+For MLA, `kvHeadNum == 1`; the per-core work unit is one `(bN2Idx, s1GIdx)` pair, and
+`mBaseSize == gSize` means all Q heads of the group live in that single unit. So for
+**batch=1, one query token, MLA**: `totalBaseNum = 1` → `usedCoreNum = 1` → cores `1..23` take
+the early `return`, and the entire sparse attention for that layer executes on cube core 0 plus
+its two paired vector cores.
+
+`IS_SPLIT_G` does not rescue this. From `GenTilingKey()` above it is
+`static_cast<uint32_t>(sfaInfo_->gSize > 64)`, with the comment `N1 > 64时核间切G`. Splitting
+over heads only switches on above 64 heads *per rank*. At TP16 there is no configuration of any
+published GLM/DeepSeek MLA model that leaves more than 64 Q heads on a rank.
+
+### 8.4 The workspace confirms a GM staging round trip for the per-token gather
+
+`op_host/sparse_flash_attention_tiling.cpp`, `GetWorkspaceSize()`, the non-A5 (A3) branch:
+
+```cpp
+        workspaceSize_ += preLoadNum * (mmResUbSize_ * actCoreNum * sfaMmResElemSize);
+        workspaceSize_ +=
+            preLoadNum *
+            static_cast<size_t>(static_cast<float>(mmResUbSize_ * actCoreNum * sfaVec1ResElemSize) * sfaKvDtypeRatio);
+        workspaceSize_ += preLoadNum * bmm2ResUbSize_ * actCoreNum * sfaBmm2ResElemSize;
+        workspaceSize_ +=
+            preLoadNum * static_cast<size_t>(static_cast<float>(qPreSizeMla_ * actCoreNum * sfaQPreProcResElemSize) *
+                                             sfaKvDtypeRatio);
+        workspaceSize_ += preLoadNum * mBaseSize_ * actCoreNum * sfaNUpdateElemSize;
+        workspaceSize_ += preLoadNum * mBaseSize_ * actCoreNum * sfaSoftmaxSumElemSize;
+        // topk BlkSize == 1场景, 需要额外空间缓存离散聚合的值
+        //              bufNum  s2Base   D   dRope  sizeOf(half)
+        // 4:bufNum  512:s2Base  512:D  64:dRope  2:sizeOf(half)
+        workspaceSize_ += 4 * 512 * (512 + 64) * 2 * actCoreNum;
+        // 缓存有效mte2 size的长度 份数  512B对齐的长度  sizeof(int32_t)   aiv核数
+        workspaceSize_ +=
+            4 * 128 * 4 * (2 * actCoreNum); // 4:缓存有效mte2 size的长度 128:份数  4:512B对齐的长度  2:aiv核数
+```
+
+`topk BlkSize == 1场景, 需要额外空间缓存离散聚合的值` — "the top-k block-size-1 case needs extra
+space to cache the discretely-gathered values". 4 buffers x 512 S2 slots x 576 dims x 2 B per
+core = 2.25 MB per core of HBM workspace, and the gathered KV is written there and read back.
+That buffer is `kvMergeGm_` in the kernel. The second line caches "the length of the valid MTE2
+size", 4 copies x 128 entries x 4 B, for `2 * actCoreNum` vector cores.
+
+The matching `PRE_LOAD_NUM`:
+
+```cpp
+constexpr uint32_t PRE_LOAD_NUM = 2;
+```
+
+### 8.5 The fixed per-core budget: 512-row S2 workspace, 64x576 L1 blocks, 128x128 cube tiles
+
+`op_kernel/arch22/sparse_flash_attention_service_cube_mla.h`:
+
+```cpp
+    static constexpr uint32_t M_SPLIT_SIZE = 128;     // m方向切分
+    static constexpr uint32_t N_SPLIT_SIZE = 128;     // n方向切分
+    static constexpr uint32_t N_WORKSPACE_SIZE = 512; // n方向切分
+
+    static constexpr uint32_t L1_BLOCK_SIZE = (64 * (512 + 64) * sizeof(Q_T));
+    static constexpr uint32_t L1_BLOCK_OFFSET = 64 * (512 + 64); // 72K的元素个数
+
+    static constexpr uint32_t L0A_PP_SIZE = (32 * 1024);
+    static constexpr uint32_t L0B_PP_SIZE = (32 * 1024);
+    static constexpr uint32_t L0C_PP_SIZE = (64 * 1024);
+```
+
+```cpp
+    constexpr uint32_t MERGE_K_PITCH = 576;
+```
+
+`M_SPLIT_SIZE = 128` is the cube M tile. At batch=1 decode the real M is `gSize` — 4 to 8 rows at
+TP16 — against a 128-row tile. `L1_BLOCK_SIZE = 64 * 576 * 2 = 72 KiB` per L1 block, `L0C_PP_SIZE
+= 64 KiB`.
+
+The cube/vector sync event budget, same file:
+
+```cpp
+    static constexpr uint32_t L1_EVENT0 = EVENT_ID2;
+    static constexpr uint32_t L1_EVENT1 = EVENT_ID3;
+    static constexpr uint32_t L1_EVENT2 = EVENT_ID4;
+    static constexpr uint32_t L1_EVENT3 = EVENT_ID5;
+    static constexpr uint32_t L1_EVENT4 = EVENT_ID6;
+    static constexpr uint32_t L1_EVENT5 = EVENT_ID7;
+    static constexpr uint32_t L1_EVENT6 = EVENT_ID1;
+
+    static constexpr uint32_t mte21QPIds[4] = {L1_EVENT0, L1_EVENT1, L1_EVENT2, L1_EVENT3}; // mte12复用
+    static constexpr uint32_t sfaMte21KvEvents[3] = {L1_EVENT4, L1_EVENT5, L1_EVENT6};
+```
+
+and the cross-core sync IDs that a megakernel would have to reproduce,
+`op_kernel/arch22/sparse_flash_attention_common.h`:
+
+```cpp
+struct ConstInfo {
+    // CUBE与VEC核间同步的模式
+    static constexpr uint32_t SFA_SYNC_MODE2 = 2;
+    ...
+    // CUBE和VEC的核间同步EventID
+    uint32_t syncV1NupdateC2 = 0U;
+    uint32_t syncV0C1 = 0U;
+    uint32_t syncC1V1 = 0U;
+    uint32_t syncV1C2 = 0U;
+    uint32_t syncC2V2 = 0U;
+    uint32_t syncC2V1 = 0U;
+```
+
+`splitKVNum` is in that struct and documented as the inter-core S2 split count — the field exists,
+it is just always fed 0:
+
+```cpp
+    uint32_t splitKVNum = 0U;         // S2核间切分的切分份数
+    ...
+    // FlashDecoding
+    uint32_t actualCombineLoopSize = 0U; // FlashDecoding场景, S2在核间切分的最大份数
+    uint64_t combineLseOffset = 0ULL;
+    uint64_t combineAccumOutOffset = 0ULL;
+```
+
+### 8.6 The template mode switch: `sparseBlockSize <= 4` picks `V_TEMPLATE`
+
+```cpp
+    if (sfaInfo_->s2Size != 0 && sfaInfo_->sparseBlockSize <= 4) { // 4:当前支持范围
+        perfMode_ = SFAPerfMode::V_TEMPLATE_MODE;
+    } else {
+        perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
+    }
+```
+
+with the `sparse_block_size` validity constraints from the same file:
+
+```cpp
+    OP_CHECK_IF((npuArch_ == NpuArch::DAV_3510 && *opParamInfo_.sparseBlockSize != 1),
+                ...
+    OP_CHECK_IF((*opParamInfo_.sparseBlockSize <= 0 || *opParamInfo_.sparseBlockSize > 128 ||
+                 (static_cast<uint64_t>(*opParamInfo_.sparseBlockSize) &
+                  static_cast<uint64_t>(*opParamInfo_.sparseBlockSize - 1L)) != 0UL),
+```
+
+and
+
+```cpp
+    OP_CHECK_IF(blockSize_ % sparseBlockSize_ > 0,
+                ... ") must be divided by sparse_block_size(" + std::to_string(sparseBlockSize_) +
+```
+
+So: `sparse_block_size` must be a power of two in `[1, 128]`; the PageAttention `block_size` must
+be a multiple of it; on `DAV_3510` (A5/950) it must be exactly 1; and a DSA-style per-token
+selection (`sparse_block_size = 1`) lands in `V_TEMPLATE_MODE`.
+
+## Relevance
+
+This is the answer to the question the earlier Gaps entry left open, and it is a *structural*
+answer rather than a data-movement one.
+
+`SparseFlashAttention` on A3 has **no decode specialization at all**. The three things that would
+give a batch=1 single-query decode its parallelism are each disabled by a constant:
+
+| lever | state on A3 | where |
+|---|---|---|
+| split-KV across cores (`FLASH_DECODE`) | `GET_TPL_TILING_KEY(0U, ...)` literal; never in `ASCENDC_TPL_SEL`; `splitKVFlag_` assigned nowhere | `GenTilingKey()`, `template_tiling_key.h` |
+| split over Q heads (`IS_SPLIT_G`) | only when `gSize > 64`, i.e. >64 heads per rank | `GenTilingKey()` |
+| S2 base block size | `sInnerSize_ = 512` always, decode halving branch unreachable | `CalcInnerSize()` |
+
+and the kernel's own distribution counts base blocks as `sum_b q_tokens_b` with
+`actBatchS2 = 1`, then *lowers* `usedCoreNum` to that count. At batch=1, Q_S=1, MLA
+(`kvHeadNum=1`) that count is **1**. So the op that costs us 6.973 ms — the largest family in the
+round — is running on 1 of 24 cube cores while 23 sit in an early `return`.
+
+This reframes our own decomposition. Of the four candidate causes in the brief, this is (c)
+*insufficient parallelism across the AI cores at one query token*, and it is not a soft effect: it
+is a hard 1/24. It subsumes (d) as well — the 512-row `s2BaseSize` and the 128-row `M_SPLIT_SIZE`
+cube tile are prefill-shaped constants applied to a 1-token query, so the first S2 block is also
+the tail block, and the cube runs a 128x128 tile to produce `gSize`(=4..8) useful rows.
+
+Two concrete levers follow, both available to a hand-written engine without touching CANN:
+
+1. **Supply the parallelism the op refuses to find.** Because the base block is
+   `(batch, kv_head, q_token)` and `usedCoreNum` is just `totalBaseNum`, presenting the same
+   decode work as `totalBaseNum >= 24` — splitting the selected KV list into 24 chunks ourselves
+   and reducing the partial `(out, lse)` outside, which is exactly what the dead `FLASH_DECODE`
+   path would have done with `accumOutSize` / `logSumExpSize` — recovers the cores. The op even
+   exposes `softmaxMax` / `softmaxSum` outputs and a `returnSoftmaxLse` attribute to make the
+   external combine possible. The alternative framing is to fake `q_tokens` by packing the
+   `gSize` heads along S1 in TND layout, which turns `gSize` into `totalBaseNum`.
+2. **Stop paying the MIX launch floor per layer.** `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)`
+   makes every `SparseFlashAttention` call a MIX_AIC launch — our measured 13.58 us floor, 6.5
+   MIX_AIC calls per layer, 11.5 ms of launch floor per round. A one-core kernel paying a
+   13.58 us MIX launch is the worst possible trade.
+
+And one number to check against ours: 1/24 of the cores predicts a gap far larger than the 5.0x
+we measure (6.973 ms spent vs 1.382 ms of bytes). Either the 1.382 ms roofline is computed
+against a bandwidth a single core can nearly saturate, or our call is not shaped the way
+`InitCalcParamsEach` sees batch=1 — e.g. we pass TND with the heads packed along T, which would
+make `totalBaseNum = gSize` and use `gSize` cores rather than 1. Resolving which is the single
+highest-value profiling question: read `usedCoreNum` out of the `OP_LOGI` line
+`SFA block dim: %u aiv Num: %u aic Num: %u.` in plog, or count active cores in the Level-2
+profile. If it really is 1, there is far more than 5.6 ms available here.
+
+---
+
+## 9. The `V_TEMPLATE` gather: a mandatory HBM round trip, 2 tokens per DMA, 32-row UB staging
+
+Same clone and commit as section 8 (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20). Files:
+`attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_service_vector_mla.h`
+and `..._service_cube_mla.h`.
+
+### 9.1 In `V_TEMPLATE` the cube never touches the KV cache — it reads a merged GM buffer
+
+`sparse_flash_attention_service_cube_mla.h`, `ComputeMm1NoRope`. The `V_TEMPLATE` branch is a
+single contiguous `Nd2NzParams` copy out of `kvMergeGm_`; only the `else` (= `C_TEMPLATE`) branch
+walks the top-k list:
+
+```cpp
+            if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+                Nd2NzParams sfaCubeCopyParams;
+                sfaCubeCopyParams.ndNum = 1;
+                sfaCubeCopyParams.nValue = mm1NrNL1Size;
+                sfaCubeCopyParams.dValue = sfaCubeConstInfo.headDim >> 1;
+                sfaCubeCopyParams.srcDValue = sfaCubeConstInfo.headDim;
+                sfaCubeCopyParams.dstNzC0Stride = mm1NrNL1SizeAlign;
+                sfaCubeCopyParams.dstNzNStride = 1;
+                sfaCubeCopyParams.srcNdMatrixStride = 0;
+                sfaCubeCopyParams.dstNzMatrixStride = 0;
+                DataCopy(mm1NrBL1Tensor,
+                         kvMergeGm_[sfaCubeRunInfo.loop % 4 * N_WORKSPACE_SIZE * MERGE_K_PITCH +
+                                    mm1NrKL1 * (sfaCubeConstInfo.headDim >> 1) +
+                                    mm1NrNL1 * N_SPLIT_SIZE * sfaCubeConstInfo.headDim],
+                         sfaCubeCopyParams);
+            } else {
+                while (copyFinishRowCnt < mm1NrNL1Size) {
+                    CalcTopKBlockInfo(sfaCubeRunInfo, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt,
+                                      idInTopK);
+```
+
+`kvMergeGm_` is the HBM workspace that section 8.4 budgets as
+`4 * 512 * (512 + 64) * 2 * actCoreNum` with the comment
+`topk BlkSize == 1场景, 需要额外空间缓存离散聚合的值`. So in the DSA case
+(`sparse_block_size <= 4` → `V_TEMPLATE`) the data path is:
+
+```
+KV cache in HBM  --(scattered MTE2, AIV)-->  UB (kvMergUb_)
+UB               --(MTE3, AIV)-----------> kvMergeGm_ in HBM     <-- extra write
+kvMergeGm_       --(contiguous MTE2, AIC)-> L1                   <-- extra read
+```
+
+Every selected KV token is read from HBM once, written back to HBM once, and read from HBM again.
+Three HBM transits where a roofline model counts one.
+
+### 9.2 The gather loop: one `topkGm_.GetValue()` scalar GM read per selected token
+
+`sparse_flash_attention_service_vector_mla.h`:
+
+```cpp
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2GmOffset, int64_t& realS2Idx,
+                                                            int64_t topkGmBaseOffset, const RunInfo& sfaVecRunInfo)
+{
+    int64_t topkGmIdx =
+        (s2GmOffset + sfaVecRunInfo.s2Idx * sfaVecConstInfo.s2BaseSize) / sfaVecConstInfo.sparseBlockSize;
+    if (unlikely(topkGmIdx >= sfaVecConstInfo.sparseBlockCount)) {
+        realS2Idx = -1;
+        return;
+    }
+    realS2Idx = topkGm_.GetValue(topkGmBaseOffset + topkGmIdx) * static_cast<int64_t>(sfaVecConstInfo.sparseBlockSize) +
+                static_cast<int64_t>((s2GmOffset + sfaVecRunInfo.s2Idx * sfaVecConstInfo.s2BaseSize) %
+                                     sfaVecConstInfo.sparseBlockSize);
+}
+```
+
+and in PageAttention mode a *second* scalar GM read per token, for the block table:
+
+```cpp
+    if constexpr (PAGE_ATTENTION) {
+        int64_t blkTableIdx = realS2Idx / sfaVecConstInfo.kvCacheBlockSize;
+        int64_t blkTableOffset = realS2Idx % sfaVecConstInfo.kvCacheBlockSize;
+        realKeyGmOffset = blkTableGm_.GetValue(sfaVecRunInfo.bIdx * sfaVecConstInfo.maxBlockNumPerBatch + blkTableIdx) *
+                              static_cast<int64_t>(sfaVecConstInfo.kvCacheBlockSize) *
+                              static_cast<int64_t>(sfaVecConstInfo.kvHeadNum) +
+                          blkTableOffset;
+    } else {
+```
+
+At `sparse_block_size = 1` this is `2 * top_k` scalar GM loads per (head-group, layer), each on the
+AIV scalar pipe, each in the dependency chain ahead of the `DataCopyPad` that uses its result.
+
+### 9.3 `MergeKv`: the main loop advances TWO tokens at a time and flushes every 32 rows
+
+```cpp
+// b s1 k
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo& sfaVecRunInfo)
+{
+    int64_t s2ProcessSize = sfaVecRunInfo.actualSingleProcessSInnerSize;
+    int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * sfaVecConstInfo.sparseBlockSize);
+```
+
+```cpp
+    int64_t s2GmStartOffset = GetSubBlockIdx() == 0 ? 0 : CeilDiv(s2Pair, 2L) * 2 * sfaVecConstInfo.sparseBlockSize;
+    int64_t s2GmLimit =
+        GetSubBlockIdx() == 0 ? CeilDiv(s2Pair, 2L) * 2 * sfaVecConstInfo.sparseBlockSize : s2ProcessSize;
+    if (s2GmLimit > s2ProcessSize) {
+        s2GmLimit = s2ProcessSize;
+    }
+    for (int64_t s2GmOffsetArray = s2GmStartOffset; s2GmOffsetArray < s2GmLimit;
+         s2GmOffsetArray += 2 * sfaVecConstInfo.sparseBlockSize) {
+        if (needWaitMte3ToMte2) {
+            WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            needWaitMte3ToMte2 = false;
+        }
+        GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, sfaVecRunInfo);
+        if (unlikely(s2IdxArray0 < 0)) {
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, sfaVecRunInfo);
+            SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            mergeMte3Idx++;
+            break;
+        }
+        GetRealS2Idx(s2GmOffsetArray + sfaVecConstInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, sfaVecRunInfo);
+        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, sfaVecRunInfo);
+        if ((mte2Size - mte3Size + 2 * sfaVecConstInfo.sparseBlockSize > 32) ||
+            s2GmOffsetArray + 2 * sfaVecConstInfo.sparseBlockSize >= s2GmLimit) {
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, sfaVecRunInfo);
+            mte3Size = mte2Size;
+            SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            mergeMte3Idx++;
+            needWaitMte3ToMte2 = true;
+        }
+    }
+```
+
+The loop stride is `2 * sparseBlockSize` — **two selected tokens per iteration**. The UB staging
+buffer holds 32 rows (`mte2Size - mte3Size + 2 * sparseBlockSize > 32` triggers the flush), and
+the UB offsets confirm the size: `kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + ...]` is a double-buffered
+32x512 tile, `ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + ...]` a 32x64 tile. So at
+`sparse_block_size = 1` the pipeline is: 16 loop iterations (32 tokens) of MTE2, then one MTE3
+flush, with a two-deep `MTE3_MTE2` ping-pong and an explicit `SetFlag`/`WaitFlag` pair in between.
+
+The GM merge buffer rotates over 4 slots:
+
+```cpp
+    static constexpr uint64_t MERGE_CACHE_GM_BUF_NUM = 4;
+```
+
+### 9.4 `CopyInKv`: the whole optimization is folding exactly 2 scattered tokens into one `DataCopyPad`
+
+```cpp
+    if (unlikely(keySrcStride >= INT32_MAX || keySrcStride < 0 ||
+                 (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
+                 realS2Idx1 + sfaVecConstInfo.sparseBlockSize >= s2IdLimit ||
+                 realS2Idx2 + sfaVecConstInfo.sparseBlockSize >= s2IdLimit)) {
+        // stride溢出、stride为负数、s2超长等异常场景，还原成2条搬运指令
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, sfaVecRunInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, sfaVecRunInfo);
+    } else {
+        DataCopyExtParams intriParams;
+        intriParams.blockLen = sfaVecConstInfo.sparseBlockSize * sfaVecConstInfo.headDim * sizeof(KV_T);
+        intriParams.blockCount = (keyOffset1 >= 0) + (keyOffset2 >= 0);
+        intriParams.dstStride = 0;
+        intriParams.srcStride = keySrcStride;
+        DataCopyPadExtParams<KV_T> padParams;
+
+        int64_t startGmOffset = keyOffset1 > -1 ? keyOffset1 : keyOffset2;
+        if (keyOffset2 > -1 && keyOffset2 < keyOffset1) {
+            startGmOffset = keyOffset2;
+        }
+        DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * sfaVecConstInfo.headDim],
+                    keyGm_[startGmOffset * sfaVecConstInfo.headDim], intriParams, padParams);
+
+        if constexpr (SFAT::hasRope) {
+            intriParams.blockLen = sfaVecConstInfo.sparseBlockSize * sfaVecConstInfo.headDimRope * sizeof(KV_T);
+            intriParams.dstStride = 0;
+            intriParams.srcStride = keyRopeSrcStride;
+            DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * sfaVecConstInfo.headDimRope],
+                        keyRopeGm_[startGmOffset * sfaVecConstInfo.headDimRope], intriParams, padParams);
+        }
+        mte2Size += ((keyOffset1 > -1) + (keyOffset2 > -1)) * sfaVecConstInfo.sparseBlockSize;
+    }
+```
+
+This is the entirety of the `搬运聚合` ("transfer aggregation") that the
+`kv_quant_sparse_flash_attention` README advertises: `blockCount = 2`, `srcStride` = the gap
+between the two chosen tokens. Two tokens per MTE2 instruction and no more, because `DataCopyPad`
+takes a single uniform `srcStride` and three arbitrary top-k indices do not share one.
+
+`blockLen` per instruction at MLA/DSA shape: `1 * 512 * 2 = 1024` bytes for nope, and a separate
+instruction of `1 * 64 * 2 = 128` bytes for rope. With `blockCount = 2`: 2 KiB and 256 B per pair.
+The rope copy is a **128-byte** burst.
+
+Note also the `还原成2条搬运指令` ("fall back to 2 transfer instructions") path: whenever the gap
+between the two chosen tokens is negative in the index order, or either token is near the sequence
+end, the pairing is abandoned and it becomes one instruction per token. Since the top-k index list
+is not guaranteed sorted ascending, `keySrcStride < 0` is a live condition.
+
+### 9.5 `CopyOutMrgeResult` — the write-back, 512 B + 128 B per row
+
+```cpp
+    DataCopyExtParams dataCopyParams;
+    dataCopyParams.blockCount = mte2Size - mte3Size;
+    dataCopyParams.blockLen = sfaVecConstInfo.headDim * sizeof(KV_T);
+    dataCopyParams.srcStride = 0;
+    dataCopyParams.dstStride = 0;
+
+    DataCopyPad(kvMergeGm_[sfaVecRunInfo.loop % 4 * 512 * 576 + (s2GmStartOffset + mte3Size) * sfaVecConstInfo.headDim],
+                kvMergUb_[mergeMte3Idx % 2 * 32 * 512], dataCopyParams);
+
+    if constexpr (SFAT::hasRope) {
+        dataCopyParams.blockLen = sfaVecConstInfo.headDimRope * sizeof(KV_T);
+        DataCopyPad(kvMergeGm_[sfaVecRunInfo.loop % 4 * 512 * 576 + 512 * 512 +
+                               (s2GmStartOffset + mte3Size) * sfaVecConstInfo.headDimRope],
+                    ropeMergUb_[mergeMte3Idx % 2 * 32 * 64], dataCopyParams);
+    }
+```
+
+with a hard MTE2→MTE3 barrier immediately before it:
+
+```cpp
+    SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+```
+
+`SetFlag` immediately followed by `WaitFlag` on the same event is a full serialization point, not
+a pipelined handoff: the MTE3 flush cannot overlap the MTE2 fill of the same buffer.
+
+### 9.6 The zero-fill tail: one `DataCopyPad` per *missing* row
+
+When fewer than `s2ProcessSize` tokens were found (the usual case at decode when top-k exceeds
+the real sequence length, or when the index list terminates with `-1`), the remainder of the 512-row
+merge buffer is zeroed one row at a time:
+
+```cpp
+        for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
+            DataCopyPad(kvMergeGm_[sfaVecRunInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                                   s2GmOffset * sfaVecConstInfo.headDim],
+                        kvMergUb_, dataCopyParams);
+        }
+        if constexpr (SFAT::hasRope) {
+            dataCopyParams.blockLen = sfaVecConstInfo.headDimRope * sizeof(KV_T);
+            for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
+                DataCopyPad(kvMergeGm_[sfaVecRunInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                                       512 * sfaVecConstInfo.headDim + s2GmOffset * sfaVecConstInfo.headDimRope],
+                            kvMergUb_, dataCopyParams);
+            }
+        }
+```
+
+`dataCopyParams.blockCount = 1` (set just above), so these are **single-row, 1 KiB (then 128 B)
+MTE3 instructions, one per padded row** — and the cube still multiplies against those zero rows
+because `mm1NrNL1Size` is derived from `actualSingleProcessSInnerSize`, not from `mte2Size`.
+
+### 9.7 The cube serializes its own M pipe whenever the Mmad tile is small
+
+`sparse_flash_attention_service_cube_mla.h`, inside the Mmad loop:
+
+```cpp
+                    MmadParams mm1NrMmadParams;
+                    mm1NrMmadParams.m = mm1NrML1SizeAlign;
+                    mm1NrMmadParams.n = mm1NrNL1SizeAlign;
+                    mm1NrMmadParams.k = mm1NrKL0Size;
+                    mm1NrMmadParams.cmatrixInitVal = (mm1NrKL1 == 0 && mm1NrKL0 == 0);
+                    mm1NrMmadParams.cmatrixSource = false;
+                    mm1NrMmadParams.unitFlag = (mm1NrKL1 == 1 && mm1NrKL0 == (mm1NrKL0Loops - 1)) ? 0b11 : 0b10;
+                    Mmad(mm1NrCL0Tensor, mm1NrAL0Tensor, mm1NrBL0Tensor, mm1NrMmadParams);
+                    if ((mm1NrMmadParams.m / 16) * (mm1NrMmadParams.n / 16) < 10) {
+                        PipeBarrier<PIPE_M>();
+                    }
+```
+
+with the K split fixed at:
+
+```cpp
+    constexpr uint32_t mm1NrKL1Loops = 2;
+    constexpr uint32_t mm1NrKL0Size = 128;
+    constexpr uint32_t mm1NrKL0Loops = 2;
+```
+
+At batch=1 decode the M of the first matmul is `gSize` rounded up to 16. With `N_SPLIT_SIZE = 128`:
+`(16/16) * (128/16) = 8 < 10`, so `PipeBarrier<PIPE_M>()` fires on **every single `Mmad`** —
+4 Mmads per (M-tile, N-tile) from `mm1NrKL1Loops * mm1NrKL0Loops`. The guard exists to work
+around a small-tile hazard, and decode shape sits permanently on the wrong side of it. The cube's
+M pipe is fully drained between consecutive 16x128x128 Mmads.
+
+## Relevance
+
+This answers (b) and (d) of the four candidates, quantitatively, and it changes which number we
+should be comparing against.
+
+**The roofline denominator is wrong by ~3x for the DSA path.** Our 1.382 ms is the time to move
+the bytes the algorithm needs. Section 9.1 shows `V_TEMPLATE` moves each selected KV token across
+HBM three times — scattered read into UB, MTE3 write to `kvMergeGm_`, contiguous read back into
+L1. So the *op as written* has a floor near 3 x 1.382 = 4.15 ms, not 1.382 ms. Our measured
+6.973 ms is 1.68x that floor, not 5.0x. That reframes the opportunity: the 5.6 ms we hoped to
+recover by "closing to roofline" is not available inside this operator at all. About 2.8 ms of it
+is the staging round trip, and only a hand-written kernel that keeps the gathered KV in UB/L1 and
+feeds the cube directly can claim it.
+
+**The per-instruction burst lengths are small and fixed.** Nope: 1024 B x `blockCount=2`. Rope:
+128 B x `blockCount=2`. The merge write-back: 1024 B and 128 B per row. The zero-pad tail: single
+1024 B and 128 B instructions, one per row, no batching. A 128-byte MTE2/MTE3 burst is well under
+any plausible efficient DMA length, and the rope stream alone is `top_k` instructions of 128 B
+per head-group per layer.
+
+**The aggregation ceiling is 2.** `CopyInKv` pairs exactly two tokens per `DataCopyPad` because
+`DataCopyExtParams` carries one `srcStride`. Three or more arbitrary top-k indices cannot share
+an instruction. So at `sparse_block_size = 1` the instruction count is `top_k / 2` MTE2 pairs
+plus the same again for rope — and halves to `top_k` whenever the `还原成2条搬运指令` fallback
+trips, which it does whenever the index list is not ascending. If our indexer emits unsorted
+top-k, sorting it on the host or in the indexer kernel is a free 2x on MTE2 instruction count.
+
+**Two hard serializations per 32 tokens plus one per Mmad.** The `SetFlag`/`WaitFlag` pair on
+`MTE2_MTE3` in `CopyOutMrgeResult` (9.5) prevents overlap of gather and flush within a buffer;
+the `PipeBarrier<PIPE_M>()` in 9.7 fires on every Mmad at decode M. Neither is visible as bytes.
+Both show up as `aic_mte2_time` / `aiv_mte2_time` far below the kernel wall time, which is the
+signature to look for in our own Level-2 profile: if `mte2_ratio` is low *and* `aic_mac_ratio` is
+low, the time is in barriers and scalar address generation, not in either pipe.
+
+**Three levers, in descending value:**
+1. Eliminate the `kvMergeGm_` round trip. This is the ~2.8 ms item and it is only reachable by
+   owning the kernel: gather scattered KV straight into L1 (the `C_TEMPLATE` branch already does
+   this, via `CopyInMm1BToL1` / `DataCopyPA`) instead of through GM. The reason upstream went
+   through GM at `sparse_block_size <= 4` is that the cube cannot issue `top_k` separate L1 loads
+   without stalling its own MTE2 — but with the KV gather on the AIV and a UB→L1 path, or with
+   more than 2 tokens per instruction, that constraint is ours to re-examine.
+2. Sort the top-k index list ascending. Keeps `CopyInKv` on the paired path instead of the
+   `还原成2条搬运指令` fallback, halving MTE2 instruction count.
+3. Do not pad to 512. `s2BaseSize` is fixed at 512 (section 8.1) and the shortfall is zero-filled
+   one row at a time, then multiplied. At seq 8K with a top-k below 512 per S2 block, the padding
+   rows are pure waste in MTE3 instructions, in HBM traffic, and in cube Mmad.
+
+---
+
+## 10. `IncreFlashAttention` vs `SparseFlashAttention`: same vendor, same A3, 16 cores vs 1
+
+Same clone and commit (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20).
+`attention/incre_flash_attention/op_host/incre_flash_attention_tiling_check.cpp` and
+`..._tiling.cpp`.
+
+This is the A/B the brief asked for, and it is in source rather than in a benchmark: the dense
+decode attention op on the same chip implements the split-KV flash-decode that
+`SparseFlashAttention` leaves stubbed out (section 8.1).
+
+### 10.1 `IFATiling::IsFlashDecode` — the live heuristic
+
+```cpp
+bool IFATiling::IsFlashDecode(uint32_t coreNum, IfaPerfMode perfMode)
+{
+    if (socVersion_ == IfaSocVersion::SOC_ASCEND_310P) {
+        perfMode = IfaPerfMode::BMM_ALL_BY_VEC;
+        if (nNumOfQInOneGroup_ * qSeqSize_ > 1U) {
+            OP_LOGD(ifaContext_->opName, "flash decode has not been implemented when 310P and GQA > 1.");
+            return false;
+        }
+    }
+    if (balanceModeFlag_) {
+        uint32_t tndFDCoreArrLen = tilingDataMla_.tndSplitCoreParams.get_tndFDCoreArrLen();
+        return tndFDCoreArrLen > 0U;
+    }
+    if (pageAttentionFlag_ && socVersion_ == IfaSocVersion::SOC_ASCEND_910B &&
+        perfMode != IfaPerfMode::CUBE_VIEW_MM_MLA && maxActualseq_ <= 1024U) { // 1024, 经验值
+        return false;
+    }
+    constexpr uint32_t maxQNum = 128U;
+    if (ropeFlag_ && (qSeqSize_ > 1U || nNumOfQInOneGroup_ > maxQNum)) {
+        return false; // 投机推理 和 G > 64 切G待实现
+    }
+
+    if (gqaMtpFlag_) {
+        return false; // 投机推理FD待实现
+    }
+
+    if (CheckCoreOkFlag(coreNum, perfMode)) {
+        return true;
+    }
+
+    return false;
+}
+```
+
+```cpp
+bool IFATiling::CheckCoreOkFlag(uint32_t coreNum, IfaPerfMode perfMode) const
+{
+    bool coreOkFlag = false;
+    float flashDecodeBNRatio = static_cast<float>(0.4); // 0.4, 经验值
+    if (perfMode == IfaPerfMode::CUBE_VIEW_MM_FULL_LOAD || perfMode == IfaPerfMode::CUBE_VIEW_MM ||
+        perfMode == IfaPerfMode::CUBE_VIEW_MM_MLA || perfMode == IfaPerfMode::CUBE_VIEW_MM_DD) {
+        flashDecodeBNRatio = 0.5; // 0.5, 经验值
+        coreOkFlag = (static_cast<float>(batchSize_ * numKvHeads_) <= flashDecodeBNRatio * coreNum);
+    } else if (perfMode == IfaPerfMode::BMM_ALL_BY_VEC) {
+        flashDecodeBNRatio = 0.5; // 0.5, 全V模板可以按0.5切分
+        coreOkFlag = (static_cast<float>(batchSize_ * numKvHeads_) < flashDecodeBNRatio * coreNum);
+    } else {
+        coreOkFlag = (static_cast<float>(batchSize_ * numKvHeads_) < flashDecodeBNRatio * coreNum);
+    }
+
+    if (coreOkFlag && (nNumOfQInOneGroup_ == 1U)) {
+        OP_LOGD(ifaContext_->opName, "Flash Decode Split kv."); // 非gqa时这里只判断bn是否满足
+        return true;
+    }
+
+    if (coreOkFlag && (maxActualseq_ >= 2048U)) { // 2048, 在flash decode + gqa时的经验值
+        OP_LOGD(ifaContext_->opName, "Flash Decode And GQA Split kv.");
+        return true;
+    }
+```
+
+The trigger condition is stated as a ratio against the core count: flash-decode turns on when
+`batch * kv_heads <= 0.5 * coreNum`. The *fewer* the batch-and-head work units, the *more* the op
+splits KV. That is the exact inverse of what `SparseFlashAttention`'s `InitCalcParamsEach` does
+(section 8.3), which lowers `usedCoreNum` to `batch * q_tokens` and leaves the rest idle.
+
+Also note `IfaPerfMode::CUBE_VIEW_MM_MLA` is in the 0.5-ratio list and that the only MLA-specific
+exclusion is speculative decoding (`qSeqSize_ > 1U`) or `G > 128`:
+
+```cpp
+enum class IfaPerfMode : uint32_t {
+    NORMAL = 0,
+    BMM_ALL_BY_VEC,         // 1
+    C1_V1,                  // 2
+    CUBE_VIEW_MM,           // 3
+    CUBE_VIEW_MM_FULL_LOAD, // 4
+    CUBE_VIEW_MM_MLA,       // 5
+    CUBE_VIEW_MM_DD         // 6
+};
+```
+
+### 10.2 `IFATiling::SplitBNS` — the split count, and the 512-token-per-core empirical floor
+
+```cpp
+ge::graphStatus IFATiling::SplitBNS()
+{
+    formerCoreNum_ = 0U;
+    blockSplitBn2Range_ = 1U;
+    tailSplitedBatchRange_ = 1U;
+
+    uint32_t bn = batchSize_ * numKvHeads_;
+    kvSplitPart_ = coreNum_ / bn;
+    while (((maxActualseq_ / kvSplitPart_) < 512U) && (kvSplitPart_ > 1U)) { // 512, 经验值
+        kvSplitPart_--;
+    }
+
+    usedCoreNum_ = bn * kvSplitPart_;
+    uint32_t computeSeqSize = (seqSize_ + (kvSplitPart_ - 1U)) / kvSplitPart_;
+    if (pageAttentionFlag_) {
+        computeSeqSize = Align(computeSeqSize, blockSize_);
+    }
+    if (inputKvType_ == ge::DT_INT4) {
+        computeSeqSize = Align(computeSeqSize, 2U);
+    }
+    CalcInnerSize(computeSeqSize);
+    return ge::GRAPH_SUCCESS;
+}
+```
+
+and the flag being set, from `incre_flash_attention_tiling.cpp` (three separate call sites plus
+one unconditional one):
+
+```cpp
+            OP_LOGI(ifaContext_->opName, "aicNum_(use for usedCoreNum_ and kvSplitPart_):%u\n", aicNum_);
+            ...
+            splitKVFlag_ = true;
+            kvSplit_++;
+            kvSplitPart_ = aicNum_;
+```
+
+```cpp
+    if (IsFlashDecode(coreNum_, perfMode_)) {
+        splitKVFlag_ = true;
+        kvSplit_++;
+        kvSplitPart_ = tilingInfo.maxKvSplitPart;
+```
+
+**Worked for our shape.** batch=1, MLA so `numKvHeads_ = 1`, `coreNum_ = 24` AICs, seq 8192:
+
+- `bn = 1 * 1 = 1`
+- `kvSplitPart_ = 24 / 1 = 24`
+- loop: `8192 / 24 = 341 < 512` → decrement. `8192/23 = 356`, ... `8192/17 = 481 < 512`,
+  `8192/16 = 512` → stop. **`kvSplitPart_ = 16`**
+- `usedCoreNum_ = 1 * 16 = 16`
+- `computeSeqSize = ceil(8192/16) = 512` KV tokens per core
+
+And the gate passes: `CheckCoreOkFlag` with `CUBE_VIEW_MM_MLA` gives `1 <= 0.5 * 24 = 12` → true;
+`nNumOfQInOneGroup_ > 1` for MLA so it falls through to `maxActualseq_ >= 2048` → `8192 >= 2048`
+→ true. `IsFlashDecode` is not blocked by `ropeFlag_` because `qSeqSize_ == 1` and
+`nNumOfQInOneGroup_ <= 128`.
+
+So on the *identical* decode shape: `IncreFlashAttention` uses **16 of 24 cube cores**;
+`SparseFlashAttention` uses **1**.
+
+The `512U // 512, 经验值` constant is itself a published number worth having: Huawei's own
+empirical floor for the minimum KV chunk worth giving a core in a decode attention split. Below
+512 tokens per core they stop splitting. Note this is the same 512 that
+`SparseFlashAttention`'s `sInnerSize_ = 512` uses as its *S2 base block*, i.e. the two ops agree
+on 512 as the unit — one of them distributes those units across cores, the other does not.
+
+### 10.3 The combine kernel SFA lacks exists for IFA on A3
+
+`attention/incre_flash_attention/op_kernel/arch22/` contains, at 845 lines:
+
+```
+service_vector_flashdecode_mla.h
+```
+
+with the reduction interface:
+
+```cpp
+class ServiceFlashDecode {
+...
+    __aicore__ inline void InitGlobalTensor(GlobalTensor<T> lseMaxFdGm, GlobalTensor<T> lseSumFdGm,
+                                            GlobalTensor<T> accumOutGm, GlobalTensor<OUT_T> attentionOutGm,
+    __aicore__ inline void InitParams(const AttentionCommonFlashDecode::ConstInfoFD& constInfo);
+    __aicore__ inline void InitDecodeParams();
+    __aicore__ inline void InitBuffers(TPipe* pipe);
+    __aicore__ inline void AllocEventID();
+    __aicore__ inline void FreeEventID();
+    __aicore__ inline void FlashDecode(FDparams& fd);
+...
+    __aicore__ inline void CopyAccumOutIn(LocalTensor<T>& accumOutLocal, uint32_t splitKVIndex, uint32_t startRow,
+    __aicore__ inline void CopyLseIn(uint32_t startRow, uint32_t dealRowCount, int64_t baseOffset, uint32_t cntM);
+```
+
+and the per-row rescale primitives it is built from:
+
+```cpp
+__aicore__ inline void MatDivsVecFd(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
+__aicore__ inline void RowSubFd(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
+__aicore__ inline void ColMaxFd(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
+__aicore__ inline void ColAddFd(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
+```
+
+`SparseFlashAttention`'s own kernel already allocates exactly the buffers this consumes —
+`accumOutSize`, `logSumExpSize`, `lseSumFdGm`, `lseMaxFdGm` (section 8.1 and
+`sparse_flash_attention_kernel_mla.h:503-508`) — behind `if constexpr (FLASH_DECODE)`, which is
+never true.
+
+The A3 IFA kernel file inventory, for scale:
+
+```
+   1264 ifa_service_matmul_full_quant.h
+   4619 incre_flash_attention_preload.h
+   4119 incre_flash_attention_preload_dd.h
+   4324 incre_flash_attention_preload_mla.h
+   4286 incre_flash_attention_split_Bbn2s2_Us2.h
+   1987 paged_attention_antiquantkv.h
+    845 service_vector_flashdecode_mla.h
+  21444 total
+```
+
+`incre_flash_attention_split_Bbn2s2_Us2.h` — the name is the split axes: B, bn2, s2, with `Us2`
+the KV-split variant. `SparseFlashAttention`'s entire `arch22` kernel is 4140 lines across four
+files and has no `s2` split template at all.
+
+### 10.4 A5 (`arch35`) has the same hole — this is not an A3-only gap
+
+`attention/sparse_flash_attention/op_kernel/arch35/sparse_flash_attention_kernel_mla_arch35.h`:
+
+```cpp
+template <typename CubeBlockType, typename VecBlockType>
+__aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::InitCalcParamsEach()
+{
+    // 计算总的基本块
+    maxS2LoopCnt = 0; // 所有核中最大累计s2Loop
+    uint32_t sfaTotalBaseNum = 0;
+    uint32_t s1GBaseSize = sfaConstInfo.gSize;
+    uint32_t actBatchS2 = 1;
+    uint32_t coreNum = GetBlockNum(); // G128时相邻两个cube核处理一个s1，coreNum减半
+    uint32_t sfaCurrCoreIdx = aicIdx;
+    if constexpr (IS_SPLIT_G) {
+        coreNum = coreNum >> 1;
+        sfaCurrCoreIdx = sfaCurrCoreIdx >> 1;
+    }
+    uint32_t actBatchS1 = 1;
+    for (uint32_t bIdx = 0; bIdx < sfaConstInfo.bSize; bIdx++) {
+        actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx); // 不切S2，只关注S1
+        if (actBatchS1 < sfaConstInfo.s1Size) {
+            sfaConstInfo.needInit = true;
+        }
+        sfaTotalBaseNum += actBatchS1 * actBatchS2;
+    }
+    uint32_t sfaAvgBaseNum = 1;
+    if (sfaTotalBaseNum > coreNum) {
+        sfaAvgBaseNum = (sfaTotalBaseNum + coreNum - 1) / coreNum;
+        if constexpr (IS_SPLIT_G) {
+            usedCoreNum = (sfaTotalBaseNum + sfaAvgBaseNum - 1) / sfaAvgBaseNum << 1;
+        }
+    } else {
+        if constexpr (IS_SPLIT_G) {
+            usedCoreNum = sfaTotalBaseNum << 1;
+        } else {
+            usedCoreNum = sfaTotalBaseNum;
+        }
+    }
+    ...
+    if (aicIdx >= usedCoreNum) {
+        return;
+    }
+```
+
+The comment is explicit: `// 不切S2，只关注S1` — "do not split S2, only consider S1". Same
+`actBatchS2 = 1`, same `usedCoreNum = sfaTotalBaseNum`, same early `return`. On A5 the only
+mitigation is `IS_SPLIT_G`, which doubles the core count — and `GenTilingKey` only sets it when
+`gSize > 64`.
+
+One thing A5 does gain is a real top-k length input, so the zero-padding of section 9.6 can be
+avoided:
+
+```cpp
+    GlobalTensor<int32_t> oriTopkLengthGm;
+    bool hasOriTopkLength = false;
+```
+
+(present only in `arch35`; `grep -rn 'oriTopkLength' op_kernel/ op_host/` returns these two lines
+and nothing in `arch22`.)
+
+### 10.5 The published `SparseFlashAttention` contract, for reference
+
+`attention/sparse_flash_attention/README.md`:
+
+> - API功能：sparse_flash_attention（SFA）是针对大序列长度推理场景的高效注意力计算模块，该模块通过“只计算关键部分”大幅减少计算量，然而会引入大量的离散访存，造成数据搬运时间增加，进而影响整体性能。
+
+> 其中$\tilde{K},\tilde{V}$为基于某种选择算法（如`lightning_indexer`）得到的重要性较高的Key和Value，一般具有稀疏或分块稀疏的特征，$d_k$为$Q,\tilde{K}$每一个头的维度。
+> 本次公布的`sparse_flash_attention`是面向Sparse Attention的全新算子，针对离散访存进行了指令缩减及搬运聚合的细致优化。
+
+The `sparse_indices` contract — note what it does and does *not* require:
+
+> | sparse_indices | 输入 | 离散取kvCache的索引，不支持空tensor和非连续。sparse_size为一次离散选取的block数，需要保证每行有效值均在前半部分、无效值均在后半部分，且sparse_size大于0。layout_query为"BSND"时，shape为[B, Q_S, KV_N, sparse_size]。layout_query为"TND"时，shape为[Q_T, KV_N, sparse_size]。 | INT32 | ND |
+
+Valid entries must be contiguous at the front of each row; **ascending order is not required**.
+
+> | sparse_block_size | 可选属性 | 代表sparse阶段的block大小。sparse_block_size为1时，为Token-wise稀疏化场景；sparse_block_size大于1且小于等于128时，为Block-wise稀疏化场景，块内token共享相同的稀疏化决策。默认值为1。 | INT64 | - |
+
+> | attention_mode | 可选属性 | 表示attention的模式，仅支持传入2，表示MLA-absorb模式。 | INT64 | - |
+
+> | return_softmax_lse | 可选属性 | 用于表示是否返回softmax_max和softmax_sum。True表示返回，False表示不返回，默认值为False。 | BOOL | - |
+
+Constraints:
+
+> ## 约束说明
+>
+> - 该接口支持推理场景下使用。
+> - 该接口支持图模式。
+> - KV_N仅支持1。
+> - block_size为一个block的token数，block_size取值为16的倍数，且最大支持1024。
+> - 参数query中的Q_D和key、value的KV_D值相等为512，参数query_rope中的Dr和key_rope的Dr值相等为64。
+> - 参数query、key、value的数据类型必须保持一致。
+> - 当前只支持query_rope和key_rope传入，不支持rope为空。
+> - sinks仅支持Ascend 950PR&950DT系列产品。
+> - <term>Ascend 950PR&950DT系列产品</term>：
+>   - Q_N支持1~128。
+>   - sparse_block_size仅支持1。
+>   - 仅在layout_kv为PA_BSND时，key、value和key_rope支持0轴非连续。
+>   - return_softmax_lse为True时，支持layout_kv为PA_BSND。
+> - <term>Atlas A3系列产品</term>、<term>Atlas A2系列产品</term>：
+>   - Q_N支持1/2/4/8/16/32/64/128。
+>   - 参数sparse_block_size支持[1,128]，且要求是2的幂次方，在PageAttention场景下要求sparse_block_size整除block_size。
+>   - 不支持sinks。
+>   - key、value和key_rope不支持非连续。
+>   - return_softmax_lse为True时，layout_kv不支持PA_BSND。
+
+`Q_N支持1/2/4/8/16/32/64/128` on A3 — Q heads per rank must be a power of two in that set, so a
+TP16 split of a 64- or 128-head MLA model lands on `Q_N` = 4 or 8, far below the `gSize > 64`
+threshold that would enable `IS_SPLIT_G`.
+
+## Relevance
+
+This is the strongest single fact in this whole investigation, because it is an A/B with the
+confound removed: same vendor, same repository, same A3 `arch22` target, same decode shape,
+same 512-token empirical unit — and the dense op splits KV across 16 cores while the sparse op
+splits across 1. The 5.0x roofline miss on `SparseFlashAttention` is not a property of sparse
+attention, of scattered DMA, or of A3. It is a missing tiling mode in one operator.
+
+Three consequences for our 6.973 ms.
+
+**The fix has a reference implementation to copy.** `SplitBNS` + `service_vector_flashdecode_mla.h`
+is 845 lines of A3 AscendC that does exactly the partial-`(out, max, sum)` combine our
+hand-written kernel needs. `SparseFlashAttention` already allocates the workspace for it
+(`accumOutSize`, `logSumExpSize`) and already exposes `softmax_max` / `softmax_sum` as outputs
+under `return_softmax_lse`, so the external-combine route is open without any CANN change: call
+SFA `kvSplitPart_` times over disjoint slices of the sparse index list with
+`return_softmax_lse=true`, then run our own `ColMax`/`ColAdd`/`MatDivs` rescale. The cost is
+`kvSplitPart_` extra MIX_AIC launches per layer against our 13.58 us floor — at 16 slices that is
+217 us per layer, which is far worse than the 75 us we currently pay. **So the external-combine
+route only pays inside a megakernel**, where the 16 slices are 16 core-groups of one launch
+rather than 16 launches. That is a direct argument for the megakernel being the enabling vehicle
+rather than an optimization on top.
+
+**`IFATiling`'s 512-token floor bounds how far the split can go.** `while ((maxActualseq_ /
+kvSplitPart_) < 512U && kvSplitPart_ > 1U) kvSplitPart_--;` means at seq 8192 the maximum useful
+split is 16, not 24. If our DSA top-k is 2048 rather than the full 8192, the same rule gives
+`2048/512 = 4` — only 4 cores' worth of useful split. This is the number that decides whether
+closing the parallelism gap is worth 16x or 4x, and it turns on the top-k, which is why the top-k
+value matters more than any other single model parameter here.
+
+**Our 5.0x is smaller than single-core execution predicts, so one of our premises is wrong.**
+Section 8.3 says 1 core; section 9.1 says 3 HBM transits. Together they predict a gap far beyond
+5.0x. The reconciliation candidates, in order of likelihood: (i) we pass `layout_query = "TND"`
+with the `gSize` heads packed along `Q_T`, which makes `totalBaseNum = gSize` and recovers
+`gSize` cores — testable by reading `Q_T` at the call site; (ii) our 1.382 ms roofline denominator
+is a per-die or per-core bandwidth rather than aggregate HBM; (iii) the op is being called once
+per head rather than once per layer, which would multiply the launch count and show up in our
+3008-kernels-per-round figure. Determining which costs one plog read of
+`SFA block dim: %u aiv Num: %u aic Num: %u.` and is the highest-value next measurement.

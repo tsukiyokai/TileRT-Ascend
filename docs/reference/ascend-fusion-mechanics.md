@@ -19510,3 +19510,537 @@ Finally, 48.4 is the official confirmation of §47's premise: a `__mix__` kernel
 halves, and `ASCEND_IS_AIV` / `ASCEND_IS_AIC` are the only partition. Anything not inside one of those two
 guards executes on both cores — which is precisely why an ungated `DataCopy` to GM in a `Cast`-bearing function
 gives the allocation a second, uncoordinated writer.
+
+## 49. ★ The Fixpipe dtype matrix on A3 — int32→int8 requant is free on the cube's drain, int4 is NOT, and the architecture doc contradicts the API doc on that
+
+Source: `/home/shanshan/repo/cann/asc-devkit/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_store/Fixpipe_L0CToGM.md`
+and `Fixpipe_L0CToUB.md`, plus
+`docs/zh/api/SIMD-API/basic_api/cube_compute_TensorAPI/cube_store_key_features/quant_pre.md` for the newer
+Tensor-API form. Read 2026-10-20. This matters because our `Cast` family costs 2.300 ms a round against
+0.076 ms of bytes it must move — 30x off roofline, the worst ratio in the profile — and the question is how much
+of it the cube can absorb on the way out of L0C instead.
+
+### 49.1 ★ The supported source/destination dtype combinations, per product, verbatim
+
+```
+## 数据类型
+
+**源矩阵与目的矩阵支持的数据类型组合**
+
+针对Ascend 950PR/Ascend 950DT，Fixpipe接口支持的数据类型组合如下：
+| 源矩阵（L0C Buffer） | 目的矩阵（GM） |
+| float   | int8_t、uint8_t、hifloat8_t、fp8_e4m3fn_t、half、bfloat16_t、float。 |
+| int32_t | int8_t、uint8_t、half、bfloat16_t、int32_t。 |
+
+针对Atlas A3 训练系列产品/Atlas A3 推理系列产品，Fixpipe接口支持的数据类型组合如下：
+| 源矩阵（L0C Buffer） | 目的矩阵（GM） |
+| float   | int8_t、uint8_t、half、bfloat16_t、float。 |
+| int32_t | int8_t、uint8_t、half、int32_t。 |
+
+针对Atlas A2 训练系列产品/Atlas A2 推理系列产品，Fixpipe接口支持的数据类型组合如下：
+| 源矩阵（L0C Buffer） | 目的矩阵（GM） |
+| float   | int8_t、uint8_t、half、bfloat16_t、float。 |
+| int32_t | int8_t、uint8_t、half、int32_t。 |
+
+针对Kirin X90，Fixpipe接口支持的数据类型组合如下：
+| float   | int8_t、half。 |
+| int32_t | int8_t、half、int32_t。 |
+
+针对Kirin 9030，Fixpipe接口支持的数据类型组合如下：
+| float   | half |
+| int32_t | half |
+```
+
+**No `int4b_t` appears in any row, for any product.** Not A3, not A2, not even 950PR/950DT.
+
+### 49.2 ★★ The contradiction: the architecture doc says the hardware can do S322S4, the API doc does not expose it
+
+§8 of this file quotes the A3 architecture chapter's own Fixpipe capability list, verbatim:
+
+> 量化反量化：包括S322FP16、S322S32、S322S4、S322S8、S322S16、FP322FP16、FP322BF16、FP322S8、FP322S4、FP322FP32。
+
+— i.e. the hardware Fixpipe is documented to do **S322S4** (int32→int4) and **FP322S4** (float→int4), and the
+same chapter describes the int4 channel-merge that goes with it:
+
+> Channel merge（S4和U4数据类型）
+> 对于转换为S4或U4的目标数据类型，分形矩阵通过硬件从16x16转换为16x64，如果输出通道数N是64的倍数，则N方向上每4个相邻的16x16分形矩阵将合并为1个16x64分形矩阵。
+> 在这种情况下，N的配置必须是64的倍数。
+
+But §49.1's API table has no int4 destination on any part, and the `QuantMode_t` enum exposed on A3 (§49.3) has
+no S4 mode. **So the capability exists in the architecture description and is not reachable through the
+`Fixpipe` API.** Either an undocumented path exists, or the architecture list describes a superset of what CANN
+binds. Treat int4-out-of-Fixpipe as unavailable until someone produces a working call.
+
+### 49.3 The exact `QuantMode_t` enum available on A3, verbatim
+
+From the A3 arm of the `quantPre` parameter description:
+
+```cpp
+enum QuantMode_t{
+    NoQuant,      // 不开启量化功能
+    F322F16,      // Float32_2_Float16：float cast成half，cast mode为CAST_RINT模式
+    F322BF16,     // Float32_2_BFloat16：float cast成bfloat16_t，cast mode为CAST_RINT模式
+    DEQF16,       // DeQuant_Float16：int32_t量化成half，scalar量化
+    VDEQF16,      // Vector_DeQuant_Float16：int32_t量化成half，tensor量化
+    QF322B8_PRE,  // Quant_Float32_2_B8：float量化成int8_t/uint8_t，scalar量化
+    VQF322B8_PRE, // Vector_Quant_Float32_2_B8：float量化成int8_t/uint8_t，tensor量化
+    REQ8,         // ReQuant_int8：int32_t量化成uint8_t/int8_t，scalar量化
+    VREQ8,        // Vector_ReQuant_int8：int32_t量化成uint8_t/int8_t，tensor量化
+};
+```
+
+Nine modes. **`REQ8` / `VREQ8` are the int32→int8 requantization, scalar and per-channel-tensor respectively**,
+and `DEQF16` / `VDEQF16` are int32→half. The 950PR list adds the FP8 and HiFloat8 modes
+(`QF322FP8_PRE`, `VQF322FP8_PRE`, `QF322HIF8_PRE`, `VQF322HIF8_PRE`, `QF322HIF8_PRE_HYBRID`,
+`VQF322HIF8_PRE_HYBRID`, `QS322BF16_PRE`, `VQS322BF16_PRE`, `QF322F16_PRE`, `VQF322F16_PRE`, `QF322BF16_PRE`,
+`VQF322BF16_PRE`, `QF322F32_PRE`, `VQF322F32_PRE`) — still no S4. Also recorded from the 950 list, because it
+is a precision note that applies to any `float→float` drain:
+
+> QF322F32_PRE, // Quant_Float32_2_Float32: float量化成float，scalar量化，精度可以达到双千分之一，无法达到双万分之一。如果有双万分之一的精度要求，建议使用AscendDeQuant高阶API。
+
+The tensor-quantization parameter constraints, verbatim from `quant_pre.md`:
+
+> - tensor量化参数张量应位于L1 Buffer，元素类型为`uint64_t`，地址要求32字节对齐。
+> - 量化参数不能为`inf`、`nan`或非规格化数。该约束属于硬件约束，接口不单独检查参数值。
+> - 不传入`quant`时，仅支持不量化输出或`float`到`half`/`bfloat16_t`的直接cast输出。
+
+So a per-channel requant scale lives in **L1**, is `uint64_t` per channel, 32-byte aligned, and an `inf`/`nan`/
+denormal in it is a hardware constraint the API does **not** check.
+
+### 49.4 `Fixpipe(L0C→UB)` is 不支持 on A3 — a fourth independent confirmation
+
+`Fixpipe_L0CToUB.md`, 产品支持情况, verbatim:
+
+```
+- Ascend 950PR/Ascend 950DT：支持包含FixpipeParamsArch3510参数的接口。
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+- Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+- Atlas 200I/500 A2 推理产品：支持包含FixpipeParamsM300参数的接口。
+- Atlas 推理系列产品AI Core：不支持
+...
+```
+
+and `Fixpipe_L0CToGM.md`'s own 产品支持情况 names the A3 restriction on the interface shape:
+
+```
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：仅支持包含FixpipeParamsV220参数的接口。
+```
+
+So on A3 the cube's only drain destination is GM, through the `FixpipeParamsV220` form — consistent with §35.4,
+§46.3 and the `GetQueEvt` assert, now from the API page too.
+
+### 49.5 ★ `ndNum = 0` turns a Fixpipe into a silent NOP
+
+From the `params` description, verbatim:
+
+> ndNum：源NZ矩阵的数目，也就是传输ND矩阵的数目，取值范围为ndNum∈[0, 65535]。**注：ndNum=0表示不执行搬运，该接口将被视为NOP（空操作）。**
+
+and for the 950 NZ2DN form:
+
+> dnNum：传输DN矩阵的数目，取值范围为dnNum∈[0, 65535]。**注：dnNum=0表示不执行搬运，该接口将被视为NOP（空操作）。**
+
+A zero count is not an error and not a one-element move; it is a documented no-op. Add it to the §42.4 /
+§43.5 list of silent-drop mechanisms.
+
+### 49.6 Two more drain knobs worth having
+
+Verbatim from the same parameter table:
+
+> unitFlag | unitFlag是一种Mmad指令和Fixpipe指令细粒度的并行，开启该功能后，硬件每计算完一个分形，计算结果就会被搬出，该功能不适用于在L0C Buffer累加的场景。取值说明如下：0（2'b00）：不开启unitFlag；2（2'b10）：开启unitFlag，硬件执行完指令之后，不会设置寄存器；3（2'b11）：开启unitFlag，硬件执行完指令之后，会将unitFlag关闭。
+
+> isChannelSplit | 是否开启通道拆分的功能。默认为false，不开启该功能。仅在src和dst都为float时才能开启通道拆分，且不能同时开启ChannelSplit和NZ2ND功能。
+
+> reluEn | 是否开启ReLU的开关
+
+`unitFlag` is Mmad/Fixpipe fine-grained overlap — the result of each fractal drains as soon as it is computed —
+and it is **incompatible with accumulating in L0C**, which rules it out for any split-K or multi-pass
+accumulation. `isChannelSplit` requires both src and dst `float` and cannot be combined with NZ2ND.
+
+## Relevance
+
+The headline is a split verdict on the `Cast` family's 2.300 ms. **The int32→int8 half of it is absorbable into
+the cube's drain at zero vector cost**: `REQ8` is a scalar requant and `VREQ8` a per-output-channel tensor
+requant, both int32→int8, both applied by Fixpipe on the way out of L0C with no Vector involvement, with the
+per-channel scale sitting in L1 as `uint64_t` 32-byte-aligned. Every place we currently matmul to int32 and then
+`Cast` down to the int8 activation of the next stage is a candidate. **The int4 direction is not available**:
+no product's Fixpipe table has an int4 destination and the A3 `QuantMode_t` has no S4 mode, so the W4 output
+quantization has to stay a Vector `Cast` — which also means §47's `Cast → Cast → DataCopy` shape is not
+avoidable by pushing the quantization into the cube, and the fix there really is the half-guarding one.
+
+49.2 is the contradiction to carry: the A3 *architecture* chapter lists `S322S4` and `FP322S4` among Fixpipe's
+hardware quantization conversions, and documents the matching S4 channel-merge (16x16 fractals merged four-wide
+into 16x64, with N required to be a multiple of 64 — the same 64 as §45.3's shape constraint), while the Fixpipe
+*API* exposes no int4 destination on any part. Hardware capability and API surface disagree. If an undocumented
+S4 drain exists it is worth a probe, because it would remove the last Vector pass from a W4A8 expert chain
+entirely; until then, plan for the Vector `Cast`.
+
+Two traps for the silent-failure list that §42.4 and §43.5 started: `ndNum = 0` makes a Fixpipe a documented
+NOP rather than an error, and a tensor quant scale containing `inf`/`nan`/a denormal is a hardware constraint
+the API explicitly does not check — 「该约束属于硬件约束，接口不单独检查参数值」. And one scheduling knob with a
+hard precondition: `unitFlag` overlaps Mmad with Fixpipe at fractal granularity but is 「不适用于在L0C Buffer
+累加的场景」, so it cannot be combined with L0C accumulation across K-passes.
+
+## 50. ★★★ `KERNEL_TYPE_AIC_ONLY` IS supported on A3 — the type we need is `KERNEL_TYPE_MIX_AIC_1_0`; plus the head-overhead itemization, the 512-byte same-address serialization rule, and the transfer-size and L2 rules
+
+Sources, all in the shipped devkit on this machine, read 2026-10-20:
+
+- `docs/zh/api/SIMD-API/basic_api/Kernel-Tiling/set_Kernel_type.md`
+- `docs/zh/guide/operator_practice/simd_operator_optimization/overhead_optimization/core_count_kernel_type.md`
+- `.../simd_operator_optimization/memory_access/avoid_same_address_access.md`
+- `.../simd_operator_optimization/memory_access/gm_address_512b_alignment.md`
+- `.../simd_operator_optimization/memory_access/transfer_larger_data_blocks.md`
+- `.../simd_operator_optimization/memory_access/l2_cache_mode_config.md`
+
+### 50.1 ★★★ The contradiction: the official page lists `KERNEL_TYPE_AIC_ONLY` as supported on A3
+
+We measured `KERNEL_TYPE_AIC_ONLY` being **rejected at kernel submission with `sqe_type=3, errType=0x20`**.
+The official 「设置核函数（Kernel）类型」 page says it is supported. 产品支持情况, verbatim:
+
+```
+- Ascend 950PR/Ascend 950DT：支持
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+- Atlas A2 训练系列产品/Atlas A2 推理系列产品：支持
+- Atlas 200I/500 A2 推理产品：不支持
+- Atlas 推理系列产品AI Core：支持
+- Atlas 推理系列产品Vector Core：不支持
+- Atlas 训练系列产品：不支持
+```
+
+and 约束说明 → kernel type 取值约束, verbatim:
+
+```
+-   Ascend 950PR/Ascend 950DT，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+-   Atlas A3 训练系列产品/Atlas A3 推理系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+-   Atlas A2 训练系列产品/Atlas A2 推理系列产品，支持KERNEL_TYPE_AIV_ONLY、 KERNEL_TYPE_AIC_ONLY、KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2。
+-   Atlas 推理系列产品，支持KERNEL_TYPE_AICORE、KERNEL_TYPE_MIX_VECTOR_CORE。
+```
+
+### 50.2 ★★★ The resolution, from the same page: `AIC_ONLY` has no hard sync; `MIX_AIC_1_0` does
+
+The full enum and the 表2 descriptions, verbatim:
+
+```cpp
+enum KernelMetaType {
+    KERNEL_TYPE_AIV_ONLY,
+    KERNEL_TYPE_AIC_ONLY,
+    KERNEL_TYPE_MIX_AIV_1_0,
+    KERNEL_TYPE_MIX_AIC_1_0,
+    KERNEL_TYPE_MIX_AIC_1_1,
+    KERNEL_TYPE_MIX_AIC_1_2,
+    KERNEL_TYPE_AICORE,
+    KERNEL_TYPE_VECTORCORE,
+    KERNEL_TYPE_MIX_AICORE,
+    KERNEL_TYPE_MIX_VECTOR_CORE,
+    KERNEL_TYPE_MAX
+};
+```
+
+> **KERNEL_TYPE_AIV_ONLY** — 算子执行时仅启动AI Core上的Vector核：比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+>
+> **KERNEL_TYPE_AIC_ONLY** — 算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+>
+> **KERNEL_TYPE_MIX_AIV_1_0** — AIC、AIV混合场景下，**使用了多核控制相关指令时**，设置核函数（Kernel）的类型为MIX AIV:AIC 1:0（**带有硬同步**），算子执行时仅会启动AI Core上的Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Vector核。
+> 硬同步的概念解释如下：当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用SyncAll()函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬同步是利用硬件自带的全核同步指令由硬件保证多核同步。
+>
+> **KERNEL_TYPE_MIX_AIC_1_0** — AIC、AIV混合场景下，**使用了多核控制相关指令时**，设置核函数（Kernel）的类型为MIX AIC:AIV 1:0（**带有硬同步**），算子执行时仅会启动AI Core上的Cube核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核。
+>
+> **KERNEL_TYPE_MIX_AIC_1_1** — AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和10个Vector核。
+>
+> **KERNEL_TYPE_MIX_AIC_1_2** — AIC、AIV混合场景下，设置核函数（Kernel）的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和20个Vector核。
+>
+> **KERNEL_TYPE_AICORE** — 算子执行时仅会启动AI Core，比如用户在host侧设置numBlocks为5，则会启动5个AI Core。
+>
+> **KERNEL_TYPE_VECTORCORE** — 该参数为预留参数，当前版本暂不支持。
+>
+> **KERNEL_TYPE_MIX_AICORE** — 该参数为预留参数，当前版本暂不支持。
+>
+> **KERNEL_TYPE_MIX_VECTOR_CORE** — 基于Ascend C开发的矢量计算相关的算子可以运行在Vector Core上，调用本接口传入该参数用于启用Vector Core。启用Vector Core后，算子执行时会同时启动AI Core和Vector Core，用于并行计算。… 需要注意的是，通过SetSimdNumBlocks设置核数时，需要大于AI Core的核数，否则不会启动VectorCore。
+
+**`KERNEL_TYPE_MIX_AIC_1_0` launches only the Cube cores *and carries the hard sync*, and the page says in so
+many words that it is the type to use 「使用了多核控制相关指令时」.** `KERNEL_TYPE_AIC_ONLY` is the plain
+cube-only launch with no hard sync. So a cube-only kernel that calls `SyncAll()` or any cross-core control
+instruction is a *content/type mismatch* when declared `AIC_ONLY`, and the page states the matching rule
+explicitly, verbatim:
+
+> -   当设置具体的kernel task type时，用户的算子实现需要与kernel type相匹配。比如用户设置kernel type为KERNEL_TYPE_MIX_AIC_1_2，则算子内部实现应与核配比AIC:AIV为1:2相对应；若用户设置kernel type为KERNEL_TYPE_AIC_ONLY，则算子内部实现应该为纯cube逻辑，不应该存在vector部分的逻辑。其他的kernel type类似。
+
+and a second constraint that is a plausible independent cause of a submission-time rejection, verbatim:
+
+> -   当纯cube或者纯vec算子强制设定kernel type为MIX类型时，workspace的大小不能设置为0，需要设置一个大于0的值（比如16、32等）。
+
+The remaining constraints, verbatim:
+
+> -   **KERNEL_TASK_TYPE**优先级高于**KERNEL_TASK_TYPE_DEFAULT**，同时设置了全局kernel type和某一个tiling key的kernel type，该tiling key的kernel type以**KERNEL_TASK_TYPE**设置的为准。
+> -   没有设置全局默认kernel type的情况下，如果开发者只为其中的某几个tiling key设置kernel type，即部分tiling key没有设置kernel type，会导致算子kernel编译报错。
+> -   使用Tiling模板编程时，需要通过ASCENDC_TPL_KERNEL_TYPE_SEL设置核函数（Kernel）类型即可，无需再通过该接口进行设置，本接口不生效。
+
+and the two setters, with their project-type restriction, verbatim:
+
+> -   设置全局默认的kernel type，对所有的tiling key生效。当前支持在自定义算子工程和核函数（Kernel）直调工程中使用。
+>     `KERNEL_TASK_TYPE_DEFAULT(value)`
+> -   设置某一个具体的tiling key对应的kernel type。当前仅支持在自定义算子工程中使用。
+>     `KERNEL_TASK_TYPE(key, value)`
+
+so a `<<<>>>` direct-launch project (ours) can only use `KERNEL_TASK_TYPE_DEFAULT`.
+
+### 50.3 ★ Head overhead, itemized — and the official advice to use FEWER cores at microsecond scale
+
+`core_count_kernel_type.md`, verbatim and nearly complete:
+
+> 在算子执行过程中，可能会因为以下几个原因产生额外的启动开销或者头开销：
+>
+> 1. **核启动**：每个核在启动时需要进行初始化操作，加载必要的配置和资源。
+> 2. **核取址TLB MISS**：当核在访问内存时，如果Translation Lookaside Buffer（TLB）中没有对应的页表项，就需要从内存中加载页表项，这会导致额外的延迟。
+> 3. **同地址访问冲突**：由于硬件限制，多个核同时访问相同的内存地址时可能会发生冲突，导致额外的时延。
+> 4. **变量资源初始化**：在算子执行前，需要初始化一些变量和资源，这也可能带来额外的性能开销。
+>
+> 头开销会随着使用的核数增加而增加。
+>
+> **对于整体耗时在微秒级别且单核计算量耗时较少的算子，可以通过减少启动核数并增加单核计算量的方式来获得性能提升。** 这种优化方式的本质是在头开销耗时和单核计算量耗时之间进行权衡。为了达到最佳性能，开发者需要通过实践尝试，找到最合适的核数设置。
+>
+> - 对于自定义算子工程，可以在TilingFunc中通过SetSimdNumBlocks接口来设置算子使用的核数…；对于核函数（Kernel）直调工程，可以在>>>调用时指定算子使用的核数。
+> - 此外，算子的核函数（Kernel）类型也会影响算子启动的核数。**以纯Vector算子为例，如果以混合启动的方式执行该算子，调度器会同时启动Vector核和Cube核。然而，此时Cube核并没有实际的计算指令，但仍会产生核启动和核初始化的头开销。** 因此，建议设置合适的核函数（Kernel）类型以最小化头开销。
+>
+>   通常，算子工程会通过算子使用的指令自动识别算子类型，但该功能**无法区分AIC和AIV的配比，默认按照AIV:AIC为1:2的配比下发任务**。此外，**自动识别功能可能失效，因为其依赖于编译优化的结果**。所以推荐用户手动设置算子的核函数（Kernel）类型。
+
+### 50.4 ★★ 「避免同地址访问」 — GM requests are coalesced at 512-byte granularity and SERIALIZED, and this applies to A3
+
+Verbatim, 【优先级】高, with the product list naming A3 explicitly:
+
+> 该性能优化指导适用于如下产品型号：Ascend 950PR/Ascend 950DT；Atlas A3 训练系列产品/Atlas A3 推理系列产品；Atlas A2 训练系列产品/Atlas A2 推理系列产品
+>
+> 【描述】**MTE2、MTE3、Scalar等单元访问Global Memory数据时，其地址请求会按照512字节粒度对齐后进行处理。当同时访问Global Memory的数据，且地址处于连续的512字节范围内时，由于数据一致性的原因，多个请求会被串行处理，进而影响数据搬运效率。**
+>
+> 当前算子执行机制保证用户核函数（Kernel）入参（包括Workspace/Tiling）的地址512字节对齐，因此开发者只需要根据地址的偏移量即可判断两个地址是否会落入连续的512字节范围内。
+>
+> …尽管addr0~addr5是多个不同的地址，但因为落在连续的512字节范围内，被视为同一个地址请求，此时这几个数据请求会被串行处理，数据访问效率会降低。**同地址访问的影响受同时访问的核数影响，同地址访问的核数越多时，串行导致的性能劣化越严重。**
+
+The fix is a rotation of the access order, and the guide ships both arms verbatim. Scenario: a `[6144, 512]`
+half input, GM→UB, 48 cores, tile `[128, 64]`, `DataCopyPad`, L2 cache hint off, **每个核都会完整载入一遍输入
+矩阵** — every core loads the whole input matrix, which is exactly the decode-time weight-broadcast pattern.
+
+反例 (原始实现), verbatim:
+
+```cpp
+uint32_t blockIdx = AscendC::GetBlockIdx();
+for (uint32_t mBlockIdx = 0; mBlockIdx < fullMBlockCount; mBlockIdx++) {
+    // 原始实现：所有核使用相同的mBlockIdx。
+    uint32_t curMBlockIdx = mBlockIdx;
+    uint32_t mStart = curMBlockIdx * singleCoreM;
+    DataCopyPad(...) // 搬运逻辑相同
+}
+```
+
+正例 (优化实现), verbatim:
+
+```cpp
+uint32_t blockIdx = AscendC::GetBlockIdx();
+for (uint32_t mBlockIdx = 0; mBlockIdx < fullMBlockCount; mBlockIdx++) {
+    // 优化实现：在每组numBlocks 个M块内，
+    // 按当前核的blockIdx轮转访问顺序。
+    uint32_t blockGroupStart = (mBlockIdx / numBlocks) * numBlocks;
+    uint32_t curMBlockIdx = blockGroupStart + (mBlockIdx + blockIdx) % numBlocks;
+    uint32_t mStart = curMBlockIdx * singleCoreM;
+    DataCopyPad(...) // 搬运逻辑相同
+}
+```
+
+> 原始实现下，48个核在同一时刻访问相同的curMBlockIdx：T0时刻均访问M0，T1时刻均访问M1，T2时刻均访问M2，依次类推。
+> 优化实现下，不同核在同一时刻访问不同的curMBlockIdx：T0时刻block0访问M0、block1访问M1、block46访问M46、block47访问M47；T1时刻分别访问M1、M2、M47、M0。
+
+and the measurement recipe, verbatim: 「你可以通过执行如下命令行，通过msOpProf工具获取上述示例的性能数据并进行
+对比。`msopprof ./demo`。重点关注op_summary_*.csv中的MTE2搬运相关指标。」 The worked sample is at
+`examples/01_simd_cpp_api/05_best_practices/04_memory_access/data_copy`, 优化点4.
+
+### 50.5 The two bandwidth rules: ≥16 KB per transfer, and 512-byte GM alignment (A2 only)
+
+`transfer_larger_data_blocks.md`, 【优先级】高, verbatim:
+
+> 【描述】搬运不同大小的数据块时，对带宽的利用率（有效带宽/理论带宽）不一样。**根据实测经验，单次搬运数据长度16KB以上时，通常能较好地发挥出带宽的最佳性能。** 因此对于单次搬运，应考虑尽可能的搬运较大的数据块。
+
+`gm_address_512b_alignment.md`, 【优先级】高, verbatim — note the product restriction, which is **A2 only**:
+
+> 【描述】由于AI处理器内部设计约束，从GM向Local Memory搬运数据时，保证GM地址512B对齐可以最有效的发挥出带宽的效率。如下图示例，展示了在512B对齐以及32B对齐情况下单核的带宽效率：**搬运同等数据量，带宽差距最大的情况，32B对齐场景只能达到512B对齐场景的70%。**
+>
+> - 本性能优化手段仅针对Atlas A2 训练系列产品/Atlas A2 推理系列产品生效。
+
+`reduce_non_contiguous_transfer.md`, 【优先级】中, is **950-only** (「该性能优化建议适用于如下产品型号：
+Ascend 950PR/Ascend 950DT」) and describes `DataCopyPad`'s Loop mode and `DataCopy`'s multi-dimensional
+(NDDMA) form as the way to collapse many small non-contiguous moves into one. Neither is offered for A3.
+
+### 50.6 L2 CacheMode, and why a streaming read evicts the data you wanted cached
+
+`l2_cache_mode_config.md`, 【优先级】高, product list includes A3, verbatim:
+
+> L2 Cache的带宽相比GM的带宽有数倍的提升，因此当数据命中L2 Cache时，数据的搬运耗时会优化数倍。…
+>
+> 从上面的流程可以看出，**当数据访问总量超出L2 Cache容量时，AI Core会对L2 Cache进行数据替换。由于Cache一致性的要求，替换过程中旧数据需要先写回GM（此过程中会占用GM带宽），旧数据写回后，新的数据才能进入L2 Cache。**
+>
+> 开发者可以针对访问的数据设置其CacheMode，**对于只访问一次的Global Memory数据设置其访问状态为不进入L2 Cache**，这样可以更加高效的利用L2 Cache缓存需要重复读取的数据，避免一次性访问的数据替换有效数据。
+>
+> Ascend C基于GlobalTensor提供了SetL2CacheHint接口，用户可以根据需要指定CacheMode。
+
+The worked sample is `examples/01_simd_cpp_api/05_best_practices/00_vector_compute/add_high_performance`
+(two-tensor add, `(8192, 8192)` each, 384 MB total, 48 cores, 6-way row × 8-way column split).
+
+## Relevance
+
+50.1 and 50.2 are the most consequential pair in this file, because they contradict a measurement of ours and
+then supply the fix. We measured `KERNEL_TYPE_AIC_ONLY` rejected at submission with
+`sqe_type=3, errType=0x20`; the official page lists it as supported on A3. The reconciliation is in the type
+descriptions: **`KERNEL_TYPE_AIC_ONLY` is a plain cube-only launch with no hard sync, while
+`KERNEL_TYPE_MIX_AIC_1_0` is a cube-only launch 「带有硬同步」 and is documented as the type to use
+「使用了多核控制相关指令时」** — i.e. when the kernel calls `SyncAll()` or any cross-core control instruction.
+A kernel that uses those and declares `AIC_ONLY` violates the page's own matching rule
+(「若用户设置kernel type为KERNEL_TYPE_AIC_ONLY，则算子内部实现应该为纯cube逻辑，不应该存在vector部分的逻辑」),
+which is exactly the shape of a submission-time rejection. **So for a cube-only megakernel that needs a grid
+barrier, the type is `MIX_AIC_1_0`, not `AIC_ONLY` — that is the one-line unblock for the in-kernel-collective
+work.** A second candidate from the same constraint list is worth checking in the same breath: 「当纯cube或者
+纯vec算子强制设定kernel type为MIX类型时，workspace的大小不能设置为0，需要设置一个大于0的值（比如16、32等）」.
+And since we launch with `<<<>>>`, only `KERNEL_TASK_TYPE_DEFAULT(value)` is available — `KERNEL_TASK_TYPE(key,
+value)` is 「仅支持在自定义算子工程中使用」.
+
+50.3 explains the measured MIX floor and points the opposite way from intuition. The vendor itemizes head
+overhead as 核启动 + 核取址TLB MISS + **同地址访问冲突** + 变量资源初始化, says 「头开销会随着使用的核数增加而
+增加」, and then advises in bold that **for microsecond-scale operators with little per-core work the way up is
+to launch FEWER cores and give each more work** — which is precisely our batch=1 regime, and precisely the
+opposite of filling all 20/24. It also names the mechanism behind our 0.70 us AI_VECTOR_CORE versus 12.04 us
+MIX_AIV gap: a pure-vector operator launched as MIX still pays the Cube cores' launch and init overhead for
+cores that have no instructions. And it warns that automatic kernel-type detection **cannot distinguish the
+AIC:AIV ratio and defaults to 1:2**, and 「可能失效，因为其依赖于编译优化的结果」 — so our 505 MIX_AIC calls a
+round may be partly a misclassification we can set away by hand.
+
+50.4 is a mechanism for the roofline gaps that is not launch overhead and not bandwidth. **GM address requests
+from MTE2/MTE3/Scalar are coalesced at 512-byte granularity, and simultaneous requests landing in one
+contiguous 512-byte window are serialized for coherence, worse the more cores participate** — and it is listed
+as applying to A3 at 【优先级】高. The guide's own scenario is 「每个核都会完整载入一遍输入矩阵」, which is the
+decode-time weight broadcast: every core reading the same weight tile at the same time is the worst case for
+this rule, and it would show up exactly as we see it — time far above the bytes moved, with no single operator
+to blame. The fix is free and is given as code: rotate each core's access order by
+`blockGroupStart + (mBlockIdx + blockIdx) % numBlocks`. This belongs on the list of things to try before any
+redesign, and `msopprof ./demo` with 「op_summary_*.csv中的MTE2搬运相关指标」 is the vendor's own way to see it.
+
+50.5 and 50.6 are the two remaining cheap rules. **≥16 KB per single transfer** is where bandwidth saturates,
+which is a hard constraint on how finely a fused kernel may tile its GM traffic — and a direct warning for any
+sparse-attention gather that reads many small KV blocks. The 512-byte GM alignment rule with its 70% penalty is
+**A2 only** and does not apply to us, which is worth knowing because it is easy to assume otherwise; the
+same-address rule in 50.4 is the one that does. And `SetL2CacheHint` matters more than it looks: when the
+working set exceeds L2, eviction must write the old line back to GM *before* the new line can enter, so a
+streaming read with no hint actively burns GM bandwidth evicting the weights we wanted resident — the fix is to
+mark read-once data as not entering L2.
+
+## 51. ★★ Three measured vendor cases that all blame GM same-address conflict for an MTE2-bound matmul — and the skinny-M parallelism answer, split-K
+
+Sources, all in the shipped devkit, read 2026-10-20:
+`docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_multi_core_split_k.md`,
+`matmul_multi_core_k_stagger.md`, `matmul_l2_cache_split.md`. Read these together with §50.4, which states the
+512-byte serialization rule; these three are its measured consequences on real matmuls.
+
+### 51.1 ★ Split-K: the only parallelism available when M and N are small, with its three hard constraints
+
+案例介绍, verbatim:
+
+> 为了实现算子在多核上并行执行，提升计算效率，需要将矩阵数据进行切分，切分后的数据块被分配到不同的核上处理。**通常情况下，切分矩阵数据时仅切分M、N轴，不切分K轴。若M和N较小，切分M和N轴较困难，此时需要考虑K轴切分**；开启多核切K功能后，该场景下可以对矩阵的K轴进行切分，从而使算子在多核上并行执行。由于K轴较大，在该场景下不切分K轴通常会导致单核的输入数据量过大，开启K轴切分后，切分策略能够更有效地平衡输出带宽和输入带宽。
+>
+> - 开启多核切K的适用场景
+>     - 矩阵的K轴较大，M轴和N轴相比K轴较小，可以在K轴进行切分，使算子并行执行的核数更多。
+>     - 矩阵的M轴、N轴和K轴均较大时，可以在K轴进行切分，使切分策略更好地平衡输入和输出带宽。
+> - 开启多核切K的约束条件
+>     - 开启多核切K的场景，**获取C矩阵结果时仅支持输出到Global Memory**。
+>     - 开启多核切K的场景，**需在核函数（Kernel）侧代码中首次将C矩阵分片的结果写入Global Memory之前，先对Global Memory进行清零，在获取C矩阵分片的结果时，开启AtomicAdd累加**。如果不预先清零Global Memory，可能会因为累加Global Memory中的原始无效数据而产生精度问题。
+>     - 开启多核切K的场景，**不支持Bias参与矩阵乘计算**。
+
+The case spec, verbatim — note how skinny it is:
+
+> | 输入 | Shape | Data type | Format |
+> | a | 16, 1024 | float16 | ND |
+> | b | 1024, 16 | float16 | ND |
+>
+> 当前案例使用的AI处理器共24个核，算子中开启高阶API Matmul的纯Cube模式。Tiling参数如下：
+> - 原始shape：M=16, N= 16, K=1024。
+> - 单核shape：未开启多核切K时，singleCoreM=16，singleCoreN=16，singleCoreK=1024；开启多核切K后，singleCoreM=16，singleCoreN=16，singleCoreK=512。
+
+and the measurement, verbatim:
+
+> - 优化前的流水图如下，由于未开启多核切K，且M和N非常小，原始矩阵数据未进行切分，**所有数据在单核上进行计算**。
+> - 优化前的Profiling数据如下，可以看到算子只在单核上执行，**aic_time耗时约19.60us**，其中**aic_mte2_time的平均耗时约为13.72us**，aic_mte2_ratio占比较高。
+> - 优化后的流水图如下，开启多核切K后，切分原始矩阵的K方向，单核处理K方向的数据量由原来的1024变为512，单核处理的数据量减半，MTE2流水变短。
+> - 优化后的Profiling数据如下，可以看到算子在两个核上执行，**aic_time平均耗时约为13.70us**，较优化前的19.60us有较大提升。
+
+**19.60 → 13.70 us, −30.1%, with `aic_mte2_time` 13.72 us of the original 19.60 dominating.** Only two cores,
+because K/512 = 2.
+
+### 51.2 ★★ K-axis staggering: the same-address conflict, measured, −13.2% end to end
+
+案例介绍, verbatim — this is §50.4's rule stated as a matmul problem:
+
+> 在多核并行执行Matmul计算时，**如果输入矩阵A或B的内存位置位于GM，并且参与多核计算的矩阵相同，那么将出现多核同时访问相同GM地址的情况，导致地址访问冲突，从而影响算子性能。** 若开启多核K轴错峰访问Device内存，切分的矩阵K轴方向对应的不同核将尽量从不同的GM起始地址开始访问和搬运数据，缓解地址访问冲突，提升算子性能。
+>
+> - 开启多核K轴错峰访问内存的适用场景：多核执行Matmul，且输入矩阵的K轴较大。
+> - 开启多核K轴错峰访问内存的约束条件：
+>     - **输入矩阵的K轴非全载**，K轴非全载即矩阵的K方向数据不能同时搬入及保持在L1 Buffer中。
+>     - **仅支持MDL模板。**
+>     - 在多核上执行Matmul计算。
+>     - **A矩阵或B矩阵的内存位置位于GM。**
+
+Spec: `a` (768, 6144) float16 ND, `b` (6144, 2048) float16 ND. The diagnosis and result, verbatim:
+
+> 优化前的Profiling数据（PipeUtilization.csv）如下所示，**aic_mte2_ratio平均达到0.93**，MTE2在算子整体执行时长中占比较高，算子当前为MTE2 Bound。本案例中，矩阵按M和N方向切分，单核shape[singleCoreM，singleCoreN，singleCoreK]为[128, 512, 6144]，基本块shape[baseM，baseN，baseK]为[128, 256, 64]，**每次加载A矩阵的数据时，多核有概率同时访问同一GM地址，引发地址冲突，导致MTE2搬运效率降低，MTE2执行耗时增加。**
+>
+> 查看OpBasicInfo.csv文件，优化前算子整体耗时为**98.72us**。
+>
+> 算子Tiling参数不变，优化后的Profiling数据（PipeUtilization.csv）如下所示。可以看到，**MTE2耗时显著降低，MTE2的平均耗时从90us降低到69.87us，最大耗时从91.94us降低到75.82us。**
+>
+> 查看OpBasicInfo.csv文件，优化后算子整体耗时为**85.68us**，耗时从98.72us降低到85.68us，**性能提升13.2%**。
+
+> 总结：在多核执行Matmul的场景，当输入矩阵K轴较大（**一般大于4096**）时，可以尝试使用MDL模板并开启K轴错峰访问内存的功能，缓解地址访问冲突，提升MTE2搬运效率，进而优化算子性能。
+
+**98.72 → 85.68 us, −13.2%, with the tiling unchanged.** MTE2 mean 90 → 69.87 us, max 91.94 → 75.82 us. The
+only change is which GM address each core starts from.
+
+### 51.3 L2 Cache splitting — and a third appearance of the same-address fix
+
+案例介绍 and the diagnosis, verbatim:
+
+> 当前案例基于Tiling全量常量化进一步优化… 优化前的Profiling数据如下，C列的**aic_time是867us**，K列的**aic_mte2_time是861.9us，MTE2占比为99%**，MTE2数据搬运是当前算子性能的瓶颈。
+
+The three optimization points, verbatim:
+
+> - 优化点一：调整切块大小和计算次数
+>     - 优化前，输入数据不进行切分，所有核一次计算全部数据。…24个核一次计算A和B矩阵的所有数据。
+>     - 优化后，输入数据被切分多次，所有核分多次计算，每个核单次计算只依赖切分后的数据量。**L2 Cache切分方案确保单次计算的数据都在L2 Cache缓存中**，搬运输入数据的效率更高。
+> - 优化点二：**选择拖尾较小的L2 Cache切分方案**
+> - 优化点三：**错位分核，减少左右矩阵同地址冲突问题**
+
+and the result, verbatim:
+
+> 优化后的Profiling数据如下，C列的**aic_time为805.6us**，相比于优化前，**总执行时间降低了约7.1%，MTE2搬运时间降低了约10.7%**。
+
+**867 → 805.6 us, −7.1%, MTE2 −10.7%** — and note that optimization point three is 「错位分核」, staggered core
+assignment to reduce left/right-matrix same-address conflict, i.e. the same fix again.
+
+## Relevance
+
+Three independent vendor tuning cases, on three different shapes, all diagnose an MTE2-bound matmul and all
+reach for staggering as part of the fix: §50.4's `(mBlockIdx + blockIdx) % numBlocks` rotation for a plain
+`DataCopy`, §51.2's K-axis staggering worth **−13.2% end to end with the tiling unchanged**, and §51.3's
+「错位分核」 as one of three points worth **−7.1%**. Together with §50.4's statement of the mechanism — GM
+requests coalesced at 512 bytes and serialized when several cores land in one window, worse the more cores
+participate, at 【优先级】高 on A3 — that is a convergent, measured explanation for time far above bytes moved
+with no single operator to blame. Our above-roofline families all share the shape the cases describe: 「参与多核
+计算的矩阵相同」, every core reading the same weight. It costs index arithmetic to test.
+
+§51.1 is the structural answer for our regime rather than a tuning knob. At batch=1 M is 1 (or 8 rows under the
+MSD stack) and N per expert is modest, so **M and N cannot supply 20-24 cores of parallelism and K is the only
+axis left** — which is exactly the case the document is written for, and it measures 19.60 → 13.70 us, −30.1%,
+on M=N=16, K=1024, the skinniest shape in the whole guide. Its three constraints are the price and all three
+bite us: C must go to **Global Memory** (no L0C-resident accumulation across the split), the output buffer must
+be **zeroed before the first write and accumulated with AtomicAdd** (「如果不预先清零Global Memory，可能会因为
+累加Global Memory中的原始无效数据而产生精度问题」), and **Bias is not supported** in a split-K matmul — which
+collides directly with folding our `8*sum(w)` correction in as a bias, and pushes it back to a post-GEMM
+row-scale (`fused-moe-expert.md` §B7.2, equation 6) or to the extra `-8` matmul row of PR #17201.
+
+§51.2's constraints are cheaper and worth checking against our tiling now: it needs the **MDL template**, K
+**not** fully resident in L1 (`singleK > baseK * stepK`), multi-core execution, and A or B in GM — and the
+summary puts the useful threshold at K **> 4096**. GLM-5.2's per-expert K is in that range, so the gate is the
+MDL template and L1 residency rather than the shape.
