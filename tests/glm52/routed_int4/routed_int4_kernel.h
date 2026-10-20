@@ -17,7 +17,7 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         void* gu_tiling, void* down_tiling, void* witness,
                         void* group_count, void* group_start,
                         void* source_row, float* row_weight,
-                        void* workspace, int64_t experts, int64_t layers);
+                        void* workspace, int64_t experts);
 
 /** Fill a 256-byte buffer with the cube tiling for one INT4 projection. */
 extern "C" int routed_int4_build_tiling(int rows, int columns, int inner,
