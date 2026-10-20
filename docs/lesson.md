@@ -1767,3 +1767,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      in a graph), as the native device cost (80x smaller) and as arrival skew.
      What remains is message size: a MoE all-gather carries rows x hidden x
      world, 2.3 MB at twelve rows, against the 12 to 576 KB swept so far.
+
+171. Four explanations excluded, and the fourth indicts the profile. Sixteen
+     ranks under AIV: an all_reduce is 186.96 us at twelve rows and 288.82 at
+     384, so the profile's 831 us needs far more rows than a decode has, and
+     its 882 us all_gather about 450. With host issue, the native device cost
+     and arrival skew already excluded, what remains is that
+     profile-rope-20261018 carries max_tokens 6 and mtp_width 4 -- the
+     configuration this project already ruled void for steady-state accounting.
+     Its collectives are prefill-sized and include the domain build. So the 858
+     us was never a decode figure and two of today's reversals leaned on it.
+     The queued steady-state capture is not one experiment among several; it is
+     the only thing that closes this.

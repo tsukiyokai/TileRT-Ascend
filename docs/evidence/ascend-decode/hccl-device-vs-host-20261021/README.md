@@ -113,3 +113,39 @@ shape from the 12 to 576 KB swept here. That is measurable without the engine
 -- the MoE's gather is rows x hidden x world, and at twelve rows that is 2.3 MB
 -- and it is the next thing to try rather than another reading of the same
 profile.
+
+## Message size is excluded too, which indicts the profile rather than the engine
+
+Sixteen ranks under AIV with determinism:
+
+| rows | sent MB | gathered MB | all_reduce | all_gather |
+|---|---|---|---|---|
+| 12 | 0.15 | 2.36 | 186.96 | 178.52 |
+| 48 | 0.59 | 9.44 | 187.09 | 395.88 |
+| 96 | 1.18 | 18.87 | 202.50 | 430.76 |
+| 192 | 2.36 | 37.75 | 222.63 | 532.83 |
+| 384 | 4.72 | 75.50 | 288.82 | 758.60 |
+
+Reaching the profile's 831 us an allReduce would need far more than 384 rows,
+and its 882 us an allGather about 450. A decode round has twelve.
+
+So all four explanations are excluded: host-side issue, the native device cost,
+arrival skew, and message size.
+
+## Which leaves the profile itself
+
+`profile-rope-20261018` carries `max_tokens: 6, mtp_width: 4` -- a configuration
+this project already ruled void for steady-state decode accounting, in the
+correction that voided a whole day's device-time budget. Its collectives are
+therefore prefill-sized and include the domain build, which is exactly what a
+previous page found when the by-type average folded a one-off into a per-round
+figure.
+
+So the 858 us was never a decode figure, and two of today's reversals leaned on
+it. The honest state: at decode shapes a sixteen-rank collective is 177 to 187
+us through torch and 10.74 on the device, the engine's share of that is
+unmeasured because no steady-state capture exists, and the 374 us a layer
+residual has no attribution.
+
+The queued steady-state capture is not one more experiment among several. It is
+the only thing that can close this.
