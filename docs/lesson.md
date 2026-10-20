@@ -1938,3 +1938,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      count while quadrupling the read loses, because at twelve rows attention
      is read-dominated. So the gate is not only numerically right, it protects
      a path 19 percent slower at the width the drafters want.
+
+185. Attention's cost is 88 percent fixed and the KV read is 12 percent of it.
+     One die, twelve rows, capacity swept: 171.75 us at 512 rows and 207.96 at
+     16384 -- thirty-two times the cache for 21 percent more time, fitting 170
+     us of intercept and 2.3 us a thousand rows. So the previous turn's claim
+     that the cost "equals reading 9.4 MB, a physical quantity" was wrong by a
+     division: 9.4 MB in 196 us is 48 GB/s, three percent of HBM. It also
+     explains why the gathered path loses, keeping the fixed term while
+     quadrupling the bytes, and why 64 heads cost 1.85 times four. A 170 us
+     intercept once a layer is 13.3 ms a round, the largest fixed cost after
+     the collectives, and it is neither the cache nor the heads nor the rows.
