@@ -269,3 +269,24 @@ curve, where the bank is nearly free.
 The device figure is what a captured layer pays, so 7.79 ms a round is the one
 to carry. The others were all measured around a synchronise and each carried
 part of the host tax that a graph removes.
+
+## At the row count a rank actually receives
+
+Twelve draft rows pick eight of 256 experts each and a rank owns sixteen, so a
+rank receives about `12 * 8 * 16/256 = 6` rows, not the 96 the earlier
+measurement used. Profiled at both:
+
+| experts | 6 rows | 96 rows |
+|---|---|---|
+| 2 | 17.02 us | 18.15 us |
+| 16 | 114.05 | 116.95 |
+| saved | 97.03 us, **7.57 ms a round** | 98.80 us, 7.71 ms |
+
+Sixteen times the rows changes the cost by two to three percent, so the
+operator is flat in rows at the shapes that matter as well as the ones first
+measured, and the lever's price is 7.57 to 7.71 ms a round either way.
+
+That is the session's best-evidenced lever: device time rather than host round
+trip, the row count a rank really sees, bit-exact across five gap patterns, a
+superlinear curve whose flat part is where the workload sits, and the
+zero-copy form the operator accepts.

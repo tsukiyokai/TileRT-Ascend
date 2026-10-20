@@ -2016,3 +2016,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      fused with its neighbours. What survives is the rope lever, measured
      directly as 7588.89 us eager against 336.63 replayed rather than inferred
      from a profile. A profile cannot tell you which path the host took.
+
+191. The bank narrowing holds at the row count a rank actually receives. Twelve
+     draft rows picking eight of 256 experts on a rank owning sixteen is about
+     six rows, not the 96 first measured. Profiled at both: two experts cost
+     17.02 us at six rows and 18.15 at 96, sixteen cost 114.05 and 116.95 --
+     two to three percent across sixteen times the rows. So the lever is 7.57
+     to 7.71 ms a round either way, and the operator's flatness in rows holds
+     at the shape that matters rather than only the one convenient to measure.
