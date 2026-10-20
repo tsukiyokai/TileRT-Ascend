@@ -1910,6 +1910,10 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      against a measured 50.710 -- an upper bound, since the engine fuses into
      637 super kernels and overlaps streams. The parts are what transfer:
      collectives are 29.44 ms a round with AIV already on, and at 5.441
-     accepted that alone is 5.41 ms of TPOT. So the target is unreachable while
-     every layer reduces twice, and all five exits from the collective cost are
-     closed by measurement.
+     accepted that alone is 5.41 ms of TPOT. But pricing the reduce count with
+     the compute kept in corrects that reading: two reduces a layer give 12.52
+     ms, one gives 9.79, none gives 7.07, all on the synthetic layer's 38.47 ms
+     of compute. So removing every reduce is not sufficient, and the earlier
+     2.72 ms came from dividing only the collective term. The target needs the
+     reduce count halved and the compute at the engine's fused figure and the
+     drafting at its ceiling, together.

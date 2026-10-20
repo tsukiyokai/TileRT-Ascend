@@ -47,3 +47,31 @@ primitive -- are all closed. At 5.441 accepted, 29.44 ms of collectives alone is
 
 That is the session's hardest finding and it is now measured rather than
 inferred: the target is unreachable while every layer reduces twice.
+
+## Pricing the reduce count, with the compute kept in
+
+The collective floor is per call and the message is free, so the reduce count
+is the only collective lever left. At 5.441 accepted:
+
+| reduces a layer | collectives ms | + compute | TPOT ms |
+|---|---|---|---|
+| 2 | 29.64 | 68.11 | 12.52 |
+| 1 | 14.82 | 53.29 | 9.79 |
+| 0 | 0.00 | 38.47 | 7.07 |
+
+Compute is the synthetic layer's 38.47 ms, which is an upper bound -- the
+engine's own round is 50.710 against this arrangement's 67.91, because it fuses
+into 637 super kernels and overlaps streams. On the census's 16.4 ms of super
+kernel time instead, one reduce a layer gives 5.74 ms.
+
+## Which corrects the previous section's arithmetic
+
+That section divided only the collective term by the acceptance and read 2.72
+ms. With the compute kept in, removing every reduce still leaves 7.07 ms on the
+naive layer and the target needs both halves down.
+
+So the honest statement: the reduce count is worth 2.73 ms of TPOT on this
+bound, which is real and not sufficient. The target needs the reduce count
+halved **and** the compute at the engine's fused figure **and** the drafting at
+its measured ceiling, all three at once -- which is the first time this session
+has priced them together rather than one at a time.
