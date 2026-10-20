@@ -1889,3 +1889,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      ten are AddRmsNorm at 208 to 215 us, a merge already taken. Twenty percent
      of super kernel time is in kernels whose names carry a collective, which
      is where AIV lands inside the super kernel rather than beside it.
+
+181. Reducing the argmax instead of the logits does not help, and it reprices
+     the outlier. Sixteen ranks under AIV: all-reducing 7.3 MB of logits then
+     taking argmax is 356.79 us, while all-gathering twelve rows of (value,
+     global index) -- 1.5 KB -- is 406.48, worse by 49.68. Both pay the same
+     per-call floor, and the pair version adds a local max, two writes and a
+     second argmax. And since a full-vocabulary fp32 all_reduce at decode sizes
+     is 357 us against the capture's 3282 for the kernel wrapping one, the
+     outlier is 9.2x too large to be that reduction -- it is a prefill figure,
+     the capture being max_tokens 6. Third time today this capture's scope
+     produced a number that does not transfer.
