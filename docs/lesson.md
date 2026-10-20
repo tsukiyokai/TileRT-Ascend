@@ -1170,3 +1170,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      either would weaken a real guarantee for the sake of a measurement. Five
      of the seven were our own hard-coded depths, which is what makes a model
      impossible to shrink for any purpose at all.
+
+120. The project's best result belongs to a different drafter than the plan
+     credits. `lever84-20261020/auto12` records `drafter: "lookup"`, and the
+     bench writes that field as `"automaton" if args.automaton else "lookup"`,
+     so the 9.3794 ms TPOT is `LookupDrafter`'s and the suffix automaton has
+     never run in the engine. The directory names -- auto8, auto12, auto16 --
+     were read as the drafter rather than as the sweep. The same reading found
+     that `--automaton` did not imply the host-drafted path, so all
+     thirty-five arms queued today would have measured the MTP engine under
+     names that say drafter. Read the record's own fields, not the directory's
+     name.
