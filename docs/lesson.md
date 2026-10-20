@@ -975,3 +975,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      their TBE kernels. Net 2.14 ms a round against 1.4 for unsetting the path
      wholesale. The third failure is what located the layer; the first two were
      guesses at it.
+
+103. The width cost is capture, not the operators, and a synthetic graph shows
+     it without the machine. Eight layers of projections and norms: eager goes
+     568.7 to 554.4 us across a fourfold row range -- flat and slightly
+     decreasing -- while replay goes 527.0 to 582.9, monotonically up, 2.3 us a
+     row. Scaled to 78 layers that is 1.77 ms a row a round against the round
+     model's 0.814, high by about twice in the direction an eight-layer
+     extrapolation should be. So capture fixes shapes into the task list and a
+     list built for more rows costs more to replay even where the operators are
+     flat. Ten mechanisms were hypothesised for this before a graph was
+     captured at two widths, which was always the direct test.
