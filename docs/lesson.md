@@ -509,3 +509,18 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     attribution of mine that measurement overturned today, and the four share
     a shape: I measured what I assumed the engine does. Read the call site
     first.
+
+61. Find the outermost opaque boundary before deciding what to fuse. I chose
+    the quant method for the integration because it looked like the smallest
+    change -- and it sits between the permutation and the combine, so it can
+    deliver the grouped matmuls and nothing else. The boundary that holds the
+    whole block is one custom op: `ascend_moe_forward_shared_sp` takes the
+    unpermuted hidden states and the router logits and returns the shared and
+    routed outputs, and `AscendMoERunner` keeps it in `_forward_entry`, an
+    instance attribute, so substituting it is one assignment a layer and
+    brings the gating, the permutation, both sets of experts, the combine and
+    the shared path's reduce-scatter inside. Fusion is worth what the boundary
+    encloses, which is this project's whole argument; I nearly violated it in
+    my own integration design. This constrains design where lesson 60
+    constrains measurement: read the call chain outward before pricing a
+    saving, not just before measuring one.
