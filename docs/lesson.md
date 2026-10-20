@@ -777,3 +777,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     punctuated by short rewrites -- so a single width tuned for the mean is
     wrong at both ends, and the drafter should widen inside a copy stretch and
     narrow inside a rewrite.
+
+84. A proposal ceiling is not a quota. Sizing the automaton's proposal at twice
+    the last round's acceptance keeps 83 percent of the acceptance for 39
+    percent of the mean width, which is TPOT 6.75 against 7.18 at an edit rate
+    of 0.02 and 12.02 against 13.24 at 0.05 -- because a round costs 0.814 ms a
+    proposed row and rows that were never going to hold are paid for anyway.
+    The first signal tried, the matched suffix length, measured worse at every
+    rate: it is typically under nine on this corpus, so a threshold at eight
+    never fired, and the automaton's advantage comes from the most frequent
+    continuation of a short match rather than from a long match. Scoring any of
+    this inside a loop whose columns share one advance locks the feedback at the
+    narrowest width; an adaptive column needs its own trajectory.

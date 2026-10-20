@@ -105,6 +105,8 @@ def run(stream, prompt_length, width, budget, branches, longest):
     chain_accepted = []
     long_accepted = []
     automaton_accepted = []
+    adaptive_accepted = []
+    adaptive_cost = []
     tree_accepted = []
     at = prompt_length
     while at < len(stream):
@@ -113,6 +115,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
         matched = accepted_by_chain(linear, truth)
         longer = accepted_by_chain(long_chain.propose(width), truth)
         walked = accepted_by_chain(automaton.propose(width), truth)
+
         tokens, parents = tree.propose()
         through_tree = accepted_by_tree(tokens, parents, truth)
         # A round commits what the draft got right plus the one token the
@@ -120,6 +123,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
         chain_accepted.append(matched + 1)
         long_accepted.append(longer + 1)
         automaton_accepted.append(walked + 1)
+
         tree_accepted.append(through_tree + 1)
         step = min(max(matched, longer, walked, through_tree) + 1,
                    len(stream) - at)
@@ -128,7 +132,22 @@ def run(stream, prompt_length, width, budget, branches, longest):
         automaton.commit(stream[at:at + step])
         tree.commit(stream[at:at + step])
         at += step
-    return chain_accepted, long_accepted, automaton_accepted, tree_accepted
+    walker = AutomatonDrafter(prompt, longest=longest, shortest=2)
+    at = prompt_length
+    taken_last = 1
+    while at < len(stream):
+        truth = stream[at:at + max(width, budget)]
+        here = min(width, max(2, 2 * taken_last))
+        taken = accepted_by_chain(walker.propose(here), truth) + 1
+        taken = min(taken, len(stream) - at)
+        walker.commit(stream[at:at + taken])
+        adaptive_accepted.append(taken)
+        adaptive_cost.append(here)
+        taken_last = taken
+        at += taken
+
+    return (chain_accepted, long_accepted, automaton_accepted,
+            adaptive_accepted, adaptive_cost, tree_accepted)
 
 
 def main():
@@ -150,12 +169,15 @@ def main():
     print(f"width {arguments.width}  budget {arguments.budget}  "
           f"branches {arguments.branches}  longest {arguments.longest}")
     print(f"{'edit rate':>10}  {'chain8':>7}  {'chain32':>7}  "
-          f"{'automaton':>9}  {'tree':>7}  {'swap':>6}  {'rounds':>7}")
+          f"{'automaton':>9}  {'adaptive':>8}  {'width':>6}  "
+          f"{'tree':>7}  {'tpot@w':>8}  {'tpot@adp':>9}  {'rounds':>7}")
     for rate in [float(piece) for piece in arguments.rates.split(",")]:
         generator = random.Random(arguments.seed)
         chain_total = []
         long_total = []
         automaton_total = []
+        adaptive_total = []
+        adaptive_width = []
         tree_total = []
         for body in bodies:
             if len(body) < 64:
@@ -165,7 +187,10 @@ def main():
             columns = run(stream, len(body), arguments.width,
                           arguments.budget, arguments.branches,
                           arguments.longest)
-            chain_accepted, long_accepted, automaton_accepted, tree_accepted = columns
+            (chain_accepted, long_accepted, automaton_accepted,
+             adaptive_accepted, adaptive_cost, tree_accepted) = columns
+            adaptive_total.extend(adaptive_accepted)
+            adaptive_width.extend(adaptive_cost)
             chain_total.extend(chain_accepted)
             long_total.extend(long_accepted)
             automaton_total.extend(automaton_accepted)
@@ -176,9 +201,14 @@ def main():
         long_mean = sum(long_total) / len(long_total)
         walked_mean = sum(automaton_total) / len(automaton_total)
         tree_mean = sum(tree_total) / len(tree_total)
-        print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {long_mean:>7.3f}  "
-              f"{walked_mean:>9.3f}  {tree_mean:>7.3f}  "
-              f"{walked_mean / chain_mean:>6.3f}  {len(chain_total):>7}")
+        adaptive_mean = sum(adaptive_total) / len(adaptive_total)
+        width_mean = sum(adaptive_width) / len(adaptive_width)
+        fixed_tpot = (45.88 + 0.814 * arguments.width) / walked_mean
+        adaptive_tpot = (45.88 + 0.814 * width_mean) / adaptive_mean
+        print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {walked_mean:>9.3f}  "
+              f"{adaptive_mean:>8.3f}  {width_mean:>6.1f}  "
+              f"{tree_mean:>7.3f}  {fixed_tpot:>8.2f}  "
+              f"{adaptive_tpot:>9.2f}  {len(chain_total):>7}")
 
 
 if __name__ == "__main__":
