@@ -69,3 +69,36 @@ cube is flat in rows, so the cost should hold under a real group list, but
 variable rows are unmeasured and the host side of a group list is a separate
 change. And none of this is integrated: the graph still runs the vendor's two
 grouped matmuls, so no end-to-end TPOT has moved.
+
+## Padding is not free, and the floor is weight streaming
+
+Rows an expert is a build-time capacity, swept at sixteen experts on sixteen
+blocks. The premise under test was that the cube is flat in rows, so padding
+every expert to one capacity would cost nothing and retire the host side of a
+group list.
+
+| capacity | wall, µs | against the host reference |
+|---|---|---|
+| 2 | 49.289 | 0 of 196608 |
+| 4 | 51.969 | 0 of 393216 |
+| 8 | 55.263 | 0 of 786432 |
+| 16 | 63.308 | 0 of 1572864 |
+| 32 | 79.820 | 0 of 3145728 |
+
+The premise is wrong, and visibly so: 1.62 times from two rows to
+thirty-two. The cube is flat in rows, but this kernel is not only cube -- the
+epilogue walks rows by 6144 and is linear in them. The fit is
+47.25 µs + 1.02 µs a row, over the whole range.
+
+That fixed 47.25 µs is weight streaming. Each block pulls its expert's
+2.36 MB of INT8 weights, sixteen blocks at once, so 799 GB/s against the
+die's 1.155 TB/s: 69% of peak. For batch-one decode that is where the floor
+belongs, and it is the thing to attack next, not the per-row term.
+
+So capacity must follow the real row counts rather than the worst case. A
+round at width 32 puts 32 tokens through top-8, which is 256 selections over
+256 experts, so a rank's sixteen average one row each -- but a popular expert
+can take several, and a capacity sized for 32 would pay 62% over the
+measurement above. The group list the routing op already emits gives the
+actual counts, so variable rows cost 47.25 + 1.02 × the busiest block's rows,
+which beats every fixed capacity.

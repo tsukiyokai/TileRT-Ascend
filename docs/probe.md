@@ -77,6 +77,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 | 10-20 | [Handshake modes](evidence/ascend-decode/handshake-20261020/README.md) | Four reverse modes × three set-and-wait patterns × one and four rounds, each variant its own process under a timeout. | Reverse modes0 and1 deadlock in every pattern; mode2 is live only when both subblocks set and the cube waits once; mode3 is live in all three. Markers are unreliable (scalar store from a vector core); liveness is the measurement. |
 | 10-20 | [Routed experts, one kernel](evidence/ascend-decode/routed-kernel-20261020/README.md) | Expert-axis split, no grid barrier, hand-written AscendC on one die of a3-187. Sixteen experts on sixteen blocks is the per-rank shape at TP16. | 49.3–49.8µs a layer against the vendor's165.2 =3.3x, within12% of the45µs byte floor; 3.71ms a round against12.39, saving 8.68 ⇒1.24ms TPOT at acceptance7. Correct at every configuration up to44 experts／22 blocks: 0 of540672. Not integrated; rows an expert fixed at2. |
 
+| 10-20 | [Capacity sweep](evidence/ascend-decode/routed-kernel-20261020/README.md) | Rows an expert as a build-time capacity, 2／4／8／16／32 at16 experts on16 blocks. | Padding is not free: 49.289／51.969／55.263／63.308／79.820µs, a fit of 47.25µs+1.02µs a row. The cube is flat in rows but the epilogue is linear in them. The fixed term is weight streaming -- 2.36MB a block,16 at once,799GB/s =69% of the die's peak -- so that is the floor to attack, and capacity must follow the group list rather than the worst case. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

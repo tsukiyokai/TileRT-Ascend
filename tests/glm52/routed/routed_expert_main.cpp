@@ -25,8 +25,13 @@ namespace {
 constexpr int64_t HIDDEN = 6144;
 constexpr int64_t HALF = 128;
 constexpr int64_t GATE_UP = 2 * HALF;
-constexpr int64_t ROWS = 2;
-constexpr int64_t SCALE_STRIDE = 8;
+#ifndef ROWS_PER_EXPERT
+#define ROWS_PER_EXPERT 2
+#endif
+constexpr int64_t ROWS = ROWS_PER_EXPERT;
+constexpr int64_t BLOCK_FLOATS = 8;
+constexpr int64_t SCALE_STRIDE = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
+                                 * BLOCK_FLOATS;
 constexpr size_t TILING_BYTES = 256;
 
 void Check(aclError status, const char* what)

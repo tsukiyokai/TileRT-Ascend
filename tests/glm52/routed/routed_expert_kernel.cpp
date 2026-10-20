@@ -34,12 +34,18 @@ using namespace AscendC;
 constexpr int64_t HIDDEN = 6144;
 constexpr int64_t HALF = 128;
 constexpr int64_t GATE_UP = 2 * HALF;
-constexpr int64_t ROWS_PER_EXPERT = 2;
+#ifndef ROWS_PER_EXPERT
+#define ROWS_PER_EXPERT 2
+#endif
+constexpr int64_t ROWS = ROWS_PER_EXPERT;
 // One vector repeat of FP32, in elements; buffers carry it as slack because
 // the operators round their count up to a whole repeat.
 constexpr int64_t SLACK = 64;
 // A reduction writes a whole 32-byte block, so each row gets its own.
-constexpr int64_t REDUCE_ALIGN = 8;
+constexpr int64_t BLOCK_FLOATS = 8;
+// The scales of a expert travel as whole blocks.
+constexpr int64_t SCALE_SPAN = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
+                               * BLOCK_FLOATS;
 // One tile of the 6144-wide output a vector core walks at a time.
 constexpr int64_t TILE = 2048;
 
@@ -91,10 +97,10 @@ __aicore__ inline void ProjectGateUp(TPipe& pipe, __gm__ int8_t* rows,
     GlobalTensor<int8_t> a;
     GlobalTensor<int8_t> b;
     GlobalTensor<int32_t> c;
-    a.SetGlobalBuffer(rows, ROWS_PER_EXPERT * HIDDEN);
+    a.SetGlobalBuffer(rows, ROWS * HIDDEN);
     b.SetGlobalBuffer(weight, GATE_UP * HIDDEN);
-    c.SetGlobalBuffer(product, ROWS_PER_EXPERT * GATE_UP);
-    mm.SetOrgShape(ROWS_PER_EXPERT, GATE_UP, HIDDEN);
+    c.SetGlobalBuffer(product, ROWS * GATE_UP);
+    mm.SetOrgShape(ROWS, GATE_UP, HIDDEN);
     mm.SetTensorA(a);
     mm.SetTensorB(b, true);
     mm.IterateAll(c);
@@ -114,10 +120,10 @@ __aicore__ inline void ProjectDown(TPipe& pipe, __gm__ int8_t* codes,
     GlobalTensor<int8_t> a;
     GlobalTensor<int8_t> b;
     GlobalTensor<int32_t> c;
-    a.SetGlobalBuffer(codes, ROWS_PER_EXPERT * HALF);
+    a.SetGlobalBuffer(codes, ROWS * HALF);
     b.SetGlobalBuffer(weight, HIDDEN * HALF);
-    c.SetGlobalBuffer(product, ROWS_PER_EXPERT * HIDDEN);
-    mm.SetOrgShape(ROWS_PER_EXPERT, HIDDEN, HALF);
+    c.SetGlobalBuffer(product, ROWS * HIDDEN);
+    mm.SetOrgShape(ROWS, HIDDEN, HALF);
     mm.SetTensorA(a);
     mm.SetTensorB(b, true);
     mm.IterateAll(c);
@@ -150,21 +156,20 @@ struct Epilogue {
     __aicore__ inline void Init(TPipe& pipe)
     {
         pipe.InitBuffer(product_buffer,
-                        (ROWS_PER_EXPERT * GATE_UP + SLACK) * sizeof(int32_t));
+                        (ROWS * GATE_UP + SLACK) * sizeof(int32_t));
         pipe.InitBuffer(gate_buffer, (HALF + SLACK) * sizeof(float));
         pipe.InitBuffer(up_buffer, (HALF + SLACK) * sizeof(float));
         pipe.InitBuffer(work_buffer, (HALF + SLACK) * sizeof(float));
         pipe.InitBuffer(scale_buffer, (GATE_UP + SLACK) * sizeof(float));
-        pipe.InitBuffer(token_buffer, (ROWS_PER_EXPERT + SLACK)
-                                      * sizeof(float));
+        pipe.InitBuffer(token_buffer, (SCALE_SPAN + SLACK) * sizeof(float));
         pipe.InitBuffer(rowmax_buffer,
-                        ROWS_PER_EXPERT * REDUCE_ALIGN * sizeof(float));
+                        ROWS * BLOCK_FLOATS * sizeof(float));
         pipe.InitBuffer(activation_buffer,
-                        (ROWS_PER_EXPERT * HALF + SLACK) * sizeof(float));
+                        (ROWS * HALF + SLACK) * sizeof(float));
         pipe.InitBuffer(half_buffer,
-                        (ROWS_PER_EXPERT * HALF + SLACK) * sizeof(half));
+                        (ROWS * HALF + SLACK) * sizeof(half));
         pipe.InitBuffer(code_buffer,
-                        (ROWS_PER_EXPERT * HALF + SLACK) * sizeof(int8_t));
+                        (ROWS * HALF + SLACK) * sizeof(int8_t));
         product = product_buffer.Get<int32_t>();
         gate = gate_buffer.Get<float>();
         up = up_buffer.Get<float>();
@@ -209,18 +214,18 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* product,
     GlobalTensor<float> token_global;
     GlobalTensor<int8_t> code_global;
     GlobalTensor<float> out_scale_global;
-    product_global.SetGlobalBuffer(product, ROWS_PER_EXPERT * GATE_UP);
+    product_global.SetGlobalBuffer(product, ROWS * GATE_UP);
     scale_global.SetGlobalBuffer(gu_scale, GATE_UP);
-    token_global.SetGlobalBuffer(token_scale, REDUCE_ALIGN);
-    code_global.SetGlobalBuffer(codes, ROWS_PER_EXPERT * HALF);
-    out_scale_global.SetGlobalBuffer(out_scale, REDUCE_ALIGN);
+    token_global.SetGlobalBuffer(token_scale, SCALE_SPAN);
+    code_global.SetGlobalBuffer(codes, ROWS * HALF);
+    out_scale_global.SetGlobalBuffer(out_scale, SCALE_SPAN);
 
     DataCopy(held.scale, scale_global, GATE_UP);
-    DataCopy(held.token, token_global, REDUCE_ALIGN);
+    DataCopy(held.token, token_global, SCALE_SPAN);
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::UB>();
 
-    for (int64_t row = 0; row < ROWS_PER_EXPERT; ++row) {
+    for (int64_t row = 0; row < ROWS; ++row) {
         DataCopy(held.product, product_global[row * GATE_UP], GATE_UP);
         PipeBarrier<PIPE_ALL>();
         Cast(held.gate, held.product, RoundMode::CAST_NONE, HALF);
@@ -240,14 +245,14 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* product,
         DataCopy(held.activation[row * HALF], held.gate, HALF);
         Abs(held.work, held.gate, HALF);
         PipeBarrier<PIPE_V>();
-        ReduceMax(held.rowmax[row * REDUCE_ALIGN], held.work, held.work, HALF,
+        ReduceMax(held.rowmax[row * BLOCK_FLOATS], held.work, held.work, HALF,
                   false);
     }
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::UB>();
 
-    for (int64_t row = 0; row < ROWS_PER_EXPERT; ++row) {
-        const float largest = held.rowmax.GetValue(row * REDUCE_ALIGN);
+    for (int64_t row = 0; row < ROWS; ++row) {
+        const float largest = held.rowmax.GetValue(row * BLOCK_FLOATS);
         const float quantum = largest / 127.0F;
         held.token.SetValue(row, quantum);
         Muls(held.gate, held.activation[row * HALF], 1.0F / quantum, HALF);
@@ -258,10 +263,10 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* product,
              HALF);
     }
     PipeBarrier<PIPE_ALL>();
-    DataCopy(code_global, held.code, ROWS_PER_EXPERT * HALF);
+    DataCopy(code_global, held.code, ROWS * HALF);
     // The scale leaves by MTE. A scalar store to global memory from a vector
     // core does not land -- it goes through the one incoherent cache here.
-    DataCopy(out_scale_global, held.token, REDUCE_ALIGN);
+    DataCopy(out_scale_global, held.token, SCALE_SPAN);
 }
 
 /** Scale one expert's down product into BF16. */
@@ -280,7 +285,7 @@ __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* product,
     pipe.InitBuffer(value_buffer, (TILE + SLACK) * sizeof(float));
     pipe.InitBuffer(scale_buffer, (TILE + SLACK) * sizeof(float));
     pipe.InitBuffer(narrow_buffer, (TILE + SLACK) * sizeof(bfloat16_t));
-    pipe.InitBuffer(row_buffer, (ROWS_PER_EXPERT + SLACK) * sizeof(float));
+    pipe.InitBuffer(row_buffer, (SCALE_SPAN + SLACK) * sizeof(float));
     LocalTensor<int32_t> wide = product_buffer.Get<int32_t>();
     LocalTensor<float> value = value_buffer.Get<float>();
     LocalTensor<float> scale = scale_buffer.Get<float>();
@@ -291,16 +296,16 @@ __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* product,
     GlobalTensor<float> scale_global;
     GlobalTensor<float> middle_global;
     GlobalTensor<bfloat16_t> out_global;
-    product_global.SetGlobalBuffer(product, ROWS_PER_EXPERT * HIDDEN);
+    product_global.SetGlobalBuffer(product, ROWS * HIDDEN);
     scale_global.SetGlobalBuffer(down_scale, HIDDEN);
-    middle_global.SetGlobalBuffer(middle_scale, REDUCE_ALIGN);
-    out_global.SetGlobalBuffer(out, ROWS_PER_EXPERT * HIDDEN);
+    middle_global.SetGlobalBuffer(middle_scale, SCALE_SPAN);
+    out_global.SetGlobalBuffer(out, ROWS * HIDDEN);
 
-    DataCopy(row_scale, middle_global, REDUCE_ALIGN);
+    DataCopy(row_scale, middle_global, SCALE_SPAN);
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::UB>();
 
-    for (int64_t row = 0; row < ROWS_PER_EXPERT; ++row) {
+    for (int64_t row = 0; row < ROWS; ++row) {
         const float of_row = row_scale.GetValue(row);
         for (int64_t done = from; done < upto; done += TILE) {
             const int64_t count = (upto - done < TILE) ? upto - done : TILE;
@@ -349,16 +354,16 @@ __aicore__ void routed_expert_fused(
             if (expert >= experts) {
                 break;
             }
-            ProjectGateUp(pipe, rows + expert * ROWS_PER_EXPERT * HIDDEN,
+            ProjectGateUp(pipe, rows + expert * ROWS * HIDDEN,
                           gate_up + expert * GATE_UP * HIDDEN,
-                          partial + expert * ROWS_PER_EXPERT * GATE_UP,
+                          partial + expert * ROWS * GATE_UP,
                           gu_tiling);
             Publish();
             CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
             CrossCoreWaitFlag<0x03, PIPE_MTE2>(MIDDLE_READY);
-            ProjectDown(pipe, middle + expert * ROWS_PER_EXPERT * HALF,
+            ProjectDown(pipe, middle + expert * ROWS * HALF,
                         down + expert * HIDDEN * HALF,
-                        wide + expert * ROWS_PER_EXPERT * HIDDEN,
+                        wide + expert * ROWS * HIDDEN,
                         down_tiling);
             Publish();
             CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
@@ -376,19 +381,19 @@ __aicore__ void routed_expert_fused(
             }
             CrossCoreWaitFlag<0x02, PIPE_MTE2>(GATE_READY);
             if (sub == 0) {
-                Activate(pipe, partial + expert * ROWS_PER_EXPERT * GATE_UP,
+                Activate(pipe, partial + expert * ROWS * GATE_UP,
                          gu_scale + expert * GATE_UP,
-                         token_scale + expert * REDUCE_ALIGN,
-                         middle + expert * ROWS_PER_EXPERT * HALF,
-                         middle_scale + expert * REDUCE_ALIGN);
+                         token_scale + expert * SCALE_SPAN,
+                         middle + expert * ROWS * HALF,
+                         middle_scale + expert * SCALE_SPAN);
                 Publish();
                 CrossCoreSetFlag<0x03, PIPE_MTE3>(MIDDLE_READY);
             }
             CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
-            Narrow(pipe, wide + expert * ROWS_PER_EXPERT * HIDDEN,
+            Narrow(pipe, wide + expert * ROWS * HIDDEN,
                    down_scale + expert * HIDDEN,
-                   middle_scale + expert * REDUCE_ALIGN,
-                   out + expert * ROWS_PER_EXPERT * HIDDEN, from,
+                   middle_scale + expert * SCALE_SPAN,
+                   out + expert * ROWS * HIDDEN, from,
                    from + share);
         }
     }

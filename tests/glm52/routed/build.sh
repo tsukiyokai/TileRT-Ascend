@@ -30,17 +30,20 @@ sanitize=${SANITIZE:+--cce-enable-sanitizer}
 # kernel metadata, which the runtime log reports as schemMode.
 debug=${DEBUG:+-g}
 arch=${ARCH:---npu-arch=dav-2201}
+# Rows an expert is a build-time capacity: the cube is flat in rows, so
+# padding every expert to one may cost nothing and retire the group list.
+capacity=${CAPACITY:+-DROWS_PER_EXPERT=$CAPACITY}
 host_incs="-I $H/tikcpp/tikcfw -I $H/tikcpp/tikcfw/lib -I $H/tikcpp/tikcfw/impl"
 host_incs="$host_incs -I $H/tikcpp/tikcfw/interface"
 host_incs="$host_incs -I /opt/ascend/cann-9.2.0/include -I $here"
 
 /opt/ascend/cann-9.2.0/bin/bisheng -xcce "$arch" \
-  -std=c++17 -O2 ${sanitize:-} ${debug:-} $device_incs \
+  -std=c++17 -O2 ${sanitize:-} ${debug:-} ${capacity:-} $device_incs \
   -c "$here/routed_expert_kernel.cpp" \
   -o "$out/kernel.o" > "$out/kernel_build.log" 2>&1
 g++ -std=c++17 -O2 $host_incs -c "$here/routed_tiling.cpp" \
   -o "$out/tiling.o" > "$out/tiling_build.log" 2>&1
-g++ -std=c++17 -O2 $host_incs -c "$here/routed_expert_main.cpp" \
+g++ -std=c++17 -O2 ${capacity:-} $host_incs -c "$here/routed_expert_main.cpp" \
   -o "$out/main.o" > "$out/main_build.log" 2>&1
 g++ "$out/kernel.o" "$out/tiling.o" "$out/main.o" \
   -L"$H/lib64" -L/opt/ascend/cann-9.2.0/lib64 \
