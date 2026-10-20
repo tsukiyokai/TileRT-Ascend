@@ -108,6 +108,8 @@ def run(stream, prompt_length, width, budget, branches, longest):
     automaton_accepted = []
     adaptive_accepted = []
     adaptive_cost = []
+    tree_adaptive_accepted = []
+    tree_adaptive_cost = []
     tree_accepted = []
     at = prompt_length
     while at < len(stream):
@@ -137,6 +139,24 @@ def run(stream, prompt_length, width, budget, branches, longest):
 
     factor = float(os.environ.get("FACTOR", "2"))
     floor = int(os.environ.get("FLOOR", "2"))
+    # The tree on its own trajectory too, and with its budget sized the way
+    # the automaton's width is: a tree whose budget exceeds what the stream
+    # will accept pays for the excess in verification rows.
+    grove = TreeDrafter(prompt, longest=longest, budget=budget,
+                        branches=branches)
+    at = prompt_length
+    took = 1
+    while at < len(stream):
+        truth = stream[at:at + budget]
+        grove.budget = max(4, min(budget, 2 * took))
+        tokens, lineage = grove.propose()
+        took = accepted_by_tree(tokens, lineage, truth) + 1
+        took = min(took, len(stream) - at)
+        grove.commit(stream[at:at + took])
+        tree_adaptive_accepted.append(took)
+        tree_adaptive_cost.append(len(tokens))
+        at += took
+
     walker = AutomatonDrafter(prompt, longest=longest, shortest=2)
     at = prompt_length
     taken_last = 1
@@ -152,7 +172,8 @@ def run(stream, prompt_length, width, budget, branches, longest):
         at += taken
 
     return (chain_accepted, long_accepted, automaton_accepted,
-            adaptive_accepted, adaptive_cost, tree_accepted)
+            adaptive_accepted, adaptive_cost, tree_accepted,
+            tree_adaptive_accepted, tree_adaptive_cost)
 
 
 def main():
@@ -175,7 +196,8 @@ def main():
           f"branches {arguments.branches}  longest {arguments.longest}")
     print(f"{'edit rate':>10}  {'chain8':>7}  {'chain32':>7}  "
           f"{'automaton':>9}  {'adaptive':>8}  {'width':>6}  "
-          f"{'tree':>7}  {'tpot@w':>8}  {'tpot@adp':>9}  {'rounds':>7}")
+          f"{'tree':>7}  {'tpot@w':>8}  {'tpot@adp':>9}  "
+          f"{'grove':>7}  {'rows':>6}  {'tpot@grv':>9}  {'rounds':>7}")
     for rate in [float(piece) for piece in arguments.rates.split(",")]:
         generator = random.Random(arguments.seed)
         chain_total = []
@@ -183,6 +205,8 @@ def main():
         automaton_total = []
         adaptive_total = []
         adaptive_width = []
+        grove_total = []
+        grove_width = []
         tree_total = []
         for body in bodies:
             if len(body) < 64:
@@ -193,7 +217,10 @@ def main():
                           arguments.budget, arguments.branches,
                           arguments.longest)
             (chain_accepted, long_accepted, automaton_accepted,
-             adaptive_accepted, adaptive_cost, tree_accepted) = columns
+             adaptive_accepted, adaptive_cost, tree_accepted,
+             grove_accepted, grove_cost) = columns
+            grove_total.extend(grove_accepted)
+            grove_width.extend(grove_cost)
             adaptive_total.extend(adaptive_accepted)
             adaptive_width.extend(adaptive_cost)
             chain_total.extend(chain_accepted)
@@ -208,12 +235,17 @@ def main():
         tree_mean = sum(tree_total) / len(tree_total)
         adaptive_mean = sum(adaptive_total) / len(adaptive_total)
         width_mean = sum(adaptive_width) / len(adaptive_width)
+        grove_mean = sum(grove_total) / len(grove_total)
+        grove_rows = sum(grove_width) / len(grove_width)
+        grove_tpot = (45.88 + 0.814 * grove_rows) / grove_mean
         fixed_tpot = (45.88 + 0.814 * arguments.width) / walked_mean
         adaptive_tpot = (45.88 + 0.814 * width_mean) / adaptive_mean
         print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {walked_mean:>9.3f}  "
               f"{adaptive_mean:>8.3f}  {width_mean:>6.1f}  "
               f"{tree_mean:>7.3f}  {fixed_tpot:>8.2f}  "
-              f"{adaptive_tpot:>9.2f}  {len(chain_total):>7}")
+              f"{adaptive_tpot:>9.2f}  {grove_mean:>7.3f}  "
+              f"{grove_rows:>6.1f}  {grove_tpot:>9.2f}  "
+              f"{len(chain_total):>7}")
 
 
 if __name__ == "__main__":

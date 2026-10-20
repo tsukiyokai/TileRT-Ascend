@@ -61,3 +61,21 @@ buckets.
 
 Final figures at 0.05: fixed width 32 accepts 5.393 for a TPOT of 13.34, and
 adaptive accepts 4.351 at a mean width of 8.0 for 12.05 -- 9.7 percent.
+
+## The tree with an adaptive budget is the best configuration measured
+
+Each column on its own trajectory, width ceiling 32, budget ceiling 64:
+
+| edit rate | automaton @32 | TPOT | adaptive chain | TPOT | adaptive tree | nodes | TPOT |
+|---|---|---|---|---|---|---|---|
+| 0.02 | 10.063 | 7.15 | 8.385 | 6.71 | 9.288 | 13.1 | **6.09** |
+| 0.05 | 5.436 | 13.23 | 4.358 | 12.03 | 4.731 | 7.4 | **10.97** |
+
+15 and 17 percent better than the fixed-width automaton, and better than the
+adaptive chain, by the same mechanism twice over: the tree raises what a round
+accepts, and sizing the budget by the last acceptance stops paying for
+verification rows that were not going to hold.
+
+The fixed-budget tree accepts more -- 14.647 at 0.02 -- and has a worse TPOT,
+because 64 verification rows cost 52 ms by the round model. The ceiling is not
+a quota, on a tree as on a chain.
