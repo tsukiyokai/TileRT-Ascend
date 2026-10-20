@@ -32,6 +32,11 @@ source /workspace/environment/activate.sh
 set -u
 export PYTHONPATH="$tree${PYTHONPATH:+:$PYTHONPATH}"
 [ -n "$overlay" ] && export ASCEND_CUSTOM_OPP_PATH="$overlay:${ASCEND_CUSTOM_OPP_PATH}"
+# CANN's own grouped matmul is the fastest of the four implementations on the
+# path at the decode shape -- 66.813 us against 97.362, 104.929 and 123.985 --
+# and activate.sh puts two custom packages ahead of it for every engine
+# process. STOCK_OPP drops them so the comparison can be made end to end.
+[ -n "${STOCK_OPP:-}" ] && unset ASCEND_CUSTOM_OPP_PATH
 
 # A cache root per arm, because a shared one replays another arm's compiled
 # graph. A port range per arm, not per pass: two arms of one pass cannot share

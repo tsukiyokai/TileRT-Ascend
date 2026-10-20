@@ -271,7 +271,7 @@ int main(int argc, char** argv)
                        (float*)gu_bias, (float*)gu_scale, down,
                        (float*)down_bias, (float*)down_scale, (float*)token,
                        partial, middle, (float*)middle_scale, wide, out,
-                       gu_tiling, down_tiling, witness, workspace, experts);
+                       gu_tiling, down_tiling, witness, workspace, experts, 1);
     Check(aclrtSynchronizeStream(stream), "once");
 
     std::vector<uint16_t> out_host(experts * ROWS * HIDDEN);
@@ -540,7 +540,7 @@ int main(int argc, char** argv)
                                down, (float*)down_bias, (float*)down_scale,
                                (float*)token, partial, middle,
                                (float*)middle_scale, wide, out, gu_tiling,
-                               down_tiling, witness, workspace, experts);
+                               down_tiling, witness, workspace, experts, 1);
         }
         Check(aclrtSynchronizeStream(stream), "timing");
         clock_gettime(CLOCK_MONOTONIC, &end);

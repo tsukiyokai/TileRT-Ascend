@@ -184,6 +184,7 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
                          const at::Tensor& group_start,
                          const at::Tensor& source_row,
                          const at::Tensor& row_weight, int64_t experts,
+                         int64_t layers,
                          int64_t blocks)
 {
     TORCH_CHECK(rows.dtype() == at::kChar, "rows must be INT8");
@@ -236,7 +237,7 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
         held.gate_up_tiling(), held.down_tiling(), held.witness(),
         group_count.data_ptr(), group_start.data_ptr(),
         source_row.data_ptr(), row_weight.data_ptr<float>(),
-        held.workspace(), experts);
+        held.workspace(), experts, layers);
     if (std::getenv("TILERT_SHOW_STACKED") != nullptr) {
         // What Split wrote for the cube to read: the activation's two INT4
         // halves, M-stacked. The cube's product is zero, so either this is
@@ -286,7 +287,8 @@ TORCH_LIBRARY(tilert, library)
         "routed_experts(Tensor rows, Tensor gate_up, Tensor gu_bias, "
         "Tensor gu_scale, Tensor down, Tensor down_bias, Tensor down_scale, "
         "Tensor token_scale, Tensor group_count, Tensor group_start, "
-        "Tensor source_row, Tensor row_weight, int experts, int blocks) "
+        "Tensor source_row, Tensor row_weight, int experts, int layers, "
+        "int blocks) "
         "-> Tensor");
 }
 

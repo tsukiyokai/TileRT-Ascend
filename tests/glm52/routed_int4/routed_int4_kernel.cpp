@@ -618,7 +618,7 @@ __aicore__ void routed_int4_fused(
     __gm__ int4b_t* witness, __gm__ int32_t* group_count,
     __gm__ int32_t* group_start, __gm__ int32_t* source_row,
     __gm__ float* row_weight, GM_ADDR workspace, int64_t experts,
-    int64_t blocks)
+    int64_t blocks, int64_t layers)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     InitSocState();
@@ -692,6 +692,12 @@ __aicore__ void routed_int4_fused(
         AfterLoadForScalar();
     }
 
+    // One launch over `layers` layers. The operator's cost is a
+    // per-execution constant the data does not move, so whether two
+    // layers cost one tax or two decides whether cross-layer fusion
+    // reaches the round's fixed term. The weights repeat, because the
+    // tax is what is being measured.
+
     // Stage-major, not expert-major. Expert-major cost four barriers a round,
     // so sixteen rounds at the engine's 256 experts cost sixty-four, and the
     // sparse case came out slower than the dense one -- an empty expert
@@ -700,7 +706,9 @@ __aicore__ void routed_int4_fused(
     // at once and the barriers drop to one a stage.
     if ASCEND_IS_AIV {
         if (sub == 0) {
-            for (int64_t step = 0; step < per_block; ++step) {
+            for (int64_t layer = 0; layer < layers; ++layer)
+        for (int64_t layer = 0; layer < layers; ++layer)
+    for (int64_t step = 0; step < per_block; ++step) {
                 const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
                 if (expert >= experts || held.group.GetValue(expert) == 0) {
                     continue;
@@ -717,7 +725,9 @@ __aicore__ void routed_int4_fused(
     SyncAll<false>();
 
     if ASCEND_IS_AIC {
-        for (int64_t step = 0; step < per_block; ++step) {
+        for (int64_t layer = 0; layer < layers; ++layer)
+        for (int64_t layer = 0; layer < layers; ++layer)
+    for (int64_t step = 0; step < per_block; ++step) {
             const int64_t expert = GetBlockIdx() * per_block + step;
             if (expert >= experts || cube_group.GetValue(expert) == 0) {
                 continue;
@@ -733,7 +743,9 @@ __aicore__ void routed_int4_fused(
 
     if ASCEND_IS_AIV {
         if (sub == 0) {
-            for (int64_t step = 0; step < per_block; ++step) {
+            for (int64_t layer = 0; layer < layers; ++layer)
+        for (int64_t layer = 0; layer < layers; ++layer)
+    for (int64_t step = 0; step < per_block; ++step) {
                 const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
                 if (expert >= experts || held.group.GetValue(expert) == 0) {
                     continue;
@@ -752,7 +764,9 @@ __aicore__ void routed_int4_fused(
     SyncAll<false>();
 
     if ASCEND_IS_AIC {
-        for (int64_t step = 0; step < per_block; ++step) {
+        for (int64_t layer = 0; layer < layers; ++layer)
+        for (int64_t layer = 0; layer < layers; ++layer)
+    for (int64_t step = 0; step < per_block; ++step) {
             const int64_t expert = GetBlockIdx() * per_block + step;
             if (expert >= experts || cube_group.GetValue(expert) == 0) {
                 continue;
@@ -767,7 +781,9 @@ __aicore__ void routed_int4_fused(
     SyncAll<false>();
 
     if ASCEND_IS_AIV {
-        for (int64_t step = 0; step < per_block; ++step) {
+        for (int64_t layer = 0; layer < layers; ++layer)
+        for (int64_t layer = 0; layer < layers; ++layer)
+    for (int64_t step = 0; step < per_block; ++step) {
             const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
             if (expert >= experts || held.group.GetValue(expert) == 0) {
                 continue;
@@ -792,7 +808,7 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         void* gu_tiling, void* down_tiling, void* witness,
                         void* group_count, void* group_start,
                         void* source_row, float* row_weight,
-                        void* workspace, int64_t experts)
+                        void* workspace, int64_t experts, int64_t layers)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
@@ -803,5 +819,5 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
         (__gm__ uint8_t*)gu_tiling, (__gm__ uint8_t*)down_tiling,
         (__gm__ int4b_t*)witness, (__gm__ int32_t*)group_count,
         (__gm__ int32_t*)group_start, (__gm__ int32_t*)source_row,
-        row_weight, (GM_ADDR)workspace, experts, blocks);
+        row_weight, (GM_ADDR)workspace, experts, blocks, layers);
 }
