@@ -33,17 +33,26 @@ constexpr int64_t HIDDEN = 6144;
 constexpr int64_t HALF = 128;
 // One token scale a row, staged on chip; the widest arm verifies 32 rows.
 constexpr int64_t MAX_ROWS = 32;
+// One vector repeat of FP32, in elements.
+constexpr int64_t SLACK = 64;
 constexpr int64_t GATE_UP = 2 * HALF;
 // CANN's own Matmul-to-vector example uses mode 2 and flag 8. A3 allows
 // flag ids 0 through 10 only, and the Matmul library consumes some itself, so
 // a hand-written flag beside it is a collision risk -- 8 is what the vendor
 // example picks for exactly this handoff. A flag's counter also saturates at
 // 15 sets, which a per-layer persistent kernel will have to reckon with.
-constexpr uint16_t GATE_READY = 8;
-constexpr uint16_t VECTOR_ALIVE = 9;
+// Flag 8 is `AIV_INTER_BLOCK_BARRIER` in catlass, and the vendor warns that
+// the Matmul high-level API uses this interface for its own cross-core
+// control, so sharing an id with it risks a collision. Two Matmul objects run
+// in this kernel; stay off 8, 9 and 10.
+constexpr uint16_t GATE_READY = 4;
+constexpr uint16_t VECTOR_ALIVE = 5;
 
 using AQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, false>;
 using BQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, true>;
+// The vendor's cube-only sample declares C at `VECIN` on the kernel side.
+// Copying that made the four-block arm measurably worse here -- 448 448 448
+// 224 896 0 against 0 0 448 0 0 0 -- so GM it stays.
 using CProduct = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
 using BiasNone = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
 
@@ -59,12 +68,33 @@ namespace {
  * correct every time when downloaded, and the count of wrong rows differed on
  * every run.
  */
-__aicore__ inline void Publish(__gm__ int32_t* buffer)
+/** Producer side: wait for this core's writes to retire.
+ *
+ * `PipeBarrier` blocks a pipe's *issue* order, which is why three of them
+ * changed nothing here. This blocks until the memory accesses retire, and it
+ * is what makes the cube's write-back visible: the fixpipe's store can still
+ * be in a write buffer when the flag goes up, and a consumer that invalidates
+ * its own cache then reads the old value anyway.
+ *
+ * No clean on this side. A clean of the entire data cache writes back
+ * whatever stale lines this core happens to hold, which across eight cores
+ * sharing one buffer means each can clobber another's fresh values -- a
+ * published A/B measured more mismatches with the producer's clean on than
+ * off.
+ */
+__aicore__ inline void Drain()
+{
+    DataSyncBarrier<MemDsbT::DDR>();
+}
+
+/** Consumer side: drop this core's view before reading what another wrote. */
+__aicore__ inline void Acquire(__gm__ int32_t* buffer)
 {
     GlobalTensor<int32_t> whole;
     whole.SetGlobalBuffer(buffer);
     DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
                              DcciDst::CACHELINE_OUT>(whole);
+    DataSyncBarrier<MemDsbT::DDR>();
 }
 
 /** One contiguous run of output channels, from global memory to global.
@@ -121,12 +151,18 @@ struct Epilogue {
 
     __aicore__ inline void Init(TPipe& pipe)
     {
-        pipe.InitBuffer(product_buffer, GATE_UP * sizeof(int32_t));
-        pipe.InitBuffer(gate_buffer, HALF * sizeof(float));
-        pipe.InitBuffer(up_buffer, HALF * sizeof(float));
-        pipe.InitBuffer(work_buffer, HALF * sizeof(float));
-        pipe.InitBuffer(scale_buffer, GATE_UP * sizeof(float));
-        pipe.InitBuffer(narrow_buffer, HALF * sizeof(bfloat16_t));
+        // A repeat of a vector operator is 256 bytes, and the operators
+        // round their element count up to one. A buffer sized exactly to the
+        // count has no room for that: at one block the counts reach the
+        // buffer sizes exactly and the result alternated between right and
+        // wrong on every other run, while at four blocks, a quarter of the
+        // way in, it did not.
+        pipe.InitBuffer(product_buffer, (GATE_UP + SLACK) * sizeof(int32_t));
+        pipe.InitBuffer(gate_buffer, (HALF + SLACK) * sizeof(float));
+        pipe.InitBuffer(up_buffer, (HALF + SLACK) * sizeof(float));
+        pipe.InitBuffer(work_buffer, (HALF + SLACK) * sizeof(float));
+        pipe.InitBuffer(scale_buffer, (GATE_UP + SLACK) * sizeof(float));
+        pipe.InitBuffer(narrow_buffer, (HALF + SLACK) * sizeof(bfloat16_t));
         pipe.InitBuffer(token_buffer, MAX_ROWS * sizeof(float));
         product = product_buffer.Get<int32_t>();
         gate = gate_buffer.Get<float>();
@@ -168,10 +204,14 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     GlobalTensor<float> scale_global;
     GlobalTensor<float> token_global;
     GlobalTensor<bfloat16_t> out_global;
-    product_global.SetGlobalBuffer(partial);
-    scale_global.SetGlobalBuffer(gu_scale);
-    token_global.SetGlobalBuffer(token_scale);
-    out_global.SetGlobalBuffer(out);
+    // With a length. `SetGlobalBuffer(ptr)` alone leaves the tensor's extent
+    // unset, and then only the offset-zero row reads back correctly: row 0
+    // was right and rows 1 through 7 wrong, every run, from a `partial` that
+    // verified against the host every run.
+    product_global.SetGlobalBuffer(partial, rows * GATE_UP);
+    scale_global.SetGlobalBuffer(gu_scale, GATE_UP);
+    token_global.SetGlobalBuffer(token_scale, MAX_ROWS);
+    out_global.SetGlobalBuffer(out, rows * HALF);
 
     // This core's own slice of both halves' scales, so the loop below reads
     // only what it owns.
@@ -183,11 +223,12 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     // zeroed output with the INT32 product provably correct. Stage it.
     DataCopy(held.token, token_global, MAX_ROWS);
     PipeBarrier<PIPE_ALL>();
-    // The scale is then read by the scalar unit, and a pipe barrier does not
-    // order MTE2 against it: the read returned zero for every row but the
-    // first, on about half of otherwise identical runs.
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    // The scale is then read by the scalar unit. A pipe barrier orders issue,
+    // not retirement, and `HardEvent::MTE2_S` did not help either: the read
+    // returned zero for every row but the first on exactly every other run of
+    // the same binary, which is unified buffer still holding what the
+    // previous kernel left. Wait for the copy to retire.
+    DataSyncBarrier<MemDsbT::UB>();
 
     // Two vector subblocks, alternate rows each. At eight rows the work is
     // 1024 elements, so the split is about keeping both subblocks fed rather
@@ -263,8 +304,8 @@ __aicore__ void mix_expert_fused(
                     HALF + channel, channels);
             // Drain the fixpipe, then publish out of the data cache, then
             // raise the flag. All three, in that order.
-            PipeBarrier<PIPE_ALL>();
-            Publish(partial);
+            Drain();
+            PipeBarrier<PIPE_FIX>();
         }
         if (stages & 2) {
             // Mode 2 is the only one that crosses from cube to vector. Mode 0
@@ -272,6 +313,12 @@ __aicore__ void mix_expert_fused(
             // cube raises a flag only another cube would consume and the
             // waiting vector core never sees it -- which is what hung every
             // run that included this flag.
+            // Once, not once per waiter. Under mode 2 a single set wakes
+            // both of this cube's vector subblocks, consecutive sets of one
+            // flagId are not allowed, and a second set leaves the counter a
+            // surplus that survives the process -- which showed as a
+            // perfectly alternating 896, 0, 896, 0 across runs of the same
+            // binary.
             CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
         }
         if (stages & 16) {
@@ -281,10 +328,14 @@ __aicore__ void mix_expert_fused(
     if ASCEND_IS_AIV {
         TPipe vector_pipe;
         if (stages & 8) {
-            CrossCoreWaitFlag(GATE_READY);
-            PipeBarrier<PIPE_ALL>();
-            // Invalidate before reading what the other core published.
-            Publish(partial);
+            // A bare `CrossCoreWaitFlag` resolves to mode 0 on `PIPE_S`:
+            // the wrong direction, and a scalar-pipe wait lets the following
+            // MTE2 issue early and read a half-updated buffer.
+            // Mode spelled out, pipe defaulted, as the vendor's own sample
+            // writes it: the set's template arguments and the wait's must
+            // agree or they are different flags.
+            CrossCoreWaitFlag<0x02>(GATE_READY);
+            Acquire(partial);
         }
         if (stages & 16) {
             CrossCoreSetFlag<0x02, PIPE_MTE3>(VECTOR_ALIVE);

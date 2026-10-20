@@ -100,6 +100,39 @@ mixed-core barrier. `token_scale` read as zero for every row but the first,
 which showed as a zeroed output while the product verified. Staging it into
 UB first fixes the common case.
 
+## Six defects found, and the handshake still is not right
+
+Each of these was real and each is fixed. None of them was the whole thing.
+
+A `GlobalTensor` needs its extent. `SetGlobalBuffer(ptr)` without a length
+leaves it unset, and then only the offset-zero row reads back correctly: row 0
+right, rows 1 through 7 wrong, every run, from a `partial` that verified
+against the host every run.
+
+An output buffer needs a sentinel, not a zero. Four runs reading 896 wrong and
+four reading 0 looked like a race until the output was pre-filled with 0x7777
+and the count held at 896 every time: the allocator was handing back the
+previous process's buffer, and an untouched output and a zeroed one are
+indistinguishable. The sentinel also proved every element *is* written —
+`untouched 0 of 1024` — which ruled out coverage and left arithmetic.
+
+`PipeBarrier` is an issue-order barrier, 「阻塞相同流水」. The one that waits
+for memory accesses to retire is `DataSyncBarrier<MemDsbT::DDR>()`, and that
+is why three `PipeBarrier<PIPE_ALL>()` changed nothing. `MemDsbT::UB` after
+the staging copy took the four-block arm from 2 of 6 clean to 5 of 6.
+
+One set, not one per waiter. Under mode 2 a single `CrossCoreSetFlag` wakes
+both of a cube's vector subblocks; consecutive sets of one flagId are not
+allowed, and a surplus set leaves a counter that survives the process.
+
+Flag 8 is `AIV_INTER_BLOCK_BARRIER` in `catlass` and the vendor advises
+against sharing an id with the Matmul high-level API, which this kernel also
+uses. Moved to 4.
+
+The cube's C stays at `TPosition::GM`. The vendor's cube-only sample declares
+it `VECIN` on the kernel side; copying that made the four-block arm worse,
+448 448 448 224 896 0 against 0 0 448 0 0 0.
+
 ## The flag orders nothing, and that is where this stops
 
 The brick is not yet reliable. Across identical runs the error count is 0,
@@ -122,9 +155,26 @@ DcciDst::CACHELINE_OUT>` on both sides, which is the spelling
 scalar read.
 
 So the handshake needs to be something other than a bare
-`CrossCoreSetFlag<0x02, PIPE_FIX>` plus `CrossCoreWaitFlag`, and the next
-change is to find out what the working hand-written kernels actually use
-rather than to try a fifth barrier.
+`CrossCoreSetFlag<0x02, PIPE_FIX>` plus `CrossCoreWaitFlag`.
+
+The documentation does not settle it. CANN's own 220x architecture page says
+the flag is what 「确保数据从L0C成功搬运到GM后，再从GM搬运到UB」 and mentions
+no cache maintenance; the vendor's `matmul_fused_manual` sample carries no
+DCCI, no `DataSyncBarrier` and no `PipeBarrier` at all, and passes. Against
+that, three third-party kernels on the same 2201 measure that the flag alone
+does not publish, one with this exact symptom — the consumer reads all zeros,
+and 「加探针即掩盖」, adding a probe hides it. The sample's evidence is one
+verification run at `numBlocks = 1` on a single tile, which cannot tell
+correct from one-in-three.
+
+Our own measurements are evidence on the second side: at four blocks the arm
+is clean in 3 of 6 runs with every documented barrier in place, and at eight
+blocks never. At one block it alternates, which the sentinel showed is partly
+the allocator rather than the kernel. Treat the cache operations as a
+workaround with a measured effect, not as the rule, and A/B them once the
+handshake is correct — `ENTIRE_DATA_CACHE` is 「耗时较大」 and a per-layer
+kernel would pay it per stage.
+[reference](../../reference/ascend-fusion-mechanics.md)
 
 ## What it is not yet
 

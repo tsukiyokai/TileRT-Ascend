@@ -5300,6 +5300,1768 @@ every element section 5 described in prose, in one file:
 
 ---
 
+---
+
+## 31. The A3 cube→vector GM visibility rule: `CrossCoreSetFlag` is NOT enough, `DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on **both** sides is
+
+This section answers the concrete failure "AIC writes INT32 to a GM `partial` buffer, `PipeBarrier<PIPE_ALL>()`,
+`CrossCoreSetFlag<0x02, PIPE_FIX>(8)`; AIV does `CrossCoreWaitFlag(8)`, `PipeBarrier<PIPE_ALL>()`, `DataCopy` — and
+reads zeros non-deterministically, while the same buffer downloaded to the host is always correct."
+
+### 31.1 The rule, stated by the people who hit the identical bug
+
+https://github.com/flashserve/flash-linear-attention-npu/blob/main/fla/ops/ascendc/cp/pre_process_fwd_kernel_merged/op_kernel/arch22/pre_process_fwd_kernel_merged_cube.h
+Repo `flashserve/flash-linear-attention-npu`, branch `main`, file
+`fla/ops/ascendc/cp/pre_process_fwd_kernel_merged/op_kernel/arch22/pre_process_fwd_kernel_merged_cube.h`,
+`arch22` = our DAV_2201. Retrieved 2026-10-20.
+
+This is the **producer (AIC) side**, verbatim, including its comment. `vTmpF_` and `t1F_` are `GlobalTensor<float>`
+holding the cube's `C` output; `AicSetToAiv` is the `CrossCoreSetFlag` wrapper:
+
+```cpp
+        // 注意： 写侧也要 clean（写回），只靠读者 DCCI 不够：FIX
+        // 写回可能还停在写缓冲里，
+        //   此时 AIV 即便 DCCI 也会读到旧值。实测（PPFM_DIAG 指纹）：AIV 读到 vTmp 全 0，
+        //   而 AIC 实际写了 -0.013/+0.0092 → v_new 退化成 v，h 半边随机整头崩（m
+        // 不受影响）。
+#if !PPFM_T1_FIXPIPE_BF16
+#if !PPFM_VTMP_UB
+#if PPFM_LEGACY_CACHEOPS
+        DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(vTmpF_);
+#endif
+#endif
+#endif
+#if PPFM_LEGACY_CACHEOPS
+        DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(t1F_);
+#endif
+#if !PPFM_T1_FIXPIPE_BF16
+        // 注意： 正式原语：DDR 数据同步屏障——保证 C 的写回对其他核可见后再抬 flag。
+        //   诊断版实验表明竞态是"flag 已到、写回仍在途"的时序窗口（加探针即掩盖）。
+#if PPFM_LEGACY_CACHEOPS
+        DataSyncBarrier<MemDsbT::DDR>();
+#endif
+        AicSetToAiv(kFlagHalf1);
+#endif
+```
+
+Translated for the record, because this is the rule: *the write side must clean too — the reader's DCCI alone is not
+enough: the FIX write-back may still be sitting in the write buffer, in which case the AIV reads the old value even
+after a DCCI. Measured (PPFM_DIAG fingerprint): the AIV read vTmp as all zeros while the AIC had actually written
+-0.013/+0.0092.* And: *the proper primitive is the DDR data-sync barrier — it guarantees C's write-back is visible to
+other cores before raising the flag. The diagnostic build showed the race is the timing window "flag already arrived,
+write-back still in flight" (adding a probe masks it).*
+
+"AIV 读到 vTmp 全 0" is our symptom exactly, and "加探针即掩盖" is why our host download of `partial` is always correct.
+
+The same file, the **consumer-of-the-other-core's-GM** direction (here AIC reading what AIV wrote — the mirror image,
+same rule):
+
+```cpp
+        AicWaitFromAiv(kFlagInputs);
+        // 注意： 读别的核（AIV）刚写过的 GM 之前必须让本核的 cache 失效：h/m 每 chunk 都被
+        //    AIV 重写，若 AIC 命中自己缓存的旧行，mm1/mm3 就会拿到过期的 h/m
+        //    （实测表现为概率性的 h 半边大面积错、m 只是略偏，且随调度时好时坏）。
+#if PPFM_LEGACY_CACHEOPS
+        DataCacheCleanAndInvalid<bfloat16_t, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(wBf_);
+#endif
+#if PPFM_LEGACY_CACHEOPS
+        DataCacheCleanAndInvalid<bfloat16_t, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(hBf_);
+#endif
+#if PPFM_LEGACY_CACHEOPS
+        DataCacheCleanAndInvalid<bfloat16_t, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(mBf_);
+#endif
+```
+
+### 31.2 The AIV side of the same kernel — our exact case, cube product read back by vector
+
+https://github.com/flashserve/flash-linear-attention-npu/blob/main/fla/ops/ascendc/cp/pre_process_fwd_kernel_merged/op_kernel/arch22/pre_process_fwd_kernel_merged_vector.h
+Same repo/branch, `arch22` vector half. Retrieved 2026-10-20.
+
+Verbatim — note the cited precedent "CANN `matmul_client.h` does a DCCI before reading a cross-core GM flag", and the
+hard-won detail that **every** alias of the buffer must be invalidated, not just the one the even iteration uses:
+
+```cpp
+            AivWaitFromAic(kFlagDH);
+            // 读别的核（AIC）写的 GM 前必须让本核缓存行失效，否则会读到过期数据
+            // （与 CANN matmul_client.h 中"读跨核 GM flag 前先 DCCI"的用法一致）
+            // 注意： 原来只失效了**偶数奇偶**的 dHF_/t2F_，而下面按 chunk 奇偶读的是
+            //   `dhBuf`/`t2Buf`（两份）⇒ 奇数 chunk 读的 `dHF1_`/`t2F1_` 从来没被失效过，
+            //   命中旧行就会把过期 T2 减进 m（表现为 m 半边小范围错、h 正常）。
+            //   这个缺口在 A2 上（PPFM_LEGACY_CACHEOPS=1）才暴露得出来；补齐两份。
+#if PPFM_KEEP_CACHEOPS_R
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                     DcciDst::CACHELINE_OUT>(dHF_);
+#endif
+#if PPFM_KEEP_CACHEOPS_R
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                     DcciDst::CACHELINE_OUT>(dHF1_);
+#endif
+#if PPFM_KEEP_CACHEOPS_R
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                     DcciDst::CACHELINE_OUT>(t2F_);
+#endif
+#if PPFM_KEEP_CACHEOPS_R
+            DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                     DcciDst::CACHELINE_OUT>(t2F1_);
+#endif
+```
+
+And the AIV reading the cube's `vTmpF_` / `t1F_`, i.e. literally "vector reads the cube's INT32/FP32 product out of
+GM" — the invalidate sits immediately before the consuming vector code:
+
+```cpp
+#if !PPFM_VTMP_UB
+#if PPFM_KEEP_CACHEOPS_R
+        DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(vTmpF_);
+#endif
+#endif
+#if PPFM_KEEP_CACHEOPS_R
+        DataCacheCleanAndInvalid<float, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(t1F_);
+#endif
+        // v_new = (v - vTmp) · dg → bf16（逐行；整块版本会引入 ~0.4% 的 GDN 偏差，待查）
+```
+
+### 31.3 The flag wrappers — where the cache ops go relative to the flag, and the `pipe` that matters
+
+https://github.com/flashserve/flash-linear-attention-npu/blob/main/fla/ops/ascendc/cp/pre_process_fwd_kernel_merged/op_kernel/pre_process_fwd_kernel_merged_common.h
+Same repo/branch. Retrieved 2026-10-20. All four wrappers, verbatim and complete:
+
+```cpp
+// ---------------- CrossCore flag（MIX 内 AIC <-> 2×AIV）----------------
+// 两个平台的同步模型不同（见 PPFM_XCORE_MODE / PPFM_ARCH_IS_950）：
+//   * 950 用 mode 0x4：flag ID 按 subblock 分槽（第二个子核 = id + 16），AIC 侧显式
+//     wait/set 两个 slot。与仓内 arch35 算子的约定一致
+//     （见 chunk_fwd_h/op_kernel/chunk_fwd_h_policy.h、kda/chunk_kda_fwd/.../fwd_h.h）。
+//     实测反例：用 A2/A3 风格的 `CrossCoreSetFlag<0x2, ...>` 时，950 上先干完的那个
+//     子核就会把 AIC 放行，AIC 的 mm1/mm3 读到"只写了一半"的 h/m bf16 状态，
+//     表现为 h 半边约一半行数据错、m 基本对（GDN 快路径暴露，KDA 慢路径看不出来）。
+//   * 910B/910_93 用 mode 0x2：AIC 与「本 block 的 2 个 AIV」是集合同步 —— AIC 的一次
+//     set 对本 block 两个 AIV 同时置起；两个 AIV 都 set 同一个 ID 才算 AIC 侧事件置起。
+//     因此 AIC 侧每轮只需一对 set/wait（多 set/多 wait 会让 flag 计数失衡）。
+constexpr uint16_t PPFM_SUBFLAG_STRIDE = 16;   // AIV 子核 1 的 slot 偏移
+constexpr uint16_t kFlagInputs = 1;   // AIV -> AIC：本 chunk staging 就位
+constexpr uint16_t kFlagState = 2;    // AIV -> AIC：h/m 状态就位
+constexpr uint16_t kFlagHalf1 = 3;    // AIC -> AIV：vTmp 与 T1 就位
+constexpr uint16_t kFlagVNew = 4;     // AIV -> AIC：bf16(v_new) 与 bf16(T1) 就位
+constexpr uint16_t kFlagDH = 5;       // AIC -> AIV：dH 与 T2 就位
+// （dH 走 L0C->UB）：dH 的 UB 槽「归还」信用（AIV -> AIC）。槽 j 用 id + j，
+// AIC 侧按 subblock 各等一次（id 与 id+PPFM_SUBFLAG_STRIDE），
+// 与仓内 arch35 的 MATRIX_CV_AIV_TO_AIC_FLAG_BEGIN/CV_SUBBLOCK_FLAG_STRIDE 同构。
+constexpr uint16_t kFlagDhFree = 8;
+// T2 的 UB 槽归还信用（AIV -> AIC），单槽。
+constexpr uint16_t kFlagT2Free = 10;
+
+// AIV 子核：写自己本地 slot（硬件按子核自动映射到 id / id+16）
+__aicore__ inline void AivSetToAic(uint16_t id)
+{
+    // set_intra_block 不保证"之前的搬运已落地"，这里显式排空 MTE3
+    PipeBarrier<PIPE_MTE3>();
+    // 对称于 AIC 侧：本核写出的 GM（kBf_/wBf_/lBf_/vNewBf_/t1Bf_/状态）也要先对其他核可见
+#if PPFM_LEGACY_CACHEOPS
+    DataSyncBarrier<MemDsbT::DDR>();
+#endif
+    CrossCoreSetFlag<PPFM_XCORE_MODE, PIPE_MTE3>(id);
+}
+
+__aicore__ inline void AivWaitFromAic(uint16_t id)
+{
+    // 950：用 PIPE_S 排队 —— 等待指令卡住后续指令的发射（否则后面的 MTE2/V 会先跑）。
+    // 910B/910_93：消费方是 MTE2（从 GM 回读 cube 的 C），按 A2 惯用法在 MTE2 上排队
+    //   （见仓内 arch22 的 `CrossCoreWaitFlag<0x2, PIPE_MTE2>(..._READY_FLAG)`）。
+    //   实测 A2 上用 PIPE_S 等待时，随后的 MTE2 会提前发射，读到"半新半旧"的 C：
+    //   表现为 h 半边误差 ~1.5e-2 且逐次小幅跳动（v=0 的探针本应得到 h≡0）。
+#if PPFM_ARCH_IS_950
+    CrossCoreWaitFlag<PPFM_XCORE_MODE, PIPE_S>(id);
+#else
+    CrossCoreWaitFlag<PPFM_XCORE_MODE, PIPE_MTE2>(id);
+#endif
+}
+```
+
+and the AIC half (note `PipeBarrier<PIPE_FIX>()` before the set, and the "15 consecutive sets hangs" citation):
+
+```cpp
+//   950 (mode 0x4)：flag ID 按 subblock 分槽，两个 AIV 子核各自 set 自己的 ID ⇒ 这里要等两次
+//   910B/910_93 (mode 0x2)：AIC 与「本 block 的 2 个 AIV」是**集合同步**——两个 AIV 必须
+//     都 set 同一个 ID，事件才会对 AIC 置起 ⇒ 这里只等一次
+//   （约定出处：仓内 chunk_fwd_h/op_kernel/chunk_fwd_h_policy.h 的 FwdHAicPeerFlag 注释）
+__aicore__ inline void AicWaitFromAiv(uint16_t id)
+{
+#if PPFM_ARCH_IS_950
+    CrossCoreWaitFlag<PPFM_XCORE_MODE, PIPE_S>(id);
+    CrossCoreWaitFlag<0x4, PIPE_S>(static_cast<uint16_t>(id + PPFM_SUBFLAG_STRIDE));
+#else
+    // 910B：AIC 侧消费方同样是 MTE2（把 AIV 写好的 k/w/h/m/vNew 搬进 L1/L0）
+    CrossCoreWaitFlag<PPFM_XCORE_MODE, PIPE_MTE2>(id);
+#endif
+}
+
+// AIC -> AIV：
+//   950：两个 slot 都要置位，否则只会唤醒一个子核；
+//   910B/910_93：0x2 下一次 set 即对本 block 的两个 AIV 同时置起，只能 set 一次
+//   （多 set 会让计数失衡 —— 单条 flag 连续 set 超过 15 次会挂死，见 catlass
+// cross_core_sync.hpp）
+__aicore__ inline void AicSetToAiv(uint16_t id)
+{
+    PipeBarrier<PIPE_FIX>();
+    CrossCoreSetFlag<PPFM_XCORE_MODE, PIPE_FIX>(id);
+#if PPFM_ARCH_IS_950
+    CrossCoreSetFlag<PPFM_XCORE_MODE, PIPE_FIX>(static_cast<uint16_t>(id + PPFM_SUBFLAG_STRIDE));
+#endif
+}
+```
+
+https://github.com/flashserve/flash-linear-attention-npu/blob/main/fla/ops/ascendc/cp/pre_process_fwd_kernel_merged/op_kernel/pre_process_fwd_kernel_merged_policy.h
+Same repo/branch. The mode and the per-arch default of the cache ops, verbatim:
+
+```cpp
+constexpr int32_t PPFM_XCORE_MODE = 0x4;
+```
+```cpp
+constexpr int32_t PPFM_XCORE_MODE = 0x2;
+```
+```cpp
+// 950：实测只用跨核 flag 就够（并且去掉 DCCI 后竞态由 3/6 降到 1/6），默认 0。
+// 910B/910_93：实测 AIC 会读到 AIV 尚未对其他核可见的 bf16(h)（chunk0 的 h≡0 探针
+//   仍得到 1.6e-2 的 h），故先按 A2 老做法启用 DCCI/DSB；若后续定位到更精确的边，
+//   可只保留必要的那一条。
+#ifndef PPFM_LEGACY_CACHEOPS
+#if PPFM_ARCH_IS_950
+#define PPFM_LEGACY_CACHEOPS 0
+#else
+#define PPFM_LEGACY_CACHEOPS 1
+#endif
+#endif
+
+// ---- C3 实验（A2 专用；默认 = 现状，950 机器码按构造不变）----
+// 动机：A2 的 DCCI/DSB 目前"不分生产方"地全开（AIC 每 chunk 10 次整缓存 DCCI + AIV 6 次
+//   + 4 次 DSB），而 950 的实测记录是"去掉 DCCI 后竞态由 3/6 降到 1/6"。
+//   把 A2 的缓存操作按**数据生产方**拆成两组，做 4 组 A/B（默认都是 1 = 现状）：
+//     W 组 = AIC 抬 flag 前，对**自己算出的 C** 做的 DCCI/DSB（vTmp / t1Bf_ / dH / T2 及末尾 DSB）
+//     R 组 = AIV 读 **AIC 算出的 C** 之前做的失效（dHF_/dHF1_/t2F_/t2F1_/vTmpF_/t1F_）
+//   保留不动的是"消费 AIV 产物"的那一半（AIC 读 wBf_/kBf_/hBf_/mBf_/lBf_/vNewBf_ 前的 DCCI，
+//   以及 AivSetToAic 的 DSB）—— 那一半有明确故障证据（AIC 读到尚未可见的 bf16(h)）。
+//   实验矩阵：W1R1（基线）/ W0R1 / W1R0 / W0R0，判据 = PROC S≥40 的失败率 + L1 + perf。
+#ifndef PPFM_A2_CACHEOPS_W
+//   **结论（2026-10-08，234 上机）**：W0R1（=A2 默认）在 60 进程位级口径下残差 1/60，
+//   基线 W1R1 是 9/60 ⇒ 去掉 W 组的 DCCI 没有让竞态变差，反而随 C7/C9 一起变好。
+#define PPFM_A2_CACHEOPS_W (PPFM_ARCH_IS_950 ? 1 : 0)
+#endif
+#ifndef PPFM_A2_CACHEOPS_R
+#define PPFM_A2_CACHEOPS_R 1
+#endif
+```
+
+Read that last block carefully: their final A2/A3 default is **W0R1** — producer-side DCCI *off*, consumer-side DCCI
+*on*, with `DataSyncBarrier<MemDsbT::DDR>()` kept on the producer before the flag
+(`PPFM_KEEP_CACHEOPS_W` gates both the producer DCCI *and* its DSB, but the DSB inside `AivSetToAic` is gated by
+`PPFM_LEGACY_CACHEOPS` alone, which stays 1 on A2/A3). Measured: W1R1 baseline 9/60 processes mismatched, W0R1 1/60.
+So the producer-side *cache* op was not what paid; the producer-side *barrier* and the consumer-side *invalidate* did.
+
+### 31.4 A second, independent kernel that hit the same thing — the V→C relay, with a 2000-trial A/B
+
+https://github.com/flashserve/flash-linear-attention-npu/pull/860
+Author `weinachuan` (Collaborator), opened 2026-10-10T09:33:09Z, title
+「fix(kda): ChunkKdaFwdPrepare 的 V6→C7 relay 交接补保守可见性同步（Arch22，临时验证）」. Draft, 2 commits
+(`1a606d6`, `af7a2af`). Retrieved 2026-10-20.
+
+PR body, verbatim excerpt — this is the general statement of the rule, and it is attributed to a repo-wide
+"established conclusion":
+
+```
+// AIV → AIC 跨核 GM 交接的保守同步档位（Arch22 现场 A/B 用）。
+//
+// V6 把 K_beta_g/V_beta 写进 workspace relay，随后由 AIC 的 C7 读回并计算
+// W/U；这条交接当前只依赖 ready/free 跨核 flag。A2/A3 上"只靠跨核 flag 传递
+// GM 数据"不足以稳定保证写侧已经对读侧可见（同 CP/PPFM 的既定结论），这里提供
+// 一个可回退的加固开关：
+//   0 = 与改动前逐字节一致（基线）；
+//   1 = 只在 V6 → C7 这条交接上补"写侧 clean + 读侧失效 + DSB"；
+//   2 = 再把 C2/C4 读入 AIV payload 的位置按同样方式加固（默认，现场验证档位 1 无效、
+//       档位 2 消除漂移；见 PR 描述）。
+// 只影响同步强度，不改变任何计算、地址、输出档位或 tiling 数据。
+#ifndef CHUNK_KDA_FWD_PREPARE_RELAY_SYNC
+#define CHUNK_KDA_FWD_PREPARE_RELAY_SYNC 2
+#endif
+```
+
+The producer-side hunk from the same PR's diff (`.../arch22/chunk_kda_fwd_prepare_vec.h`), verbatim, showing the
+order **DataCopy → DCCI → DSB → flag**:
+
+```cpp
+         AscendC::DataCopy(kBetaRelay, kBetaG, rhsRows * Shape::kHeadDim);
+         AscendC::DataCopy(vBetaRelay, vBeta, rhsRows * Shape::kValueDim);
++#if CHUNK_KDA_FWD_PREPARE_RELAY_SYNC >= 1
++        // 写侧加固（保守）：这两份 relay 马上会被 AIC 的 C7 跨核读回。只靠
++        // ready 跨核 flag 时，MTE3 写缓冲/L2 里的数据可能还没对读侧可见，读侧
++        // 就会拿到 relay 的旧内容（现场表现为单个 work item 的 U 整块错、同一
++        // Stage 的 W 正常）。先把两份 relay clean 出去再放行下一步。
++        AscendC::DataCacheCleanAndInvalid<bfloat16_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
++                                          AscendC::DcciDst::CACHELINE_OUT>(kBetaRelay);
++        AscendC::DataCacheCleanAndInvalid<bfloat16_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
++                                          AscendC::DcciDst::CACHELINE_OUT>(vBetaRelay);
++        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
++#endif
+         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(ioFree_[pair]);
+```
+
+and the consumer-side hunk (`.../arch22/chunk_kda_fwd_prepare_cube.h`), order **wait → DCCI → DSB → DataCopy**:
+
+```cpp
++#if CHUNK_KDA_FWD_PREPARE_RELAY_SYNC >= 1
++            // 读侧加固（保守）：读 AIV 刚写过的 relay 之前先让本核缓存行失效，
++            // 否则 MTE2 可能命中旧行，把上一代（或空）的 K_beta_g/V_beta 读成
++            // 本代的 RHS（现场表现为同一 Stage 里 W 正常、U 整块错）。
++            AscendC::DataCacheCleanAndInvalid<bfloat16_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
++                                              AscendC::DcciDst::CACHELINE_OUT>(kBetaRelay);
++            AscendC::DataCacheCleanAndInvalid<bfloat16_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
++                                              AscendC::DcciDst::CACHELINE_OUT>(vBetaRelay);
++            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
++#endif
+             AscendC::DataCopy(kBetaL1, kBetaRelay, rhsCopy);
+             AscendC::DataCopy(vBetaL1, vBetaRelay, rhsCopy);
+```
+
+Measured A/B from the PR's commit `af7a2af` message and body: tier 0 (baseline) gave
+「~19-22/2000 trial 出现跨 stream 不一致」, tier 1 (that one handoff only) 「仍然 ~19/2000，无改善」, tier 2 (also
+hardening the two other read sites) 「漂移消失」. The diagnostic signature, verbatim:
+
+```
+现场反馈 KDA 前向在并发场景下 fwd / recompute 输出不一致。离线逐元素分析显示：差异集中在一个
+`(value head, chunk)` work item 的 `u` 上，而同一 Stage 的 `w`、更早 Stage 的 `gk / Aqk / Akk / qg / kg`
+逐位一致；`u` 的等效右操作数中位幅值比正常小约 4 个数量级、约 1.4% 元素为巨大脏值，指向"读到了尚未写入或已过期的
+relay 缓冲"。
+```
+
+and the author's own verdict on the cost, verbatim:
+
+```
+- 代价是每个 work item 多两次 `ENTIRE_DATA_CACHE` 级 clean/invalidate 与 DSB，属于保守选择，**可能带来性能回退**。
+  若现场验证有效，后续应换成 slot 级双缓冲 + 代际号（或 L1 中转）的结构性方案再收口，不建议以本 PR 形态合入。
+```
+
+The "tier 1 ineffective, tier 2 effective" result is the single most useful datum here: **it is not enough to harden
+the one handoff you suspect.** Every GM buffer that one core writes and another reads needs the treatment, or the
+drift survives.
+
+### 31.5 `DataCacheCleanAndInvalid` — the official API page, exact spelling and parameters
+
+https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0177.html
+CANN Commercial 8.0 API reference, 「缓存处理」. Retrieved 2026-10-20. Verbatim:
+
+```
+DataCacheCleanAndInvalid
+功能说明
+在AI Core内部，Scalar单元和DMA单元都可能对Global Memory进行访问。
+图1 DataCache内存层次示意图
+如上图所示：
+DMA搬运单元读写Global Memory，数据通过DataCopy等接口在UB等Local Memory和Global Memory间交互，没有Cache一致性问题；
+Scalar单元访问Global Memory，首先会访问每个核内的Data Cache，因此存在Data Cache与Global Memory的Cache一致性问题。
+该接口用来刷新Cache，保证Cache的一致性，使用场景如下：
+读取Global Memory的数据，但该数据可能在外部被其余核修改，此时需要使用DataCacheCleanAndInvalid接口，直接访问Global Memory，获取最新数据；
+用户通过Scalar单元写Global Memory的数据，希望立刻写出，也需要使用DataCacheCleanAndInvalid接口。
+函数原型
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dstTensor)
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const LocalTensor<T>& dstTensor)
+该原型支持的硬件平台型号：
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品
+Atlas 200I/500 A2 推理产品
+template <typename T, CacheLine entireType>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dstTensor)
+该原型支持的硬件平台型号：
+Atlas 推理系列产品AI Core
+参数说明
+dstTensor  输入  需要刷新Cache的Tensor。
+entireType 输入  指令操作的模式：
+SINGLE_CACHE_LINE：只刷新传入地址所在的cacheLine，注意如果该地址非64B对齐，只会操作传入地址到64B对齐的部分。
+ENTIRE_DATA_CACHE：此时传入的地址无效，核内会刷新整个Data Cache，但是耗时较大，性能敏感的场景慎用。
+dcciDst    输入  表示使用该接口来保证Data Cache与哪一种存储保持一致性，类型为DcciDst枚举类。
+CACHELINE_ALL：与CACHELINE_OUT效果一致;
+CACHELINE_UB：预留参数，暂未支持;
+CACHELINE_OUT：表示通过该接口来保证Data Cache与Global Memory的一致性;
+CACHELINE_ATOMIC：预留参数，暂未支持。
+```
+
+and its multi-core warning, verbatim:
+
+```
+// 示例3：SINGLE_CACHE_LINE 模式，假设mmAddr_为0x40（64B对齐），多核处理场景（本样例仅做示例说明，便于开发者理解使用限制，非正常使用样例）
+AscendC::GlobalTensor<uint64_t> global;
+global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_);
+global.SetValue(AscendC::GetBlockIdx(), AscendC::GetBlockIdx());
+// 算子中多核操作虽然不在同一个地址，但在同一个CacheLine, 会出现数据的随机覆盖，和通用CPU的行为不同
+// 调用DataCacheCleanAndInvalid指令后，由于多核操作的时间不一致，最终结果存在随机性，后执行的核会覆盖前面核的结果
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+```
+
+Note the tension worth carrying forward: the official page asserts 「DMA搬运单元读写Global Memory ... 没有Cache一致性
+问题」 — DMA has no coherence problem — while both kernels in §31.1-31.4 are pure-DMA handoffs (FIXPIPE out, MTE2 in)
+that measurably needed DCCI and DSB on DAV_2201. Treat the doc's claim as scoped to a single core's own DMA, not to
+cross-core publication.
+
+### 31.6 `DataSyncBarrier` — the primitive that actually waits for the write-back
+
+https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0272.html
+CANN Commercial 8.0 API reference, 「核内同步」. Retrieved 2026-10-20. Verbatim, complete:
+
+```
+DataSyncBarrier(ISASI)
+功能说明
+用于阻塞后续的指令执行，直到所有之前的内存访问指令（需要等待的内存位置可通过参数控制）执行结束。
+函数原型
+template <MemDsbT arg0>
+__aicore__ inline void DataSyncBarrier()
+参数说明
+arg0  模板参数，表示需要等待的内存位置，类型为MemDsbT，可取值为：
+ALL，等待所有内存访问指令。
+DDR，等待GM访问指令。
+UB，等待UB访问指令。
+SEQ，预留参数，暂未启用，为后续的功能扩展做保留。
+返回值
+无。
+支持的型号
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品
+Atlas 200I/500 A2 推理产品
+约束说明
+无。
+调用示例
+AscendC::Mmad(...);
+AscendC::DataSyncBarrier<MemDsbT::ALL>();
+AscendC::Fixpipe(...);
+```
+
+This is the semantic distinction our problem turns on. `PipeBarrier<PIPE_ALL>()` is declared as
+「阻塞相同流水」 — it orders instruction *issue* between pipes inside one core. `DataSyncBarrier<MemDsbT::DDR>()` is
+declared as blocking until the *memory access instructions themselves have finished*. Only the second one can close
+the window PPFM named: 「flag 已到、写回仍在途」.
+
+It is declared in the public AscendC header alongside the other sync primitives (see §1):
+
+```cpp
+template <MemDsbT arg0>
+__aicore__ inline void DataSyncBarrier();
+```
+
+### 31.7 `CrossCoreSetFlag` / `CrossCoreWaitFlag` — what they do and do not promise
+
+https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0273.html
+https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0274.html
+CANN Commercial 8.0 API reference, 「核间同步」. Retrieved 2026-10-20. `CrossCoreSetFlag`, verbatim:
+
+```
+CrossCoreSetFlag(ISASI)
+功能说明
+面向分离架构的核间同步控制接口。
+该接口和CrossCoreWaitFlag接口配合使用。使用时需传入核间同步的标记ID(flagId)，每个ID对应一个初始值为0的计数器。执行CrossCoreSetFlag后ID对应的计数器增加1；执行CrossCoreWaitFlag时如果对应的计数器数值为0则阻塞不执行；如果对应的计数器大于0，则计数器减一，同时后续指令开始执行。
+同步控制分为以下几种模式，如图1所示：
+模式0：AI Core核间的同步控制。对于AIC场景，同步所有的AIC核，直到所有的AIC核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行；对于AIV场景，同步所有的AIV核，直到所有的AIV核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行。
+模式1：AI Core内部，AIV核之间的同步控制。如果两个AIV核都运行了CrossCoreSetFlag，CrossCoreWaitFlag后续的指令才会执行。
+模式2：AI Core内部，AIC与AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后， 两个AIV上CrossCoreWaitFlag后续的指令才会继续执行；两个AIV都执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+函数原型
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId)
+参数说明
+modeId  核间同步的模式，取值范围为0~2。
+pipe    设置这条指令所在的流水类型，流水类型可参考硬件流水类型。
+flagId  输入  核间同步的标记。
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品，取值范围是0-10。
+返回值
+无
+支持的型号
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品
+约束说明
+因为Matmul高阶API内部实现中使用了本接口进行核间同步控制，所以不建议开发者同时使用该接口和Matmul高阶API，否则会有flagID冲突的风险。
+同一flagId的计数器最多设置16次。
+调用示例
+// 注意：如果调用高阶API,无需开发者处理AIC和AIV的同步
+// AIC侧做完Matmul计算后通知AIV进行后处理
+if (g_coreType == AscendC::AIC) {
+ // Matmul处理
+ AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0x8);
+}
+// AIV侧等待AIC Set消息, 进行Vector后处理
+if (g_coreType == AscendC::AIV) {
+ AscendC::CrossCoreWaitFlag(0x8);
+ // Vector后处理
+}
+父主题： 核间同步
+```
+
+`CrossCoreWaitFlag`, verbatim:
+
+```
+CrossCoreWaitFlag(ISASI)
+功能说明
+面向分离架构的核间同步控制接口。该接口和CrossCoreSetFlag接口配合使用。具体使用方法请参考CrossCoreSetFlag。
+函数原型
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId)
+参数说明
+modeId  核间同步的模式，取值范围为0~2。
+pipe    设置这条指令所在的流水类型，流水类型可参考硬件流水类型。
+flagId  输入  核间同步的标记。
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品，取值范围是0-10。
+约束说明
+CrossCoreWaitFlag必须与CrossCoreSetFlag接口配合使用，避免计算核一直处于阻塞阶段。
+如果执行CrossCoreWaitFlag时该flagId的计数器的值为0，则CrossCoreWaitFlag之后的所有指令都将被阻塞，直到该flagId的计数器的值不为0。同一个flagId的计数器最多设置16次。
+```
+
+Three things to extract. (a) The entire documented semantics are a **counter**: set increments, wait decrements and
+blocks at zero. Nothing in either page claims any memory-ordering or cache effect. The flag is a token, not a fence.
+(b) 「因为Matmul高阶API内部实现中使用了本接口进行核间同步控制，所以不建议开发者同时使用该接口和Matmul高阶API，否则
+会有flagID冲突的风险」 — the vendor explicitly advises against hand-rolling `CrossCoreSetFlag` in the same kernel as
+the Matmul high-level API, which is exactly what a `Matmul<...>::IterateAll` + hand-written flag kernel does. See §20
+for the per-arch occupancy table. (c) The published example uses flagId `0x8` with a bare, un-templated
+`CrossCoreWaitFlag(0x8)` on the AIV side — which, per the header in §1, defaults to `modeId = 0, pipe = PIPE_S`:
+
+```cpp
+template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId);
+```
+
+And flagId 8 is not neutral: `catlass` reserves it (§31.8).
+
+### 31.8 `catlass/arch/cross_core_sync.hpp` — the 15-set limit in vendor source, and the reserved flagIds
+
+https://gitcode.com/cann/catlass/blob/master/include/catlass/arch/cross_core_sync.hpp
+raw: https://raw.gitcode.com/cann/catlass/raw/master/include/catlass/arch/cross_core_sync.hpp
+Repo `cann/catlass`, branch `master`, copyright 2025 Huawei, CANN Open Software License Agreement Version 2.0.
+Retrieved 2026-10-20. Verbatim, the whole substantive part of the file:
+
+```cpp
+// A certain cross core flag can be continuously set up to 15 times without waiting. In scenarios where there is only
+// one-way synchronization between cores and the synchronization operation is executed multiple times, if the core
+// performing the set operation runs faster, it may result in the flag being set more than 15 times consecutively,
+// leading to a system freeze. To prevent such a freeze, we need to wait for the waiting cores to perform a reverse
+// synchronization operation after executing the set operation MAX_REVERSE_DEPTH times.
+constexpr uint32_t MAX_REVERSE_DEPTH = 15;
+
+using FlagID = uint16_t;
+constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+constexpr FlagID AIC_INTER_BLOCK_BARRIER = 9;
+constexpr FlagID AIV_INTER_SUBBLOCK_BARRIER = 10;
+constexpr FlagID FFTS_MAX_FLAG = 7;
+
+struct CrossCoreFlag {
+    CATLASS_DEVICE
+    CrossCoreFlag() : id(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlag(FlagID id) : id(id)
+    {}
+
+    FlagID id;
+};
+
+template <uint32_t REVERSE_DEPTH_ = MAX_REVERSE_DEPTH>
+struct CrossCoreFlagWithReverse {
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse() : id(0), reverseId(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse(FlagID id, FlagID reverseId) : id(id), reverseId(reverseId)
+    {}
+
+    FlagID id;
+    FlagID reverseId;
+    uint32_t count{0};
+};
+
+template <uint8_t MODE, int32_t CORE_TYPE>
+struct BarrierFlag {
+    static_assert(MODE != 255 && MODE == 255, "Unsupported cross core barrier flag, can not find the specialization.");
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIC> {
+    static constexpr FlagID ID = AIC_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x1, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_SUBBLOCK_BARRIER;
+};
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreBarrier()
+{
+    constexpr FlagID flagId = BarrierFlag<MODE, g_coreType>::ID;
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flagId);
+    AscendC::CrossCoreWaitFlag(flagId);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreSetFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+}
+
+CATLASS_DEVICE
+void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag<MODE, PIPE>(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreSetFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreWaitFlag(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreWaitFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.reverseId);
+        flag.count = 0;
+    }
+}
+```
+
+This file answers two separate questions at once. For §31 it says flagId **8 is `AIV_INTER_BLOCK_BARRIER`** in vendor
+library convention and 9 and 10 are the AIC inter-block and AIV inter-subblock barriers; `FFTS_MAX_FLAG = 7` marks the
+boundary of what FFTS+ itself may use. For question 2's "78 layers of handshakes" it is the canonical answer —
+`CrossCoreFlagWithReverse` + `CrossCoreSetFlagWithReverse`, which pairs every flag with a `reverseId` and, every
+`REVERSE_DEPTH = 15` sets, blocks on the consumer's reverse set. That is how a one-way producer→consumer handshake
+survives an unbounded number of stages: back-pressure every 15, not a reset.
+
+### 31.9 `IterateAll` and `End` — what they guarantee
+
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0640.html
+CANN Community Edition 9.0 API reference, 「Matmul Kernel侧接口」 → `IterateAll`. Retrieved 2026-10-20. Verbatim:
+
+```
+功能说明
+调用一次IterateAll，会计算出singleCoreM * singleCoreN大小的C矩阵。迭代顺序可通过tiling参数iterateOrder调整。
+函数原型
+template <bool sync = true> __aicore__ inline void IterateAll(const GlobalTensor<DstT>& gm, uint8_t enAtomic = 0, bool enSequentialWrite = false, bool waitIterateAll = false, bool fakeMsg = false)
+template <bool sync = true> __aicore__ inline void IterateAll(const LocalTensor<DstT>& ubCmatrix, uint8_t enAtomic = 0)
+参数说明
+sync
+获取C矩阵过程分为同步和异步两种模式：
+同步：需要同步等待IterateAll执行结束
+异步：不需要同步等待IterateAll执行结束
+通过该参数设置同步或者异步模式：同步模式设置为true；异步模式设置为false，默认为同步模式。
+Atlas 200I/500 A2 推理产品只支持设置为true。
+...
+waitIterateAll
+输入
+仅在异步场景下使用，是否需要通过WaitIterateAll接口等待IterateAll执行结束。
+true：需要通过WaitIterateAll接口等待IterateAll执行结束。
+false：不需要通过WaitIterateAll接口等待IterateAll执行结束，开发者自行处理等待IterateAll执行结束的过程。
+fakeMsg
+输入
+仅在IBShare场景（模板参数中开启了doIBShareNorm开关）和IntraBlockPartSum场景（模板参数中开启了intraBlockPartSum开关）使用。
+...
+约束说明
+传入的C矩阵地址空间大小需要保证不小于singleCoreM * singleCoreN个元素。
+调用示例
+REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+mm.SetTensorA(gm_a);
+mm.SetTensorB(gm_b);
+if (tiling.isBias) {
+ mm.SetBias(gmBias);
+}
+mm.IterateAll(gm_c); // 计算
+mm.End();
+```
+
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0645.html
+`End`. Retrieved 2026-10-20. Verbatim, complete:
+
+```
+End
+功能说明
+多个Matmul对象之间切换计算时，必须调用一次End函数，用于释放Matmul计算资源，防止多个Matmul对象的计算资源冲突。
+函数原型
+__aicore__ inline void End()
+参数说明
+无
+返回值说明
+无
+约束说明
+无
+调用示例
+mm1.IterateAll(gm_c1);
+mm1.End();
+mm2.IterateAll(gm_c2);
+mm2.End();
+```
+
+So: `IterateAll<true>` (the default) does mean "wait for IterateAll to finish" at the issuing core, and `End()` is
+documented purely as resource release — 「释放Matmul计算资源，防止多个Matmul对象的计算资源冲突」 — and is
+**mandatory between two Matmul objects**, which is exactly the two-projection shape. Neither one says anything about
+publishing the result to another core. There is no visibility guarantee anywhere in the Matmul API; it has to come
+from §31.5/§31.6.
+
+### 31.10 The third witness: scalar-store vs DMA incoherence, with a 12.9M-mismatch A/B
+
+https://github.com/tile-ai/tilelang-ascend/pull/1834
+Title 「[Bugfix] Scalar GM stores race MTE3 DMA through an incoherent write-back cache (#1304)」, author
+`2Sheldonlaw` (commits authored by `m0_69757319`), opened 2026-09-23, closed 2026-09-28, head
+`2Sheldonlaw:fix/copy-ub2gm-scalar-cache-1304-investigation` → base `tile-ai:ascendc_pto`, commits `e187fbe`,
+`27b0a78`. Environment stated as Ascend910 A3 (dav-c220), CANN 9.0.0. Retrieved 2026-10-20.
+
+The mechanism, verbatim fragments as published:
+
+```
+标量路径「经过写回缓存」：写 4 字节前先从 GM 拉入整条 64B cache line（read-modify-write），标脏，
+把该行的写回推迟到逐出时。
+MTE3 DMA 则「绕过该缓存直写 GM」。
+```
+```
+t1: row oh 的标量尾触发 RMW → 下一行头部的旧值（0）被夹带进写回缓存（标脏）
+t2: row oh+1 的 DMA 把正确新值写进 GM（绕过缓存）
+t3: t1 的脏行被逐出 → 整条 64B 写回 GM → 旧值 0 覆盖 t2 的新值 ✗
+```
+```
+DataCacheCleanAndInvalid<ENTIRE_DATA_CACHE, CACHELINE_OUT> before the DMA
+```
+
+and the scoping fact that matters for a megakernel, verbatim: both `dcci` and `MTE3_S` are 「本核作用域的」 — this
+core's scope only — which is why synchronization alone left ~27% residual mismatches when t1/t3 ran on core A and t2
+on core B. Measured: 12,967,510 → 3,496,136 mismatches with commit 1 (−73%), → 0 with commit 2 (which rewrote the
+scalar store loop into a UB staging buffer plus one DMA burst). A template-level fix was rejected for ~12% slowdown
+on GM-traffic-heavy kernels. `AllocateEventId` was also changed to cycle 1..7 instead of 0..7 because the C++
+template `copy_gm_to_ub` in `tl_templates/ascend/common.h` hard-codes event id 0, and a pass-emitted id-0 allocation
+on kernels with 8+ sync points collapsed two sets into one and deadlocked the second wait.
+
+### 31.11 SuperKernel confirms the framework normally issues DCCI ALL around every operator
+
+Already quoted in §19 and §22, repeated here because it is the direct confirmation the question asked for.
+`cap` bit 4, verbatim:
+
+```
+• 4：disable_dcci，表示当前算子需要SuperKernel框架关闭调用前后的DCCI ALL指令。
+```
+
+and the TorchAir default, verbatim:
+
+```
+•当dcci_before_kernel_start、dcci_after_kernel_end和dcci_disable_on_kernel均未配置时，子算子内部调用GlobalTensor的GetValue/SetValue时默认不自动插入缓存刷新指令，SuperKernel默认会在所有子算子调用后插入DataCacheCleanAndInvalid指令刷新ENTIRE_DATA_CACHE。
+```
+
+and the single-operator compile behaviour, verbatim from §19:
+
+```
+- 在单算子编译场景下，毕昇编译器自动在算子末尾添加DataCacheCleanAndInvalid指令，刷新整个DCache（数据缓存）。
+```
+```
+在开发自定义算子时，开发者必须确保所有对GM的标量读写操作都按需正确插入DataCacheCleanAndInvalid指令。
+```
+
+Confirmed, then: in the ordinary single-operator path the Bisheng compiler appends a whole-DCache
+`DataCacheCleanAndInvalid` at the **end of the operator**, and SuperKernel by default inserts a
+`ENTIRE_DATA_CACHE` DCCI **after every sub-operator call**. Both are per-operator-boundary flushes. A hand-written
+megakernel that fuses 78 layers into one launch crosses zero operator boundaries, therefore receives exactly one
+trailing flush for the whole kernel, and must issue every intermediate flush itself.
+
+## Relevance
+This is the answer to the blocking `mix_expert_kernel.cpp` failure: 0/0/416/672/896/896 wrong of 1024 across six runs
+of one binary, with `partial` downloaded to the host always bit-correct, and wrong values being 0 — AIV saw zeros.
+- The matching report is verbatim in §31.1: 「实测（PPFM_DIAG 指纹）：AIV 读到 vTmp 全 0，而 AIC 实际写了
+  -0.013/+0.0092」, on `arch22` = DAV_2201, with the race named as 「flag 已到、写回仍在途」 and the note
+  「加探针即掩盖」 — which is why our host readback is always clean.
+- The ordering to write, both sides, is therefore:
+  producer `Matmul::IterateAll(...)` → `End()` → `DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
+  DcciDst::CACHELINE_OUT>(partialGlobal)` → `DataSyncBarrier<MemDsbT::DDR>()` → `PipeBarrier<PIPE_FIX>()` →
+  `CrossCoreSetFlag<0x02, PIPE_FIX>(flag)`; consumer `CrossCoreWaitFlag<0x02, PIPE_MTE2>(flag)` →
+  `DataCacheCleanAndInvalid<int32_t, ENTIRE_DATA_CACHE, CACHELINE_OUT>(partialGlobal)` →
+  `DataSyncBarrier<MemDsbT::DDR>()` → `DataCopy`. `PipeBarrier<PIPE_ALL>()` cannot substitute: it is documented as
+  「阻塞相同流水」, an issue-order barrier, whereas `DataSyncBarrier` blocks until the memory accesses themselves
+  retire (§31.6).
+- PPFM's own A/B (§31.3) says which half pays: W1R1 → 9/60 failures, W0R1 → 1/60. The producer's **DSB** and the
+  consumer's **invalidate** are load-bearing; the producer's DCCI was not. Start with both on, then A/B the producer
+  DCCI away — it is an `ENTIRE_DATA_CACHE` flush, the expensive one, and at 2.x ms TPOT we cannot afford one per
+  stage per layer.
+- Two further suspects in the same kernel, independent of cache coherence. (i) `CrossCoreWaitFlag(8)` with no
+  template arguments resolves to `modeId = 0, pipe = PIPE_S` (§31.7 header). Mode 0 is the all-AIV inter-block sync,
+  not the AIC↔AIV mode, and PPFM measured that on A2 a `PIPE_S` wait lets the following MTE2 issue early and read
+  「半新半旧」 C — they use `CrossCoreWaitFlag<0x2, PIPE_MTE2>` on 2201 for exactly this. (That measurement sits
+  against §20's official claim that on 2201 the `pipe` argument is inert and all pipes block; the conflict is
+  unresolved, but writing `<0x02, PIPE_MTE2>` costs nothing.) (ii) flagId 8 is `AIV_INTER_BLOCK_BARRIER` in
+  `catlass` (§31.8) and the vendor explicitly warns against mixing hand-written `CrossCoreSetFlag` with the Matmul
+  high-level API because of flagId collision (§31.7) — and this kernel does both, with two Matmul objects.
+- `End()` is **mandatory** between two Matmul objects (§31.9), which is the two-projection shape in
+  `mix_expert_kernel.cpp`; but it is resource release only and buys no visibility.
+- §31.4's tier-1-vs-tier-2 result is the design lesson for the per-layer kernel: hardening the one handoff you
+  suspect left ~19/2000 trials still wrong; only hardening *every* cross-core GM buffer removed the drift. For 78
+  fused layers that means the visibility protocol has to be a property of the buffer abstraction, not something
+  sprinkled at suspected sites.
+- §31.11 closes the question the `disable_dcci` capability bit raised: the Bisheng compiler appends a whole-DCache
+  DCCI at the end of each single operator and SuperKernel inserts an `ENTIRE_DATA_CACHE` DCCI after every
+  sub-operator by default. Our 3008 kernels/round each got one for free. One fused kernel per layer gets 78 instead
+  of 3008, so the flushes we now need inside the kernel are ours to place — and their cost is a new line item
+  against the 11.5 ms launch floor we are trying to remove.
+- §31.8's `CrossCoreFlagWithReverse` / `MAX_REVERSE_DEPTH = 15` is the pre-answer to question 2.1.
+
+
+---
+
+## 32. `matmul_fused_manual` — the vendor's own A3 `ASCENDC_CUBE_ONLY` + manual `CrossCoreSetFlag` sample, complete, and what it does *not* do
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_fused_manual/README.md
+raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_fused_manual/matmul_fused_manual.asc
+Repo `cann/asc-devkit`, branch `master`. Copyright 2025 Huawei, CANN Open Software License Agreement Version 2.0.
+Retrieved 2026-10-20.
+
+This is the nearest official analogue of `tests/glm52/mixbrick/mix_expert_kernel.cpp`: the same `ASCENDC_CUBE_ONLY`
+pure-Cube Matmul object, the same `IterateAll` to a `GlobalTensor`, the same hand-written `CrossCoreSetFlag` /
+`CrossCoreWaitFlag` handoff, the same `__mix__(1, 2)`, the same `<<<>>>` launch, the same `dav-2201`.
+
+Its own description of itself, verbatim:
+
+```
+# 融合编程matmul_fused_manual样例
+
+## 概述
+
+分核AIC、AIV融合编程实现，主要介绍了Matmul高阶API的纯Cube模式，需要调用相关接口实现手动控制AIC、AIV的核间同步。
+
+## 本样例支持的产品及CANN软件版本
+
+| 产品 | CANN软件版本 |
+|------|-------------|
+| Ascend 950PR&950DT系列产品 | >= CANN 9.1.0 |
+| Atlas A3系列产品 | >= CANN 9.0.0 |
+| Atlas A2系列产品 | >= CANN 9.0.0 |
+
+## 样例描述
+
+- 样例功能：
+  本样例在AIC核创建纯Cube模式的Matmul对象，实现Matmul计算，中间结果输出至GM。AIC核计算完成后，通过调用CrossCoreSetFlag和CrossCoreWaitFlag接口手动控制核间同步，继续在AIV核对GM上的中间结果进行LeakyRelu的计算。
+
+- 样例规格：
+  本样例中：M = 128, N = 128, K = 256
+```
+
+and its documented handoff, verbatim:
+
+```
+  - Kernel关键步骤
+    - AIC侧具体步骤：
+      - 创建Matmul对象并初始化。
+        在#include "lib/matmul_intf.h"前配置ASCENDC_CUBE_ONLY宏，创建纯Cube模式的Matmul对象
+          ```cpp
+          #define ASCENDC_CUBE_ONLY
+          #include "lib/matmul_intf.h"
+          ```
+      - 完成Matmul计算。
+      - 设置核间同步。
+        ```cpp
+        if ASCEND_IS_AIC {
+          AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
+        }
+        ```
+    - AIV侧具体步骤：
+      - 创建LeakyRelu对象并初始化。
+      - 等待核间同步。
+        ```cpp
+        if ASCEND_IS_AIV {
+          AscendC::CrossCoreWaitFlag<0x2>(3);
+        }
+        ```
+      - 完成LeakyRelu计算。
+```
+
+and the stated acceptance criterion, verbatim:
+
+```
+- 执行结果
+
+  执行结果如下，说明精度对比成功：
+  ```bash
+  test pass!
+  ```
+```
+
+The build line, verbatim — `dav-2201` is the default and A2/A3 both map to it:
+
+```
+  cmake -DCMAKE_ASC_ARCHITECTURES=dav-2201 ..;make -j;             # 编译工程，默认npu模式
+```
+```
+  | `CMAKE_ASC_ARCHITECTURES` | `dav-2201`（默认）、`dav-3510` | NPU 架构：dav-2201 对应 Atlas A2系列产品和 Atlas A3系列产品，dav-3510 对应 Ascend 950PR&950DT系列产品 |
+```
+
+### 32.1 The kernel, verbatim
+
+The entry point and the handoff, verbatim and complete:
+
+```cpp
+extern "C" __global__ __mix__(1, 2) void matmul_fused_manual_custom(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c,
+    __gm__ uint8_t* __kfc_workspace__ workspace, __gm__ uint8_t* tilingGm)
+{
+    AscendC::TPipe pipe;
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+
+    if ASCEND_IS_AIC {
+        MatmulLeakyKernel<half, half, float, float> matmulLeakyKernel;
+        matmulLeakyKernel.Init(a, b, bias, c, workspace, tiling, &pipe);
+        REGIST_MATMUL_OBJ(
+            &pipe, GetSysWorkSpacePtr(), matmulLeakyKernel.matmulObj,
+            &matmulLeakyKernel.tiling); // Initialize the matmul object.
+        matmulLeakyKernel.Process(&pipe);
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
+    }
+    if ASCEND_IS_AIV {
+        LeakyReluKernel<float> leakyReluKernel;
+        leakyReluKernel.Init(c, tiling, &pipe);
+        AscendC::CrossCoreWaitFlag<0x2>(3);
+        leakyReluKernel.Process(&pipe);
+    }
+}
+```
+
+The Matmul object's declared types — note the **C matrix is declared `TPosition::VECIN`**, not `GM`, even though
+`IterateAll` is handed a `GlobalTensor`:
+
+```cpp
+    Matmul<
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BType>,
+        MatmulType<AscendC::TPosition::VECIN, CubeFormat::ND, CType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasType>>
+        matmulObj;
+```
+
+`Process` — the whole cube side, verbatim. `End()` is called, and it is called **before** the flag set:
+
+```cpp
+template <typename AType, typename BType, typename CType, typename BiasType>
+__aicore__ inline void MatmulLeakyKernel<AType, BType, CType, BiasType>::Process(AscendC::TPipe* pipe)
+{
+    matmulObj.SetTensorA(aGlobal);
+    matmulObj.SetTensorB(bGlobal);
+    matmulObj.SetBias(biasGlobal);
+
+    matmulObj.template IterateAll(cGlobal);
+    matmulObj.End();
+}
+```
+
+The consumer side, verbatim — a bare `DataCopy` from the same `c` pointer the cube wrote, with no cache op:
+
+```cpp
+template <typename CType>
+__aicore__ inline void LeakyReluKernel<CType>::Init(__gm__ uint8_t* c, const TCubeTiling& tiling, AscendC::TPipe* pipe)
+{
+    this->tiling = tiling;
+    // c:v = 1:2, split into 2 parts, for vector calculation.
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(c) + AscendC::GetBlockIdx() * tiling.M * tiling.N / 2);
+
+    // Init input buffer.
+    pipe->InitBuffer(reluInQueue_, 1, tiling.singleCoreM * tiling.singleCoreN * sizeof(CType) / 2);
+    // Init output buffer.
+    pipe->InitBuffer(reluOutQueue_, 1, tiling.singleCoreM * tiling.singleCoreN * sizeof(CType) / 2);
+}
+```
+```cpp
+template <typename CType>
+__aicore__ inline void LeakyReluKernel<CType>::LeakyReluCopyIn(const TCubeTiling& tiling)
+{
+    AscendC::LocalTensor<float> reluInLocal = reluInQueue_.AllocTensor<float>();
+    AscendC::DataCopy(reluInLocal, cGlobal, tiling.singleCoreM * tiling.singleCoreN / 2);
+    reluInQueue_.EnQue<float>(reluInLocal);
+}
+```
+
+The tiling, verbatim — one `baseM = baseN = 128` tile, i.e. a single `Iterate` worth of work, `FIRSTM` traversal, and
+the tiling side declares the result position as **GM** while the kernel side declared it `VECIN`:
+
+```cpp
+    matmul_tiling::TPosition resultPosition = matmul_tiling::TPosition::GM;
+    matmul_tiling::CubeFormat resultFormat = matmul_tiling::CubeFormat::ND;
+    matmul_tiling::DataType resultDtype = matmul_tiling::DataType::DT_FLOAT;
+```
+```cpp
+    int baseM = 128;
+    int baseN = 128;
+```
+```cpp
+    tilingApi.SetOrgShape(M, N, K);
+    tilingApi.SetShape(M, N, K);
+    tilingApi.SetBias(isBias);
+    tilingApi.SetTraverse(matmul_tiling::MatrixTraverse::FIRSTM); // Set the matmul traverse is FIRSTM.
+    tilingApi.SetFixSplit(baseM, baseN, -1);                      // Set the fixed baseM=128, baseN=128.
+    tilingApi.SetBufferSpace(-1, -1, -1);
+```
+
+And the launch, verbatim — **one block**:
+
+```cpp
+    uint32_t numBlocks = 1;
+```
+```cpp
+    matmul_fused_manual_custom<<<numBlocks, 0, stream>>>(
+        inputADevice, inputBDevice, inputBiasDevice, outputCDevice, workspaceDevice, tilingDevice);
+```
+
+### 32.2 What the sample omits
+
+Enumerated plainly, because the absences are the finding. The sample contains, across the whole file:
+no `DataCacheCleanAndInvalid`, no `DataSyncBarrier`, no `PipeBarrier` of any pipe, and no `SetFlag`/`WaitFlag`.
+The entire producer-to-consumer protocol is three lines:
+
+```cpp
+    matmulObj.template IterateAll(cGlobal);
+    matmulObj.End();
+    AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
+```
+```cpp
+    AscendC::CrossCoreWaitFlag<0x2>(3);
+```
+
+Four structural differences from our failing kernel, any of which could be why the sample gets away with it:
+`numBlocks = 1` (our brick launches `<<<blocks>>>` with blocks > 1, and §4 records mode 2 as documented to leak
+across MIX blocks at `blockDim > 1`); a single `IterateAll` of a single `baseM × baseN = 128 × 128` tile (ours is two
+projections); `flagId = 3`, not 8 — 8 is `catlass`'s `AIV_INTER_BLOCK_BARRIER` (§31.8); and the mode template
+argument is written out on the wait, `CrossCoreWaitFlag<0x2>(3)`, so only `pipe` takes its default.
+
+## Relevance
+This is the "known-good hand-written MIX kernel passing cube results to the vector side through global memory,
+documented to be correct" that the brick was looking for, and it is structurally identical to
+`tests/glm52/mixbrick/mix_expert_kernel.cpp` down to the `__mix__(1, 2)`, `ASCENDC_CUBE_ONLY`, `IterateAll` to GM and
+`CrossCoreSetFlag<0x2, PIPE_FIX>`. Copy its skeleton.
+- But read it against §31 rather than instead of §31. The sample's acceptance criterion is a single `test pass!` on
+  M=N=128, K=256, one block, one tile. The failures §31 documents are probabilistic at rates of 19/2000 trials,
+  9/60 processes, and our own 2-of-6 runs clean — a rate that one verification run of one shape cannot distinguish
+  from correct. The sample is evidence that the flag-only protocol is *sufficient at blockDim = 1 on one tile*. It is
+  not evidence that it is sufficient at `blockDim > 1` across 78 layers, and the three third-party kernels in §31 all
+  broke in exactly the regime the sample does not enter.
+- Two free corrections it hands us regardless: `End()` goes **between** `IterateAll` and the flag set, and the
+  wait should be written `CrossCoreWaitFlag<0x2>(...)` with the mode spelled out (our bare `CrossCoreWaitFlag(8)`
+  takes `modeId = 0`, the all-AIV inter-block mode, per the header in §1). And move off flagId 8.
+- The `MatmulType<TPosition::VECIN, ...>` for C while the host tiling says `TPosition::GM` is the vendor's own
+  configuration for this pattern — worth copying exactly rather than "fixing", since the Matmul high-level API's
+  choice of fixpipe path depends on it.
+- `__gm__ uint8_t* __kfc_workspace__ workspace` is the attribute that marks the KFC (kernel function call) workspace
+  argument in a `__mix__` kernel; our brick must carry it too, sized from
+  `ascendcPlatform->GetLibApiWorkSpaceSize()`.
+- The sample's one-tile shape is also a reminder of the economics: at `M = 1` decode our MIX_AIC launch floor is
+  13.58 us against a GroupedMatmul family that spends 5.596 ms moving 1.212 ms of bytes. The brick exists to delete
+  the launch, not to make the tile faster.
+
+
+---
+
+## 33. `MixDualMaster` — turning off the AIV→AIC message drive, on A3, with `ASCENDC_CUBE_ONLY`
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_mixdualmaster/README.md
+raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_mixdualmaster/matmul_mixdualmaster.asc
+Repo `cann/asc-devkit`, branch `master`. Copyright 2025 Huawei, CANN Open Software License Agreement Version 2.0.
+Retrieved 2026-10-20.
+
+The README, verbatim and in full for the substantive part:
+
+```
+# Matmul 双主模式直调样例
+## 概述
+使能双主模式（MixDualMaster）的Matmul样例，AIC和AIV独立运行代码，不依赖消息驱动，用于提升性能。
+
+Matmul API在默认的MIX模式下，通过消息机制由AIV驱动AIC运行；而在双主模式下，AIC和AIV独立运行代码，不依赖消息驱动，性能更优。
+当满足以下条件之一时，可以开启双主模式：
+- 核函数类型为MIX，且AIC核数：AIV核数=1：1
+- 核函数类型为MIX，且AIC核数：AIV核数=1：2，且A矩阵和B矩阵同时使能IBSHARE参数
+
+## 本样例支持的产品及CANN软件版本
+
+| 产品 | CANN软件版本 |
+|------|-------------|
+| Ascend 950PR&950DT系列产品 | >= CANN 9.1.0 |
+| Atlas A3系列产品 | >= CANN 9.0.0 |
+| Atlas A2系列产品 | >= CANN 9.0.0 |
+```
+
+and its acceptance criterion, verbatim: 「执行结果如下，说明精度对比成功：`test pass!`」, built with
+`cmake -DCMAKE_ASC_ARCHITECTURES=dav-2201`.
+
+The switch, verbatim — one `MatmulConfig` field off `CFG_NORM`:
+
+```cpp
+__aicore__ inline constexpr MatmulConfig GetCustomCFG()
+{
+    auto mmCfg = CFG_NORM;
+    mmCfg.enableMixDualMaster = true;
+    return mmCfg;
+}
+```
+
+The Matmul object, verbatim — note `IBSHARE` is the **sixth** `MatmulType` template argument, `true` on both A and B,
+which is what the 1:2 ratio requires:
+
+```cpp
+    constexpr static MatmulConfig CUSTOM_CFG = GetCustomCFG();
+    // Enable IBSHARE parameters for matrix A and matrix B
+    AscendC::Matmul<
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AType, IS_TRANS_A, LayoutMode::NONE, true>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BType, IS_TRANS_B, LayoutMode::NONE, true>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, CType>,
+        AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasType>, CUSTOM_CFG>
+        matmulObj;
+```
+
+The entry point, verbatim — declared `__cube__`, **not** `__mix__`, with `ASCENDC_CUBE_ONLY` defined before
+`lib/matmul_intf.h`, and no `ASCEND_IS_AIC` / `ASCEND_IS_AIV` split at all:
+
+```cpp
+#define ASCENDC_CUBE_ONLY
+#include "lib/matmul_intf.h"
+
+constexpr uint32_t M = 12288;
+constexpr uint32_t N = 256;
+constexpr uint32_t K = 128;
+constexpr bool IS_TRANS_A = false;
+constexpr bool IS_TRANS_B = false;
+constexpr bool IS_BIAS = true;
+```
+```cpp
+__global__ __cube__ void matmul_mixdualmaster_custom(
+    __gm__ uint8_t* a, __gm__ uint8_t* b, __gm__ uint8_t* bias, __gm__ uint8_t* c, __gm__ uint8_t* workspace,
+    __gm__ uint8_t* tilingGm)
+{
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+    AscendC::TPipe pipe;
+
+    MatmulKernel<half, half, float, float> matmulKernel;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulKernel.matmulObj, &tiling);
+    matmulKernel.Init(a, b, bias, c, tiling);
+    matmulKernel.Process();
+}
+```
+
+The compute body, verbatim — `SetTail` for the ragged edge, then `IterateAll` then `End()`:
+
+```cpp
+    // process with tail block
+    int tailM = tiling.M - mCoreIndex * tiling.singleCoreM;
+    tailM = tailM < tiling.singleCoreM ? tailM : tiling.singleCoreM;
+    int tailN = tiling.N - nCoreIndex * tiling.singleCoreN;
+    tailN = tailN < tiling.singleCoreN ? tailN : tiling.singleCoreN;
+    if (tailM < tiling.singleCoreM || tailN < tiling.singleCoreN) {
+        matmulObj.SetTail(tailM, tailN);
+    }
+
+    matmulObj.SetTensorA(aGlobal, IS_TRANS_A);
+    matmulObj.SetTensorB(bGlobal, IS_TRANS_B);
+    if (tiling.isBias) {
+        matmulObj.SetBias(biasGlobal);
+    }
+    matmulObj.IterateAll(cGlobal);
+    matmulObj.End();
+```
+
+and the host side, verbatim — the grid is the AIC core count, taken from the tiling:
+
+```cpp
+    tilingApi.SetDim(ascendcPlatform->GetCoreNumAic());
+```
+```cpp
+    uint32_t numBlocks = reinterpret_cast<TCubeTiling*>(tilingBuf)->usedCoreNum;
+```
+
+## Relevance
+This is the named, A3-supported mechanism for deleting the thing that makes a MIX launch cost 13.58 us instead of
+2.30 us: 「Matmul API在默认的MIX模式下，通过消息机制由AIV驱动AIC运行；而在双主模式下，AIC和AIV独立运行代码，不依赖消息
+驱动，性能更优」. 505 MIX_AIC calls/round at 13.58 us is 6.86 ms of our 11.6198 ms TPOT, and §15 already showed the
+MIX controller as the cost `ASCENDC_CUBE_ONLY` is meant to avoid — `enableMixDualMaster` is the matching
+`MatmulConfig` field.
+- The eligibility rule is the catch, verbatim: either 1:1 AIC:AIV, or 1:2 **with IBSHARE enabled on both A and B**.
+  Our brick is `KERNEL_TYPE_MIX_AIC_1_2`, so the 1:2 branch applies and both operands must be IBShare. §11 records
+  the A3 restriction that comes with that: 「Atlas A3 训练系列产品 / Atlas A3 推理系列产品，获取矩阵计算结果时，只支持
+  调用IterateAll接口，且只支持输出到GlobalTensor」 — which is already what the brick does, so the two constraints are
+  compatible. But IBShare on A *and* B means both operands are L1-resident and shared across Matmul objects, which
+  for our W4A8 routed experts (128 columns of `moe_intermediate` per rank) is a real tiling constraint, not a free
+  switch.
+- Note what the sample is *not*: it is a pure-cube `__global__ __cube__` kernel with no vector half and therefore no
+  cross-core handoff. So it demonstrates the config flag and its eligibility rule, not a dual-master CV handoff. The
+  combination we actually want — `enableMixDualMaster` plus a hand-written `CrossCoreSetFlag` to an AIV half — is not
+  exhibited by any sample found.
+- `SetTail(tailM, tailN)` is the documented way to run the ragged last tile without a second Matmul object, which at
+  M=1 decode with 128 columns per rank is the normal case rather than the exception.
+
+
+---
+
+## 34. The official 220x memory model for AIC→AIV — the vendor says the flag *is* the ordering mechanism
+
+https://www.hiascend.com/doc_center/source/zh/canncommercial/83RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0011.html
+CANN Commercial 8.3.RC1 算子开发指南 → 架构规格 → 「NPU架构版本220」. This page covers
+「Atlas A3 训练系列产品 / Atlas A3 推理系列产品 / Atlas A2 训练系列产品 / Atlas A2 推理系列产品」, i.e. our
+DAV_2201. Retrieved 2026-10-20.
+
+This is the authoritative statement of the question §31 was asked about, and it answers it in the opposite
+direction. Read §31 and §34 together; the contradiction is the finding.
+
+The architecture, verbatim:
+
+```
+如下图所示，本架构中AI Core分为AIC和AIV两个独立的核，分别用于矩阵计算和向量计算。每个核都有自己的Scalar单元，能独立加载自己的代码段。AIV与AIC之间通过Global Memory进行数据传递。
+```
+
+The inter-core section, verbatim and complete:
+
+```
+ 核间同步 
+ 当不同核之间操作同一块全局内存时，可能存在读后写、写后读以及写后写等数据依赖问题，需要进行核间同步控制。
+ 核间同步控制分为以下几种模式，如下图所示：
+ 模式0：AI Core核间的同步控制。对于AIC场景，同步所有的AIC核，直到所有的AIC核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行；对于AIV场景，同步所有的AIV核，直到所有的AIV核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行。
+ 模式1：AI Core内部，AIV核之间的同步控制。如果两个AIV核都运行了CrossCoreSetFlag，CrossCoreWaitFlag后续的指令才会执行。
+ 模式2：AI Core内部，AIC与AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后， 两个AIV上CrossCoreWaitFlag后续的指令才会继续执行；两个AIV都执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+ 例如，在AIC中将L0C的计算结果搬运到GM后，AIV需要将GM的数据搬运到UB。此时，可以使用CrossCoreSetFlag和CrossCoreWaitFlag命令，确保数据从L0C成功搬运到GM后，再从GM搬运到UB，流程如下图所示。
+ CrossCoreSetFlag和CrossCoreWaitFlag接口配合使用。使用时需传入核间同步的标记ID(flagId)，即上图中的ID1，每个ID对应一个初始值为0的计数器。执行CrossCoreSetFlag后ID对应的计数器增加1；执行CrossCoreWaitFlag时如果对应的计数器数值为0则阻塞不执行；如果对应的计数器大于0，则计数器减一，同时后续指令开始执行。flagId取值范围是0-10。
+ 需要注意以下几点：
+ 成对使用
+ CrossCoreSetFlag和CrossCoreWaitFlag必须成对使用，否则可能导致算子超时问题。
+ 一致性要求
+ CrossCoreSetFlag 的模板参数和flagId必须与CrossCoreWaitFlag完全一致，否则视为不同的flagId。例如，CrossCoreSetFlag<0x0, PIPE_MTE3>(0x8) 和 CrossCoreSetFlag<0x2, PIPE_FIX>(0x8) 设置的不是同一个flagId。
+ 避免连续设置
+ 不允许连续设置同一个flagId，以防止计数器状态混乱。
+ 与高阶 API 的使用冲突
+ Matmul高阶API内部实现中使用了本接口进行核间同步控制，所以不建议开发者同时使用该接口和Matmul高阶API，否则会有flagId冲突的风险。
+ 计数器限制
+ 同一flagId的计数器最多可以设置15次。
+ 默认流水类型
+ CrossCoreWaitFlag不需要显式设置指令所在的流水类型，默认使用PIPE_S。
+```
+
+The intra-core section, verbatim — the `SetFlag`/`WaitFlag` identity rule and the reserved event ids:
+
+```
+ 核内同步 
+ 由于AI Core内部的执行单元（如MTE2搬运单元、Vector计算单元等）以异步并行的方式运行，在读写Local Memory（如Unified Buffer）时可能存在数据依赖关系。为确保数据一致性及计算正确性，需通过同步控制协调操作时序。
+...
+ 需要注意以下几点： 
+ 建议通过AllocEventID或者FetchEventID接口获取EventID，以确保其合法性和有效性。
+ EventID的数量有限，使用后应立即调用ReleaseEventID释放资源，避免EventID耗尽，影响系统正常运行。
+ SetFlag和WaitFlag必须成对使用，且SetFlag和WaitFlag的参数必须完全一致（包括模板参数和事件ID）。如果不匹配，可能导致当前核的计算异常，或影响下一个核的算子执行，引发timeout问题。 
+ 例如，SetFlag<HardEvent::S_MTE3>(1)和SetFlag<HardEvent::MTE3_MTE1>(1)设置的不是同一个EventID，因为其模板参数不同。只有当模板参数和事件ID完全一致时，才表示同一个EventID。
+ 不允许连续设置同一个EventID，因为这可能导致事件状态混乱或未被正确处理。
+ 不建议手动插入 TEventID，不能手动插入6和7的TEventID，因为它们可能被系统预留或用于特殊用途。
+```
+
+The Fixpipe capability list, verbatim — this is the quantisation and activation set available *on the way out of
+L0C*, i.e. for free, before the result ever reaches GM:
+
+```
+ 支持Fixpipe硬件化加速
+ Fixpipe是NPU将典型操作进行硬化的加速模块，位于AIC内部，配合Cube计算单元完成随路计算，主要功能如下：
+ 量化反量化：包括S322FP16、S322S32、S322S4、S322S8、S322S16、FP322FP16、FP322BF16、FP322S8、FP322S4、FP322FP32。
+ Relu功能，包括ReLu、PReLu和Leaky ReLu等典型的激活函数。
+ 数据格式转换，包括： 
+ 通过Channel merge、Channel split可以实现分形大小的转换，保证输出到L1 Buffer/GM的分形满足诉求。
+ NZ2ND数据格式转换。
+```
+
+and the alignment table, verbatim:
+
+```
+ 核 存储单元 对齐要求
+ AIV Unified Buffer 32Byte对齐。
+ AIC L1 Buffer 32Byte对齐。
+ L0A Buffer 512Byte对齐。
+ L0B Buffer 512Byte对齐。
+ L0C Buffer 64Byte对齐。
+ BiasTable Buffer 64Byte对齐。
+```
+
+and the cross-card note, verbatim — relevant to the TP reduce, since it says `DataCopy` itself can cross cards but
+only over HCCS on A2:
+
+```
+ 支持跨卡数据搬运（Hccs物理链路）
+ 在跨卡通信算子开发场景，DataCopy类接口支持跨卡数据搬运，在
+ Atlas A2 训练系列产品 / Atlas A2 推理系列产品
+ 设备上，仅支持Hccs物理链路，不支持其他通路；开发者开发过程中，请关注涉及卡间通信的物理通路； 通过npu-smi info -t topo指令查询Hccs 物理通路。
+```
+
+## Relevance
+This page is the official answer to "what makes an AIC's global write visible to an AIV's `DataCopy`", and the answer
+it gives is: the flag, and nothing else. Verbatim, in exactly our scenario:
+「例如，在AIC中将L0C的计算结果搬运到GM后，AIV需要将GM的数据搬运到UB。此时，可以使用CrossCoreSetFlag和
+CrossCoreWaitFlag命令，**确保数据从L0C成功搬运到GM后，再从GM搬运到UB**」. No cache maintenance is mentioned
+anywhere on the page. Combined with §32's vendor sample, which carries no DCCI either, the documented contract is
+flag-only.
+- Against that stand the three measured third-party failures in §31 on this same DAV_2201, including one whose
+  symptom is ours to the letter (AIV reads all zeros where AIC wrote nonzero). The resolution is not available from
+  any source found: either the hardware does not honour the documented contract in some regime (multi-block, multi-
+  tile, high occupancy), or all three kernels had a different bug that DCCI happened to mask. Treat the DCCI+DSB as
+  an empirical workaround with a measured effect, not as the documented rule — and A/B it rather than adopting it.
+- Four hard constraints to take at face value, all new or sharper than what §20 and §4 carried:
+  (a) 「CrossCoreSetFlag 的模板参数和flagId必须与CrossCoreWaitFlag完全一致，否则视为不同的flagId」 — the Set's
+  template arguments must match the Wait's exactly, or they are different flagIds. Our brick sets
+  `<0x02, PIPE_FIX>(8)` and waits with a bare `CrossCoreWaitFlag(8)`, which is `<0x0, PIPE_S>`. By the letter of this
+  rule those are two different flags and the wait should block forever. It does not — the kernel produces output —
+  and the same page's own 「默认流水类型：CrossCoreWaitFlag不需要显式设置指令所在的流水类型，默认使用PIPE_S」 plus
+  §20's 「在NPU架构版本2201上，CrossCoreWaitFlag传入的pipe参数无效」 plus the `CrossCoreSetFlag` page's own example
+  pairing `<0x2, PIPE_FIX>(0x8)` with a bare `CrossCoreWaitFlag(0x8)` all say the Wait's template arguments are not
+  part of the flag's identity on 2201. So the consistency requirement is, in practice, about matching two *Sets* —
+  which is how the page's own illustration reads, both of its examples being `CrossCoreSetFlag`. Write
+  `CrossCoreWaitFlag<0x02>(...)` anyway, as `matmul_fused_manual` does; it costs nothing and removes the ambiguity.
+  (b) 「同一flagId的计数器最多可以设置15次」 — **15** here, against 「同一flagId的计数器最多设置16次」 on both the
+  `CrossCoreSetFlag` and `CrossCoreWaitFlag` API pages (§31.7) and 「continuously set up to 15 times」 in `catlass`
+  (§31.8). Two of three sources say 15; design to 15.
+  (c) 「不允许连续设置同一个flagId」 — restated, and it is the reason §31.3's `AicSetToAiv` sets once under mode 2
+  rather than once per AIV.
+  (d) 「不建议手动插入 TEventID，不能手动插入6和7的TEventID」 — intra-core event ids 6 and 7 are reserved, which
+  narrows the usable `SetFlag`/`WaitFlag` event space to 0-5 per pipe pair, tighter than the "8 ids" figure in
+  `ascend-launch-overhead-and-sync.md` §3. Note `tile-ai/tilelang-ascend` PR #1834 (§31.10) independently moved its
+  allocator to cycle 1..7 for a different reason (a template hard-coding id 0).
+- The Fixpipe list is a direct lever on our measured numbers. `Cast` costs 2.300 ms/round against 0.076 ms of bytes
+  moved — a pure overhead family — and Fixpipe does `S322FP16`, `S322S8`, `S322S16`, `FP322BF16`, `FP322S8` and
+  ReLU/PReLU/LeakyReLU *in the AIC on the way out of L0C*. For W4A8 routed experts producing INT32, the
+  `S322S8`/`S322FP16` conversion and the NZ2ND format change can happen before the data is ever written, which both
+  removes the Cast and shrinks the GM traffic the AIV must then read back.
+- 「AIV与AIC之间通过Global Memory进行数据传递」 is the official confirmation of README finding 3b: there is no
+  L0C→UB path on 220x, so a per-layer fused kernel's cube→vector edge is always a GM round trip, and the only
+  question is whether it stays in L2.
+
+
+---
+
+## 35. `asc.gitcode.com` — the full AscendC API reference as static HTML, and the definitive 2201 cache model it contains
+
+### 35.0 The source itself
+
+https://asc.gitcode.com/api/
+A complete mirror of the Ascend C API reference, served as static HTML (VitePress), with a product-version selector
+listing 「全量 / Ascend 950 / Atlas A3 / Atlas A2 / Atlas 训练系列 / Atlas 推理系列 / Atlas 200I/500 A2 / Kirin X90 /
+Kirin 9030」, and **every page carries an explicit 「产品支持情况」 block naming Atlas A3 by name**. Retrieved
+2026-10-20.
+
+This matters operationally: `hiascend.com/document/detail/...` is a JavaScript SPA that returns an empty body to a
+fetcher, and `hiascend.com/doc_center/source/...` works but has a sparse, undiscoverable id space (see this file's
+Gaps). `asc.gitcode.com` resolves by readable path and contains the sidebar of every page, so one fetch yields the
+whole URL map. URL shape:
+
+```
+https://asc.gitcode.com/api/SIMD-API/基础API/同步控制/核间同步/SyncAll.html
+https://asc.gitcode.com/api/SIMD-API/基础API/同步控制/核内同步/DataSyncBarrier_ISASI.html
+https://asc.gitcode.com/api/SIMD-API/基础API/缓存控制/系统缓存概述.html
+https://asc.gitcode.com/api/SIMD-API/基础API/缓存控制/DataCacheCleanAndInvalid.html
+https://asc.gitcode.com/api/SIMD-API/基础API/标量计算/WriteGmByPassDCache_ISASI.html
+https://asc.gitcode.com/api/SIMD-API/基础API/标量计算/ReadGmByPassDCache_ISASI.html
+https://asc.gitcode.com/api/SIMD-API/基础API/cube_compute_ISASI/矩阵计算的搬出/Fixpipe_L0CToUB.html
+```
+(percent-encode the Chinese path segments.) It is also newer than the CANN 8.0 `doc_center` copies quoted in §31:
+several pages carry content those do not.
+
+### 35.1 「系统缓存概述」 — the authoritative per-cache coherence table for 2201
+
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E7%BC%93%E5%AD%98%E6%8E%A7%E5%88%B6/%E7%B3%BB%E7%BB%9F%E7%BC%93%E5%AD%98%E6%A6%82%E8%BF%B0.html
+Retrieved 2026-10-20. This is the page `WriteGmByPassDCache` cross-references as 「Cache写策略与Cache一致性问题」.
+Verbatim, the parts that settle §31 and §34:
+
+```
+表1 Cache类型及功能说明 
+Cache类型
+说明
+L2 Cache
+L2 Cache作为二级缓存，专门用于存储频繁访问的数据和指令，以便减少对GM的读写。
+•通过MTE2单元读取GM时，优先从L2 Cache中读取数据；当L2 Cache未命中时，再从GM加载数据并更新到L2 Cache中。
+•通过Scalar单元读取GM时，优先从DCache中读取数据；当DCache未命中时，再从L2 Cache中读取数据。当L2 Cache也未命中时，再从GM加载数据并更新到L2 Cache和DCache中。
+•通过Scalar单元读取GM指令时，优先从ICache中读取指令；当ICache未命中时，再从L2 Cache中读取指令。当L2 Cache也未命中时，再从GM加载指令并更新到L2 Cache和ICache中。
+DCache
+DCache（Data Cache）用于缓存Scalar单元近期可能被重复访问的数据段。
+通过Scalar单元读取GM时，优先从DCache中读取数据；当DCache未命中时，再从L2 Cache中读取数据。当L2 Cache也未命中时，再从GM加载数据并更新到L2 Cache和DCache中。
+ICache
+ICache（Instruction Cache）用于缓存Scalar单元最近使用或频繁使用的指令。
+```
+
+and the architecture inventory, verbatim:
+
+```
+以NPU架构版本3510为例，图1展示了AI Core中支持的五类Cache（L2 Cache、DCache、ICache、SIMT DCache、NDDMA Cache）在硬件架构中的位置关系。
+以NPU架构版本2201为例，图2展示了AI Core中支持的三类Cache（L2 Cache、DCache和ICache）在硬件架构中的位置关系。
+```
+
+the write policies, verbatim:
+
+```
+Cache写策略与Cache一致性问题​
+当向GM写入数据，并且启用Cache时，存在以下两种Cache写策略：延迟写回（Write-Back）和直写（Write-Through）。
+当向GM写数据时采取延迟写回策略，工作原理如下：
+开发者预期向GM写入数据（即期望数据直接写入GM），硬件实际行为是：
+当数据被修改时，只在缓存中更新数据。
+缓存中的数据标记为“脏”。
+当该Cache Line被替换时（或通过软件显式执行Clean操作时），数据才会被写回GM，Cache Line何时被替换由硬件决定。
+...
+在延迟写回策略下，被修改的数据仅更新在本地缓存中，不会立即同步到GM。当其他核读取GM上同一地址时，获取的将是过时数据，从而导致不同核间缓存数据不一致。 Cache一致性是多核中确保数据正确性的核心机制。简单来说，当多个核各自拥有独立的Cache时，它们可能同时缓存相同的数据。如果某个核修改了缓存中的数据，其他核的缓存副本就会变得“过时”，如果不及时同步，就会导致多个核间的数据不一致，进而引发计算错误。
+```
+
+and — the single most load-bearing paragraph in this file — the per-cache verdict for **our architecture**, verbatim:
+
+```
+针对NPU架构版本2201，支持的三类Cache在多核间数据一致性方面的情况如下： L2 Cache：多核间共享的缓存，因此不需要考虑多核间数据不一致的问题。
+DCache：多核独立缓存，因此需要考虑多核间数据一致性的问题。
+ICache：只读，因此不需要考虑多核间数据不一致的问题。
+```
+
+the four cache operations, verbatim — note that `Invalid` discards dirty lines:
+
+```
+表2 Cache操作及功能说明
+操作名称
+功能说明
+Prefetch
+硬件根据访问模式自动将预期访问的数据提前加载到缓存，提升后续访问速度。
+Preload
+软件通过显式指令将指定数据主动加载到缓存，为即将到来的读写操作做准备。
+Invalid
+•将指定地址范围的Cache Line（缓存的最小操作单元）标记为“无效”，使其从缓存中移除。
+•保证下一次访问这些内存地址时，会从GM重新加载数据，而不是使用可能过期的缓存数据。
+•注意：Invalid操作不检查缓存行是否为“脏”（dirty，表示该数据已被修改但尚未写回到GM），若存在脏数据将被直接丢弃。
+Clean
+将缓存中被修改过的数据（脏数据）写回到GM中，避免数据丢失。Clean操作不将缓存行标记为“无效”，缓存行仍保持有效状态。
+```
+
+and the control-interface summary, verbatim:
+
+```
+表3 缓存控制接口汇总
+L2 Cache  SetL2CacheHint  读写GM的数据都默认被缓存在L2 Cache（默认启用L2 Cache），SetL2CacheHint能够设置GlobalTensor是否启用L2 Cache。
+DCache  DataCachePreload  DataCachePreload接口从源地址所在的特定GM地址预加载数据到DCache中，每次调用只能预加载一个Cache Line大小的数据。
+DCache  DataCacheCleanAndInvalid  当Scalar单元访问GM时，使用该接口刷新Cache，保证Cache的一致性，使用场景如下：
+•读取GM的数据，但该数据可能在外部被其余核修改，此时需要使用DataCacheCleanAndInvalid接口，直接访问GM，获取最新数据。
+•用户通过Scalar单元写GM的数据，希望立刻写出，也需要使用DataCacheCleanAndInvalid接口。
+DCache  ReadGmByPassDCache/WriteGmByPassDCache  不经过DCache向GM地址上读/写数据。使用场景：
+•当多个核写入的数据落在同一条Cache Line内时，经过DCache的读写将以64B为粒度，可能引发多核数据随机覆盖问题。使用该接口不经过DCache直接按操作数大小读/写GM，可避免此问题。
+•使用该接口不经过DCache直接向GM读/写数据，可避免由DCache缓存引发的多核间数据不一致问题。
+ICache  ICachePreLoad  开发者手动调用ICachePreLoad接口，能够从指令所在GM地址预加载指令到ICache中。
+ICache  GetICachePreloadStatus  GetICachePreloadStatus为调试接口，在调用ICachePreLoad后调用，用于获取ICache的PreLoad的状态。当返回值为0时，说明ICache的PreLoad已完成；当返回值为1时，说明ICache的PreLoad未完成。
+NDDMA Cache  NdDmaDci  在使用DataCopy（GMToUB多维数据搬运NDDMA）接口进行数据搬运前，需要使用NdDmaDci接口刷新NDDMA Cache缓存保证为最新状态。
+```
+
+### 35.2 `DataSyncBarrier` — the official cross-core publication idiom, with a complete worked example
+
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E5%90%8C%E6%AD%A5%E6%8E%A7%E5%88%B6/%E6%A0%B8%E5%86%85%E5%90%8C%E6%AD%A5/DataSyncBarrier_ISASI.html
+Retrieved 2026-10-20. This page is materially different from the CANN 8.0 copy in §31.6 — the `MemDsbT::ALL`
+definition is narrower and `SEQ` is now live. Verbatim:
+
+```
+DataSyncBarrier(ISASI)
+产品支持情况​
+Ascend 950PR/Ascend 950DT：支持
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：支持
+Atlas 200I/500 A2 推理产品：支持
+Atlas 推理系列产品AI Core：不支持
+Atlas 推理系列产品Vector Core：不支持
+Atlas 训练系列产品：不支持
+功能说明​
+头文件路径为："basic_api/kernel_operator_block_sync_intf.h"。
+阻塞后续的指令执行，直到所有之前的内存访问指令（需要等待的内存位置可通过参数控制）执行结束，用于解决Scalar的内存依赖。
+函数原型​
+template <MemDsbT arg0>
+__aicore__ inline void DataSyncBarrier()
+参数说明​
+arg0
+模板参数，表示需要等待的内存位置，类型为MemDsbT，可取值为：
+• ALL，等待GM和UB的访问指令（不包括其他内存位置，例如L0C Buffer、L1 Buffer）。
+• DDR，等待GM访问指令。
+• UB，等待UB访问指令。
+• SEQ，等待SEQ访问指令。
+约束说明​
+等待的内存位置取值为ALL时，只能等待GM和UB的访问指令，不包括其他内存位置，例如L0C Buffer、L1 Buffer。
+```
+
+and its 调用示例, verbatim and complete — this is a producer/consumer handoff between two blocks with **no
+`CrossCoreSetFlag` at all**, just a GM flag, `DataSyncBarrier<DDR>` and the bypass-DCache accessors:
+
+```cpp
+if (blockIdx == 0) {
+ // 先写入被依赖数据，再通过DataSyncBarrier等待GM访问完成。
+ AscendC::WriteGmByPassDCache<T>(reinterpret_cast<__gm__ T *>(srcGm) + 1, DATA_VALUE);
+ // DataSyncBarrier<DDR>阻塞后续GM写，确保上一条GM写对其他核可见。
+ AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+ // 最后写入同步标记，block 1读到该标记后即可安全读取srcGm[1]。
+ AscendC::WriteGmByPassDCache<T>(reinterpret_cast<__gm__ T *>(srcGm), SYNC_FLAG);
+ }
+ if (blockIdx == 1) {
+ while (true) {
+ __gm__ T *addr = const_cast<__gm__ T *>(srcGlobal.GetPhyAddr());
+ // 轮询GM第0个元素，等待block 0写入同步标记。
+ T flagValue = AscendC::ReadGmByPassDCache<T>(addr);
+ if (flagValue == SYNC_FLAG) {
+ // DataSyncBarrier保证同步标记之前的srcGm[1]写入已完成。
+ T dataValue = AscendC::ReadGmByPassDCache<T>(addr + 1);
+ AscendC::WriteGmByPassDCache<T>(reinterpret_cast<__gm__ T *>(dstGm), 2 * dataValue);
+ return;
+ }
+ }
+ }
+```
+
+### 35.3 `WriteGmByPassDCache` / `ReadGmByPassDCache` — A3-supported, and the ordering rule between them and DCCI
+
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E6%A0%87%E9%87%8F%E8%AE%A1%E7%AE%97/WriteGmByPassDCache_ISASI.html
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E6%A0%87%E9%87%8F%E8%AE%A1%E7%AE%97/ReadGmByPassDCache_ISASI.html
+Retrieved 2026-10-20. Verbatim:
+
+```
+WriteGmByPassDCache(ISASI)
+产品支持情况​
+Ascend 950PR/Ascend 950DT：支持
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：支持
+Atlas 200I/500 A2 推理产品：不支持
+Atlas 推理系列产品AI Core：不支持
+Atlas 推理系列产品Vector Core：不支持
+Atlas 训练系列产品：不支持
+功能说明​
+头文件路径为："basic_api/kernel_operator_scalar_intf.h"。
+不经过DCache向GM地址上写数据。使用场景：
+当多个核写入的数据落在同一条Cache Line内时，经过DCache的读写将以64B为粒度，可能引发多核数据随机覆盖问题（参考DataCacheCleanAndInvalid调用示例3）。使用该接口不经过DCache直接按操作数大小写GM，可避免此问题。
+经过DCache写GM时可能导致多核间的数据不一致问题（详细原因请参考Cache写策略与Cache一致性问题），使用该接口不经过DCache直接向GM写数据，可避免此问题。
+由于WriteGmByPassDCache接口向GM写数据时不经过DCache，因此开发者需要考虑如下场景：
+当GM上地址addr已经在DCache缓存并且其对应的Cache Line标记为“脏”（dirty，表示该数据已被修改但尚未写回到GM）时，开发者应该在WriteGmByPassDCache接口之前调用DataCacheCleanAndInvalid接口将addr对应的Cache Line立即写回GM，否则WriteGmByPassDCache接口写入addr的数据后续可能被DCache写回的脏数据覆盖。
+DataCacheCleanAndInvalid接口与WriteGmByPassDCache接口向GM写数据时硬件不能保证两个接口的执行顺序，因此开发者应该在WriteGmByPassDCache接口之前调用DataSyncBarrier接口对这两个接口进行同步，否则WriteGmByPassDCache接口写入addr的数据依然可能被DCache写回的脏数据覆盖。
+根据以上的描述，为了简化编程（开发者无需关心addr是否在DCache缓存以及是否被标记为“脏”），建议开发者在使用WriteGmByPassDCache接口时采用如下代码片段：
+```
+```cpp
+AscendC::GlobalTensor<T> global; // global为addr对应的GlobalTensor
+AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+// 保证WriteGmByPassDCache接口向addr写入value之前，DCache中的脏数据已经写回GM。
+AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+AscendC::WriteGmByPassDCache<T>(addr, value);
+```
+```
+函数原型​
+template <typename T>
+__aicore__ inline void WriteGmByPassDCache(__gm__ T* addr, T value)
+数据类型​
+支持的数据类型为int8_t、uint8_t、int16_t、uint16_t、int32_t、uint32_t、int64_t、uint64_t。
+```
+```
+ReadGmByPassDCache(ISASI)
+功能说明​
+头文件路径为："basic_api/kernel_operator_scalar_intf.h"。
+不经过DCache从GM地址上读数据。
+函数原型​
+template <typename T>
+__aicore__ inline T ReadGmByPassDCache(__gm__ T* addr)
+数据类型​
+支持的数据类型为int8_t、uint8_t、int16_t、uint16_t、int32_t、uint32_t、int64_t、uint64_t。
+```
+
+### 35.4 The A3 cube→vector data-path support matrix, checked page by page
+
+Each of these is the verbatim 「产品支持情况」 line for `Atlas A3 训练系列产品/Atlas A3 推理系列产品`, from the
+mirror, retrieved 2026-10-20.
+
+`Fixpipe（L0C Buffer到UB数据搬运）` —
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/cube_compute_ISASI/%E7%9F%A9%E9%98%B5%E8%AE%A1%E7%AE%97%E7%9A%84%E6%90%AC%E5%87%BA/Fixpipe_L0CToUB.html
+```
+Ascend 950PR/Ascend 950DT：支持包含FixpipeParamsArch3510参数的接口。
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+Atlas 200I/500 A2 推理产品：支持包含FixpipeParamsM300参数的接口。
+```
+
+`DataCopy（L0C Buffer到UB数据搬运）` —
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/cube_compute_ISASI/%E7%9F%A9%E9%98%B5%E8%AE%A1%E7%AE%97%E7%9A%84%E6%90%AC%E5%87%BA/DataCopy_L0CToUB.html
+```
+说明： 本接口搬运功能仅在Atlas 推理系列产品AI Core产品型号的L0C Buffer->UB（CO1 -> CO2）通路支持。其他型号和其他通路支持接口调用但功能不生效，功能等同于基础数据搬运。
+Ascend 950PR/Ascend 950DT：不支持
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+```
+
+`DataCopyL1ToUB（L1到UB数据搬运）` —
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/cube_compute_ISASI/%E7%9F%A9%E9%98%B5%E8%AE%A1%E7%AE%97%E7%9A%84%E6%90%AC%E5%87%BA/DataCopyL1ToUB.html
+```
+Ascend 950PR/Ascend 950DT：支持
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+```
+and its constraint, verbatim — worth recording for the 950 port even though A3 lacks it:
+```
+该接口仅适用于Mix算子场景，且仅支持Cube核数与Vector核数比例为1:2的配置。在该场景下，subBlockId仅支持取值0或1。
+如果需要执行多个DataCopyL1ToUB指令，且DataCopyL1ToUB的目的地址存在重叠，需要通过调用PipeBarrier(ISASI)来插入同步指令，保证多个DataCopyL1ToUB指令的串行化，防止出现异常数据。
+```
+with `subBlockId` documented as 「AI Core上的Vector核ID。根据输入的Vector核ID，将数据搬运至对应核上的UB地址。」
+
+`Fixpipe（L0C到L1数据搬运）` — the one on-chip egress A3 *does* have —
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/cube_compute_ISASI/%E7%9F%A9%E9%98%B5%E8%AE%A1%E7%AE%97%E7%9A%84%E6%90%AC%E5%87%BA/Fixpipe_L0CToL1.html
+```
+Ascend 950PR/Ascend 950DT：支持包含FixpipeParamsV220/FixpipeParamsArch3510参数的接口。
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：仅支持包含FixpipeParamsV220参数的接口。
+Atlas A2 训练系列产品/Atlas A2 推理系列产品：仅支持包含FixpipeParamsV220参数的接口。
+```
+with the A3-specific caveat on its `config`, verbatim:
+```
+  • CFG_ROW_MAJOR（默认取值）：开启NZ2ND，输出数据格式为ND格式。针对Atlas A3 训练系列产品/Atlas A3 推理系列产品，
+Atlas A2 训练系列产品/Atlas A2 推理系列产品，
+在L0C Buffer -> L1 Buffer通路下不生效。
+  • CFG_NZ：NZ2NZ，输出数据格式为NZ格式。
+```
+
+### 35.5 `SyncAll` on A3 — a MIX grid barrier that does three syncs in one, and its 2201 flagId bill
+
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E5%90%8C%E6%AD%A5%E6%8E%A7%E5%88%B6/%E6%A0%B8%E9%97%B4%E5%90%8C%E6%AD%A5/SyncAll.html
+Retrieved 2026-10-20. The three prototypes and their A3 support, verbatim:
+
+```
+软同步原型​
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+硬同步（不支持config指定流水）原型​
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+硬同步（支持config指定流水）原型​
+Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+```
+
+the semantics, verbatim — the fused-operator hard sync is three barriers in one instruction:
+
+```
+SyncAll是核间同步控制接口，根据不同的函数原型介绍其功能：
+硬件同步接口： 用于多个核之间的同步控制，支持以下同步场景：
+纯Vector算子的全核同步，可参考CrossCoreSetFlag的模式0。
+融合算子的全核同步，一次性实现三个核间同步能力（参考CrossCoreSetFlag的关键特性说明）：首先完成单个AI Core内，AIC与所有AIV同步（AIC等AIV）；接着完成多个AI Core间，所有AIC的同步；最后完成单个AI Core内，所有AIV与AIC同步（AIV等AIC）。
+软件同步接口： 仅支持纯Vector算子的多核（参与同步的核数可通过入参指定）同步。每一个AIV都向全局内存对应位置写入信号值1，接着每一个AIV都持续轮询全局内存中所有AIV对应的信号值，直到所有AIV核对应的信号值都变为1。
+在纯Vector算子场景中，若所有AIV核默认参与同步，推荐采用性能更优的硬件同步接口；若需指定部分AIV核参与同步，则应使用软件同步接口，并通过入参usedCores完成配置。
+```
+
+the hard-sync constraints, verbatim — the kernel-modifier requirement and the `isAIVOnly` traps:
+
+```
+硬件同步接口约束：
+使用硬同步接口时，需根据场景使用合适的核函数修饰符：
+在纯Vector算子，需使用__mix__(0, 1)修饰核函数，而不是使用__vector__，具体原因请参考CrossCoreSetFlag约束说明中的Kernel类型配置说明。
+对于Mix（包含Cube和Vector计算）算子，需使用__mix__(1, 1)或__mix__(1, 2)修饰核函数。
+对于纯Vector算子，模板参数isAIVOnly必须设置为true，否则会导致程序卡死。
+对于Mix（包含Cube和Vector计算）算子，模板参数isAIVOnly设置为true，会导致接口实际只能完成Vector全核同步与预期同步行为不符。
+使用该接口时，建议开启batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+多流并发场景（≥2条执行流）。
+≥2个算子并发执行。
+所有并发算子的核数总和超过物理核数。
+≥2个并发算子使用了核间同步功能。
+具体而言，在多流场景下，某条流的核间同步算子虽分配到n个物理核，但可能仅有n-m个核先被调度执行，而其余m个核因被其他流的核间同步算子抢占而尚未启动。先启动的n-m个核执行到核间同步时等待剩余m核完成，而剩余m核因被其他流的核间同步算子占用而无法释放，形成死锁。 Kernel直调场景下通过__schedmode__(mode)限定符来设置batchmode模式；工程化算子开发场景下，通过TilingContext的SetScheduleMode接口来设置batchmode模式
+```
+
+the flagId bill for 2201, verbatim:
+
+```
+SyncAll硬件同步接口内部实现中使用了CrossCoreSetFlag和CrossCoreWaitFlag进行核间同步控制，因此开发者同时使用CrossCoreSetFlag（或CrossCoreWaitFlag）和SyncAll硬件同步接口时，需注意避免以下flagId冲突：
+表4 SyncAll硬件同步接口flagId占用情况
+SyncAll 使用场景
+占用flagId汇总
+各计算核flagId占用情况
+isAIVOnly=true
+14
+AIV：14
+isAIVOnly=false
+11、12、13
+AIC：11、12、13；AIV：12、13
+```
+(and for 3510, for comparison: 「isAIVOnly=false（核函数使用__mix__(1, 2)修饰时）| 11、12、13、28、29」.)
+
+the common constraint, verbatim:
+
+```
+硬件同步接口和软件同步接口公共约束：使用该接口进行多核控制时，算子调用时指定的逻辑AI Core核数numBlocks必须保证不大于实际运行该算子的AI处理器核数，否则框架进行多轮调度时会插入异常同步，导致Kernel“卡死”现象。
+```
+
+and the soft-sync sizing, verbatim:
+
+```
+软件同步接口约束：
+gmWorkspace缓存申请的空间大小要求大于等于GetBlockNum()*32Bytes，并且缓存的值需要初始化为0。目前常见的有两种初始化方式： 通过在host侧进行初始化操作，确保传入该接口时，gmWorkspace缓存已经初始化为0；
+在kernel侧初始化的时候对gmWorkspace缓存初始化，需要注意的是，每个核上都需要初始化全部的gmWorkspace缓存空间。
+ubWorkspace申请的空间大小要求大于等于GetBlockNum()*32Bytes。
+usedCores传入数值不能超过算子调用时指定的逻辑AI Core中AIV的数量：GetBlockNum()*GetTaskRatio()，不传此参数表示全核软同步。
+```
+
+and `SyncAllConfig`, which A3 does **not** get, verbatim:
+
+```
+struct SyncAllConfig {
+ pipe_t triggerPipe;
+ pipe_t waitPipe;
+};
+// 默认使用全部流水来进行触发和等待行为。
+constexpr SyncAllConfig DEFAULT_SYNC_ALL_CONFIG = {PIPE_ALL, PIPE_ALL};
+• triggerPipe：指定哪个流水用于“发送触发信号”。仅支持MTE2、MTE3、PIPE_ALL。
+• waitPipe：指定哪个流水用于“接收等待信号”。仅支持MTE2、MTE3、PIPE_ALL。
+```
+
+## Relevance
+§35.1 settles question 1.1, and it revises the recommendation I drew from §31. On NPU architecture 2201, verbatim:
+「L2 Cache：多核间共享的缓存，因此不需要考虑多核间数据不一致的问题。DCache：多核独立缓存，因此需要考虑多核间数据
+一致性的问题。」 — and 「通过MTE2单元读取GM时，优先从L2 Cache中读取数据」. So:
+- **The AIC→FIXPIPE→GM→MTE2→AIV path has no cache-coherence problem on A3.** Both ends go through the shared L2.
+  The only incoherent cache on 2201 is the per-core DCache, which only the **Scalar** unit uses. That is exactly what
+  the `DataCacheCleanAndInvalid` page means by 「Scalar单元访问Global Memory ... 存在 ... 一致性问题」, and it is why
+  §31's producer-side DCCI on a FIXPIPE-written buffer was aimed at the wrong cache — which is also, retrospectively,
+  why PPFM's measured A/B found the producer DCCI *unnecessary* (W0R1 1/60 beat W1R1 9/60) while the producer's
+  `DataSyncBarrier` stayed in.
+- **What `mix_expert_kernel.cpp` is missing is completion ordering, not cache maintenance.** The primitive for it is
+  named and its contract is quoted in the vendor's own example comment: 「DataSyncBarrier<DDR>阻塞后续GM写，确保上一条
+  GM写对其他核可见」. So the minimal correct producer sequence is `IterateAll` → `End()` →
+  `DataSyncBarrier<MemDsbT::DDR>()` → `CrossCoreSetFlag<0x02, PIPE_FIX>(flag)`, and the consumer needs **nothing**
+  beyond `CrossCoreWaitFlag<0x02>(flag)` → `DataCopy`, unless it also touches the buffer with Scalar
+  (`GetValue`/`SetValue`). One instruction, no `ENTIRE_DATA_CACHE` flush, no per-stage cost worth measuring. Try
+  that before the §31 protocol.
+- **Caveat on `MemDsbT`:** 「ALL，等待GM和UB的访问指令（不包括其他内存位置，例如L0C Buffer、L1 Buffer）」. `ALL` does
+  not cover L0C or L1, so there is no `DataSyncBarrier` flavour that waits on the cube's own L0C staging; the FIXPIPE
+  write to GM is what `DDR` covers, which is the edge we need. Note also that the CANN 8.0 page in §31.6 defined
+  `ALL` as 「等待所有内存访问指令」 and `SEQ` as reserved; the newer page narrows `ALL` and activates `SEQ`. Use the
+  newer wording.
+- **For every flag, counter and epoch tag in the megakernel, use `WriteGmByPassDCache` / `ReadGmByPassDCache`
+  instead of `GetValue`/`SetValue` + DCCI.** Both are A3-supported, both are in
+  `basic_api/kernel_operator_scalar_intf.h`, and §35.2's example is a complete host-barrier-free producer/consumer
+  handoff built from nothing but them plus `DataSyncBarrier<DDR>` — no `CrossCoreSetFlag` at all. That is the
+  building block for question 2.1 (78 layers of handshakes without burning flagIds), question 2.3 (epoch-tagged
+  in-kernel collective) and question 2.4 (GM-counter grid reduction), and it sidesteps the flagId budget entirely.
+  The one rule to respect, verbatim: DCCI and `WriteGmByPassDCache` have no hardware-guaranteed order, so a
+  `DataSyncBarrier` must separate them — the vendor's own three-line recipe is quoted in §35.3.
+- §35.4 **confirms README finding 3b rather than overturning it**, and closes the "go via L1" idea: on A3,
+  `Fixpipe(L0C→UB)` 不支持, `DataCopy(L0C→UB)` 不支持, and `DataCopyL1ToUB` 不支持. `Fixpipe(L0C→L1)` *is* supported
+  (with `FixpipeParamsV220`), but with no L1→UB egress, L1 is only useful for feeding back into the cube. So the
+  cube→vector edge of a per-layer kernel is unavoidably `L0C → Fixpipe → GM → MTE2 → UB` and the design goal stays
+  "stay in L2", consistent with the measured `aiv_mte2_time` 320.543 → 57.145 us when fused.
+- §35.5 is a grid barrier for a MIX megakernel that we did not have. `SyncAll<false>()` under `__mix__(1, 2)` does
+  three barriers in one — AIC waits all its AIVs, then all AICs across blocks, then all AIVs wait their AIC — which
+  is exactly the inter-layer boundary a 78-layer fused kernel needs, and it costs flagIds **11, 12, 13** on 2201
+  rather than any of the hand-allocatable ones. Two traps to encode now: `isAIVOnly=true` in a MIX kernel silently
+  degrades to a Vector-only barrier (「与预期同步行为不符」), and `numBlocks` must not exceed the physical core count
+  or the framework's multi-round scheduling inserts a bad sync and hangs. `__schedmode__` is restated as the
+  anti-deadlock requirement, with the four co-occurring conditions spelled out — consistent with
+  `ascend-fusion-mechanics.md` §25's measured 3-hangs-in-49.
+- Finally, §35.0 is a tooling result for this channel: every future AscendC API question should start at
+  `asc.gitcode.com`, because it is static, path-addressable, newer than the `doc_center` copies, and states A3
+  support explicitly on every page.
+
+
 ## Gaps
 
 What was looked for and not found, or found only partially.
@@ -5361,3 +7123,31 @@ What was looked for and not found, or found only partially.
   `operator/ascendc/0_introduction/22_baremix_kernellaunch/`. The canonical `Ascend/samples` upstream path was not
   confirmed, and the sample's own `README.md` / `main.cpp` / `baremix_custom_tiling.cpp` were not fetched (so the host
   side's `blockDim`, `__schedmode__` setting and workspace sizing are unverified).
+- **`matmul_client.h` was not obtained, so the vendor's own cross-core DCCI could not be quoted first-hand.**
+  §31.2's comment cites 「与 CANN matmul_client.h 中"读跨核 GM flag 前先 DCCI"的用法一致」, which would be the
+  strongest possible evidence (the Matmul high-level API doing it internally). `cann/asc-devkit` does not appear to
+  ship the Matmul high-level implementation headers: `include/lib/matmul_intf.h`,
+  `include/high_level_api/lib/matmul_intf.h`, `impl/high_level_api/lib/matmul/matmul_client.h` and
+  `impl/high_level_api/matmul/matmul_client.h` all return 404, while `include/basic_api/...` resolves. The file
+  presumably lives only in the installed CANN toolkit under `.../tikcpp/tikcfw/lib/matmul/matmul_client.h` — read it
+  on the A3 and quote it.
+- **`WaitIterateAll` has no reachable API page.** It is listed in the 「Matmul Kernel侧接口」 TOC (§11) but the TOC
+  link extraction in §31.9 returned pages for `IterateAll` (0640) and `End` (0645) and no `WaitIterateAll` entry;
+  the referenced 「IterateAll异步场景样例」 was likewise not located. So the exact asynchronous contract
+  (`sync=false` plus `waitIterateAll=true` plus a `WaitIterateAll()` call) is documented only by the parameter
+  descriptions quoted there, not by its own page.
+- **The `pipe`-argument conflict on 2201 is unresolved.** §20 quotes the official claim 「在NPU架构版本2201上，
+  `CrossCoreWaitFlag`传入的`pipe`参数无效，无论取值为何都默认阻塞全部流水的后续指令，建议省略`pipe`参数并使用默认值」;
+  §31.3 quotes a measured counter-claim from a shipping A2 kernel that a `PIPE_S` wait lets the following MTE2 issue
+  early and read half-stale C, which is why they pass `PIPE_MTE2` on 2201. No third source was found to adjudicate,
+  and no erratum or DTS number was located for either statement.
+- **No vendor erratum or DTS number was found for the cross-core GM visibility behaviour itself.** The evidence in
+  §31 is three independent third-party kernels plus the API pages' silence. Nothing on `hiascend.com`,
+  `bbs.huaweicloud.com` or gitcode states the DAV_2201 publication rule as a documented hardware property, and the
+  official `DataCacheCleanAndInvalid` page positively asserts the opposite for DMA
+  (「DMA搬运单元读写Global Memory ... 没有Cache一致性问题」).
+- **`MemDsbT::SEQ` is 「预留参数，暂未启用」** and `DcciDst::CACHELINE_UB` / `CACHELINE_ATOMIC` are both
+  「预留参数，暂未支持」 on the pages quoted in §31.5/§31.6, so the only usable combinations on A3 are
+  `CacheLine::{SINGLE_CACHE_LINE, ENTIRE_DATA_CACHE}` × `DcciDst::{CACHELINE_ALL, CACHELINE_OUT}` and
+  `MemDsbT::{ALL, DDR, UB}`. No cost figure was found for any of them; PPFM's own accounting is only
+  「AIC 每 chunk 10 次整缓存 DCCI + AIV 6 次 + 4 次 DSB」 with no per-instruction time.

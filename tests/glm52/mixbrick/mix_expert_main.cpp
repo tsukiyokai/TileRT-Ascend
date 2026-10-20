@@ -66,6 +66,7 @@ int main(int argc, char** argv)
     const int arm = (argc > 5) ? std::atoi(argv[5]) : 0;
     const int stages = (argc > 6) ? std::atoi(argv[6]) : 7;
     const uint32_t blocks = (argc > 7) ? std::atoi(argv[7]) : 4;
+    const bool uniform = (argc > 8) && std::atoi(argv[8]) != 0;
 
     std::vector<uint8_t> tiling_host(TILING_BYTES, 0);
     const int tiling_status = mix_build_tiling(
@@ -104,7 +105,12 @@ int main(int argc, char** argv)
         scale_host[index] = 0.00031F + 0.0000007F * static_cast<float>(index);
     }
     for (int64_t index = 0; index < rows; ++index) {
-        token_host[index] = 0.021F + 0.003F * static_cast<float>(index);
+        // `uniform` makes every row's scale identical, so a wrong per-row
+        // scalar read becomes invisible: it tells a bad scalar read apart
+        // from a stale product.
+        token_host[index] = uniform ? 0.021F
+                                    : 0.021F + 0.003F
+                                      * static_cast<float>(index);
     }
 
     void* x = nullptr;
@@ -145,6 +151,20 @@ int main(int argc, char** argv)
     Check(aclrtMemcpy(tiling, TILING_BYTES, tiling_host.data(), TILING_BYTES,
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload tiling");
 
+    // A sentinel separates "written wrongly" from "never written", which a
+    // zero cannot: an untouched output and a zeroed one read the same, and
+    // the allocator hands back the previous process's buffer often enough to
+    // make the difference alternate.
+    const size_t out_bytes_pre = rows * HALF * sizeof(uint16_t);
+    const uint16_t SENTINEL = 0x7777;
+    std::vector<uint16_t> sentinel(rows * HALF, SENTINEL);
+    Check(aclrtMemcpy(fused_out, out_bytes_pre, sentinel.data(),
+                      out_bytes_pre, ACL_MEMCPY_HOST_TO_DEVICE),
+          "sentinel fused");
+    Check(aclrtMemcpy(staged_out, out_bytes_pre, sentinel.data(),
+                      out_bytes_pre, ACL_MEMCPY_HOST_TO_DEVICE),
+          "sentinel staged");
+
     if (arm != 2) {
         std::printf("staged launching\n");
         std::fflush(stdout);
@@ -172,6 +192,8 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    int64_t untouched = 0;
+    int64_t untouched_rows = 0;
     std::vector<uint16_t> fused_host(rows * HALF);
     std::vector<uint16_t> staged_host(rows * HALF);
     const size_t out_bytes = rows * HALF * sizeof(uint16_t);
@@ -245,8 +267,18 @@ int main(int argc, char** argv)
             wrong_arms += (fused_host[index] != staged_host[index]);
         }
     }
-    std::printf("rows %lld  blocks %u  tiling %d\n", (long long)rows,
-                blocks, tiling_status);
+    for (int64_t row = 0; row < rows; ++row) {
+        int64_t row_untouched = 0;
+        for (int64_t column = 0; column < HALF; ++column) {
+            row_untouched += (fused_host[row * HALF + column] == SENTINEL);
+        }
+        untouched += row_untouched;
+        untouched_rows += (row_untouched == HALF);
+    }
+    std::printf("rows %lld  blocks %u  tiling %d  untouched %lld of %lld "
+                "in %lld whole rows\n", (long long)rows, blocks,
+                tiling_status, (long long)untouched,
+                (long long)(rows * HALF), (long long)untouched_rows);
     std::printf("fused against host reference, 1 ulp allowed: %lld of %lld\n",
                 (long long)wrong_reference, (long long)(rows * HALF));
     std::printf("fused against staged arm, exact:             %lld of %lld\n",

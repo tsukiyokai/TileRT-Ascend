@@ -20,7 +20,7 @@ ForeachAddList 1.622 / 0.018.
 | File | Covers |
 | --- | --- |
 | `megakernel-persistent-decode.md` | Hazy Research Llama-1B megakernel (full text), MPK / Mirage Persistent Kernel, FlashMoE/FlashDMoE, **CANN SuperKernel device-side source**, ThunderMLA, Event Tensor / ETC, plus a cross-system comparison table |
-| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source |
+| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence) |
 | `ascend-launch-overhead-and-sync.md` | **Internal Wiki only — do not publish.** Measured MIX head-overhead decomposition, the CrossCoreSetFlag counter limit and MlaPrologV3's real CV pipeline, the 0–7 event-id budget, A3 buffer capacities, `blade/runtime` (an existing Ascend megakernel runtime with `aclrtLaunchMega`), an internal plan for an Ascend MPK, heterogeneous workers, Async-MoE scoreboard sync |
 | `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming |
 | `mla-decode-fusion.md` | MlaPrologV3, SparseFlashAttention / DSA, FusedInferAttentionScore, FlashMLA, weight absorption |
@@ -28,7 +28,7 @@ ForeachAddList 1.622 / 0.018.
 | `speculative-acceptance.md` | prompt lookup, SuffixDecoding, EAGLE/Medusa/tree drafts, MTP, acceptance-length measurements |
 | `tilelang-ascend.md` | **Deprioritized** (hand-written AscendC was chosen instead). Kept for the AscendC primitives it documents: pipe flag protocol, real L1/UB address maps, Cube↔Vector handoff, and the tile-ai repo inventory |
 
-## The five findings that change the plan
+## The six findings that change the plan
 
 0. **A working, public, hand-written Ascend megakernel already exists, and its grid barrier is
    copy-pasteable.** `huawei-csl/megagdn-pto` fuses seven stages into one `<<< >>>` launch using
@@ -71,6 +71,20 @@ ForeachAddList 1.622 / 0.018.
    L2", not "don't touch GM". Conversely `VECOUT → A1 → A2` vector→cube *is* available, and
    `TPosition::CO1` keeps an accumulator in L0C across `Iterate` calls. All in
    `ascend-fusion-mechanics.md`.
+3c. **A cross-core flag is a counter, not a fence — this is what breaks `mix_expert_kernel.cpp`.** Nothing in the
+   `CrossCoreSetFlag` / `CrossCoreWaitFlag` documentation claims any memory-ordering or cache effect: set increments
+   a counter, wait decrements it. On DAV_2201 three independent third-party kernels measured that a GM buffer written
+   by one core is *not* reliably visible to another after the flag alone, with the producer's write still in the write
+   buffer when the flag arrives — 「flag 已到、写回仍在途」, symptom 「AIV 读到 vTmp 全 0」, and 「加探针即掩盖」, a
+   probe masks it. The fix is `DataCacheCleanAndInvalid<T, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>` plus
+   `DataSyncBarrier<MemDsbT::DDR>()` — producer before the set, consumer after the wait, before the `DataCopy`.
+   `PipeBarrier<PIPE_ALL>()` cannot substitute; it orders issue, not retirement. One measured A/B says the producer's
+   *barrier* and the consumer's *invalidate* are the load-bearing halves (9/60 → 1/60 failures), and another says
+   hardening only the suspected handoff is useless (19/2000 unchanged) while hardening every cross-core buffer removes
+   the drift. The ordinary single-operator path gets a whole-DCache flush appended by the Bisheng compiler and another
+   from SuperKernel after every sub-kernel; a 78-layer megakernel crosses no operator boundary and must place all of
+   them itself. All verbatim in `ascend-fusion-mechanics.md` §31, with the official API pages for both intrinsics.
+
 4. **Fusion is not unconditionally a win at batch=1, and two sources say so with numbers.**
    MegaMoE's own authors report the fused path is *worse* than Dispatch&Combine at small shape
    because pre-synchronization outweighs the overlap (§13.6), and measure ~50% compute inflation
