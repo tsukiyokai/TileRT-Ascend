@@ -149,3 +149,44 @@ What remains is the gap between 37 us of transport and 193 us of call: a cost
 that is neither bandwidth nor participants nor host dispatch. Whatever it is
 lives inside HCCL, and 78 layers of it is the largest single item in this
 project's round.
+
+## The device figure, profiled: 452 us a call, and it includes waiting
+
+Sixteen ranks, twelve rows, one all_reduce and one all_gather a step, under the
+profiler with AIV and determinism:
+
+    AivKernel   2.0 calls a step   452.06 us each
+    the pair on the device          904.12 us a step
+    78 layers                        70.52 ms
+    one-off kernels                  18.08 ms, excluded as the domain build
+
+Forty of the forty-one kernel names appear once or twice across twenty steps --
+the domain build -- and dividing those into a per-step figure is the error a
+previous page caught in the by-type average. Only `AivKernel` recurs.
+
+## Three figures for one quantity, and they measure different things
+
+    native HCCL device unit          10.74 us   the link action alone
+    torch, timed around a barrier   177-296 us  host dispatch and synchronise
+    profiler kernel Duration         452.06 us  device occupancy including wait
+
+None of them is wrong and none of them is the others. A collective's Duration
+in a profile counts the kernel as resident until the operation completes, which
+includes time blocked on peers -- the same thing that made the engine's own
+profile read 858 us a call.
+
+So the question this page has circled all day -- what a collective costs the
+engine -- is not answerable by timing a collective. It needs the engine's own
+rounds, where the collectives sit between compute that determines when each rank
+arrives.
+
+## What stands
+
+The ratios: AIV against AI_CPU, 1.5 to 1.85x, measured in one method with both
+arms paying the same tax. The flatness in message size and the per-call floor's
+independence from the rank count, same reasoning. And the exclusions -- smaller
+messages, explicit overlap, fewer ranks, a hand-rolled primitive -- each a
+comparison rather than an absolute.
+
+What does not stand is any absolute per-round collective total. The queued arms
+measure the round directly, which is the only scope that answers it.

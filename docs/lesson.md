@@ -1974,3 +1974,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      -- 127.17 to about 71 us, 4.4 ms a round out of 17.84 -- and attention,
      which took three experiments to attack, is 3.9 ms a round. The profiler was
      available all along.
+
+188. Three figures for one collective, each measuring something else: the
+     native HCCL device unit is 10.74 us, torch timed around a barrier is 177
+     to 296, and the profiler's kernel Duration is 452.06. The profile counts
+     the kernel resident until the operation completes, so it includes time
+     blocked on peers -- the same thing that made the engine's own profile read
+     858. None is wrong and none is the others. So what a collective costs the
+     engine is not answerable by timing a collective: it needs the engine's
+     rounds, where compute determines when each rank arrives. What survives is
+     every ratio -- AIV's 1.5 to 1.85x, the flatness in message size, the
+     exclusions -- because both arms paid the same tax. What does not is any
+     absolute per-round total. Also: forty of forty-one kernel names appeared
+     once or twice in twenty steps, and dividing a domain build into a per-step
+     figure is the error already caught once in a by-type average.
