@@ -30,28 +30,43 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 合计约 53 ms，未归属 2 ms。地板是 HBM 1.011 ms/轮，所以目标不受物理限制，
 问题全在固定开销。[地板](evidence/ascend-decode/round-roofline-20261020/README.md)
 
-## 已建成、已在引擎形状下实测、未进引擎
+## 已建成、未进引擎
 
 | 杠杆 | ms | 状态 |
 |---|---|---|
-| MoE 单 kernel | 5.8 | 256 专家 79.206 µs 对 vendor 157.176，1.98x |
 | 路由置换吸收 | 7.1 | 替掉 init_routing 45.772 + finalize_routing 55.979 |
 | 单边规约 | 6.5 | 十六卡正确，32.488 µs 对 HCCL 201.995 |
+| MoE 单 kernel | −16.3 | 256 专家 365.887 µs 对 vendor 157.176，慢 2.33x |
 
-合计 19.4 ms，折算 TPOT 约 6.6 ms。三项共用同一个交付点：
+前两项合计 13.6 ms，折算 TPOT 约 8.0 ms。两项共用同一个交付点：
 `AscendMoERunner._forward_entry`（`fused_moe.py:135`，实例属性），它收未置换的
 hidden states 与 router logits、产出 `(shared_out, fused_out)`，所以 gating、
 置换、两组专家、合并、共享路径的 reduce-scatter 全在界内。
 替换未写，只有[捕获钩子](../tilert/models/glm_5_2_ascend/moe_capture.py)。
 
-## 下一个数量级在跨层
+## MoE kernel 这条路的真实形状
 
-MoE kernel 的地板是约 40 µs 的启动与同步，与专家数无关（声明 16 与 256 的空载
-相同），满载 79–107 µs 里只有一半是工作。78 层各付一次就是 3.1 ms，所以继续
-压单层回报有限；要再降一个数量级必须让一次下发覆盖多层。
-[分解](evidence/ascend-decode/stage-major-20261020/README.md)
+它慢的原因是结构性的：vendor 吃 fractal-NZ 权重、在 L0C 内经 fixpipe 反量化，
+我读 ND、在向量侧反量化，每个专家多付一次 UB 往返。调 tiling 补不上，要么改成
+NZ + fixpipe（等于重写一遍 vendor 的核心），要么放弃替换矩阵乘、只保留它作为
+跨层融合的载体——后者才是它对 2 ms 目标的真正价值：一次下发覆盖多层，省的是
+启动与同步，不是矩阵乘。
+[翻转](evidence/ascend-decode/kernel-timing-void-20261021/README.md)
 
-## 今天证伪的
+## 2026-10-21 撤回的
+
+判据"有限、非零、行数对"无法因算错而失败，而今天全部 kernel 验证都跑在
+`absmax 2.4e-17` 的配置里。以它为据的结论作废：变长 group list、吸收后的索引
+检验（含阴性对照）、256 专家形状、以及重排背后的正确性。更要紧的是计时也随之
+失真——cube 半边从 UB 读 count（该核无 UB 访问权）而跳过全部专家，于是
+79.206 µs 测的是空转，1.98x 与 5.8 ms 一并作废。
+[判据](evidence/ascend-decode/validation-void-20261020/README.md)
+[裁判](evidence/ascend-decode/vendor-verdict-20261021/README.md)
+[二分](evidence/ascend-decode/kernel-bisect-20261021/README.md)
+
+尚存一个缺陷：constant 下 0.47461 对 vendor 0.45117，每元素不等，早于重排。
+
+## 更早证伪的
 
 - 残差是宿主下发：实为 36 ms 中的 6.6
 - 紧凑专家列表：空载耗时不随专家数增长，扫描在噪声里
