@@ -704,3 +704,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     reused scratch -- the second configuration today that could not answer the
     question it was built for. The honest ceiling for one launch over many
     layers is the 23 percent nesting already collects.
+
+78. An optimisation overlay left switched on became the tax it was meant to
+    remove. Every engine arm prepends a custom operator overlay to
+    `ASCEND_CUSTOM_OPP_PATH`, and that overlay carries its own
+    `grouped_matmul_swiglu_quant_v2`. At the decode shape the same call costs
+    70.450 us without it and 100.604 with -- 43 percent, about 2.3 ms a round,
+    collectable by not setting one variable. It was built to make that operator
+    faster and has been active in every engine measurement since, including the
+    ones that set the round's budget.
