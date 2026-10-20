@@ -290,3 +290,34 @@ That is the session's best-evidenced lever: device time rather than host round
 trip, the row count a rank really sees, bit-exact across five gap patterns, a
 superlinear curve whose flat part is where the workload sits, and the
 zero-copy form the operator accepts.
+
+## The curve is a floor plus bandwidth, not a cache effect
+
+Implied bandwidth if every listed expert's weights are read, at six rows:
+
+| experts | MB | us | GB/s |
+|---|---|---|---|
+| 1 | 9.4 | 19.98 | 472 |
+| 2 | 18.9 | 18.15 | 1040 |
+| 4 | 37.7 | 19.82 | **1905** |
+| 8 | 75.5 | 49.20 | 1535 |
+| 16 | 151.0 | 116.95 | 1291 |
+
+    the 8-to-16 marginal slope is 8.47 us an expert, 1114 GB/s
+
+A3's HBM is roughly 1600 GB/s a die, so eight and sixteen experts are at
+bandwidth and the marginal expert costs what reading it costs. The four-expert
+point implies 1905 GB/s, above what exists -- so its four banks are not all
+read, most likely because at six rows the group list gives each of them one row
+and the operator shortcuts a single-row group.
+
+So the shape is a floor of about 18 us plus bandwidth above it, not the cache
+effect an earlier section claimed. What the narrowing saves is real HBM traffic,
+which is why the 7.57 ms stands.
+
+## And the first bandwidth reading was a units error
+
+The first pass divided MB per microsecond by a thousand once too often and read
+every point as 0.00 TB/s, then concluded from the pattern that small banks were
+cached. MB per microsecond is GB per millisecond; the correction is one factor
+of a thousand and it changes the mechanism, not the lever's price.

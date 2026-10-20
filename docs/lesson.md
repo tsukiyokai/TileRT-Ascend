@@ -2024,3 +2024,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      two to three percent across sixteen times the rows. So the lever is 7.57
      to 7.71 ms a round either way, and the operator's flatness in rows holds
      at the shape that matters rather than only the one convenient to measure.
+     The curve's shape is a floor plus bandwidth, not the cache effect first
+     claimed: eight and sixteen experts imply 1535 and 1291 GB/s against A3's
+     roughly 1600, and the 8-to-16 marginal expert is 8.47 us or 1114 GB/s. The
+     four-expert point implies 1905, above what exists, so its banks are not
+     all read -- at six rows each gets one row and the operator shortcuts a
+     single-row group. The first bandwidth pass divided MB per microsecond by a
+     thousand once too often, read 0.00 TB/s everywhere, and inferred caching
+     from the pattern.
