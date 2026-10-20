@@ -998,3 +998,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      which the configuration fixes, asking for fewer nodes saves nothing. The
      configuration to run is the plain automaton at a captured width near 24,
      TPOT 3.73 ms with the merges.
+
+105. A bandwidth floor is not a target unless the operator only moves bytes.
+     Sparse attention runs at 121 GB/s where a contiguous read of its cache
+     reaches 449, which read as six milliseconds a round of waste -- exactly
+     what separated the best projection from 2.x. But the operator also scores,
+     softmaxes and weighs, and doing that densely in torch costs 95.271 us
+     against the operator's 85.048: the vendor is 11 percent faster than a
+     plain implementation of the same work. The 22.316 us read is the floor of
+     reading, not of attending.
