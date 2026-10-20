@@ -1129,3 +1129,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      on the assumption that every call was decode, where six output tokens at
      an acceptance near three give about two rounds and the rest is warmup and
      prefill. This was the first thing to check and it was checked last.
+
+117. This project has never profiled steady-state decode. All three device
+     captures -- profile-rope, profile-compiled, profile-stacks, all
+     20261018 -- record `max_tokens: 6` and `mtp_width: 4`, while every
+     decision is taken against a width-12 round of 55.424 ms. So the round's
+     item-by-item table rests on single-die operator measurements, most of them
+     warm, and nothing device-side has ever been measured at the configuration
+     that matters. The first thing to do with a free machine is that capture,
+     before any lever is re-measured.

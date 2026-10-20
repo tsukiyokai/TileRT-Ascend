@@ -21,7 +21,11 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 [地板](evidence/ascend-decode/kernel-count-floor-20261021/README.md)
 [代价模型](evidence/ascend-decode/round-cost-model-20261020/README.md)
 
-一轮 55.424 ms 的构成，逐项实测：
+一轮 55.424 ms 的构成，逐项实测（**两处口径警告**：各项皆为单 die 或少 die 的
+算子级测量，且多半在热缓存下取得——同一矩阵乘重复测 31 µs、轮换权重 62 µs，
+差一倍；而项目的三份设备 profile 全部跑在 `max_tokens: 6, mtp_width: 4`，不是
+稳态解码，所以**从未有过可用的稳态设备侧分解**。拿到机器后第一件事是补这个
+capture）：
 
 | 项 | ms | 口径 |
 |---|---|---|
