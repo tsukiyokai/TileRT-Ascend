@@ -102,3 +102,46 @@ ms from 532 calls at 11.386 us. So the dispatch estimate was conservative.
 bit-exact, with the engine-side implementation committed behind `--rope-graph`.
 What remains is running it in the engine, which needs the sixteen ranks the
 tenant holds.
+
+## The full list, and attention is on it
+
+| kernel | a round | dispatch ms |
+|---|---|---|
+| `aclnnInplaceCopy_CastAiCore_Cast` | 530 | 6.03 |
+| `aclnnFusedInferAttentionScoreV4` | **81** | 0.93 |
+| `aclnnAbs_AbsAiCore_Abs` | 78 | 0.89 |
+| `aclnnMuls_Muls_Muls` | 75 | 0.85 |
+| `aclnnMatmul_MatMulCommon_MatMulV2` | 63 | 0.72 |
+| `aclnnInplaceCopy_SliceAiCore_Slice` | 38 | 0.43 |
+| `aclnnLayerNormWithImplMode` | 24 | 0.28 |
+| `aclnnIndex_IndexCheck_IndexCheck` | 19 | 0.22 |
+| total | 1108 | 12.62 |
+
+    the rope graph captures 580 of them, 6.61 ms
+    the remainder is 528 calls, 6.01 ms
+
+## Attention runs eager, once a layer
+
+Eighty-one FusedInferAttentionScore calls a round is 78 layers plus three, so
+**every layer's attention is an eager call** rather than part of a super kernel.
+Each pays 11.386 us of dispatch and, from today's measurement, about 120 us of
+the call's own argument handling -- seventeen parameters including Python lists
+rebuilt every time.
+
+`Abs` at 78 and `Muls` at 75 are also once a layer: the dynamic quant's absmax
+and scale. `Matmul` at 63 is most of the projections.
+
+So of the 528 calls the rope graph leaves, 297 are the once-a-layer items --
+attention, the quant's two parts, and the projections -- and all of them are
+outside the captured graph.
+
+## Which is a larger lever than the rope refresh
+
+The rope graph removes 6.61 ms of dispatch. The once-a-layer items are 3.39 ms
+of dispatch by the same count, but attention alone carries about 120 us a call
+of argument handling that the dispatch figure does not include: 78 calls times
+120 us is **9.4 ms a round**, which no lever has touched and which capture
+removes by construction.
+
+That is the largest single item left in the host account, and it follows from
+the same mechanism already implemented for the rope refresh.

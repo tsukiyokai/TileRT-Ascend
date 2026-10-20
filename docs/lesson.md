@@ -1988,3 +1988,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      absolute per-round total. Also: forty of forty-one kernel names appeared
      once or twice in twenty steps, and dividing a domain build into a per-step
      figure is the error already caught once in a by-type average.
+
+189. Attention runs eager once a layer, outside the captured graph. The
+     capture's eager list: 530 Cast copies a round, 81
+     FusedInferAttentionScore, 78 Abs, 75 Muls, 63 Matmul, 38 Slice copies, 24
+     LayerNorm, 19 Index -- 1108 calls and 12.62 ms of dispatch. Eighty-one
+     attention calls is 78 layers plus three, so every layer's attention is an
+     eager call, and today's profile put about 120 us of argument handling in
+     each one on top of the 11.386 us of dispatch. Seventy-eight times 120 us
+     is 9.4 ms a round that no lever has touched and that capture removes by
+     construction -- larger than the rope refresh's 6.61 ms, and the same
+     mechanism.
