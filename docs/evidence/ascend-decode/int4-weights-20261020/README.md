@@ -66,3 +66,43 @@ written in the library this project cannot use: `load_to_l0_utils.h` returns
 What is blocked is the high-level `Matmul`, not the hardware. Reaching the
 24.8 µs means managing L1 and L0 by hand -- `DataCopy` the INT4 tile to L1,
 `LoadData` it to L0B, `Mmad` -- instead of `IterateAll`.
+
+## How the part does W4A8 at all: two INT4 mads a weight tile
+
+Driving L1 and L0 by hand got one error, and it was the useful kind.
+`kernel_operator_mm_impl.h:391` wants `__cb__ signed char *` for the third
+operand, and the assertion beside it lists what `Mmad` takes:
+
+> dst: int32_t, fm: int8_t, filter: int8_t; dst: float, fm: half, filter:
+> half; dst: float, fm: float, filter: float; dst: float, fm: bfloat16_t,
+> filter: bfloat16_t; dst: int32_t, fm: int4b_t, filter: int4b_t
+
+So INT4 is there, but only with *both* operands INT4, dispatching to
+`mad_s4`. The intrinsics on this part are `mad`, `mad_s4`, `mad_sp` and
+`mad_mx` -- nothing mixed. An INT8 activation against an INT4 weight is not
+an instruction here.
+
+And a vector expansion of the weights is not an answer either: 37.7 M weight
+elements a rank-layer would have to pass through the vector units against a
+49.3 µs budget, which is orders out.
+
+The vendor's own source says what it does instead. In
+`opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/grouped_matmul_swiglu_quant/op_kernel/`
+there are three files named `grouped_matmul_swiglu_quant_a8w4_msd_pre.h`,
+`_mid.h` and `_post.h`. The pre stage holds `xHighI4Tensor` and
+`xLowI4Tensor` and masks with `Duplicate(xLowI16Tensor, 0x0F0F)`, commented
+"get rid of high 4 bits in every int8"; its buffer accounting reads
+`M * K * 7B (1B + 0.5B + 0.5B + 2B + 4B)`.
+
+So the INT8 activation is split into two INT4 halves, each is multiplied by
+the INT4 weight, and the products are recombined as 16 × high + low. Two
+`mad_s4` calls a weight tile.
+
+That is a good trade here and a bad one for the vendor. The split is over the
+activation, which at batch-one decode is 12 KB an expert against 2.36 MB of
+weights; the weight tile in L0B serves both mads, so L1 traffic is unchanged
+and HBM traffic halves; and the cube is weight-streaming bound at 66% of
+peak, not mad bound, so doubling the mads costs little. The vendor pays for
+it by splitting pre, mid and post into three kernels with global memory
+between them -- which is a plain reading of why its 165.2 µs is 10% of
+bandwidth. One kernel keeps the split in UB.

@@ -269,3 +269,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     When a mechanism moves from decoration to load-bearing, test it in
     isolation first -- one process a variant under a timeout, where finishing
     is the measurement.
+
+41. The chip said no and the vendor's own source said how. `Mmad` takes INT4
+    only with both operands INT4, A3 has no mixed-width mad, and a vector
+    expansion of the weights is orders too slow -- so W4A8 looked shut. The
+    answer was on disk: `opp/built-in/.../grouped_matmul_swiglu_quant/` ships
+    `a8w4_msd_pre/mid/post`, which split the INT8 activation into two INT4
+    halves and recombine 16 × high + low, two `mad_s4` a weight tile. Before
+    concluding a quantisation scheme is impossible on a part, read the
+    vendor's kernels for the op that already does it.
