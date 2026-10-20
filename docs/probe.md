@@ -231,3 +231,20 @@ small on its own and free to take: the code exists and the flags are wired.
 
 Two arms added to the watcher -- `hoist` alone and `all` with everything -- so
 the composition is measured rather than assumed.
+
+The watcher now holds seven arms, restarted after the edit so bash reads the
+file from the start rather than from a stale offset:
+
+    baseline
+    rope         --rope-graph
+    rope-narrow  --rope-graph --narrow-bank
+    hoist        --hoist-metadata --hoist-forward-context
+    all          all four
+    aicpu        --ai-cpu-collectives, AIV's negative control
+    steady       --profile-last
+
+The last is the artefact this project has never had: a profile scoped to a
+steady-state decode round. Every figure read today from the six-token capture
+needed withdrawing or re-deriving -- the collectives' 858 us a call, the 3.28 ms
+super kernel, the eager dispatch account -- so that capture is worth more than
+any single lever.
