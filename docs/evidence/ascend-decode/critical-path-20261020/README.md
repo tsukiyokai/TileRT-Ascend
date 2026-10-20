@@ -1,0 +1,87 @@
+# Which stream owns the round
+
+A capture tells you what every kernel cost. It does not tell you what the
+round would lose if a kernel vanished, because a kernel that overlaps another
+stream costs the round nothing. This separates the two: for each stream, the
+time it is the only one running.
+
+Input: `profiles/width8-20261019/rank-0`, `kernel_details.csv` md5
+`acde4cf368e464b7cb54580c7bff0857`, 9803 kernels. Tool
+`tests/glm52/critical_path.py`. A round is one backbone pass — every 78th
+attention call — and the first is dropped for its compilation and first-touch
+costs, leaving two complete rounds. Earlier working figures divided the
+capture into four equal parts and read 22% low; 78 layers and 75 MoE layers
+are the normalisation, from `plan.md`.
+
+Profiling inflates the round from the unprofiled 53.05 ms to 62.4 ms, so the
+shares below are the result and the absolutes are not.
+
+| per round, ms | round 2 | round 3 |
+|---|---|---|
+| span | 63.003 | 61.871 |
+| stream 81, backbone compute, alone | 35.632 | 35.588 |
+| stream 80, TP reduction, alone | 5.451 | 5.248 |
+| stream 83, draft chain, alone | 3.539 | 3.549 |
+| stream 79 alone | 0.980 | 0.978 |
+| stream 19, indexer, alone | 0.648 | 0.643 |
+| streams 13, 78, 82 and N/A, every HCCL collective, alone | 0.000 | 0.000 |
+| no kernel on any stream | 11.608 | 11.347 |
+| FP32 cast bracket around the 146 reductions | 1.991 | 1.988 |
+| the reduction between those casts | 5.644 | 5.418 |
+| AI_VECTOR_CORE, against the bytes it moves | 8.733 / 0.345 | 8.693 / 0.347 |
+
+## The TP reduction is wholly serial
+
+Every HCCL stream runs 0.000 ms alone: those collectives hide completely. The
+TP reduction does not — stream 80 runs alone for 5.35 ms a round, 8.6% of it,
+and not one microsecond overlaps compute. At batch 1 there is no independent
+work for it to hide under, which is why.
+
+`probe.md` records the complete one-shot push as "no decoder gain claimed".
+That was discipline about an unmeasured end-to-end, and it is read easily as
+evidence that the site is cheap. It is not: with the cast bracket the site is
+7.34 ms a round, 11.8% of it, all of it on the critical path.
+
+## The forced FP32 costs 1.99 ms a round in launches
+
+`cann_model._tp_reduce` widens BF16 to FP32, reduces, and narrows the result.
+146 sites a round, two `Cast` launches each, 13.6 µs a site to convert 98 KiB
+— 26% of the bracketed region, against 0.25 µs of actual data movement.
+
+The FP32 is a project invariant, not a vendor constraint: `_tp_reduce` sets
+`tp_reduction = "float32"` by choice, and `onesided_reduce.install` says it
+"inherits the bfloat16 round trip". Whether the vendor collective associates
+identically given BF16 input is untested, so on that path the casts stay.
+
+On the one-sided reducer they need not. It accumulates locally in rank order,
+which is what makes it bit-reproducible; widening each term on read and
+rounding once on write is that same arithmetic, term for term and in the same
+order. So folding both conversions into the kernel is bit-exact by
+construction, removes 292 launches a round, and halves the bytes on the wire.
+
+## The one-sided headroom is smaller than recorded
+
+`onesided_reduce`'s docstring prices the vendor collective at 63.5 µs a site
+and the one-sided push at 22.3 µs, giving 9.97 ms against 3.50 ms over 157
+reductions. The decode path's measured cost is 5.53 ms over 146 sites, 37.9 µs
+a site. Headroom against 22.3 µs is 2.28 ms a round, not 6.47. The protocol
+is still worth taking; the figure it was argued with is not the one the decode
+path pays.
+
+## Vector work runs at 25x the bytes it moves
+
+8.71 ms a round of AI_VECTOR_CORE execution moves 0.35 ms of data, 14% of the
+round. A further 0.34 ms sits in index-driven gathers, which read selected
+rows rather than their whole source, so those are reported apart rather than
+excused by name.
+
+The residual combine is the worst of it. Per layer: `Muls` 8.5 µs,
+`ForeachAddList` 21.4, and the cast pair 13.5 — 43.4 µs to compute
+`residual + scale * out`, feeding an `AddRmsNormBias` that costs 4.1. Ten
+times the normalisation it serves, for 98 KiB. `ForeachAddList` alone is 91x
+its bytes.
+
+This is the megakernel's target stated in numbers, and it is not the boundary
+the closed brick tested. That brick fused publication with its consumer and
+measured 162.141 against 162.781 µs — a communication boundary, with the
+vector launches left in place on both arms.

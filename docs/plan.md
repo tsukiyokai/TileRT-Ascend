@@ -6,15 +6,35 @@
 
 截至 2026-10-19，已测最好请求 TPOT 为 11.6198 ms。pinned `seq_lens` 与 pageable 同会话交替，两对完整对照分别节省 3.384／3.791 ms/round；六个 pinned 请求均快于九个 pageable 请求。该组受共租户影响，运行利用率设为 0.78，pageable 为 12.3–12.6 ms/token；绝对最好值与配对差分别保留。[测量记录](probe.md)、[staging 机制](evidence/ascend-decode/metadata-h2d-20261019/README.md)
 
-width-8 MTP 是当前控制组，单一冻结输入的平均实际提交数约 4.507，2 ms 对应稳态轮预算约 9.01 ms。旧相位参考为 verify 39.68、chain 10.27、conditioned 2.08 ms/round；这些来自旧配置，须随新组合重测。[宽度扫描](evidence/ascend-decode/width-sweep-20261019/README.md)、[同步相位](evidence/ascend-decode/phase-synced-20261019/README.md)
+width-8 MTP 是当前计时控制组，单一冻结输入的平均实际提交数约 4.507，2 ms 对应稳态轮预算约 9.01 ms。旧相位参考为 verify 39.68、chain 10.27、conditioned 2.08 ms/round；这些来自旧配置，须随新组合重测。[宽度扫描](evidence/ascend-decode/width-sweep-20261019/README.md)、[同步相位](evidence/ascend-decode/phase-synced-20261019/README.md)
+
+10-20 复核：旧 `chain-w8` 三条轨迹均在输出 offset4 与冻结 teacher 分叉；prompt IDs 相同，hash 差异仅来自序列化。147 轮／A=6.959 只用于旧未验收轨迹的策略筛选。可信 teacher33 的独立 CPU 回放中，width8／16／32均为28轮、新增32个输出，计划验证行数224／448／896；这段窗口加宽无接受收益；相同30个新增输出，冻结MTP4候选为14轮、lookup8为26轮，完整轮价比须低于1.857才由MTP胜出。[短窗口回放](evidence/ascend-decode/lookup-contract-20261019/teacher33/README.md)。同一前缀的完整M32/SFA已通过32个冻结标签；shared-FIA完整对照为30/32，先定位其数值差异及旧链首个分叉，再核33输出的串行／M32／Graph／reset与完整请求。[证据](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md)
 
 | 顺序 | 路线 | 下一项与通过条件 |
 |---|---|---|
 | 1 | lookup 提议与执行路径 | CPU 状态／串行对照通过；等价增量索引将每请求 CPU 查找约 1.03 s 降至 21 ms。独立开关 shortest2→1 的 width32 重放为 174→147 轮。下一步测 width 8／16／32 的真实接受数和请求 TPOT。该轨迹 A=6.959 对应 2 ms 的轮预算 13.92 ms；设备收益尚未测得。[重放](../tests/glm52/ngram_acceptance.py)、[实现](../tilert/models/glm_5_2_ascend/lookup_draft.py) |
-| 2 | 多 query／跨层共享 | 可选 `shared_fia` 支持 M8／M32：完整 KV 跨 query 复用，21 个 producer 构建选择 mask。四层完整 Graph 配对改善14.6%／37.0%，M32 为657.2→416.1 µs，A/B/reset 对重建FIA逐位一致；M1／MTP保持SFA。下一步以冻结teacher／串行等价开路，再与lookup宽度对照测整轮；旧gather_fia M≤6门槛不变。[证据](evidence/ascend-decode/fia-mask-20261020/README.md)。 |
-| 3 | 投影与归约流水 | 既有真实 O 投影＋完整归约对照：原装 CANN＋push16 为162.141 µs，融合 publication＋consumer 为162.781 µs，未减少 launch、无净收益。关闭该分支；须提出消除后续 consumer 边界的新机制再重开，停止修补不含 scale／有效 tiling 的 INT8 演示。[完整反证](evidence/ascend-decode/execution-gap-20261018/README.md#o-publication-and-complete-reduction) |
+| 2 | 多 query／跨层共享 | 可选 `shared_fia` 支持 M8／M16／M32：完整 KV 跨 query 复用，21 个 producer 构建选择 mask。各自四层 Graph 配对改善14.6%／11.9%／37.0%；M16为373.365→328.620µs，29/30对胜出，36项共享／Graph／reset检查逐位一致。[M16](evidence/ascend-decode/fia-mask-20261020/joint/m16-screen/README.md)。M1／MTP保持SFA。下一步以冻结teacher／串行等价开路，再与lookup宽度对照测整轮；旧gather_fia M≤6门槛不变。[证据](evidence/ascend-decode/fia-mask-20261020/README.md)。 |
+| 3 | 投影与归约流水 | 既有真实 O 投影＋完整归约对照：原装 CANN＋push16 为162.141 µs，融合 publication＋consumer 为162.781 µs，未减少 launch、无净收益。该反证仍然有效，但它测的是 publication＋consumer 这条边界。10-20 独占时间复核换了边界并重开本路线：两轮完整对照中 TP 归约独占 5.35 ms/round，而全部 HCCL 流独占 0.000 ms；其 FP32 cast 外壳 146 站共 1.99 ms/round；AI_VECTOR_CORE 用 8.71 ms 搬运 0.35 ms 的字节。两个具名 brick：把 widen／narrow 折进按 rank 定序的 one-sided reducer（同一结合序，故逐位一致，并把线上字节减半）；融合 residual combine（每层 Muls 8.5＋ForeachAddList 21.4＋cast 13.5 µs，喂的 AddRmsNormBias 只要 4.1）。通过条件照旧：单 die 同 ELF 配对对照与冻结 teacher 逐位一致，再测整轮。停止修补不含 scale／有效 tiling 的 INT8 演示。[完整反证](evidence/ascend-decode/execution-gap-20261018/README.md#o-publication-and-complete-reduction)、[独占时间](evidence/ascend-decode/critical-path-20261020/README.md) |
+| 4 | MoE 活跃专家表 | GMM1／GMM2均有可选 `--compact-experts` overlay，保持NZ权重、MSD算术和tile分配。单die同ELF：GMM1的M1／M8／M32随机90.90→49.36／111.56→83.91／163.28→141.16µs；GMM2的M1／M8为62.42→34.86／91.27→72.61µs，M32随机无收益、shared8为64.59→41.40µs。各自24组跨二进制和4次真实权重检查逐位一致。可选 `--adaptive-tiles` 初版在每专家≤16行时用32×1024；初版正式ABBA的M32随机143.90–146.98→106.18–107.86µs，M1／shared8分别退化1.18–1.82／5.79–7.01µs，46组Graph与4次真实权重逐位一致。[动态tiling](evidence/ascend-decode/gmm2-compact-20261020/adaptive/README.md)。默认关闭；按真实lookup专家并集选择，再分别核整模型teacher和轮耗时。[GMM1](evidence/ascend-decode/gmm-compact-20261020/README.md)、[GMM2](evidence/ascend-decode/gmm2-compact-20261020/README.md) |
+| 5 | C8缓存写入合并 | 现有CANN `ScatterPaKvCache`一次写INT8 key与FP16 scale原始字节。真实dynamic_quant→write_cache路径18组整缓存Graph/reset检查一致；M8 28.97→10.34µs，10/10对胜出。13行补丁仅在隔离模块验证，下一次整模型teacher与compiled Graph分别开关。[证据](evidence/ascend-decode/index-cache-pair-20261020/README.md) |
 
 每条路线一次只改一个可归因因素。按新策略实际经过的位置、宽度和专家并集计价；减少 launch 数量、外推行成本或套用 64-expert 数字均不能证明端到端收益。lookup 的精确 CPU 重放及外推撤回依据见[复制提议](evidence/ascend-decode/lookup-drafting-20261019/README.md)，须由与部署一致的重放及设备对照更新。
+
+已通过teacher的M32选集支持并集压紧研究：21个producer、4 heads、假设16×128 tile，union+mask工作量为全cache的45.60%，精确级联为49.42%；两者均完整保留选集。先核动态并集长度如何留在设备上，再测构建＋gather＋attention整段，不将较小工作集直接称为HBM收益。[结构计数](evidence/ascend-decode/shared-fia-model-20261020/exact-sharing/README.md)
+
+GMM1 的 full-A、N 拆分与 K512 筛选均未改善 M32 随机路由的原始对照，关闭该调参分支。[K512 结果](evidence/ascend-decode/gmm-compact-20261020/k512/README.md)。每层每新增一个专家，每 rank 增加1,256,448 B逻辑权重读取；下一项先采实际lookup的75层专家并集与接受数，再定宽度和kernel策略。[预算与边界](evidence/ascend-decode/shared-fia-model-20261020/routes/budget.md)
+
+同一旧轨迹的M64／128／256复制重放均为144轮，对照M32的147轮；扩宽只允许平均轮耗时增加2.083%，设备比较保持8／16／32。[宽度上限筛选](evidence/ascend-decode/lookup-contract-20261019/wide-frontier/README.md)。原生vLLM局部top-1虽减少词表通信，实际TP2 Graph仍退化14–30µs，暂不接入。[head对照](evidence/ascend-decode/reduced-head-20261020/README.md)
+
+固定32行的纯复制树，4条续段共享前缀后在同一旧轨迹为132轮／A=7.75；最多容许完整轮成本增加11.36%。A3 C8 indexer须在top-k前排除兄弟分支，现有有序输出不足以保证前缀／尾部合并的同分次序；先用已验收输入与实测轮预算确认价值，再改树选集与KV提交。[复制树证据与能力边界](evidence/ascend-decode/lookup-contract-20261019/copy-tree/README.md)
+
+单层驻留的M32/SFA现已完成TP16全部78层：FP32 head的32个冻结标签在16 rank全部通过，最终logits跨rank逐位相同，峰值899MiB/die。旧M1比较中582/660对边界／cache相同；hidden／residual到层67相同，层68/query13首次不同，final norm NRMSE0.02398。该诊断与标签通过分别保留。同源shared-FIA完整对照仅30/32，query3／21失败，final norm NRMSE0.15993；固定Q/KV/mask的8层单die对照中，FIA行无效修正0→2的524,288个输出逐位不变，关闭该参数分支。SFA在旧链首差前缀的top1余量仅0.002617，冻结两轮重放同时检查算术与拒绝尾部覆盖。随后仍须token-major Graph/reset、串行提交与真实轮耗时。2GiB/die配额用于共享机器上的功能验证，不产生TPOT结论。[完整证据](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md)
+
+单die补充：层66–73的M32真实attention已完成，两组C8／BF16 producer及consumer的19份新cache与旧M1逐位一致，索引选集全同；共享／逐层重建FIA输出逐位一致，FIA对SFA的pre-O NRMSE为0.00224–0.00319，峰值147MiB。该截面止于O投影前，下一项仍是完整teacher传播。[后段attention](evidence/ascend-decode/shared-fia-model-20261020/late-attention/README.md)
+
+冻结residual重建的75层teacher路由，M8／16／32平均专家并集44.35／68.07／99.36。GMM2新增条件：M32、每专家≤32行、活跃数≥64、超过16行者占比≤1/8；原小组条件保留，覆盖40→75层。正式新旧ABBA的三组teacher分布均改善11.18–22.12µs；58次Graph对CPU MSD逐位一致。同路径控制差值反转，开销未定；默认仍关闭，下一项核整模型teacher与实际lookup轮成本。这些统计不含拒绝尾部。[路由](evidence/ascend-decode/shared-fia-model-20261020/teacher-routes/README.md)、[发布对照](evidence/ascend-decode/gmm2-compact-20261020/guard-release/README.md)
+
+两轮冻结M8已通过TP16全部78层、4/4可信标签；对应hidden／residual／新KV及最终FP32 logits与已验收M32逐位一致，旧首差位置输出2524。[两轮证据](evidence/ascend-decode/shared-fia-model-20261020/two-round-replay/README.md)。历史编译图有3处稠密层norm＋量化融合。已关闭该开关并核实际IR；单die原输入→换输入→恢复输入的18项Graph对照通过，保留static／SuperKernel，OFF与未融合执行逐位一致。下一项只切换这3处算术并核完整78层传播，再测连续解码精度和同路径TPOT。[融合对照](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md)
 
 ## 执行不变量
 
@@ -45,7 +65,7 @@ width-8 MTP 是当前控制组，单一冻结输入的平均实际提交数约 4
 闭源包审计基线为 `f554fa57`／`tilert-0.1.6.post3`：DSV32 96、GLM5 37、GLM-5.2 48 项，去重 175 项；NPU 可直接复用的闭源二进制为 0/48。48 项含计算／通信 26、状态控制 12、查询 9、peer setup 1。[完整 schema](evidence/tilert-ascend/schemas.tsv)、[GLM-5.2 契约](evidence/tilert-ascend/glm52-contracts.md)
 
 - TP16：78 个主干层，前 3 层 dense，其余 75 层 top-8／256 routed experts＋shared expert；每 die 4 attention heads，专家 intermediate=128；当前选集为 top-2048，21 层重算 index。[权重与布局](evidence/ascend-decode/weight-contract.md)
-- W4 MSD：两个 FP16 部分积，按 FP32 `16H+L+checkpoint_bias` 合成；A8 倍率使用 `Div(127,amax)`；RoPE 使用 BF16 系数、FP32 乘加、末尾一次 BF16 舍入。[W4](evidence/ascend-decode/w4-msd.md)、[A8](evidence/ascend-decode/a8-rounding.md)、[RoPE](evidence/ascend-decode/rope-rounding.md)
+- W4 MSD：Fixpipe先清零scale的FP32低13位，再生成两个FP16部分积，按FP32 `16H+L+checkpoint_bias` 合成；A8倍率使用 `Div(127,amax)`；RoPE使用BF16系数、FP32乘加、末尾一次BF16舍入。[W4](evidence/ascend-decode/w4-msd.md)、[Fixpipe合同](evidence/ascend-decode/gmm2-compact-20261020/fixpipe-official-receipt.json)、[A8](evidence/ascend-decode/a8-rounding.md)、[RoPE](evidence/ascend-decode/rope-rounding.md)
 - TP 归约：BF16 partial 转 FP32 累加，再转 BF16。融合允许改变边界，须保持此算术语义；通信候选可传 BF16、累加 FP32。FP32 head 保留真实 `[9680,6144]` 分片的冻结 teacher 对照。[head 验证](evidence/ascend-decode/layer-major-20261018/README.md)
 - PD：统一 page、dtype、scale、rotation、position 和 layout version；传主干 P 行、MTP P−1 行与 12 KiB normalized hidden[P−1]。MLA latent512＋RoPE64 为 BF16；16 个主干 indexer 为 INT8＋FP16 scale，0／1／2／70／74 和 MTP78 为 BF16。[交接合同](evidence/ascend-decode/mtp-parent-handoff.md)、[CANN 请求接线](evidence/ascend-decode/cann-mtp.md)
 - 容量：主权重 404.69 GB，另有 75.5 MB `rot.weight`；decode 权重＋KV＋workspace≤48 GiB/die，P/D 共存总峰值≤60 GiB/die。完整末轮 verify 也须有空间；当前容量 9344 支持 8K＋1024 输出及 M≤32。单机 P 退出后加载 D，保留接收 KV。[容量审计](evidence/a3-model-bytes.json)、[在线交接](evidence/ascend-decode/pd-live-20261017/README.md)

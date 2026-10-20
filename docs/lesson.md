@@ -17,6 +17,9 @@
    diagnostics; fix the reference before changing tolerances. Layer metrics
    locate faults, while frozen teacher and serial/speculative output checks
    gate release. Same-configuration graph/reset should reproduce exactly.
+   A3 Fixpipe truncates scale's low13 FP32 bits; full-precision scale in an
+   oracle is a different computation. GMM2 mutates INT8 input: restore it for
+   every A/B call. Do not infer wide-verify gains from M1/M8 active-table gains.
 6. Lookup owns target KV only. Its context includes the pending output; MTP KV
    stays at the injected P−1 length. Switching back requires genuine conditioned
    MTP rows, not a logical length update. Clone hidden values before graph reuse.
@@ -40,6 +43,8 @@
     installed header/entry, bind the selected variant JSON to the new ELF SHA,
     and check actual tiling keys and mappings in the consuming process. Explicitly
     bind the experiment import root rather than relying on import side effects.
+    Static kernel cache keys omit vendor source identity and live below cwd,
+    outside VLLM_CACHE_ROOT. Compile each arm in its own fresh output directory.
 12. Pinning seq_lens removes a queue-dependent host stall without adding device
     work. Keep measured paired savings separate from the best absolute request.
     More speculative rows can expand the expert union; a 64-expert sample is
@@ -47,6 +52,8 @@
 13. A serial/speculative mismatch does not identify future-token leakage.
     Inspect selected IDs and causal thresholds, then perturb only forbidden
     KV slots. An empirical width limit is not an indexer causality boundary.
+    A width fixture must update written KV length and right-down causal
+    thresholds together; changing query width alone shifts the valid prefix.
 14. Inspect the entire dtype chain: uint8 scatter uses AIV, but OR with bool
     promotes back to uint8 and can select AI_CPU. A bool view preserves storage
     and selects LogicalOr; removing one fallback is not a complete-path win.
@@ -72,9 +79,79 @@
     `docker exec -d` and `setsid`. `pkill -f` inside `docker exec bash -c`
     matches the wrapper's own argv and kills itself first — kill by PID.
 
-Evidence: [merged tree](evidence/ascend-decode/merge-tree-20261020/README.md),
+19. After the first free-running branch, later predictions no longer test the
+    frozen teacher's inputs. Force all32 inputs in both M1 and wide execution;
+    keep label acceptance separate from serial/speculative consistency and
+    save the first difference before resetting the prefix.
+
+20. Removing a dense expert scan from one consumer can move its cold cost to
+    another. Publish one compact table and replace every consumer; retain
+    original expert IDs, row prefixes and tile order. Mixed-core barriers
+    publish DMA completion but do not replace scalar DCache invalidation.
+21. Compare captured outputs only after explicit graph replay and device sync.
+    Verify the installed OPC headers and actual ELF, not just the source tree;
+    patches rooted at `csrc/` and its parent need different strip depths.
+
+22. A dynamic fallback preserves the chosen arithmetic, not the old critical
+    path. Moving a barrier before Matmul initialization can cost time even
+    when the selected tile shape is unchanged. Compare complete release ELFs;
+    a test switch that skips a metadata read also changes the control's cost.
+
+23. Kernel templates do not override host API dtype checks. For pure copies,
+    a dtype view can preserve FP16 bytes while satisfying an INT8-only path;
+    a numeric cast cannot. Check the real producer, nonzero storage offsets
+    and the entire backing allocation before wiring the replacement.
+
+24. Count transferred bytes separately from transfer batches. With one N
+    tile, full-K A residency merges disjoint K transfers without reducing
+    their bytes; its earlier loads can also change overlap. Price the whole
+    kernel and isolate the tile-size change before attributing a gain.
+
+25. Layer-major replay must carry implicit state as well as tensors. One
+    complete teacher chunk preserves producer-mask ownership; multiple
+    chunks need separate state. Report partial-layer execution separately
+    from final teacher acceptance. Reuse checkpoint shard handles within
+    one loading scope, then close them even if the consumer fails.
+
+26. Recovering a fused norm from its saved residual requires the executed
+    kernel to normalize that rounded residual. Bind its actual tiling key
+    and compare saved outputs before reconstructing router inputs. Teacher
+    routes still omit rejected speculative suffixes.
+
+27. A bound on repeated weight reads is not a latency criterion. At the
+    same one-eighth hot-expert fraction, wide GMM2 loses with16/32 active
+    groups and wins with64. Check concentrated routes and complete release
+    binaries before extending an adaptive tile condition.
+
+28. Equal selected sets do not fix floating-point reduction order. Preserve
+    ordered IDs when locating a cross-width first difference. A later query's
+    changed cache cannot explain an earlier query through causal attention;
+    separate those observations before tracing their effects.
+
+Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/guard-counts/README.md),
+[teacher routes](evidence/ascend-decode/shared-fia-model-20261020/teacher-routes/README.md),
+[full-A screen](evidence/ascend-decode/gmm-compact-20261020/full-a/README.md),
+[paired cache](evidence/ascend-decode/index-cache-pair-20261020/README.md),
+[adaptive GMM2](evidence/ascend-decode/gmm2-compact-20261020/adaptive/README.md),
+[compact GMM1](evidence/ascend-decode/gmm-compact-20261020/README.md),
+[fixed teacher](evidence/ascend-decode/shared-fia-model-20261020/README.md),
+[merged tree](evidence/ascend-decode/merge-tree-20261020/README.md),
 [lookup](evidence/ascend-decode/lookup-contract-20261019/README.md),
 [SFA routing](evidence/ascend-decode/sfa-routing-20261019/README.md),
 [pinned staging](evidence/ascend-decode/metadata-h2d-20261019/README.md),
 [measurement workflow](workflow.md).
 [Detailed historical lessons and their evidence](lesson-20261019-2340.md).
+
+29. Local attention parity does not bound full-model drift. Same-source M32 shared-FIA reaches30/32 teacher labels, with final norm NRMSE0.15993 after78layers; keep it opt-in. At the old chain's first divergent prefix, SFA's2524/6500 margin is0.002617: capture logits and valid KV before attributing a token flip to state corruption. [Evidence](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md).
+
+30. Removing a memory write must not silently remove a rounding boundary. Dense norm/quant fusion changes451/6144 INT8 codes on frozen inputs. Disabling it preserves eager values in compiled Graph replay with static/SuperKernel retained. Use fresh processes and caches: patterns register globally and the installed compiler hash omits this flag. [Evidence](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md).
+
+31. A kernel's cost is not the round's cost. Measure the time each stream runs
+    alone: every HCCL collective runs0.000ms alone while the TP reduction runs
+    5.35ms alone, so one is free and the other is wholly critical path, and
+    "no decoder gain claimed" reads as cheap when it only meant unmeasured.
+    Normalise by the backbone's78 layers, not by an even division of the
+    capture — that read22% low. Forcing FP32 on a reduction costs1.99ms a
+    round in cast launches alone; folding the widen and narrow into a
+    rank-ordered reducer is the same association, so it is bit-exact.
+    [Evidence](evidence/ascend-decode/critical-path-20261020/README.md).
