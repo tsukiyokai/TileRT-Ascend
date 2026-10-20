@@ -185,16 +185,8 @@ __aicore__ inline void Project(Matmul<APacked, BPacked, CProduct, BiasNone>& mm,
                                __gm__ int4b_t* rows,
                                __gm__ int4b_t* weight,
                                __gm__ int32_t* product, int64_t columns,
-                               int64_t inner, __gm__ uint8_t* tiling,
-                               TPipe& pipe)
+                               int64_t inner, __gm__ uint8_t* tiling)
 {
-    // Re-initialised every call, under a switch, because hoisting it out
-    // lifted the five-round limit and has to be checked for whether it also
-    // broke the arithmetic: the cube's product is zero at the real shape and
-    // Split's output is good, so Project is the only stage left.
-    TCubeTiling cube;
-    LoadTiling(cube, tiling);
-    mm.Init(&cube, &pipe);
     GlobalTensor<int4b_t> a;
     GlobalTensor<int4b_t> b;
     GlobalTensor<int32_t> c;
@@ -733,7 +725,7 @@ __aicore__ void routed_int4_fused(
             Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
                     Nibbles(gate_up, expert * GATE_UP * HIDDEN),
                     partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
-                    gu_tiling, pipe);
+                    gu_tiling);
         }
         Publish();
     }
@@ -768,7 +760,7 @@ __aicore__ void routed_int4_fused(
             Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
                     Nibbles(down, expert * HIDDEN * HALF),
                     wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
-                    down_tiling, pipe);
+                    down_tiling);
         }
         Publish();
     }

@@ -622,3 +622,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     inputs, which is indistinguishable from an arithmetic fault by inspection.
     A scalar read from global memory fixes it and costs 256 loads a launch
     against the matmul each one guards.
+
+70. A broken correctness criterion corrupts the timings too. With the cube
+    half skipping every expert, this kernel measured 79.206 us at 256 experts
+    and was recorded as 1.98x the vendor. Running its matmuls, it measures
+    365.887 us against the vendor's 157.176 -- 2.33x slower, and the 5.8 ms a
+    round it promised becomes about 16.3 ms a round worse. The fastest
+    possible kernel is one that does nothing, so a speed number taken beside
+    an unfalsifiable correctness check is not a measurement of the work. The
+    vendor's advantage is structural: fractal-NZ weights dequantised inside
+    L0C through the fixpipe, against ND weights dequantised on the vector side
+    with a unified-buffer round trip per expert.
