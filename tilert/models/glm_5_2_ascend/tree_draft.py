@@ -201,6 +201,18 @@ class TreeDrafter:
             state = automaton.link[state]
         return []
 
+    def propose_tree(self, count):
+        """`(tokens, parents)` under a budget of `count` nodes.
+
+        The name is what `MtpRoundExecutor` dispatches on: a drafter that
+        offers it gets the tree round, one that does not keeps the chain. The
+        budget comes from the round rather than the constructor because the
+        captured graph width bounds it -- a tree wider than the graph pays for
+        rows the graph cannot replay.
+        """
+        self.budget = max(2, count)
+        return self.propose()
+
     def propose(self):
         """Return `(tokens, parents)` for a tree of at most `budget` nodes."""
         import heapq
