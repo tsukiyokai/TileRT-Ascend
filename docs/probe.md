@@ -83,6 +83,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [INT4 mad, by hand](evidence/ascend-decode/int4-weights-20261020/README.md) | `DataCopy`→L1, `LoadData`→L0, `Mmad`, `Fixpipe`→GM at M,K,N =16,64,16 with fillings that make the answer layout-independent. | Works: `0x11` gives64 =K everywhere, `0x21` gives96 =32×1+32×2, so both nibbles of a byte are separate INT4 elements. `KERNEL_TYPE_AIC_ONLY` is rejected at submission (`sqe_type=3`, `errType=0x20`); the `__mix__(1,2)` shape works with the vector half returning. Every link of the INT4 path is now proven. |
 
+| 10-20 | [Attention sparsity](evidence/ascend-decode/attention-sparsity-20261020/README.md) | Read `SparseFlashAttention`'s real arguments out of the capture. | It is handed the whole paged cache (`73,128,1,512` =9344 positions, the `--capacity` default) alongside a `1,1,2048` selection. At85.048µs a call,2048 positions would be 55GB/s and9344 would be253 -- so it reads everything and masks after, and the1.382ms recorded as its byte floor was the floor of reading everything. A read that honours the selection is4.6x less traffic. Settle it by timing against `--capacity`. Also unaccounted: `hcom_allGather_` at63554µs over140 calls, largest single13240. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

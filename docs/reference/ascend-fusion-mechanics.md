@@ -18464,3 +18464,224 @@ nondeterministic garbage in between — and then watched it disappear on a drive
 they call 「observed but unconfirmed」. A sync defect on this part can be masked by a toolkit or driver change.
 Our 24-consecutive-clean-runs standard for the fused brick is the right bar, and it must be re-run after any
 CANN or driver change rather than assumed to carry over.
+
+## 44. ★ The vendor's two shipped `int4b_t` kernels, start to finish — and what they say about aliasing two int4 tensors over one allocation, and about the 950PR unzip tax
+
+Source: `/home/shanshan/repo/cann/asc-devkit/examples/01_simd_cpp_api/06_compatibility_guide/matmul_s4/matmul_s4.asc`
+and `.../04_advanced_api/00_matmul/matmul_int4/matmul_int4.asc`, with their READMEs. Read 2026-10-20.
+Copyright header: "Copyright (c) 2025 Huawei Technologies Co., Ltd.", CANN Open Software License Agreement
+Version 2.0. `matmul_s4` is the arch-compatibility sample and is the more informative of the two: it is a
+`__mix__(1, 2)` kernel with `#define ASCENDC_CUBE_ONLY`, i.e. exactly our kernel shape, and it carries both the
+A3 int4-native path and the 950PR/950DT unzip path behind `__NPU_ARCH__` guards.
+
+### 44.1 ★ The vendor never holds two int4 tensors over one allocation — the unzip uses two distinct buffers
+
+This is the direct answer to the question asked. `matmul_s4`'s `Init`, verbatim:
+
+```cpp
+    __aicore__ inline void Init(
+        __gm__ uint8_t* a4GM, __gm__ uint8_t* b4GM, __gm__ uint8_t* aGM, __gm__ uint8_t* bGM, __gm__ uint8_t* cGM,
+        __gm__ uint8_t* tilingGM, AscendC::TPipe* pipeIn)
+    {
+        pipe = pipeIn;
+        CopyTiling(&tiling, tilingGM, pipe);
+        cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ typename C_TYPE::T*>(cGM), tiling.M * tiling.N);
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+        aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ typename A_TYPE::T*>(a4GM), tiling.M * tiling.Ka);
+        bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ typename B_TYPE::T*>(b4GM), tiling.Kb * tiling.N);
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+        aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ typename A_TYPE::T*>(aGM), tiling.M * tiling.Ka);
+        a4Global.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(a4GM), tiling.M * tiling.Ka / 2);
+        bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ typename B_TYPE::T*>(bGM), tiling.Kb * tiling.N);
+        b4Global.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t*>(b4GM), tiling.Kb * tiling.N / 2);
+        pipe->InitBuffer(inQueueSrc, 1, sizeof(int8_t) * M * K);
+        pipe->InitBuffer(tmpQueue, 1, sizeof(half) * M * K);
+        pipe->InitBuffer(outQueueDst, 1, sizeof(int8_t) * M * K);
+#endif
+    }
+```
+
+`a4GM` and `aGM` are **separate kernel arguments bound to separate device allocations** — `main()` allocates
+them independently with `a4InputByteSize = M * K * sizeof(int8_t) / 2` and
+`aInputByteSize = M * K * sizeof(int8_t)` into `x4Device` and `xDevice`. The packed int4 and the unpacked int8
+never share a block. The same holds in `matmul_int4.asc`: one `GlobalTensor` per kernel pointer, offsets applied
+only as `aGlobal = aGlobal[offsetA]`.
+
+So across both shipped int4 samples there is **no instance of two `GlobalTensor`s over one allocation for a
+sub-byte type**, and therefore no sanctioned pattern for it and no sample to copy. That is a negative result,
+not a prohibition — and §42.3's grep settles what it means: `SetGlobalBuffer` writes only `address_`,
+`oriAddress_` and `bufferSize_`, all per-object members of that one `GlobalTensor`, and there is **no
+per-allocation registry anywhere in the library**. The only case in which a second tensor can perturb the first
+is `cacheMode_ != CACHE_MODE_NORMAL`, i.e. after `SetL2CacheHint`, where `SetGlobalBuffer` rewrites the stored
+pointer through `L2CacheAlter<PrimType, CacheRwMode::RW>(buffer, cacheMode_)` instead of storing it as given.
+Absent `SetL2CacheHint`, two `GlobalTensor`s over one allocation are completely independent objects as far as
+AscendC is concerned, and the library cannot be the cause of one of them failing to land.
+
+### 44.2 The two shipped `int4b_t` arch paths, verbatim
+
+`Process()`, verbatim — note that on 2201 the vector half does nothing at all and there is no cross-core flag,
+while on 3510 the vector half does the unzip and hands off with sync mode 4:
+
+```cpp
+    __aicore__ inline void Process()
+    {
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+        if ASCEND_IS_AIC {
+            RunMatmul();
+        }
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+        if ASCEND_IS_AIV {
+            Unzip(aGlobal, a4Global, tiling.M * tiling.Ka / 2);
+            Unzip(bGlobal, b4Global, tiling.Kb * tiling.N / 2);
+            AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(8);
+        }
+        if ASCEND_IS_AIC {
+            AscendC::CrossCoreWaitFlag<4, PIPE_MTE2>(8);
+            RunMatmul();
+        }
+#endif
+    }
+```
+
+`RunMatmul()`, verbatim — the Matmul object is constructed *inside* the function, per call, and
+`SetSubBlockIdx(0)` is explicit:
+
+```cpp
+    __aicore__ inline void RunMatmul()
+    {
+        if (block_idx >= tiling.usedCoreNum) {
+            return;
+        }
+
+        int offsetA = 0;
+        int offsetB = 0;
+        int offsetC = 0;
+        CalcGMOffset<A_TYPE, B_TYPE, C_TYPE>(block_idx, tiling.usedCoreNum, tiling, offsetA, offsetB, offsetC);
+
+        auto gmA = aGlobal[offsetA];
+        auto gmB = bGlobal[offsetB];
+        auto gmC = cGlobal[offsetC];
+
+        AscendC::Matmul<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, CFG_MDL> mm;
+        mm.SetSubBlockIdx(0);
+        mm.Init(&tiling, pipe);
+        mm.SetTensorA(gmA, false);
+        mm.SetTensorB(gmB, false);
+        mm.IterateAll(gmC);
+    }
+```
+
+the type bindings, verbatim — and note `CubeFormat::ND_ALIGN` for the int32 C and bias, not plain `ND`:
+
+```cpp
+template <int32_t M, int32_t N, int32_t K>
+__global__ __mix__(1, 2) void matmul_s4(
+    __gm__ uint8_t* a4GM, __gm__ uint8_t* b4GM, __gm__ uint8_t* aGM, __gm__ uint8_t* bGM, __gm__ uint8_t* cGM,
+    __gm__ uint8_t* tilingGM)
+{
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AscendC::int4b_t, false> aType;
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, AscendC::int4b_t, false> bType;
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, int8_t, false> aType;
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, int8_t, false> bType;
+#endif
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 2201) || (__NPU_ARCH__ == 3510))
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND_ALIGN, int32_t> cType;
+    typedef AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND_ALIGN, int32_t> biasType;
+    AscendC::TPipe pipe;
+    MatMulKernel<aType, bType, cType, biasType, M, N, K> op;
+    op.Init(a4GM, b4GM, aGM, bGM, cGM, tilingGM, &pipe);
+    op.Process();
+#endif
+}
+```
+
+and the build line from the README, verbatim:
+
+```bash
+cmake -DCMAKE_ASC_ARCHITECTURES=dav-2201 ..;make -j; # 默认npu模式
+```
+
+### 44.3 ★ The 950PR/950DT unzip, in full — and why it costs the whole W4 win
+
+`Unzip`, verbatim and complete, with the vendor's own comment:
+
+```cpp
+    // int4 解压为 int8：搬运/计算阶段间用 EnQue/DeQue 衔接，自动完成 MTE2->V、V->MTE3 同步。
+    __aicore__ inline void Unzip(
+        AscendC::GlobalTensor<int8_t>& dstGlobalTensor, AscendC::GlobalTensor<int8_t>& srcGlobalTensor, uint32_t count)
+    {
+        AscendC::LocalTensor<int8_t> srcLocalTensor = inQueueSrc.AllocTensor<int8_t>();
+        AscendC::DataCopy(srcLocalTensor, srcGlobalTensor, count);
+        inQueueSrc.EnQue(srcLocalTensor);
+
+        srcLocalTensor = inQueueSrc.DeQue<int8_t>();
+        AscendC::LocalTensor<half> tmpTensor = tmpQueue.AllocTensor<half>();
+        AscendC::LocalTensor<int8_t> dstLocalTensor = outQueueDst.AllocTensor<int8_t>();
+        AscendC::LocalTensor<AscendC::int4b_t> int4SrcLocalTensor = srcLocalTensor.ReinterpretCast<AscendC::int4b_t>();
+        AscendC::Cast<half, AscendC::int4b_t>(tmpTensor, int4SrcLocalTensor, AscendC::RoundMode::CAST_NONE, count * 2);
+        AscendC::Cast<int8_t, half>(dstLocalTensor, tmpTensor, AscendC::RoundMode::CAST_CEIL, count * 2);
+        outQueueDst.EnQue<int8_t>(dstLocalTensor);
+        inQueueSrc.FreeTensor(srcLocalTensor);
+        tmpQueue.FreeTensor(tmpTensor);
+
+        dstLocalTensor = outQueueDst.DeQue<int8_t>();
+        AscendC::DataCopy(dstGlobalTensor, dstLocalTensor, count * 2);
+        outQueueDst.FreeTensor(dstLocalTensor);
+    }
+```
+
+Read off the cost, with no figure needed because the structure decides it:
+
+- **The unpacked int8 is written back to GM.** `DataCopy(dstGlobalTensor, dstLocalTensor, count * 2)` lands in
+  `aGM`/`bGM`, a second allocation of twice the packed size, and the Cube then reads *that*. So on 950PR the
+  weight crosses GM twice at **int8** width: the W4 memory footprint advantage at the point of consumption is
+  zero. For a bandwidth-bound decode this is the entire win, gone.
+- **Two full vector `Cast` passes over every weight element**, int4→half then half→int8, with no fused form —
+  `Cast<half, int4b_t>` with `RoundMode::CAST_NONE` and `Cast<int8_t, half>` with `RoundMode::CAST_CEIL`.
+- **UB must hold four bytes per element of the tile simultaneously**: `InitBuffer` reserves
+  `sizeof(int8_t) * M * K` for the packed source, `sizeof(half) * M * K` for the intermediate, and
+  `sizeof(int8_t) * M * K` for the unpacked destination — 1 + 2 + 1 bytes per unpacked element. At the sample's
+  own M = K = 256 that is 256 KB of UB for A alone.
+- **It runs per kernel invocation**, not once at load time: `Process()` calls `Unzip` on A and on B on every
+  call, before `RunMatmul`.
+- The handoff is `CrossCoreSetFlag<4, PIPE_MTE3>(8)` / `CrossCoreWaitFlag<4, PIPE_MTE2>(8)` — **sync mode 4,
+  flagId 8**, which is the 3510-only mode (§3b). There is no 2201 equivalent in this sample because on 2201 the
+  vector half has nothing to do.
+
+Two useful side-facts in the same function. First, the packed int4 is handled by
+`srcLocalTensor.ReinterpretCast<AscendC::int4b_t>()` **from a `LocalTensor<int8_t>`** — the canonical way to view
+packed nibbles is a reinterpret of an int8 tensor, not a separately typed allocation, and the element count then
+doubles (`count * 2`). Second, the vendor's own comment states the sanctioned intra-core sync idiom for exactly
+the hazard §43 is about: 「搬运/计算阶段间用 EnQue/DeQue 衔接，**自动完成 MTE2->V、V->MTE3 同步**」 — `EnQue`/`DeQue`
+on a `TQue` *is* the `SetFlag`/`WaitFlag` pair, inserted for you, and it is what the vendor writes instead of
+naming `HardEvent`s by hand.
+
+## Relevance
+
+44.1 answers the aliasing question as far as the library can answer it, and the answer is that the library has
+nothing to do with it: `SetGlobalBuffer` keeps no per-allocation state, so two `GlobalTensor<int4b_t>` over one
+block are independent objects and AscendC cannot be making one of them fail. The only exception is
+`SetL2CacheHint`, which makes `SetGlobalBuffer` store an *altered* pointer via `L2CacheAlter` rather than the
+one passed — worth checking only if that call is present. The vendor's own int4 samples never alias two tensors
+over one allocation, so there is no pattern to copy and no evidence either way that it is supported; the unzip
+path deliberately uses two separate allocations for the packed and unpacked forms. Since the library is
+exonerated, the remaining candidates are all outside it: another writer in the same kernel (a Matmul system
+workspace, or an `ND_ALIGN` output footprint wider than the logical shape — the vendor uses `ND_ALIGN` for C,
+not plain `ND`), the host-side binding of the two pointers, or the readback. The discriminating experiment is to
+distinguish «never issued» from «issued then destroyed», which the present evidence cannot: have the kernel
+itself read the 2048 values back from `+12288` at the very end — `DataCacheCleanAndInvalid` first, per §31 — into
+a *separate* witness allocation. Right data in the witness and nothing in the allocation means the store landed
+and something later overwrote it, and the hunt becomes «who else writes this block»; wrong data in the witness
+means the store never happened, and §42.4's silent `else` arm is the place to look.
+
+44.3 is the figure asked for on the 950PR int4 path, and the structure gives the answer without a measurement:
+the sanctioned route materialises the unpacked int8 weight back into GM and the Cube reads that, so the W4
+bandwidth advantage is zero at the point of consumption, on top of two vector `Cast` passes and 4 bytes of UB
+per unpacked element, executed per kernel call. Any layer-fusion design that banks on the A3 int4 Cube path is
+A3-only and does not carry to 950PR/950DT without re-deriving the weight path — the 950 answer is not «a bit
+slower», it is «W4 stops being a memory optimisation». 44.2 is the shipped template for our own kernel shape:
+a `__mix__(1,2)` `ASCENDC_CUBE_ONLY` kernel in which the 2201 path is `if ASCEND_IS_AIC { ... }` with the vector
+half idle and no cross-core flag at all, which is both a confirmation of the §43 per-half guarding rule and a
+reminder that on A3 a pure-int4 matmul needs no CV handshake whatsoever.

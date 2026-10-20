@@ -8018,3 +8018,477 @@ What was looked for and not found.
 - **`MonoMoE`'s GLM-5.2 configuration was not located.** The paper reports GLM-5.2 TPOT results
   but the shipped FlashInfer kernel is specialized to `E256/N512/K2048`; the GLM-5.2
   specialization (which would have N=1536-class and K=6144) was not found in the repo tree.
+
+## B7. ★ arXiv 2605.13915 "Multi-Scale Dequant" — one of four things CANN calls MSD, and NOT ours; read B7.-1 first. Its value to us is the M-stacked single-GEMM form, published as equation (16)
+
+"Multi-Scale Dequant: Eliminating Dequantization Bottleneck via Activation Decomposition for Efficient
+LLM Inference", Lingchao Zheng, Yuwei Fan (corresponding, fanyuwei2@huawei.com), Jun Li, Chengqiu Hu,
+Qichen Liao, Junyi Fan, Rui Shi, Fangzheng Miao. arXiv:2605.13915v1 [stat.ML], dated 13 May 2026 on the
+listing and "May 15, 2026" on the title page. 36 pages. https://arxiv.org/abs/2605.13915 /
+https://arxiv.org/pdf/2605.13915 (the HTML render was not available; the PDF was fetched and text-extracted
+with `pypdf`). Read 2026-10-20.
+
+This is a Huawei paper, and it is the public writeup of the technique whose name appears in
+`grouped_matmul_swiglu_quant_a8w4_msd_pre/mid/post.h`. **Read the first subsection before acting on anything
+here: the expansion of the acronym is not what we assumed, and the published instantiations are not ours.**
+
+### B7.-1 ★★ CORRECTION, added after this section was written: "MSD" names four different decompositions in CANN, and this paper is not the one we are building
+
+Established independently and after the rest of this section was drafted, from
+https://www.hiascend.com/developer/techArticles/20250717-2 (2025/07/17 — note that the
+`developer/techArticles/` path serves full HTML to a fetcher, unlike `document/detail/`), with the
+taxonomy verified against local clones of `gitcode.com/cann/ops-transformer` and `gitcode.com/cann/ops-nn`.
+The full write-up is in `w4a8-msd-int4-mmad.md` §1-§7; this note exists so that nobody reads B7.0 below and
+concludes that our `16*high + low` is unfounded. It is founded; it just is not this paper.
+
+For the A8W4 case — ours — the authoritative expansion is **Mixed-precision Split-activation Decomposition**,
+verbatim:
+
+> 创新性地提出MSD（Mixed-precision Split-activation Decomposition，混合精度激活拆分分解）方案，将INT8激活拆分为
+> 高、低两路INT4，并直接与INT4权重进行计算，用“高位×16+低位”合成
+
+So our reading of the *mechanism* was right all along — split the INT8 activation into a high and a low INT4
+path, multiply each directly against the INT4 weight, recombine as 「高位×16+低位」. What was wrong was only the
+expansion of the acronym, and the assumption that one paper covers it.
+
+The four families, all verified in-tree:
+
+| # | Family | Activation | Components | Radix / scales | Cube out | Where |
+|---|---|---|---|---|---|---|
+| 1 | **A8W4 MSD** — OURS | INT8 | 2 × int4 nibbles | 16 | `half` | `grouped_matmul*/..._a8w4_msd*`, `ops-nn/matmul/quant_batch_matmul_v4/op_kernel/quant_batch_matmul_v4_msd.h` |
+| 2 | A16W8 MSD | BF16/FP16 | 2 × int8 digits | 127.499, then 127.499²·2 | `int32` | `ops-nn/matmul/weight_quant_batch_matmul_v2/op_kernel/weight_quant_batch_matmul_v2_msd_*.h` |
+| 3 | A16W4 MSD | BF16/FP16 | 2 × int8 | `float multiFactors[2] = {127.0f, 254.0f}` | `int32` (`LocalTensor<int32_t> s32l0c_`) | `ops-transformer/gmm/grouped_matmul/op_kernel/a16w4_msd/` |
+| 4 | SFA antiquant MSD | — | — | `antiqCoeff1 = 127`, `scaleC1 = 1024.0/127`, `scaleC2 = 1024.0` | — | SparseFlashAttention |
+
+**arXiv 2605.13915, everything below in this section, is families 2-4 — not family 1.** Search `a8w4_msd`,
+never bare `msd`, or you land in the wrong family. Two practical notes from the same pass: the non-grouped W4A8
+MSD matmul lives in `ops-nn`, not `ops-transformer`, and its kernel carries the comment
+`// 2: in pre process, x has been splited to [2m,n]` — **the vendor M-stacks it too, and says so in a comment**,
+independently of equation (16) below. And `git clone`/`git ls-remote https://gitcode.com/cann/ops-transformer.git`
+works, whereas the `gitcode.com/.../raw/master/...` form returns a JavaScript shell to a fetcher — clone rather
+than fight the raw-URL rate limit.
+
+**Our `8*sum(w)` fold is also published formula rather than our own invention.** From
+`gmm/grouped_matmul_swiglu_quant_v2/docs/aclnnGroupedMatmulSwigluQuantV2.md`, in-repo:
+`weightAssistMatrix ∈ R^{E×N}`, 「离线生成作为输入，并非算子内部完成」, with
+`weightAssistMatrix_i = 8 × weightScale × Σ_{k=0}^{K-1} weight[:,k,:]` per-channel, or
+`8 × Σ_k (weight[:,k,:] × weightScale[:, ⌊k/num_per_group⌋, :])` per-group; the split is
+`X_high_4bits = ⌊X/16⌋`, `X_low_4bits = X & 0x0f − 8`, and the recombine is
+`C = (C_high×16 + C_low + weightAssistMatrix) ⊙ x_scale`. The same quantity ships under three names in three
+operators: `weightAssistMatrix` (GroupedMatmulSwigluQuant), `bias` (aclnnGroupedMatmulV4 — the kernel member is
+literally `GlobalTensor<DTYPE_BIAS_A8W4MSD> biasGm; // for 8 * weight`), and `yOffset` (aclnnQuantMatmulV5,
+「值要求为8*x2*x2Scale，并在第1维累加」). It is generated **offline on the host**, not inside the operator.
+
+### B7.0 ★ Three corrections to the premise we were working from
+
+1. **MSD expands to "Multi-Scale Dequant", not "most-significant-digit" or "multiple significant digit".**
+2. **The framework decomposes the ACTIVATION, never the weight, and its published instantiations all take a
+   BF16 activation.** The abstract, verbatim:
+
+   > This paper presents **Multi-Scale Dequant (MSD)**, a quantization framework that removes weight/KV
+   > dequantization from the GEMM critical path. Instead of lifting low-bit weights to BF16 precision, MSD
+   > decomposes high-precision BF16 activations into multiple low-precision components, each of which can be
+   > multiplied directly with quantized weights via native hardware-accelerated GEMM. This approach shifts the
+   > computational paradigm from *precision conversion* to *multi-scale approximation*, avoiding INT8-to-BF16
+   > weight conversion before GEMM.
+
+   The paper's own grouped-matmul reference kernel is `a16w4_msd` — **A16**, a BF16 activation against an INT4
+   weight — not `a8w4`. So the `a8w4_msd` kernel family is an instantiation this paper does not analyse. Our
+   reading of *what* those kernels do (split the activation into two INT4 components and recombine) matches the
+   framework's principle exactly; what does not match is the precision of the thing being split and the number
+   of components.
+3. **For an INT4 weight the paper's own recommendation is K = 3 INT4 passes from BF16, not K = 2.** Table 4,
+   verbatim and complete:
+
+   > Table 4: MSD applicability to various precision configurations. K denotes the number of decomposition
+   > scales. Eff. Bits and Error Bound are for the K shown.
+   >
+   > | Activation | Weight | MSD Decomposition | K | Eff. Bits | Error Bound |
+   > |---|---|---|---|---|---|
+   > | BF16 | INT8 | BF16→INT8 + INT8 | 2 | ∼16 | M/64516 |
+   > | BF16 | MXFP4 | BF16→MXFP4 + MXFP4 | 2 | ∼6.6 | α/64 |
+   > | BF16 | FP8 | BF16→FP8 + FP8 | 2 | ∼16 | TBD |
+   > | BF16 | INT4 | BF16→INT4 + INT4 + INT4 | 3 | ∼11 | TBD |
+   >
+   > Baselines for comparison:
+   >
+   > | BF16 | INT8 | Dequant (BF16×BF16) | — | ∼8 | — |
+   > | BF16 | MXFP4 | MXFP8 activation | — | ∼5.24 | — |
+
+   and §3.4, verbatim:
+
+   > **BF16→INT4:** When decomposing BF16 activations to INT4 components, two scales may not fully capture the
+   > dynamic range. We can use K = 3 or K = 4 to progressively refine the residual.
+
+   **There is no A8W4 row in Table 4 at all.** This is consistent rather than contradictory for our case: two
+   signed-INT4 components cover an INT8 range exactly (`16*high + low` with `high, low ∈ [-8,7]` is an exact
+   identity over the int8 range, so K = 2 from an *already-INT8* activation is lossless, whereas K = 2 from a
+   *BF16* activation is not and needs a third pass). But it means the paper's error bounds and effective-bit
+   figures do not apply to what we are building, and nothing in it validates a two-component INT4 split of a
+   BF16 activation.
+
+### B7.1 ★ The M-stacked single-GEMM form is published, is equation (16), and is recommended for exactly our regime
+
+This answers the question we asked directly — whether anyone concatenates the two components along M rather
+than issuing two matmuls. They do, and small batch is the stated reason. §3.9, verbatim:
+
+> **GEMM pass fusion for small-batch decode.** The MSD decomposition produces two activation components
+> X⁽¹⁾, X⁽²⁾ ∈ R^(b×n), requiring two separate GEMM calls: WX⁽¹⁾ and WX⁽²⁾. However, when b is small—as is
+> typical in decode where b ≪ m, n—the two GEMM passes can be **fused into a single GEMM call** by
+> concatenating the components along the row dimension:
+
+```
+[ α Y⁽¹⁾ ]   [ α X⁽¹⁾ ]
+[        ] = [        ] · Wᵀ ,                                   (16)
+[ β Y⁽²⁾ ]   [ β X⁽²⁾ ]
+```
+
+> where [α X⁽¹⁾ ; β X⁽²⁾] ∈ R^(2b×n) and the result is a 2b×m matrix from which α Y⁽¹⁾ and β Y⁽²⁾ are
+> extracted and summed. This reduces two kernel launches to one, eliminates inter-kernel synchronization, and
+> improves Cube utilization. When b is large (e.g., large-batch prefill), this concatenation may exceed
+> on-chip capacity, and the two GEMM passes must be computed separately.
+
+and the same point in the Figure 1 caption, verbatim:
+
+> When the left matrix has few rows (e.g., decode with b ≪ m, n), the two GEMM passes can be further fused
+> into a single GEMM by concatenating X⁽¹⁾ and X⁽²⁾ along the row dimension (see text).
+
+One notation wrinkle to be aware of rather than to copy: as written, the left operand of (16) is
+`[α X⁽¹⁾ ; β X⁽²⁾]`, which cannot be an integer matrix if α and β are reals. The integer kernel must
+concatenate the raw components `[X⁽¹⁾ ; X⁽²⁾]` and apply α and β to the two output row-blocks, which is what
+the surrounding prose describes ("from which α Y⁽¹⁾ and β Y⁽²⁾ are extracted and summed").
+
+### B7.2 The exact decomposition math (W8A16 instantiation), and the post-GEMM scale licence
+
+§3.1, verbatim:
+
+> Consider a linear layer with weight matrix W ∈ Z₈^(m×n) (quantized to INT8 offline with per-channel scales
+> s_W ∈ R^m) and activation vector x ∈ R^n (in BF16 format during inference). The standard
+> dequantization-based approach computes:
+>
+>     y = dequant(W)·x = (s_W ⊙ W_int8)·x,                                      (3)
+>
+> where the weight matrix is first dequantized from INT8 to BF16 via per-channel scaling, then multiplied with
+> the BF16 activation. This dequantization step is the bottleneck we aim to eliminate.
+>
+> MSD takes a different approach: instead of dequantizing W from INT8 to BF16, we decompose the BF16
+> activation x into K INT8 components:
+>
+>     x ≈ Σ_{k=1..K} α_k · x⁽ᵏ⁾,   x⁽ᵏ⁾ ∈ Z₈^n,                                 (4)
+>
+> where α_k ∈ R are learned or computed scaling coefficients. The output is then computed as:
+>
+>     y = Σ_{k=1..K} α_k · (W x⁽ᵏ⁾).                                            (5)
+>
+> Each W x⁽ᵏ⁾ is a native INT8×INT8 GEMM, executable directly on hardware tensor cores without
+> dequantization. Since the weight scale s_W is per-output-channel (i.e., each row of W shares a single
+> scale), it can be applied **after** the GEMM and reconstruction:
+>
+>     y = s_W ⊙ ( Σ_{k=1..K} α_k · (W_int8 x⁽ᵏ⁾) ),                             (6)
+>
+> where ⊙ denotes row-wise scaling. This is a lightweight O(m) Vector operation, analogous to how V's
+> per-channel scale is applied after the PV GEMM in attention (Section 4). In practice, we find K = 2 provides
+> an excellent trade-off between accuracy and computational cost.
+
+§3.2, the two-pass algorithm, verbatim:
+
+> For K = 2, we use a two-pass decomposition analogous to multi-grid correction in numerical analysis. The
+> algorithm proceeds as follows:
+>
+> **Pass 1: Coarse-Scale Quantization.** Compute the primary scale and quantized activation:
+>
+>     α = ‖x‖_∞ / 127,                                                          (7)
+>     x⁽¹⁾ = clamp( round( x / α ), −128, 127 ).                                (8)
+>
+> **Pass 2: Fine-Scale Residual.** Compute the residual. Since the quantization error of Pass 1 is bounded in
+> (−0.5α, 0.5α), we directly use 2 × 127 = 254 as the secondary scale without computing max:
+>
+>     r = x − α · x⁽¹⁾,                                                         (9)
+>     β = α / 254,                                                              (10)
+>     x⁽²⁾ = clamp( round( r / β ), −128, 127 ).                                (11)
+>
+> The final approximation is x ≈ α·x⁽¹⁾ + β·x⁽²⁾. The decomposition is performed on-the-fly for each
+> activation vector during inference, with negligible overhead compared to the subsequent GEMM operations.
+
+So the recombination weight on the second pass is **1/254**, not 1/16 — because the components are INT8 and
+the second scale is derived from the first pass's half-LSB bound, not from a nibble split. The `16*high + low`
+form is the INT4-component algebra, which the paper only reaches in the MXFP4 instantiation (where
+`β = α/16`, §3.2.1 Algorithm 1 line 6) and in Table 4's K = 3 INT4 row.
+
+The MXFP4 instantiation, Algorithm 1, verbatim and complete — this is the closest published analogue of a
+two-INT4-component scheme:
+
+```
+Algorithm 1 MSD MXFP4 Decomposition (per 32-element block)
+Require: Block x_b ∈ R³² (BF16), Weight block W_b (MXFP4)
+Ensure:  Decomposed components q₁, q₂ ∈ FP4³², scales α, β ∈ E8M0
+ 1: M_b ← ‖x_b‖_∞
+ 2: α ← 2^⌈log2(M_b / 1.859375)⌉           ▷ E8M0 scale (power of two)
+ 3: s ← x_b / α                            ▷ Scale to FP4 range
+ 4: q₁ ← round_to_FP4(s)                   ▷ Round-to-nearest on E1M2 grid; |s| > 1.75 maps to ±1.75
+ 5: r ← x_b − α · q₁                       ▷ Residual; ‖r‖_∞ ≤ α/8
+ 6: β ← α / 16                             ▷ E8M0 scale; no max-reduction needed
+ 7: q₂ ← round_to_FP4(r / β)               ▷ 12.5% elements clipped to ±1.75; error ≤ α/64
+ 8: return q₁, q₂, α, β
+```
+
+with the design note, verbatim: 「choosing β as powers of two is therefore deliberate: it ensures the entire
+decomposition pipeline—scale, …—」 (§3.2.1) and 「the scaled residual satisfies |r_i/β| ≤ 2, which exceeds
+FP4's 〔range〕」.
+
+### B7.3 The error bounds, as theorems — and the answer on exactness
+
+Theorem 5.1, verbatim:
+
+> **Theorem 5.1 (Multi-Scale Reconstruction Error).** Let x ∈ Rⁿ with ‖x‖_∞ = M. Under the two-pass
+> decomposition in Algorithm 2, the reconstruction error satisfies:
+>
+>     ‖x − (α x⁽¹⁾ + β x⁽²⁾)‖_∞ ≤ M / (127 × 2 × 254) = M / 64516 ≈ M / 2¹⁶.     (32)
+>
+> *Proof.* After the first quantization pass (Eqs. (7)–(8)), the per-element rounding error is bounded by:
+> |x_i − α x⁽¹⁾_i| ≤ α/2 = M/(2 × 127). (33) Therefore, the residual satisfies ‖r‖_∞ ≤ M/254. Since the
+> quantization error in Pass 1 is bounded in (−0.5α, 0.5α), we directly use β = α/254 as the secondary scale
+> without computing max. The second-pass rounding error satisfies:
+> |r_i − β x⁽²⁾_i| ≤ β/2 = α/(2 × 254) = M/(127 × 2 × 254) = M/64516 ≈ M/2¹⁶. (34)
+> Since r_i = x_i − α x⁽¹⁾_i, we have |x_i − (α x⁽¹⁾_i + β x⁽²⁾_i)| ≤ M/64516 ≈ M/2¹⁶ for all i, establishing
+> the bound. ∎
+
+> **Corollary 5.1 (Effective Precision Gain).** Standard single-scale INT8 quantization achieves error bound
+> M/254 ≈ M/2⁸. MSD with K = 2 achieves M/64516 ≈ M/2¹⁶, providing approximately **8 additional effective
+> bits** of precision (from ∼8 to ∼16 effective bits). With fractional scaling (α = M/127.49, Section 3.3),
+> the bound tightens to M/65015, which is closer to 2¹⁶.
+
+Theorem 5.2, verbatim:
+
+> **Theorem 5.2 (MXFP4 Multi-Scale Reconstruction Error).** Let x ∈ R³² be a 32-element block with
+> ‖x‖_∞ = M_b. Under the two-pass MXFP4 decomposition with α = 2^⌈log2(M_b/1.859375)⌉ and β = α/16, the
+> reconstruction error satisfies:
+>
+>     ‖x − (α q₁ + β q₂)‖_∞ ≤ α / 64.                                           (35)
+>
+> *Proof.* The FP4 E1M2 format represents positive values in {0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75} with a
+> **uniform** step size of 0.25 (including the transition from 1.0 to 1.5, which is 0.5 = 2 × 0.25, since the
+> exponent increment doubles the step).
+> **Pass 1 residual bound.** After scaling by α, the elements satisfy |x_i/α| ≤ 1.859375. We consider two
+> cases: *Normal quantization* (|x_i/α| ≤ 1.75): the rounding error is at most half the step size:
+> |x_i/α − q₁,i| ≤ 0.125, so |r_i| ≤ 0.125α = α/8. *Clipped elements* (|x_i/α| ∈ (1.75, 1.859375]): the value
+> is mapped to ±1.75 via round-to-nearest. The residual satisfies
+> |r_i| = |x_i/α − 1.75|·α ≤ (1.859375 − 1.75)α = 0.109375α < α/8. Therefore, the global Pass 1 residual bound
+> is ‖r‖_∞ ≤ α/8.
+> **Pass 2 error bound.** With β = α/16, the scaled residual satisfies |r_i/β| ≤ (α/8)/(α/16) = 2. Again two
+> cases: *Normal quantization* (|r_i/β| ≤ 1.75, approximately 87.5% of elements): rounding error
+> ≤ 0.125β = α/128. *Clipped elements* (|r_i/β| ∈ (1.75, 2], approximately 12.5% of elements): residual mapped
+> to ±1.75, error ≤ (2 − 1.75)β = 0.25β = α/64. The worst-case per-element error is therefore α/64,
+> establishing the bound. ∎
+
+> **Corollary 5.2 (Effective Precision across Formats).** … **INT8 (W8A16):** Standard single-pass INT8
+> quantization achieves ∼8 effective bits. MSD with K = 2 achieves M/64516 ≈ M/2¹⁶, providing ∼16 effective
+> bits—an 8-bit gain. **MXFP4 (W4A16):** Standard single-pass MXFP4 quantization achieves ∼2.8 effective bits.
+> MSD with K = 2 achieves error bound α/64 per block; since α/M_b ≤ 1.859375, the relative error is at most
+> 1.859375/64 ≈ 0.029, yielding ∼6.6 effective bits—a 3.8-bit gain over single-pass MXFP4 and 1.4 bits beyond
+> single-pass MXFP8 (∼5.24 bits).
+>
+> For comparison, BF16 has 7 explicit mantissa bits plus implicit leading 1, giving roughly 8 effective bits of
+> precision for normalized numbers. MSD's two-pass INT8 decomposition approaches BF16 fidelity while using
+> only INT8 operations throughout the compute-intensive GEMM.
+
+On accuracy cost overall, the abstract, verbatim:
+
+> Numerical simulations on matrix multiplication and Flash Attention kernels confirm that MSD does not degrade
+> accuracy compared to dequantization baselines, and in many settings achieves lower L2 error.
+
+**So: the MSD decomposition is approximate by construction when the source is BF16, with a proved L∞ bound,
+and the published verdict is "no accuracy degradation versus dequant, often better".** It is not presented as
+an exact identity anywhere. Our INT8→two-INT4 case is a different animal: there the split *is* exact, and the
+paper offers no bound for it because it never considers an integer source.
+
+### B7.4 ★ Ascend-specific mechanics worth lifting: FixPipe does the recombination for free
+
+§4.4.3 (the optimization list), verbatim — this is directly applicable to our `16*high + low` merge:
+
+> **Cube-side FixPipe on Ascend.** Ascend's Cube core features a *FixPipe* (fixed-point pipeline) unit that
+> performs inline post-processing on GEMM outputs **before** they leave the Cube. Specifically, FixPipe can:
+> (1) cast INT32 accumulator results to FP16/BF16, (2) multiply by a scalar coefficient, and (3) atomically
+> accumulate into global memory—all in a single pass with no Vector involvement. This maps directly onto MSD's
+> merging step: the two partial GEMMs W x⁽¹⁾ and W x⁽²⁾ (with INT32 outputs) can each be scaled by α and β
+> respectively and accumulated into the final output buffer via FixPipe's atomic add, completely bypassing the
+> Vector core for the reconstruction phase. This effectively reduces MSD's Vector overhead to **only** the
+> decomposition step, making the merging cost zero from the Vector perspective.
+>
+> With these optimizations, the effective Vector cost of MSD can be reduced by 30–50%, pushing the crossover
+> point N* significantly higher and making MSD beneficial for an even wider range of decode configurations.
+
+and, in the same list:
+
+> **Low-precision decomposition.** The MSD decomposition (round, clamp) and S/O merging (scale, add) can be
+> performed in FP16 or even INT16 instead of FP32, reducing Vector instruction count and register pressure.
+
+§3.9's four design principles for the fused tiled kernel, verbatim:
+
+> 1. **Resident weight/KV tile.** Each weight or KV tile is loaded from HBM **once** into on-chip buffer and
+>    consumed by both MSD passes before eviction. The tile must satisfy m_t k_t b_w ≤ C_tile, where C_tile is
+>    the available on-chip capacity. For attention decode with B_c = 64, d = 128: the KV tile is only 8KB—easily
+>    resident.
+> 2. **Online activation decomposition.** The activation components x⁽¹⁾, x⁽²⁾ (or Q⁽¹⁾, Q⁽²⁾, P⁽¹⁾, P⁽²⁾ in
+>    attention) are generated on-the-fly per tile, not materialized to HBM.
+> 3. **In-register/streaming partial results.** The partial outputs y⁽¹⁾, y⁽²⁾ from the two GEMM passes are
+>    scaled, summed, and accumulated into the final output buffer via FixPipe (on Ascend) or register-level
+>    operations—without intermediate HBM writes.
+> 4. **Single final writeback.** Only the reconstructed output y = s_W ⊙ (α y⁽¹⁾ + β y⁽²⁾) is written to HBM.
+
+and the opening warning of that section, verbatim:
+
+> The performance claims in this paper depend on implementing MSD as a *fused tiled kernel*, not as two
+> standalone GEMM invocations. If the two MSD GEMM passes were executed as independent kernels, the weight/KV
+> data would be read twice from HBM, partial outputs would be materialized, and kernel launch overhead would
+> erode the benefits.
+
+with the fallback, verbatim:
+
+> When the resident-tile condition cannot be met (e.g., very large weight matrices without sufficient on-chip
+> capacity), the implementation falls back to the conservative two-read model, reducing the traffic benefit from
+> ∼3× to ∼1.5× in the dominant term while still avoiding the dequantization round-trip.
+
+### B7.5 Where MSD does and does not pay, with the measured crossover
+
+§3.8, verbatim and complete:
+
+> MSD is designed for **Decode-heavy inference workloads** where batch sizes are small (b ≪ m, n) and latency
+> per token is critical. In decode, the additional MSD GEMM is absorbed by INT8's 2× throughput, and the
+> Vector-side decomposition/merging cost is O(bn + bm) ≪ O(bmn). In prefill with large batch sizes, the extra
+> MSD GEMM grows linearly with b and the dequantization cost is amortized, so MSD is not recommended.
+
+§3.4 on the INT4 trade-off, verbatim:
+
+> **Trade-off:** Increasing K improves approximation accuracy but requires more GEMM operations. On
+> accelerators with strong INT4 throughput (typically 4× BF16), this trade-off can be **better than
+> break-even**—yielding actual Cube-side speedup, as we analyze below.
+
+Table 2, verbatim:
+
+> Table 2: Effective compute time: MXFP8 baseline vs. MSD-MXFP4 (K = 2)
+>
+> | Method | Raw FLOPs | Throughput | Effective Time |
+> |---|---|---|---|
+> | MXFP8 × MXFP4 (dequant) | 2mn (FP8) | 2× | 1.0 mn |
+> | MSD-MXFP4 (2 × FP4) | 4mn (FP4) | 4× | 1.0 mn |
+>
+> Two FP4 GEMMs at 4× throughput yield the same effective Cube time as one FP8 GEMM at 2× throughput.
+
+The attention crossover table (dequant/MSD speedup ratio against sequence/query count N, with N* marking the
+break-even point), verbatim as extracted:
+
+```
+              d = 128 (GQA)        d = 576 (MLA)
+ N      Dequant/MSD ratio     Dequant/MSD ratio
+ 1            20.0×                  31.0×
+ …            22.0×                   3.0×
+32             1.0× (N*)              1.4×
+48             0.8×                   1.0× (N*)
+```
+
+and the HBM result, verbatim:
+
+> On decoupled architectures (e.g., Ascend NPUs), the dequant approach requires the same Vector→HBM→Cube
+> round-trip for K/V as for linear-layer weights (Section 2.1), resulting in 5Md bytes of HBM traffic per
+> attention head. MSD avoids this round-trip: K and V remain in INT8 and are read **once** directly by Cube
+> cores (2Md bytes total for K+V), a 2.5× reduction. … This efficient data movement enables MSD to achieve
+> **over 80% HBM bandwidth utilization** in GQA decode scenarios on Ascend 910B, compared to 40–50% for
+> dequant.
+
+### B7.6 Deployment status and the exact kernel paths
+
+§7 / conclusion, verbatim:
+
+> MSD has been deployed in Huawei **CANN 8.0** and validated in production inference workloads on Ascend 910B,
+> achieving significant performance improvements in decode-〔heavy scenarios〕.
+
+> The MSD technique is used in multiple operator kernels within the CANN ops-transformer repository
+> (https://gitcode.com/cann/ops-transformer). Two representative examples are: the attention kernel
+> (https://gitcode.com/cann/ops-transformer/blob/master/attention/incre_flash_attention/op_kernel/arch32/incre_flash_attention_preload_dd.h)
+> and the grouped matmul A16W4 kernel
+> (https://gitcode.com/cann/ops-transformer/tree/master/gmm/grouped_matmul/op_kernel/a16w4_msd).
+
+### B7.7 The dequantization bottleneck as the paper frames it, and the Ascend numbers
+
+§1.1, verbatim:
+
+> A concrete illustration comes from DeepSeek's FlashMLA FP8 kernel on NVIDIA Hopper GPUs [2]. Profiling
+> reveals that the dequantization path—converting `float8_e4m3` → `half` → `float32` → `bfloat16` followed by
+> scale multiplication—consumes approximately **50 clock cycles per KV token**, while the matrix
+> multiply-accumulate (MMA) operations for 64 query heads require only **34 cycles**. The kernel is therefore
+> *dequantization-bound*: Tensor Cores sit idle while CUDA Cores struggle to feed them with dequantized data.
+>
+> This phenomenon is even more pronounced on architectures with decoupled compute units, such as Huawei Ascend
+> NPUs. The Ascend 910B architecture features a heterogeneous compute structure comprising Vector cores (for
+> scalar/vector operations) and Cube cores (for high-throughput matrix operations). Dequantization—which
+> involves element-wise type conversion and scaling—must execute on Vector cores, while the subsequent GEMM
+> utilizes Cube cores. The disparity in throughput between these units creates a severe pipeline stall: Cube
+> cores wait for Vector cores to complete dequantization, resulting in significant underutilization of the
+> accelerator's peak compute capacity.
+
+and the dequant data path it enumerates, verbatim:
+
+> 3. Converted weights are written back to HBM (or UB)
+> 4. Cube cores read from HBM/UB and perform GEMM
+
+Figure 1's traffic figures, verbatim: dequant path 「dominant ∼3mn」 bytes, MSD fused path 「dominant ∼mn」.
+
+### B7.8 Related work the paper positions MSD against, with its own one-line verdicts
+
+Verbatim, §2.3:
+
+> On Ascend NPUs, He et al. [20] present the first practical W4A16 kernel using Vector cores for on-the-fly
+> dequantization and Split-K parallelization, yet report that the redundant HBM transfer remains the dominant
+> cost.
+
+> **QServe** [21] introduces W4A8KV4 quantization with compute-aware weight reordering and register-level
+> parallelism to reduce dequantization latency on GPUs. **LiquidGEMM** [22] redesigns the W4A8 GEMM pipeline to
+> defer dequantization to the epilogue phase, achieving up to 2.9× speedup. **TurboMind** [23] provides a
+> comprehensive mixed-precision inference framework with offline weight packing and fused dequantization.
+> **MixPE** [25] proposes performing dequantization *after* per-group integer GEMM, reducing the overhead
+> through shift-and-add operations rather than multipliers. These approaches optimize the dequantization path
+> but do not eliminate it.
+
+> **ABQ-LLM** [24] decomposes quantized weights into binary components and reconstructs arbitrary-precision
+> GEMM via Binary TensorCore (BTC) equivalents, achieving acceleration for non-standard bit-widths such as
+> W6A6 and W2A8. **LUT-GEMM** [16] and **LUT Tensor Core** [26] replace dequantization with lookup-table-based
+> computation, precomputing partial dot products to avoid explicit type conversion. **T-MAN** [27] extends the
+> LUT approach to NPUs with a unified table layout for both prefill and decoding. **FIGNA** [28] takes a
+> hardware design approach, proposing dedicated FP-INT multiply-accumulate units that natively support
+> mixed-precision operations without dequantization.
+
+and its stated novelty claim, verbatim:
+
+> Among existing methods, ABQ-LLM is the closest in 〔spirit〕 … ABQ-LLM decomposes on the **weight** side
+> (bit-level), whereas MSD decomposes on the **activation** 〔side〕.
+
+> 〔Contribution:〕 an activation-side multi-scale decomposition framework targeting dequantization bottlenecks
+> on decoupled low-precision inference architectures. By decomposing activations rather 〔than weights〕 …
+> no binary decomposition of weights.
+
+## Relevance
+
+B7.1 is the result we wanted: concatenating the two components along the row dimension into one `2b×n` GEMM is
+published as equation (16), it is recommended specifically for `b ≪ m, n`, and the stated reasons are exactly
+ours — one launch instead of two, no inter-kernel sync, better Cube utilization. Our M-stacking is the vendor's
+own prescription for decode, not an improvisation, and the paper names the condition under which it stops being
+right (large b, on-chip capacity exceeded). B7.0 is the correction: MSD is Multi-Scale **Dequant**, it
+decomposes the activation and never the weight, its reference grouped-matmul kernel is `a16w4_msd` with a BF16
+activation, and its own INT4 row prescribes **K = 3** passes — so the `a8w4_msd` family is an instantiation this
+paper does not cover and its error bounds do not transfer. That cuts both ways for us: it means no published
+bound applies to our split, and it means our split is the easy case, because `16*high + low` over INT4 halves of
+an INT8 activation is an exact identity while every decomposition in the paper is approximate.
+
+B7.4 is the one piece of free performance here. FixPipe can cast the INT32 accumulator, multiply by a scalar
+coefficient, and atomically accumulate into GM in a single pass with no Vector involvement, which is exactly our
+`16 * high + low` merge — so the recombination of an M-stacked W4A8 GEMM should cost zero Vector time, not a
+`Mul` + `Add` pass. The paper claims this plus FP16/INT16 decomposition arithmetic cuts MSD's Vector overhead by
+30–50%. B7.2's equation (6) is the structural licence for folding a per-output-channel correction after the
+GEMM — the same argument that makes our `8*sum(w)` per-column fold legitimate as a post-GEMM row-scale rather
+than a pre-GEMM weight edit. B7.5 says MSD is not recommended in large-batch prefill at all, and gives a
+measured MLA crossover at N* ≈ 48 against a 31× advantage at N = 1, which brackets our batch=1 decode target at
+the most favourable end. B7.6 pins the deployment claim (CANN 8.0, production on 910B) and hands us the two
+exact kernel paths to read. B7.7's framing — dequant must run on Vector, GEMM on Cube, and the stall is the
+whole problem — is the same A3 Vector/Cube asymmetry our 13.58 us MIX floor and our `Cast` family's
+2.300 ms/round against 0.076 ms of bytes are symptoms of.

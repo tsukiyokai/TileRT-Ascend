@@ -3184,6 +3184,1437 @@ one-sided put is the A3 path. The UB cost is small: `UDMA_WQE_SCRATCH_BYTES = 25
 header constants say `ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE 128U` /
 `ACLSHMEM_RDMA_MTE_STAGING_UB_SIZE 128U` minimum.
 
+## 11. `examples/shmem_mega_moe` — a MoE forward pass as ONE device pipeline, with a hand-rolled epoch-tagged cross-rank barrier
+
+URL: https://gitcode.com/cann/shmem/tree/master/examples/shmem_mega_moe
+Raw base: https://raw.gitcode.com/cann/shmem/raw/master/examples/shmem_mega_moe/
+Author: Huawei Technologies Co., Ltd. (`Copyright (c) 2026`)
+Date: shipped with SHMEM v1.7.0, 2026/10 ("新增 MegaMoE、UDMA AllReduce 示例")
+Retrieved 2026-10-20.
+
+This is the closest public artifact to what we are building: token routing, cross-rank dispatch,
+two expert GEMMs, SwiGLU, and cross-rank combine, all inside one device-side pipeline. And it
+does **not** use `aclshmem_barrier_all()` in the hot path — it hand-rolls an epoch-tagged
+cross-rank barrier over symmetric memory, and it writes remote results with a **plain
+`DataCopyPad` into a `GlobalTensor` based at `aclshmem_ptr(localBase, peerRank)`**.
+
+### 11.1 README — the goal statement and the division of labour
+
+`README.md`, verbatim:
+
+> # SHMEM MegaMoE 示例（Ascend950）
+>
+> ## 样例介绍
+>
+> 本样例展示了一个面向 Ascend950 的 SHMEM 原生 MegaMoE 前向流水线。算子将
+> Token 路由、跨 Rank 数据派发、两次专家矩阵乘、SwiGLU 激活和多专家结果合并放在同一个
+> Device 侧流水线中，避免在各阶段之间回到 Host 或重复组织通信。
+>
+> 实现中各组件的职责如下：
+>
+> - ACLSHMEM 提供多 Rank 对称内存、远端地址访问和全局同步能力；
+> - AscendC AIV 核完成路由掩码生成、Token 量化、SwiGLU 后处理和最终结果合并；
+> - Catlass AIC 核完成专家网络的两次 MXFP8 GEMM；
+> - AIC/AIV 之间通过标志位和双缓冲协作，使矩阵计算、后处理与通信可以流水执行。
+
+> ## 整体数据流
+>
+> 算子的主流程位于 `kernel/arch35/shmem_mega_moe_kernel.h` 的 `Process()` 中，数据路径可概括为：
+>
+> ```text
+> 本 Rank BF16 Token
+>         |
+>         v
+> 生成目标 Rank 路由掩码 -----> 远端 Rank 的 SHMEM 对称内存
+>         |
+>         v
+> BF16 -> FP8(E4M3/E5M2) + E8M0 Scale
+>         |
+>         v
+> 目标 Rank 统计并接收 Token，生成 routing metadata
+>         |
+>         v
+> Catlass GEMM 1: model_dim -> ffn_dim
+>         |
+>         v
+> AIV SwiGLU + 再量化: ffn_dim -> ffn_dim / 2
+>         |
+>         v
+> Catlass GEMM 2: ffn_dim / 2 -> model_dim
+>         |
+>         v
+> 根据 routing metadata 写回源 Rank 的 combinedTokens
+>         |
+>         v
+> 源 Rank 按 routing_weights 累加 Top-K 结果 -> BF16 输出
+> ```
+
+> ### 1. 生成跨 Rank 路由掩码
+>
+> `BuildSendMasks` 遍历本 Rank 的 `expert_ids`，将每个 Token 的每条路由转换为目标 Rank 和
+> 目标局部专家，并生成按目标 Rank 划分的 Token 位图。位图和待发送 Token 数直接写入目标
+> Rank 的 `inboundMask` 对称内存，使接收方无需由 Host 参与即可知道需要拉取哪些 Token。
+
+> ### 4. 第一次专家投影与 SwiGLU
+>
+> `RunFirstProjection` 使用 Catlass 执行第一次 MXFP8 GEMM。AIC 核将结果分块写入 UB，AIV 核
+> 消费这些分块，完成以下操作：
+>
+> 1. 将 `ffn_dim` 宽度的输出切分为 Gate 和 Up；
+> 2. 计算 `SiLU(Gate) * Up`；
+> 3. 将 BF16 激活重新量化为 FP8，并生成第二次 GEMM 所需的 E8M0 Scale；
+> 4. 通过双缓冲标志通知 AIC 对应分块已经就绪。
+>
+> 因此，第一次 GEMM、SwiGLU 和再量化无需把完整中间张量落回全局内存后再启动新的算子。
+
+> ### 6. 远端写回专家结果
+>
+> 第二次投影结束后，AIV 根据路由元数据把每一行专家结果映射回源 Rank、源 Token 和 Top-K
+> 槽位，并写入源 Rank 的 `combinedTokens` 对称内存。写回过程使用乒乓标志同步数据生产和消费，
+> 防止不同轮次复用缓冲区时覆盖尚未被读取的数据。
+
+> ## AIC/AIV 分工与同步
+>
+> | 处理单元 | 主要工作 |
+> | --- | --- |
+> | AIC | 两次 Catlass MXFP8 GEMM、矩阵分块调度 |
+> | AIV | 路由掩码生成、Token 量化、路由数据搬运、SwiGLU、再量化和最终 Combine |
+>
+> 每个局部专家对应一组计算资源。运行时会查询设备上的 AIC/AIV 数量，并将结果写入 Tiling；
+> 也可以通过环境变量覆盖核数。AIC 和 AIV 使用以下机制协调：
+>
+> - 第一次投影采用双缓冲，AIC 生产 GEMM 分块，AIV 消费分块并执行 SwiGLU；
+> - 输入就绪、激活就绪和 Combine 就绪状态通过独立标志区传递；
+> - 路由派发按固定行数分波次处理，避免整批 Token 串行等待；
+> - 多 Rank 阶段边界使用 ACLSHMEM 同步，确保远端写入对接收方可见。
+>
+> 运行前会检查 `local_expert_count` 不大于可用 AIC 数量。如果资源不足，程序会直接报错，
+> 避免多个局部专家错误地竞争同一组 AIC 流水资源。
+
+And the MIX-ratio constraint, from the 参数说明 section:
+
+> 设置 `AIC_NUM` 或 `AIV_NUM` 时，覆盖值不能超过运行时检测到的硬件核数，并且必须保持
+> `AIC_NUM:AIV_NUM=1:2` 的 MIX Kernel 比例。建议同时设置两个变量，例如
+> `AIC_NUM=4 AIV_NUM=8`，避免只覆盖一个变量导致比例校验失败。
+
+Symmetric-memory regions:
+
+> | 区域 | 用途 |
+> | --- | --- |
+> | 控制与同步区 | 保存跨 Rank 屏障、标志位等控制信息 |
+> | `inboundMask` | 接收其他 Rank 写入的 Token 路由位图和计数 |
+> | `quantizedTokens` | 保存本 Rank 已量化的 Token，供目标 Rank 远端读取 |
+> | `combinedTokens` | 接收远端专家返回的、尚未按权重累加的 Token 结果 |
+>
+> 主要缓冲区按 512 字节对齐，以满足搬运和矩阵计算要求。样例默认申请 1 GiB 对称内存。
+
+Workspace flag regions:
+
+> | `inputReadyFlags` | 路由输入分波次就绪标志 |
+> | `activationReadyFlags` | SwiGLU 激活分块就绪标志 |
+
+### 11.2 THE EPOCH-TAGGED CROSS-RANK BARRIER — `SynchronizeRanks()`, verbatim
+
+File: `kernel/arch35/shmem_mega_moe_kernel.h`, lines 1035–1057.
+
+```cpp
+// SynchronizeRanks uses the first 48 KiB of symmetric memory for cross-rank synchronization.
+template <SHMEM_MEGA_MOE_TEMPLATE_DECL>
+__aicore__ inline void ShmemMegaMoePipeline<SHMEM_MEGA_MOE_TEMPLATE_ARGS>::SynchronizeRanks()
+{
+    if constexpr (g_coreType == AIC) {
+        return;
+    }
+    __gm__ int32_t* syncRank = (__gm__ int32_t*)(params_.symmetricMemory.localBase);
+    __gm__ int32_t* syncCount =
+        (__gm__ int32_t*)(params_.symmetricMemory.localBase + 48 * 1024 + vectorCoreIndex_ * 64);
+    int count = ShmemMegaMoeReadGmBypassDCache(syncCount) + 1;
+    for (int i = vectorCoreIndex_; i < rankCount_; i += vectorCoreCount_) {
+        __gm__ int32_t* remoteSynchronizationFlag =
+            reinterpret_cast<__gm__ int32_t*>(GetRemoteAddress(params_.symmetricMemory.localBase, i, 0)) + rankId_ * 16;
+        ShmemMegaMoeWriteGmBypassDCache(remoteSynchronizationFlag, count);
+        auto syncCheck = syncRank + i * 16;
+        WaitForRankGeneration(syncCheck, count);
+    }
+    ShmemMegaMoeWriteGmBypassDCache(syncCount, count);
+    PipeBarrier<PIPE_ALL>();
+    SyncAll<true>();
+}
+```
+
+and the three helpers it rests on, from `kernel/arch35/shmem_mega_moe_types.h` (lines 42–64,
+210–225) — **the exact code of how a receiver knows a remote write landed without a barrier**:
+
+```cpp
+namespace AscendC {
+template <typename T>
+__aicore__ inline T ShmemMegaMoeReadGmBypassDCache(__gm__ T* addr)
+{
+#if !defined(__NPU_ARCH__)
+    return *addr;
+#elif defined(SHMEM_MEGA_MOE_USE_NEW_BYPASS_DCACHE)
+    return ReadGmBypassDCache(addr);
+#else
+    return ReadGmByPassDCache(addr);
+#endif
+}
+
+template <typename T>
+__aicore__ inline void ShmemMegaMoeWriteGmBypassDCache(__gm__ T* addr, T value)
+{
+#if !defined(__NPU_ARCH__)
+    *addr = value;
+#elif defined(SHMEM_MEGA_MOE_USE_NEW_BYPASS_DCACHE)
+    WriteGmBypassDCache(addr, value);
+#else
+    WriteGmByPassDCache(addr, value);
+#endif
+}
+} // namespace AscendC
+```
+
+```cpp
+__aicore__ inline void WaitForRankGeneration(__gm__ int32_t* signal, int32_t generation)
+{
+    do {
+        // The same slot is reused by successive barrier generations. A faster rank may publish
+        // the next generation before a slower rank samples the current one, so equality can wait
+        // forever after the value has advanced past generation.
+        if (ShmemMegaMoeReadGmBypassDCache(signal) >= generation) {
+            return;
+        }
+    } while (true);
+}
+
+__aicore__ inline GM_ADDR GetRemoteAddress(GM_ADDR localBase, uint32_t rankId, uint64_t offset)
+{
+    return reinterpret_cast<GM_ADDR>(aclshmem_ptr(localBase, rankId)) + offset;
+}
+```
+
+Read the protocol off that code:
+
+- The epoch ("generation") is a **monotone per-core counter**, read from the core's own private
+  slot at `localBase + 48 KiB + coreIdx * 64`, incremented by 1 per barrier. It is never reset.
+- Rank `r` announces arrival by **writing `count` into rank `i`'s slot at
+  `aclshmem_ptr(localBase, i) + r * 16` int32s** = `r * 64` bytes = one 64-byte cache line per
+  rank, inside the first 48 KiB of symmetric memory.
+- The receiver spins on its *own* `syncRank + i * 16` with **`>= generation`, not `==`**, and the
+  comment states exactly why: the slot is reused across generations and a fast rank can race
+  ahead, so equality deadlocks. This is the whole trick, in one `if`.
+- Read and write both **bypass the data cache** (`ReadGmBypassDCache` / `WriteGmBypassDCache`,
+  spelled `ReadGmByPassDCache` on older CANN — the example CMake probes which spelling the
+  installed headers use; see `SHMEM_MEGA_MOE_BYPASS_DCACHE_MODE=OLD|NEW` in the README). No
+  `dcci` in the loop — the bypass variant replaces it.
+- **`if constexpr (g_coreType == AIC) { return; }`** — the AIC cores do not participate at all.
+  The barrier is AIV-only, then a local `SyncAll<true>()`.
+- Work is sharded across AIVs by `for (int i = vectorCoreIndex_; i < rankCount_; i += vectorCoreCount_)`,
+  so with 16 ranks and ≥16 AIVs each AIV handles one peer.
+
+### 11.3 The other spin-wait — a per-tile completion counter with a backoff
+
+`kernel/arch35/shmem_mega_moe_kernel.h`, lines 872–876:
+
+```cpp
+    __gm__ int32_t* completionCounter =
+        (__gm__ int32_t*)rowGroupCounters.GetPhyAddr() + expertIndex * expertCounterStride_ +
+        assignedRowGroup * vectorCoreCount_ * INT_CACHELINE + vectorCoreIndex_ * INT_CACHELINE;
+    while (AscendC::ShmemMegaMoeReadGmBypassDCache(completionCounter) != requiredTileCount) {
+        AscendC::Nop<200>();
+    }
+```
+
+`AscendC::Nop<200>()` is the backoff in the spin. Note that here the comparison *is* `!=` —
+because this counter is reset between rounds (`ResetRowGroupFlags()`), unlike the never-reset
+generation counter in §11.2.
+
+### 11.4 The remote write is a PLAIN `DataCopyPad` — no library call in the hot path
+
+`kernel/arch35/shmem_mega_moe_combine_pipeline.h`, `CombineTokens`, verbatim:
+
+```cpp
+template <typename ElementMMadOut2, typename BlockShape>
+__aicore__ inline void CombineTokens(
+    uint32_t rowOffset, uint32_t columnOffset, uint32_t n, LocalTensor<int32_t>& routingMetadata,
+    LocalTensor<ElementMMadOut2>& secondProjectionOutput, BlockShape& actualBlockShape,
+    const ShmemMegaMoeKernelParams& params)
+{
+    int32_t tileRowCount = Get<SHAPE_ROW_INDEX>(actualBlockShape);
+    AscendC::GlobalTensor<ElementMMadOut2> remoteOutput;
+    uint64_t combinedTokenOffset = params.symmetricMemory.combinedTokens - params.symmetricMemory.localBase;
+    AscendC::DataCopyExtParams outputCopyParams{1, 0, 0, 0, 0};
+    outputCopyParams.blockCount = 1;
+    outputCopyParams.blockLen = Get<SHAPE_COLUMN_INDEX>(actualBlockShape) * sizeof(ElementMMadOut2);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+    for (int32_t tileRowIndex = 0; tileRowIndex < tileRowCount; ++tileRowIndex) {
+        uint32_t routingRecordOffset = tileRowIndex * ROUTING_RECORD_WIDTH;
+        uint32_t destinationRank = routingMetadata.GetValue(routingRecordOffset + RANK_ID);
+        uint32_t tokenIndex = routingMetadata.GetValue(routingRecordOffset + TOKEN_ID);
+        uint32_t routeSlotIndex = routingMetadata.GetValue(routingRecordOffset + ROUTE_SLOT_INDEX);
+        remoteOutput.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMMadOut2*>(
+            GetRemoteAddress(params.symmetricMemory.localBase, destinationRank, combinedTokenOffset)));
+        uint64_t destinationOffset =
+            (static_cast<uint64_t>(tokenIndex) * params.config->expertsPerToken + routeSlotIndex) * n + columnOffset;
+        AscendC::DataCopyPad(
+            remoteOutput[destinationOffset],
+            secondProjectionOutput[tileRowIndex * Get<SHAPE_COLUMN_INDEX>(actualBlockShape)], outputCopyParams);
+    }
+}
+```
+
+`remoteOutput` is an ordinary `AscendC::GlobalTensor` whose base address is
+`aclshmem_ptr(localBase, destinationRank)`. The write is an ordinary `AscendC::DataCopyPad` on
+MTE3. **There is no `aclshmem_put` in the data path at all.** The library is used once, to
+translate the symmetric base address; after that a peer's HBM is just a `__gm__` pointer.
+
+The dispatch side reads a peer's memory the same way (`kernel/arch35/shmem_mega_moe_kernel.h`:581):
+
+```cpp
+    remoteQuantizedRows.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(
+        GetRemoteAddress(params_.symmetricMemory.localBase, sourceRank, quantizedTokenOffset_)));
+```
+
+and the mask publish (line 448):
+
+```cpp
+        outputGlobal.SetGlobalBuffer(
+            (__gm__ uint8_t*)GetRemoteAddress(params_.symmetricMemory.localBase, dstRank, dstOffset));
+        DataCopyPad(outputGlobal, maskBuffer, maskCopyConfig);
+```
+
+### 11.5 The AIC↔AIV flag discipline inside the same megakernel
+
+`kernel/arch35/shmem_mega_moe_kernel.h` — the exact `CrossCore*Flag` calls, with flag IDs:
+
+```cpp
+    // AIV side, end of CountReceivedTokens():
+    PipeBarrier<PIPE_ALL>();
+    CrossCoreSetFlag<SYNC_AIC_AIV_MODE, PIPE_MTE3>(2);
+```
+
+```cpp
+    if constexpr (Mode == ShmemMegaMoeMatmulStage::kFirstProjection) {
+        if constexpr (g_coreType == AscendC::AIC) {
+            CrossCoreWaitFlag<SYNC_AIC_AIV_MODE, PIPE_S>(2 + 16);
+            uint64_t expertCountOffset =
+                static_cast<uint64_t>(expertIndex) * 8U * cubeCoreCount_ + 8U * cubeBlockIndex_;
+            DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(
+                receivedTokenCountsGlobal_[expertCountOffset]);
+            Get<SHAPE_ROW_INDEX>(state.problemShape) = receivedTokenCountsGlobal_.GetValue(expertCountOffset);
+            CrossCoreSetFlag<SYNC_AIC_AIV_MODE, PIPE_S>(3);
+        }
+        if constexpr (g_coreType == AscendC::AIV) {
+            if (vectorSubBlockIndex_ == 0) {
+                CrossCoreWaitFlag<SYNC_AIC_AIV_MODE, PIPE_S>(3);
+                uint64_t expertCountOffset =
+                    static_cast<uint64_t>(expertIndex) * 8U * cubeCoreCount_ + 8U * cubeBlockIndex_;
+                DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(
+                    receivedTokenCountsGlobal_[expertCountOffset]);
+                Get<SHAPE_ROW_INDEX>(state.problemShape) = receivedTokenCountsGlobal_.GetValue(expertCountOffset);
+            } else {
+                Get<SHAPE_ROW_INDEX>(state.problemShape) = receivedTokenCount_;
+            }
+        }
+    }
+```
+
+Three observations. (a) The mode is a single named constant `SYNC_AIC_AIV_MODE` used for **both**
+directions — AIV→AIC (set on `PIPE_MTE3`, flag 2) and AIC→AIV (set on `PIPE_S`, flag 3). (b) The
+AIC waits on flag `2 + 16`, i.e. the **AIV sub-block offset is 16**: sub-block 0 writes flag `n`,
+sub-block 1 writes flag `n + 16`. On arch35 the paired AIVs share the Cube core's flag space and
+are distinguished by that `+16`. (c) A `DataCacheCleanAndInvalid<..., CacheLine::ENTIRE_DATA_CACHE,
+DcciDst::CACHELINE_OUT>` is needed on **both** sides around the flag before the payload is read —
+the flag orders, the dcci makes the payload visible.
+
+Core indices are derived as (lines 117–118):
+
+```cpp
+    uint32_t cubeBlockIndex_ = GetBlockIdx() / GetTaskRation();
+    uint32_t vectorCoreIndex_ = GetBlockIdx();
+```
+
+and the atomic-counter wave flag (line 701):
+
+```cpp
+            __gm__ int32_t* waveReadyFlags = matmulBuffers.waveReadyFlags;
+            for (int32_t w = firstWaveIndex; w <= finalWaveIndex; ++w) {
+                ...
+                AtomicAdd(waveReadyFlags + w, dispatchedRows);
+            }
+```
+
+### 11.6 `Process()` — the whole forward pass, one function
+
+```cpp
+template <SHMEM_MEGA_MOE_TEMPLATE_DECL>
+__aicore__ inline void ShmemMegaMoePipeline<SHMEM_MEGA_MOE_TEMPLATE_ARGS>::Process()
+{
+    int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
+    SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
+    InitSendQuantBuffers();
+    BuildSendMasks();
+    ResetPipelineFlags();
+    if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
+        ResetRowGroupFlags();
+    }
+    QuantizeLocalTokens();
+    if constexpr (g_coreType == AIV) {
+        PipeBarrier<PIPE_ALL>();
+        SyncAll<true>();
+    }
+    SynchronizeRanks();
+
+    InitDispatchBuffers();
+    ...
+    for (int localExpertId = 0; localExpertId < localExpertCount_; localExpertId++) {
+        if constexpr (g_coreType == AIV) {
+            if (vectorSubBlockIndex_ == 1) {
+                CountReceivedTokens(localExpertId);
+            }
+        }
+        if (!PrepareExpertProblem<ShmemMegaMoeMatmulStage::kFirstProjection>(firstProjectionState, localExpertId)) {
+            continue;
+        }
+        UpdateMatmulBuffers<ShmemMegaMoeMatmulStage::kFirstProjection>(matmulBuffers, firstProjectionState);
+        if constexpr (g_coreType == AIV) {
+            if (vectorSubBlockIndex_ == 1) {
+                BuildRoutingMetadataAndDispatch(matmulBuffers, localExpertId);
+            }
+        }
+        if (vectorSubBlockIndex_ == 0) {
+            ShmemMegaMoeKernel::RunFirstProjection<
+                QuantOutType, QuantOutType, bfloat16_t, QuantScaleOutType, QuantScaleOutType>(
+                epilogueOp_, firstProjectionState.problemShape, matmulBuffers, schedulerStartBlock_, vectorSyncState_);
+        }
+    }
+    FinishFirstProjectionSync(vectorSyncState_);
+    if constexpr (g_coreType == AIV) {
+        if (vectorSubBlockIndex_ == 1) {
+            CopyExpertTokenCounts();
+        }
+    }
+
+    vectorSyncState_ = 0;
+    processedTokenCount_ = 0;
+    ExpertPipelineState secondProjectionState{initShape, initOffset};
+    InitCombineBuffers();
+
+    for (uint32_t expertIndex = 0; expertIndex < localExpertCount_; expertIndex++) {
+        if (!PrepareExpertProblem<ShmemMegaMoeMatmulStage::kSecondProjection>(secondProjectionState, expertIndex)) {
+            continue;
+        }
+        UpdateMatmulBuffers<ShmemMegaMoeMatmulStage::kSecondProjection>(matmulBuffers, secondProjectionState);
+
+        ShmemMegaMoeKernel::RunSecondProjection<
+            CombineQuantMode, QuantOutType, QuantOutType, bfloat16_t, QuantScaleOutType, QuantScaleOutType>(
+            params_, secondProjectionState.problemShape, matmulBuffers, schedulerStartBlock_, vectorSyncState_,
+            processedTokenCount_, secondProjectionBufferIndex_, expertIndex, expertCounterStride_);
+
+        if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
+            RunCombine(matmulBuffers, secondProjectionState, expertIndex);
+        }
+    }
+    if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+        FinishSecondProjectionSync(vectorSyncState_, secondProjectionBufferIndex_);
+    }
+    PipeBarrier<PIPE_ALL>();
+    SyncAll<true>();
+
+    if constexpr (g_coreType == AIV) {
+        InitOutputBuffers();
+        SynchronizeRanks();
+        CombineRoutedTokens();
+    }
+    SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+}
+```
+
+Count the global barriers in one MoE layer: `SyncAll<true>()` ×3 plus `SynchronizeRanks()` ×2
+(each of which itself ends in a `SyncAll<true>()`). So five full-core barriers and two cross-rank
+rendezvous for a whole MoE layer including dispatch and combine.
+
+Shapes used in the README's run script: `TOKEN_COUNT=256 MODEL_DIM=4096 FFN_DIM=1024
+EXPERTS_PER_TOKEN=6 LOCAL_EXPERT_COUNT=4`, `RANK_SIZE=2`, 1 GiB symmetric memory,
+`MAX_RECEIVED_TOKENS` auto = `token_count * rank_size * min(experts_per_token, local_expert_count)`.
+Numerics tolerance: E4M3 5% relative, E5M2 15% relative, absolute 1.
+
+## Relevance
+
+This is the design we want, written by the vendor, with the exact code for the part we were going
+to invent. Four transfers:
+
+1. **The epoch-tagged protocol is `>=` on a never-reset monotone generation counter, read and
+   written with `ReadGmBypassDCache` / `WriteGmBypassDCache`, one 64-byte cache line per rank, in
+   the first 48 KiB of symmetric memory.** The in-source comment names the exact failure mode of
+   the naive version ("equality can wait forever after the value has advanced past generation").
+   That is §2 of our brief, answered from first-party source.
+2. **A peer's symmetric memory is just a `__gm__` pointer.** `GetRemoteAddress()` =
+   `aclshmem_ptr(localBase, rank) + offset`, then ordinary `DataCopyPad` on MTE3. Our 49.3 us MoE
+   chain can write a peer's HBM with the MTE3 instructions it already issues; no library call
+   enters the hot loop, so no UB-budget or single-core-writer penalty from
+   `aclshmem_putmem_signal` (§9.6).
+3. **The cross-rank barrier is AIV-only by construction** — `if constexpr (g_coreType == AIC)
+   { return; }`. This is a *deliberate departure* from `shmem_device_cc.h`'s own contract
+   (§9.2: the all-core barrier "require[s] a MIX kernel; all participating local AIC and AIV cores
+   must enter"). The vendor's own megakernel does not use `aclshmem_barrier_all()` in the hot
+   path; it hand-rolls precisely so Cube never enters the rendezvous. Given our measurement that
+   `SyncAll` already eats 11–13 of 16 flags, that is the right trade: the cross-rank part costs
+   zero FFTS flags, because it is GM polling, not flags.
+4. **The AIV sub-block flag offset is 16** (`CrossCoreWaitFlag<...>(2 + 16)`), matching MegaGDN's
+   A5 `SYNC_FLAG_ID_MAX` pattern in §8.4. On dav-2201 we measured 16 flags per core; on arch35
+   the same base-plus-16 scheme is used to address the two sub-blocks, which is consistent with
+   16 being the per-sub-block flag count rather than the per-core total.
+
+The caveat: this example is `Ascend950` only (`shmem_mega_moe 仅支持 Ascend950`) and uses Catlass
+arch35 GEMMs and MXFP8. But §11.2–§11.5 are platform-independent AscendC: `aclshmem_ptr`,
+`DataCopyPad`, `ReadGmBypassDCache`, `CrossCoreSetFlag`, `AtomicAdd`, `Nop<200>`. Nothing in the
+barrier protocol needs A5.
+
+## 12. The MTE engine layer — `aclshmemx_mte_*`: remote put/get/atomic-add issued from AscendC, and the ONE atomic that works on A2/A3
+
+Header: https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/engine/shmem_device_mte.h
+Doc: https://raw.gitcode.com/cann/shmem/raw/master/docs/api/atomic_api_sync_async_comparison.md
+Author: Huawei Technologies Co., Ltd. (`Copyright (c) 2025`)
+Date: current `master` as of 2026-10-20 (SHMEM v1.7.0)
+
+This is the lowest layer, the one that matters for A3. The high-level `aclshmem_*` RMA calls
+dispatch to this on a single machine ("The high-level API selects MTE for same-machine PEs and
+RDMA for cross-machine PEs" — §10.4).
+
+### 12.1 `aclshmem_ptr` — the whole symmetric-memory abstraction, in one function
+
+```cpp
+/**
+ * @brief Translate a local symmetric address to the corresponding symmetric address on the specified PE.
+ *
+ * @param ptr               [in] Symmetric address on local PE.
+ * @param pe                [in] Target PE number.
+ * @return The corresponding symmetric address on the specified PE.
+ * @note The supported access method for the returned address depends on the transport and topology.
+ */
+ACLSHMEM_DEVICE __gm__ void* aclshmem_ptr(__gm__ void* ptr, int pe);
+#define shmem_ptr aclshmem_ptr
+```
+
+That is it. It lives in the *MTE engine* header, is callable from device code, and returns a
+`__gm__ void*` you can hand to `GlobalTensor::SetGlobalBuffer` (§11.4).
+
+### 12.2 `aclshmemx_mte_put_nbi` / `get_nbi` — four overloads each, with the `sync_id` argument
+
+```cpp
+/**
+ * @brief Asynchronous interface. Copy contiguous data on symmetric memory from the specified PE to address on the local
+ * device.
+ *
+ * @param dst               [in] Pointer on local device of the destination data.
+ * @param src               [in] Pointer on Symmetric memory of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_get_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size, uint32_t elem_size, int pe, uint32_t sync_id);
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_get_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size,
+    const non_contiguous_copy_param& copy_params, int pe, uint32_t sync_id);
+#define shmem_mte_get_mem_nbi aclshmemx_mte_get_nbi
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size, uint32_t elem_size, int pe, uint32_t sync_id);
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size, const non_contiguous_copy_param& copy_params,
+    int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] GlobalTensor on Symmetric memory of the destination data.
+ * @param src               [in] GlobalTensor on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, AscendC::LocalTensor<T> buf, uint32_t elem_size, int pe,
+    uint32_t sync_id);
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, AscendC::LocalTensor<T> buf,
+    const non_contiguous_copy_param& copy_params, int pe, uint32_t sync_id);
+#define shmem_mte_put_mem_nbi aclshmemx_mte_put_nbi
+
+/**
+ * @brief Asynchronous interface. Clear instruction pipes and flush data cache to GM.
+ */
+ACLSHMEM_DEVICE void aclshmemx_mte_quiet();
+```
+
+Note what `aclshmemx_mte_quiet()` actually is: **"Clear instruction pipes and flush data cache to
+GM."** That is a local pipe barrier plus a cache flush — not a network fence. Cheap.
+
+### 12.3 `aclshmemx_mte_atomic_add` — THE A2/A3 PRIMITIVE, verbatim with its platform table
+
+```cpp
+/**
+ * @brief Atomic add operation. Adds the value to the destination address.
+ *        WARNING: Use sync_id in device_state.mte_config for pipeline synchronization.
+ *        NOTE: This is an asynchronous interface. The final operation differs by platform and type:
+ *              - On Ascend910B/Ascend910C: The atomic add is performed by MTE2 unit.
+ *              - On Ascend950:
+ *                - uint32_t/int64_t/uint64_t: scalar AtomicAdd (Scalar unit).
+ *                - Other types: UB + MTE3 (MTE3 atomic add).
+ *              If there are data dependencies, developers need to insert synchronization according
+ *              to actual situations. Scalar write to UB before MTE3 read requires S_MTE3 event
+ *              synchronization; MTE3 write to GM before subsequent reads requires MTE3_MTE2
+ *              event synchronization.
+ *
+ * | Data Type                      | Ascend910B/Ascend910C | Ascend950 |
+ * |--------------------------------|-----------------------|-----------|
+ * | int8_t/int16_t/half/bfloat16_t | ✓                     | ✓         |
+ * | int32_t/float                  | ✓                     | ✓         |
+ * | uint32_t/int64_t/uint64_t      | ✗                     | ✓         |
+ *
+ * @note The MTE transport operates over the in-die interconnect and does not support
+ *       cross-PCIe (inter-node) communication.
+ *
+ * @param dst               [in] Symmetric address of the destination data.
+ * @param value             [in] Value to be added.
+ * @param pe                [in] PE number of the remote PE.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_atomic_add(__gm__ T* dst, T value, int32_t pe);
+```
+
+The other MTE atomics all carry `Supported hardware platform: Ascend950.` in their doc comment —
+`aclshmemx_mte_atomic_fetch`, `_set`, `_swap`, `_compare_swap`, `_inc`, `_fetch_inc`,
+`_fetch_add`. Each also repeats:
+
+> @note The MTE transport operates over the in-die interconnect and does not support
+>       cross-PCIe (inter-node) communication.
+
+### 12.4 `docs/api/atomic_api_sync_async_comparison.md` — the authoritative per-platform table
+
+> # ACLSHMEM Atomic 原子操作接口用法语义总结
+>
+> > 本文档基于实际代码实现编写，覆盖各层接口：标准接口 `aclshmem_<type>_atomic_<op>`、MTE 后端 `aclshmemx_mte_atomic_<op>`、RDMA 后端 `aclshmemx_roce_atomic_<op>`。
+>
+> ## 一、接口层次关系
+>
+> ```text
+> aclshmem_<type>_atomic_<op>()          ← 标准接口
+>     │
+>     ├── topo == MTE  → aclshmemx_mte_atomic_<op>()   ← MTE 后端
+>     └── topo == ROCE → aclshmemx_roce_atomic_<op>()  ← RDMA 后端
+> ```
+>
+> 标准接口根据 `device_state->topo_list[pe]` 自动分派到 MTE 或 RDMA 后端，并在后端调用之上额外添加同步保证。
+
+> ## 二、MTE 后端接口：`aclshmemx_mte_atomic_<op>`
+>
+> > 头文件：`include/device/gm2gm/engine/shmem_device_mte.h`
+> > 实现文件：`src/device/gm2gm/engine/shmem_device_mte.hpp`
+>
+> **核心特征：所有 MTE 后端接口均为异步**，不论是否带返回值。接口仅发起硬件原子操作即返回，无 quiet/fence。
+>
+> 同步原语：`aclshmemx_mte_quiet()` 或 Kernel Runtime 级 `SetFlag/WaitFlag`。
+>
+> ### 2.1 接口清单
+>
+> | 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
+> |---|---|---|---|
+> | `aclshmemx_mte_atomic_fetch` | T | int32, uint32, float, int64, uint64 | 950 |
+> | `aclshmemx_mte_atomic_set` | void | uint32, uint64 | 950 |
+> | `aclshmemx_mte_atomic_swap` | T | uint32, uint64 | 950 |
+> | `aclshmemx_mte_atomic_compare_swap` | T | uint32, uint64 | 950 |
+> | `aclshmemx_mte_atomic_inc` | void | int32, uint32, float, int64, uint64 | 950 |
+> | `aclshmemx_mte_atomic_add` | void | int8, int16, bf16, half, int32, float (A2/A3/950) + uint32, uint64, int64 (950) | A2/A3/950 |
+> | `aclshmemx_mte_atomic_fetch_inc` | T | int32, uint32, float, int64, uint64 | 950 |
+> | `aclshmemx_mte_atomic_fetch_add` | T | int32, uint32, float, int64, uint64 | 950 |
+>
+> ### 2.2 同步要求
+>
+> 所有 MTE 后端接口调用后，如果存在**标量计算单元（Scalar）与搬运单元（MTE2/MTE3）之间的数据依赖**，开发者需根据实际数据流插入同步：
+>
+> | 时机 | 场景 | 同步方式 |
+> |---|---|---|
+> | 调用前 | 其他单元（如 MTE2）正在写同一 UB 区域 | `SetFlag/WaitFlag` on `MTE2_S` |
+> | 调用后 | 后续操作依赖原子操作在 GM 中的结果 | `SetFlag/WaitFlag` on `MTE3_MTE2` |
+> | 调用后 | 需要复用同一 UB 区域写入新数据 | `SetFlag/WaitFlag` on `MTE3_S` |
+>
+> ### 2.3 `aclshmemx_mte_atomic_add` 的类型差异（重要）
+>
+> `aclshmemx_mte_atomic_add` 在 Ascend950 上按类型有两种实现路径：
+>
+> | 类型组 | 支持类型 | 实现方式 | 同步要点 |
+> |---|---|---|---|
+> | UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
+> | Scalar AtomicAdd 路径 | uint32, uint64, int64 | Scalar 单元直接执行标量 AtomicAdd 写 GM，不经过 UB 和 MTE3 | 不需要 UB/MTE3 相关 fence；仅在 Scalar↔MTE2/MTE3 有 GM 数据依赖时按通用规则同步 |
+
+And on the standard-interface layer, the note that symmetric memory is an *interface* convention,
+not an engine restriction:
+
+> 标准 AMO 接口会将用户传入的 `dst`、`dest` 或 `source` 交给 `aclshmem_ptr(..., pe)` 换算为指定 PE 上的
+> 目标地址，因此这些参数必须指向对称内存。该要求来自标准接口的地址换算方式，并不表示 MTE 引擎本身
+> 只能访问对称内存；传输层自动分派不会改变这一接口语义。
+
+> ```text
+> aclshmem_<type>_atomic_<op>(dst, val, pe)
+>     │
+>     ├── topo_list[pe] & MTE
+>     │   ├── fetch 变体:    调用 aclshmemx_mte_atomic_fetch_<op>() + PipeBarrier<PIPE_ALL>
+>     │   ├── swap/cas:      调用 aclshmemx_mte_atomic_swap/compare_swap() + PipeBarrier<PIPE_ALL>
+>     │   ├── add/inc:       透传 aclshmemx_mte_atomic_add/inc()，未加 PipeBarrier
+>     │   └── set/and/or/xor: 透传底层异步接口，未加 PipeBarrier
+>     │
+>     └── topo_list[pe] & ROCE
+>         ├── fetch 变体:    透传 aclshmemx_roce_atomic_fetch_<op>()（后端已 quiet）
+>         ├── swap/cas:      透传 aclshmemx_roce_atomic_swap/compare_swap()（后端已 quiet）
+>         ├── add/inc:       透传 aclshmemx_roce_atomic_add/inc()（后端异步，未加 quiet）
+>         └── set/and/or/xor: 透传底层异步接口（未加 quiet）
+> ```
+
+And the RDMA concurrency warning, for completeness (does not apply to single-machine TP16):
+
+> ### 3.3 并发限制
+>
+> > **警告**：使用 RDMA 作为底层传输时，不支持对同一 PE 的并发 RMA/AMO 操作。请使用 `device_state.rdma_config` 中的 `sync_id` 进行流水线同步。
+
+## Relevance
+
+This is the single most actionable finding in this whole pass. On Ascend910B/Ascend910C — our
+part — `aclshmemx_mte_atomic_add` is **supported**, works on **bf16, half, int8, int16, int32 and
+float**, and **"the atomic add is performed by MTE2 unit"**. Every other MTE atomic is
+Ascend950-only.
+
+That means the one-sided all-reduce does not need a reduce-scatter/all-gather structure, a
+staging buffer, a flag protocol, or a receiver-side add at all. The minimal TP16 all-reduce on A3
+is: each rank atomically adds its own partial-sum tiles into *the same symmetric output buffer on
+each of the 16 peers*, i.e. `aclshmemx_mte_atomic_add(dst_sym, value, pe)` for `pe = 0..15`, then
+one epoch-tagged rendezvous (§11.2) to know all 16 contributions have landed. The reduce happens
+in the interconnect/MTE2 path, not in anybody's vector unit. For a 4096-wide bf16 activation at
+batch=1 the payload per peer is 8 KB.
+
+Three facts to carry into the design:
+- The atomic add is **asynchronous and has no implicit fence** ("所有 MTE 后端接口均为异步 … 接口仅
+  发起硬件原子操作即返回，无 quiet/fence"). Ordering is ours: `MTE3_MTE2` event before any read of
+  the result, `MTE2_S` before, `MTE3_S` to reuse the UB.
+- `aclshmemx_mte_quiet()` is only "clear instruction pipes and flush data cache to GM" — a local
+  operation. It does not wait on peers. The peer-arrival wait must be the §11.2 generation
+  counter.
+- "The MTE transport operates over the in-die interconnect and does not support cross-PCIe
+  (inter-node) communication" — fine for one machine, and a hard stop for anything beyond it.
+
+Unverified on our side: whether a *remote* `atomic_add` across HCCS on 910C has the same cost as
+the familiar local `AtomicAdd`, and whether 16 ranks all atomically adding into the same cache
+line serialise. The 64-byte-per-rank layout in §11.2 exists precisely to avoid that for flags;
+the same padding discipline presumably applies to the payload if it is small.
+
+## 13. `AscendC::Hccl` — the in-kernel HCCL client, official API reference (asc.gitcode.com, built 2026/10/20)
+
+URL root: https://asc.gitcode.com/api/SIMD-API/adv_api/HCCL_communication/
+Pages quoted: `HCCL_Kernel/HCCL_usage.html`, `HCCL_Kernel/HCCL_template_params.html`,
+`HCCL_Kernel/AllReduce.html`, `HCCL_Kernel/Commit.html`, `HCCL_Kernel/Wait.html`,
+`HCCL_Kernel/InterHcclGroupSync.html`, `HCCL_Kernel/BatchWrite.html`,
+`HCCL_Kernel/GetWindowsInAddr.html`
+Source repo: https://gitcode.com/cann/asc-devkit/ (branch `master`)
+Page footer, verbatim: 「版本 master 提交 5f50fc4c6ada构建于 2026/10/20 11:47:29包含未提交修改」
+Disclaimer footer, verbatim: 「免责声明：本站内容由 asc-devkit 仓 master 分支自动编译生成，属于持续开发版本，可能存在缺陷，仅供预览与参考。如需稳定及商用资料，请查阅官方 昇腾社区。」
+Retrieved 2026-10-20. This is the newest copy of the Ascend C API reference in existence —
+built the same day.
+
+Full page list under `HCCL_communication/`, for anyone needing a page not quoted here:
+
+```
+HCCL-Context/{GetHcclContext, SetHcclContext, HCCL_Context_intro}
+HCCL_Kernel/{HCCL_usage, HCCL_template_params, InitV2, Init_deprecated,
+             SetCcTilingV2, SetCcTiling_deprecated,
+             AllReduce, AllGather, ReduceScatter, AlltoAll, AlltoAllV, AlltoAllvWrite, BatchWrite,
+             Commit, Wait, Iterate, Query, InterHcclGroupSync, Finalize,
+             GetWindowsInAddr, GetWindowsOutAddr, GetRankId, GetRankDim, GetQueueNum, QueueBarrier}
+HCCL_MC2/{HCCL_MC2_usage, Mc2AcquireCcResCtx, Mc2CcKernelLaunch, Mc2GetCcArgs, Mc2FreeCcArgs,
+          Mc2SetCcAlgConfig, Mc2SetCcCommEngine, Mc2SetCcSrcDataType, Mc2SetCcDstDataType,
+          Mc2SetCcReduceType, CheckOpResSufficient}
+HCCL_Tiling/{HCCL_Tiling_usage, HCCL_Tiling_constructor, GetTiling, TilingData_struct,
+             SetAlgConfig, SetCommBlockNum, SetCommEngine, SetDebugMode, SetGroupName, SetOpType,
+             SetQueueNum, SetReduceType, SetSkipBufferWindowCopy, SetSkipLocalRankCopy,
+             SetStepSize, CheckOpResSufficient}
+```
+
+### 13.1 `HCCL使用说明` — the mechanism, verbatim; and the key disappointment
+
+> HCCL使用说明
+>
+> Ascend C提供一组HCCL通信类高阶API，方便算子核函数（Kernel）开发用户在AI Core侧灵活管理通算融合算子中计算与通信任务的执行顺序。
+>
+> HCCL为集合通信任务客户端，主要对外提供了集合通信原语接口（以下统称为Prepare接口），对标集合通信C++接口，当前支持AllReduce、AllGather、ReduceScatter、AlltoAll、AlltoAllV、AlltoAllvWrite、BatchWrite接口。**本章的所有接口运行在AI Core上，且不执行通信任务，而是由用户调用Prepare接口将对应类型的通信任务信息发送给AI CPU或CCU服务端，并在合适的时机通过Commit接口通知AI CPU或CCU上的服务端执行对应的通信任务。** 注意，当前Ascend 950PR&950DT系列产品上仅支持CCU服务端。
+>
+> 所谓合适的时机，取决于用户编排的是先通信后计算的任务，还是先计算后通信的任务。对于这两种场景，简述如下：
+>
+> 先通信后计算的任务：典型的如AllGather通信+Matmul计算任务编排。此场景下，用户在调用AllGather接口下发通信任务之后，通过AllGather接口返回的该通信任务标识handleId，可立即调用Commit接口通知服务端执行该handleId对应的任务，同时用户调用Wait阻塞接口等待服务端通知handleId对应的通信任务执行结束，待该通信任务结束后，再执行计算任务。
+>
+> 先计算后通信的任务：典型的如Matmul计算+AllReduce通信任务编排。此场景下，用户可以先调用AllReduce接口通知服务端先下发通信任务，再调用Matmul计算接口进行计算，这样AllReduce任务的组装和任务下发及执行过程可以被Matmul的计算流水所掩盖，待计算任务完成后，调用Commit接口通知服务端执行AllReduce任务，无须调用Wait接口等待通信任务执行结束。
+>
+> 当后续无通信任务时，调用Finalize接口，通知服务端后续无通信任务，执行结束后退出，客户端检测并等待最后一个通信任务执行结束。
+
+> 注意
+>
+> 对于Atlas A3系列产品，在AI CPU作为服务端的场景中，HCCL通信API的功能依赖开放AI CPU用户态下发调度任务，存在一定的安全风险，用户需要自行确保AI Core自定义算子的安全可靠，防止恶意攻击行为。
+
+That first bolded sentence is the whole architecture: **the AI Core does not perform the
+collective.** It builds a task descriptor and rings a doorbell; an **AI CPU** (on A3) or a
+**CCU** (on A5) server executes it. This is a device-side *submission*, not a device-side
+collective.
+
+The five steps, verbatim with the code:
+
+> 实现AI Core下发一个通信任务的具体步骤如下：
+>
+> 创建HCCL对象，并调用初始化接口InitV2。
+>
+> ```
+> // 传initTiling地址的调用方式，推荐使用该方式
+> GET_TILING_DATA_WITH_STRUCT(
+>     AllGatherCustomTilingData, tilingData, tilingGM); // AllGatherCustomTilingData为对应算子头文件定义的结构体
+>
+> Hccl<HcclServerType::HCCL_SERVER_TYPE_AICPU> hccl; // 通过模板入参的方式选择硬件类型
+> GM_ADDR contextGM = GetHcclContext<0>(); // AscendC自定义算子核函数（Kernel）中，通过此方式获取HCCL context
+>
+> hccl.InitV2(contextGM, &tilingData);
+> ```
+>
+> 当调用InitV2接口时，必须使用标准C++语法定义TilingData结构体的开发方式。
+>
+> 设置对应通信算法的Tiling地址。通过SetCcTilingV2接口设置对应通信算法的Tiling地址，调用Commit接口后，该地址被发送到服务端由服务端解析。SetCcTilingV2接口必须与InitV2接口配合使用。
+>
+> ```
+> if (SetCcTilingV2(offsetof(AllGatherCustomTilingData, mc2CcTiling)) != HCCL_SUCCESS) {
+>     return;
+> }
+> ```
+>
+> 用户通过对应的Prepare接口异步下发对应类型的通信任务，并获取到该任务的标识handleId，服务端接收到后开始通信任务的展开和下发。
+>
+> ```
+> auto handleId =
+>     hccl.ReduceScatter<false>(aGM, cGM, recvCount, AscendC::HCCL_DATA_TYPE_FP16, HCCL_REDUCE_SUM, strideCount, 1);
+> ```
+>
+> 用户调用Commit接口通知服务端执行handleId对应的通信任务。
+>
+> ```
+> // 等待通信任务执行时机成熟，调用Commit接口通知服务端执行
+> hccl.Commit(handleId);
+> ```
+>
+> 用户调用Wait阻塞接口，等待服务端执行完对应的通信任务。
+>
+> ```
+> auto ret = hccl.Wait(handleId);
+>
+> // 调用核间同步接口，防止部分核执行较快退出，触发Hccl析构，影响执行较慢的核
+> // 开发者可根据实际的业务场景，选择调用SyncAll、CrossCoreSetFlag、CrossCoreWaitFlag接口，保证全部核的任务完成后再退出执行
+> ```
+>
+> 用户调用Finalize接口，通知服务端后续无通信任务，执行结束后退出；客户端检测并等待最后一个通信任务执行结束。
+>
+> ```
+> hccl.Finalize();
+> ```
+>
+> 注意：若HCCL对象的模板参数未指定下发通信任务的核，则Prepare接口仅能在AIC或AIV之一上运行，调用步骤2到步骤5的接口前，必须指定接口代码运行在AIC或AIV核上，实现时如下代码所示。
+>
+> ```
+> // 通过内置常量g_coreType来判断AIC核或者AIV核
+> if (g_coreType == AIV) {
+> // if (g_coreType == AIC) {
+>         调用HCCL接口
+> }
+> ```
+
+The two enums, verbatim:
+
+```cpp
+enum HcclDataType {
+    HCCL_DATA_TYPE_INT8 = 0,     /* int8 */
+    HCCL_DATA_TYPE_INT16 = 1,    /* int16 */
+    HCCL_DATA_TYPE_INT32 = 2,    /* int32 */
+    HCCL_DATA_TYPE_FP16 = 3,     /* half或float16 */
+    HCCL_DATA_TYPE_FP32 = 4,     /* float */
+    HCCL_DATA_TYPE_INT64 = 5,    /* int64 */
+    HCCL_DATA_TYPE_UINT64 = 6,   /* uint64 */
+    HCCL_DATA_TYPE_UINT8 = 7,    /* uint8 */
+    HCCL_DATA_TYPE_UINT16 = 8,   /* uint16 */
+    HCCL_DATA_TYPE_UINT32 = 9,   /* uint32 */
+    HCCL_DATA_TYPE_FP64 = 10,    /* float64 */
+    HCCL_DATA_TYPE_BFP16 = 11,   /* bfloat16 */
+    HCCL_DATA_TYPE_INT128 = 12,  /* int128预留类型，暂不支持 */
+    HCCL_DATA_TYPE_HIF8 = 14,    /* hif8 */
+    HCCL_DATA_TYPE_FP8E4M3 = 15, /* fp8e4m3 */
+    HCCL_DATA_TYPE_FP8E5M2 = 16, /* fp8e5m2 */
+    HCCL_DATA_TYPE_FP8E8M0 = 17, /* fp8e8m0 */
+    HCCL_DATA_TYPE_RESERVED      /* reserved */
+};
+
+enum HcclReduceOp {
+    HCCL_REDUCE_SUM = 0,  /* sum */
+    HCCL_REDUCE_PROD = 1, /* prod */
+    HCCL_REDUCE_MAX = 2,  /* max */
+    HCCL_REDUCE_MIN = 3,  /* min */
+    HCCL_REDUCE_RESERVED  /* reserved */
+}
+```
+
+### 13.2 `HCCL模板参数` — pinning the comm client to ONE named core
+
+产品支持情况, verbatim:
+
+> Ascend 950PR&950DT系列产品：支持
+> Atlas A3系列产品：支持
+> Atlas A2系列产品：支持
+> Atlas 200I/500 A2推理产品：不支持
+> Atlas推理系列产品AI Core：不支持
+> Atlas推理系列产品Vector Core：不支持
+> Atlas训练系列产品：不支持
+
+```cpp
+template <HcclServerType serverType = HcclServerType::HCCL_SERVER_TYPE_AICPU, const auto& config = DEFAULT_CFG>
+class Hccl;
+```
+
+> | 参数名称 | 描述
+> | serverType | 支持的服务端类型。HcclServerType枚举类型，取值如下。
+> HCCL_SERVER_TYPE_AICPU：AI CPU服务端。
+> HCCL_SERVER_TYPE_CCU：CCU服务端。
+> HCCL_SERVER_TYPE_END：预留参数，不支持使用。
+>
+> 对于Ascend 950PR&950DT系列产品，当前仅支持HCCL_SERVER_TYPE_CCU。
+> **对于Atlas A3系列产品，当前仅支持HCCL_SERVER_TYPE_AICPU。**
+> 对于Atlas A2系列产品，当前仅支持HCCL_SERVER_TYPE_AICPU。
+>
+> | config | 用于指定向服务端下发任务的核。HcclServerConfig类型，定义如下代码所示，含义如下。
+>
+> type：向服务端下发任务的核的类型。CoreType类型，可取值为：
+> DEFAULT：表示不指定AIC核或者AIV核。
+> ON_AIV：表示指定为AIV核。
+> ON_AIC：表示指定为AIC核。
+>
+> blockId：向服务端下发任务的核的ID。
+>
+> 默认值DEFAULT_CFG = {CoreType::DEFAULT, 0}。
+
+```cpp
+enum HcclServerType {
+    HCCL_SERVER_TYPE_AICPU = 0,
+    HCCL_SERVER_TYPE_CCU,
+    HCCL_SERVER_TYPE_END // 预留参数，不支持使用
+};
+
+struct HcclServerConfig {
+    CoreType type;
+    int64_t blockId;
+};
+
+enum class CoreType : uint8_t { DEFAULT, ON_AIV, ON_AIC };
+```
+
+> 调用示例
+>
+> 通过如下传入模板参数config的方式创建Hccl类对象，指定HCCL客户端仅在AIV的10号核上发送通信消息给服务端，替代通过调用GetBlockIdx接口的方式指定运行的核。
+>
+> ```cpp
+> static constexpr HcclServerConfig HCCL_CFG = {CoreType::ON_AIV, 10};
+> // 选择AICPU作为服务端
+> Hccl<HcclServerType::HCCL_SERVER_TYPE_AICPU, HCCL_CFG> hccl;
+>
+> // 选择CCU作为服务端
+> Hccl<HcclServerType::HCCL_SERVER_TYPE_CCU, HCCL_CFG> hccl;
+> ```
+
+### 13.3 `AllReduce` — signature, A3 support, limits
+
+> 产品支持情况
+>
+> Ascend 950PR&950DT系列产品：支持
+> Atlas A3系列产品：支持
+> Atlas A2系列产品：支持
+> Atlas 200I/500 A2推理产品：不支持
+> Atlas推理系列产品AI Core：不支持
+> Atlas推理系列产品Vector Core：不支持
+> Atlas训练系列产品：不支持
+
+```cpp
+template <bool commit = false>
+__aicore__ inline HcclHandle AllReduce(GM_ADDR sendBuf, GM_ADDR recvBuf, uint64_t count,
+                                       HcclDataType dataType, HcclReduceOp op, uint8_t repeat = 1)
+```
+
+> | commit | 输入 | bool类型。参数取值如下：
+> true：在调用Prepare接口时，Commit同步通知服务端可以执行该通信任务。
+> false：在调用Prepare接口时，不通知服务端执行该通信任务。
+>
+> | dataType | 输入 | AllReduce操作的数据类型，目前支持float、half（即float16）、int8_t、int16_t、int32_t、bfloat16_t数据类型，即支持取值为HCCL_DATA_TYPE_FP32、HCCL_DATA_TYPE_FP16、HCCL_DATA_TYPE_INT8、HCCL_DATA_TYPE_INT16、HCCL_DATA_TYPE_INT32、HCCL_DATA_TYPE_BFP16。
+> | op | 输入 | Reduce的操作类型，目前支持sum、max、min操作类型，即支持取值为HCCL_REDUCE_SUM、HCCL_REDUCE_MAX、HCCL_REDUCE_MIN。
+> | repeat | 输入 | 一次下发的AllReduce通信任务个数。repeat取值≥1，默认值为1。当repeat>1时，每个AllReduce任务的sendBuf和recvBuf地址由服务端自动算出，计算公式如下：
+>
+> sendBuf[i] = sendBuf + count* sizeof(datatype) * i, i∈[0, repeat)
+> recvBuf[i] = recvBuf + count* sizeof(datatype) * i, i∈[0, repeat)
+>
+> 返回值说明
+> 返回该任务的标识handleId，handleId大于等于0。调用失败时，返回 -1。
+>
+> 约束说明
+> 调用本接口前确保已调用过InitV2和SetCcTilingV2接口。
+> 若HCCL对象的config模板参数未指定下发通信任务的核，该接口只能在AIC核或者AIV核两者之一上调用。**若HCCL对象的config模板参数中指定了下发通信任务的核，则该接口可以在AIC核和AIV核上同时调用，接口内部会根据指定的核的类型，只在AIC核、AIV核二者之一下发该通信任务。**
+>
+> 对于Atlas A2系列产品，一个通信域内，所有Prepare接口的总调用次数不能超过63。
+> **对于Atlas A3系列产品，一个通信域内，所有Prepare接口和InterHcclGroupSync接口的总调用次数不能超过63。**
+> 对于Ascend 950PR&950DT系列产品，一个通信域内，所有Prepare接口的总调用次数不能超过63。
+> 对于Ascend 950PR&950DT系列产品，通信服务端为CCU时，最大支持8卡的全链接，默认仅支持FullMesh算法，并且单次最大通信数据量不能超过256M。
+
+The worked example, verbatim:
+
+```cpp
+extern "C" __global__ __aicore__ void all_reduce_custom(GM_ADDR xGM, GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    auto sendBuf = xGM;       // xGM为AllReduce的输入GM地址
+    auto recvBuf = yGM;       // yGM为AllReduce的输出GM地址
+    uint64_t sendCount = 300; // 每张卡上均有300个float16的数据
+    HcclReduceOp reduceOp = HcclReduceOp::HCCL_REDUCE_SUM;
+    REGISTER_TILING_DEFAULT(AllReduceCustomTilingData); // AllReduceCustomTilingData为对应算子头文件定义的结构体
+    GET_TILING_DATA_WITH_STRUCT(AllReduceCustomTilingData, tilingData, tilingGM);
+
+    Hccl hccl;
+    GM_ADDR contextGM = AscendC::GetHcclContext<0>(); // AscendC自定义算子核函数（Kernel）中，通过此方式获取HCCL context
+
+    if (AscendC::g_coreType == AIV) { // 指定AIV核通信
+        hccl.InitV2(contextGM, &tilingData);
+        auto ret = hccl.SetCcTilingV2(offsetof(AllReduceCustomTilingData, mc2CcTiling));
+        if (ret) {
+            return;
+        }
+        HcclHandle handleId1 =
+            hccl.AllReduce<true>(sendBuf, recvBuf, sendCount, HcclDataType::HCCL_DATA_TYPE_FP16, reduceOp);
+        hccl.Wait(handleId1);
+        AscendC::SyncAll<true>(); // 全AIV核同步，防止0核执行过快，提前调用hccl.Finalize()接口，导致其他核Wait卡死
+        hccl.Finalize();
+    }
+}
+```
+
+### 13.4 `Commit` / `Wait` — exact signatures and the counting rule
+
+```cpp
+using HcclHandle = int8_t;
+
+__aicore__ inline void    Commit(HcclHandle handleId)
+__aicore__ inline int32_t Wait(HcclHandle handleId)
+```
+
+Both: 产品支持情况 — Ascend 950PR&950DT：支持 / Atlas A3：支持 / Atlas A2：支持.
+
+> Commit — 功能说明
+> 非细粒度通信时，每调用一次本接口，则通知服务端可以执行handleId对应的任务一次。细粒度通信时，每调用一次本接口，则通知服务端可以执行handleId对应的步长长度的子通信任务。
+>
+> 约束说明
+> 非细粒度通信时，本接口的调用次数应该与Prepare的repeat次数一致。细粒度通信时，本接口的调用次数应该与通信任务的总步骤数/步长*Prepare的repeat次数一致。
+> 本接口在AIC核或者AIV核上调用必须与对应的Prepare接口的调用核保持一致。
+
+> Wait — 功能说明
+> 阻塞AI Core，非细粒度通信时，等待handleId对应的通信任务完成，细粒度通信时，等待handleId对应的步长长度的子通信任务完成。handleId调用Wait接口的顺序，须和Prepare接口一致。**该接口默认在所有核上工作，用户也可以在调用前通过GetBlockIdx指定其在某一个核上运行。**
+>
+> 返回值说明
+> 0，表示成功
+> -1，表示失败
+
+Note the asymmetry: `Commit` must be on the same core as the Prepare; `Wait` "defaults to
+working on all cores" and can be narrowed with `GetBlockIdx`.
+
+### 13.5 `InterHcclGroupSync` — cross-communication-domain dependency, A3 ONLY
+
+> 产品支持情况
+>
+> Ascend 950PR&950DT系列产品：**不支持**
+> Atlas A3系列产品：**支持**
+> Atlas A2系列产品：**不支持**
+> Atlas 200I/500 A2推理产品：不支持
+> Atlas推理系列产品AI Core：不支持
+> Atlas推理系列产品Vector Core：不支持
+> Atlas训练系列产品：不支持
+>
+> 功能说明
+> 用于等待一个跨通信域的通信任务完成。调用该接口后，本通信域后续下发的通信任务，均等待指定的srcGroupID通信域中的srcHandleID通信任务执行完成，才开始执行。
+
+```cpp
+__aicore__ inline void InterHcclGroupSync(int8_t srcGroupID, HcclHandle srcHandleID)
+```
+
+> 约束说明
+> 调用本接口前确保已调用过InitV2和SetCcTilingV2接口。
+> 本接口在AIC核或者AIV核上调用必须与对应的Prepare接口的调用核保持一致。
+> 一个通信域内，所有Prepare接口和InterHcclGroupSync接口的总调用次数不能超过63。
+
+The example, verbatim — two communication domains in one kernel, chained device-side:
+
+```cpp
+extern "C" __global__ __aicore__ void alltoall_allgather_custom(GM_ADDR xGM, GM_ADDR alltoallGM, GM_ADDR allgatherGM, GM_ADDR tilingGM)
+{
+    REGISTER_TILING_DEFAULT(
+        AlltoAllAllGatherCustomTilingData); // AlltoAllAllGatherCustomTilingData为对应算子头文件定义的结构体
+    GET_TILING_DATA_WITH_STRUCT(AlltoAllAllGatherCustomTilingData, tilingData, tilingGM);
+    GM_ADDR contextGM0 = AscendC::GetHcclContext<0>();
+    GM_ADDR contextGM1 = AscendC::GetHcclContext<1>();
+
+    Hccl hccl0;
+    Hccl hccl1;
+    HcclDataType dtype = HcclDataType::HCCL_DATA_TYPE_FP16;
+    const uint64_t dataCount = 10U;
+    const uint64_t strideCount = 0U;
+    if (AscendC::g_coreType == AIV) { // 仅使用AIV核进行通信
+        hccl0.InitV2(contextGM0, &tilingData);
+        hccl1.InitV2(contextGM1, &tilingData);
+        hccl0.SetCcTilingV2(offsetof(AlltoAllAllGatherCustomTilingData, alltoallTiling));
+        hccl1.SetCcTilingV2(offsetof(AlltoAllAllGatherCustomTilingData, allgatherTiling));
+
+        // 通信域0下发1个AlltoAll任务
+        auto group0_handle = hccl0.AlltoAll(xGM, alltoallGM, dataCount, dtype, strideCount);
+
+        // 通信域1下发跨域依赖任务，保证通信域1后续的AllGather任务在通信域0的AlltoAll执行结束后，才开始执行
+        hccl1.InterHcclGroupSync(0, group0_handle);
+        // 通信域1下发1个AllGather任务
+        auto group1_handle = hccl1.AllGather(alltoallGM, allgatherGM, dataCount, dtype, strideCount);
+
+        hccl0.Commit(group0_handle);
+        hccl1.Commit(group1_handle);
+        hccl0.Wait(group0_handle);
+        hccl1.Wait(group1_handle);
+
+        AscendC::SyncAll<true>(); // 全AIV核同步，防止0核执行过快，提前调用hccl.Finalize()接口，导致其他核Wait卡死
+        hccl0.Finalize();
+        hccl1.Finalize();
+    }
+}
+```
+
+### 13.6 `GetWindowsInAddr` / `GetWindowsOutAddr` — a peer rank's HCCL window as a plain `GM_ADDR`, on A3
+
+> 产品支持情况
+>
+> Ascend 950PR&950DT系列产品：**不支持**
+> Atlas A3系列产品：**支持**
+> Atlas A2系列产品：**支持**
+>
+> 功能说明
+> **获取卡间通信数据WindowsIn起始地址，可用来直接作为计算的输入输出地址，减少拷贝。** 该接口默认在所有核上工作，用户也可以在调用前通过GetBlockIdx指定其在某一个核上运行。
+
+```cpp
+__aicore__ inline GM_ADDR GetWindowsInAddr(uint32_t rankId)
+```
+
+> | rankId | 输入 | 待查询的卡的Id。
+>
+> 返回值说明
+> 返回对应卡的卡间通信数据WindowsIn起始地址。当rankId非法时，返回nullptr。
+>
+> 约束说明
+> 无
+
+```cpp
+auto winInAddr = hccl.GetWindowsInAddr(0);
+auto winOutAddr = hccl.GetWindowsOutAddr(0);
+auto rankId = hccl.GetRankId();
+auto rankDim = hccl.GetRankDim(); // 4张卡
+```
+
+Note 「约束说明 无」 — *no constraints*. And the pair
+`SetSkipBufferWindowCopy` / `SetSkipLocalRankCopy` exist on the Tiling side precisely so you can
+tell HCCL not to copy into/out of the window when you have already written it yourself.
+
+### 13.7 `BatchWrite` — the one-sided batched remote write, A3 supported / A5 NOT
+
+> 产品支持情况
+>
+> Ascend 950PR&950DT系列产品：**不支持**
+> Atlas A3系列产品：**支持**
+> Atlas A2系列产品：**支持**
+>
+> 功能说明
+> 集合通信BatchWrite的任务下发接口，返回该任务的标识handleId给用户。**BatchWrite实现了一种点对点通信，这是一种直接传输数据的通信模式，能够同时将多份数据发送到不同的Global Memory地址上。**
+>
+> 对于Atlas A3系列产品，BatchWrite通信支持在相同或不同的昇腾AI Server之间进行。
+>
+> 对于Atlas A2系列产品，BatchWrite通信必须在不同昇腾AI Server（通常是8卡或16卡的昇腾NPU设备组成的服务器形态的统称）之间进行。
+
+```cpp
+template <bool commit = false>
+__aicore__ inline HcclHandle BatchWrite(GM_ADDR batchWriteInfo, uint32_t itemNum, uint16_t queueID = 0U)
+```
+
+The descriptor layouts — **they differ between A2 and A3**:
+
+```cpp
+// Atlas A3系列产品
+struct BatchWriteItem {
+    uint64_t type;
+    uint32_t res1[5];
+    uint32_t length;
+    uint32_t srcAddrLow;
+    uint32_t srcAddrHigh;
+    uint32_t dstAddrLow;
+    uint32_t dstAddrHigh;
+    uint32_t res2[4];
+};
+```
+
+```cpp
+// Atlas A2系列产品
+struct BatchWriteItem {
+    uint64_t localBuf;     // 本端发送数据的window地址
+    uint64_t remoteBuf;    // 对端接收数据的window地址
+    uint64_t count;        // 发送的数据个数
+    uint32_t dataType;     // 发送的数据类型
+    uint32_t remoteRankId; // 发送数据的目的卡号
+};
+```
+
+> 对于Atlas A3系列产品：
+> type：预留参数，取值为0。
+> res1[5]：预留参数，无需填写该值。
+> length：待拷贝数据的长度。
+> srcAddrLow：待拷贝数据的源地址低32位。
+> srcAddrHigh：待拷贝数据的源地址高32位。
+> dstAddrLow：待拷贝数据的目的地址低32位。
+> dstAddrHigh：待拷贝数据的目的地址高32位。
+> res2[4]：预留参数，无需填写该值。
+>
+> | itemNum | 输入 | 批量任务的个数。该参数取值必须与batchWriteInfo中通信任务信息的组数一致。
+> 对于Atlas A3系列产品，该参数取值不能大于等于2048。
+> | queueID | 输入 | 指定当前通信所在的队列ID，默认值为0。Atlas A2系列产品，该参数仅支持取值为0。
+>
+> 约束说明
+> 一个通信域内，所有Prepare接口和InterHcclGroupSync接口的总调用次数不能超过63。
+> 对于Atlas A2系列产品，当前接口仅支持不同AI Server间的通信，同时通信任务信息中指定的目的卡号不能是本卡号。
+> **通信任务信息写入batchWriteInfo前，必须通过调用DataCacheCleanAndInvalid接口，保证预期的数据成功刷新到Global Memory上。**
+
+On A3 the descriptor is a bare `(length, srcAddr64, dstAddr64)` triple — **no rank field at
+all**, because the destination address is already a globally resolvable address. Up to 2047
+items per call.
+
+## Relevance
+
+`AscendC::Hccl` is the *sanctioned* in-kernel collective, it is A3-supported, and it is not what
+we want — but it tells us exactly why, and it hands us two pieces we do want.
+
+Why it is not it: 「本章的所有接口运行在AI Core上，且不执行通信任务，而是由用户调用Prepare接口将
+对应类型的通信任务信息发送给AI CPU或CCU服务端」. On A3 the only server type is
+`HCCL_SERVER_TYPE_AICPU`. So every layer's all-reduce is a round trip to an **AI CPU** — off the
+AI Core but still off-chip-of-the-core, with the AI CPU doing task expansion and submission. That
+is cheaper than a host round trip but it is not one-sided, and it caps us at **63 Prepare calls
+per communication domain** — with 1 all-reduce per layer and GLM-5.2's layer count, a single
+persistent kernel covering the whole forward pass would blow that 63 limit outright. That is a
+hard structural argument for the §11/§12 route over this one.
+
+What we do want from it:
+
+1. **`static constexpr HcclServerConfig HCCL_CFG = {CoreType::ON_AIV, 10};
+   Hccl<HcclServerType::HCCL_SERVER_TYPE_AICPU, HCCL_CFG> hccl;`** — pin the comm client to one
+   named AIV. With that, `AllReduce`/`Commit` can be called from code compiled for all cores and
+   only core 10 issues. This is exactly the "one core is the communication core" structure a
+   megakernel wants, and it removes the `if (g_coreType == AIV)` / `GetBlockIdx()` guard clutter.
+2. **`GetWindowsInAddr(rankId)` / `GetWindowsOutAddr(rankId)` return a peer rank's HCCL window as
+   a plain `GM_ADDR`, are A3-supported, and carry 「约束说明 无」.** Combined with §11.4 (a remote
+   `GM_ADDR` is writable by ordinary `DataCopyPad`) and §12.3 (`aclshmemx_mte_atomic_add` works on
+   910B/910C), this means we can run the one-sided all-reduce **inside the HCCL window buffers
+   that HCCL has already registered**, without `aclshmem` and without a separate symmetric heap.
+   `SetSkipBufferWindowCopy` / `SetSkipLocalRankCopy` on the Tiling side exist to let us own that
+   copy.
+3. **`BatchWrite` on A3 takes a bare `(length, srcAddr64, dstAddr64)` descriptor with no rank
+   field, up to 2047 items.** That is the shape of a scatter-to-all-peers in one submission.
+
+One CONTRADICTION-adjacent datapoint for our flag budget: the HCCL usage page's own advice at the
+end of `Wait` is 「开发者可根据实际的业务场景，选择调用SyncAll、CrossCoreSetFlag、CrossCoreWaitFlag
+接口，保证全部核的任务完成后再退出执行」 — i.e. the vendor expects `SyncAll` *and* raw
+`CrossCoreSetFlag`/`WaitFlag` to coexist with an HCCL object in the same kernel. If `SyncAll`
+really consumes 11–13 of 16 flags as we measured, then HCCL's own internal flag usage plus a
+`SyncAll` plus our own handshakes cannot all fit; either HCCL uses none, or one of the three must
+go. Worth checking what `Hccl::Wait` uses internally before assuming it is free.
+
+## 14. `HCCL MC2` host-side interfaces — how the device-side comm server is actually stood up
+
+URL: https://asc.gitcode.com/api/SIMD-API/adv_api/HCCL_communication/HCCL_MC2/HCCL_MC2_usage.html
+Source repo: https://gitcode.com/cann/asc-devkit/ branch `master`, commit `5f50fc4c6ada`
+Built 2026/10/20 11:47:29. Retrieved 2026-10-20.
+
+This page answers "what is the `Mc2*` server/client split" concretely, and it carries one
+syntactic surprise worth more than the rest of the page: a kernel declared
+`__global__ __vector__`.
+
+### 14.1 The flow, verbatim
+
+> 说明
+> 本章节描述MC2内置通信算子的Host侧接口。用户通过这些接口配置通信任务、申请通信资源上下文并启动通信服务端。接口同时支持AI CPU和CCU两种通信服务端，二者共用同一组参数配置和资源上下文接口。
+>
+> HCCL MC2接口由Host侧参数配置、资源上下文申请和通信服务端启动三部分组成。用户在Host侧配置通信任务参数后，接口内部会完成算法选择、通信资源申请以及设备侧资源上下文的写入。
+>
+> **通信引擎用于选择通信服务端的执行方式：AICPU_TS表示AI CPU通信服务端，CCU_MS和CCU_SCHED表示CCU通信服务端。其中，CCU_SCHED表示CCU调度模式，建议CCU场景使用该模式。**
+>
+> 正式申请资源前，通信引擎设置为CCU_SCHED时，可以调用CheckOpResSufficient预检查通信资源是否充足。
+>
+> 典型流程如下：
+>
+> 调用Mc2GetCcArgs创建通信参数对象。
+>
+> 调用配置接口填充通信参数。
+> Mc2SetCcCommEngine：设置通信引擎。
+> Mc2SetCcSrcDataType：设置输入数据类型。
+> Mc2SetCcDstDataType：设置输出数据类型。
+> Mc2SetCcReduceType：设置Reduce操作类型，仅AllReduce、ReduceScatter等归约类任务需要配置。
+> Mc2SetCcAlgConfig：设置通信算法。
+>
+> 调用Mc2AcquireCcResCtx申请通信资源上下文，获得设备侧资源上下文地址和大小。
+>
+> 调用Mc2CcKernelLaunch启动通信服务端。AI CPU路径传入独立于AI Core任务的AI CPU任务流；CCU路径可传入nullptr。
+>
+> 在AI Core核函数中，将步骤3返回的资源上下文传入InitV2，再调用AllGather、AllReduce、AlltoAll等HCCL高阶API下发客户端通信任务。
+>
+> 参数对象不再使用后，调用Mc2FreeCcArgs释放。
+>
+> 上述流程中的第3步与第5步必须使用同一个资源上下文。ccResCtx是Mc2AcquireCcResCtx返回的设备侧通信资源上下文地址，包含通信算法和通信资源相关信息；该资源由通信域生命周期管理，用户不需要调用单独的接口释放。
+>
+> Mc2GetCcArgs创建的参数对象默认通信引擎为AICPU_TS，即AI CPU通信服务端。若使用CCU路径，必须调用Mc2SetCcCommEngine显式设置通信引擎，推荐设置为CCU_SCHED。
+
+### 14.2 The AI CPU vs CCU table — with the engine NUMBERS
+
+> AI CPU与CCU路径的主要差异如下：
+>
+> | 项目 | AI CPU路径 | CCU路径 |
+> |---|---|---|
+> | commEngine取值 | **2，AICPU_TS**，表示AI CPU通信服务端 | **5，CCU_MS；或6，CCU_SCHED，推荐使用6** |
+> | 服务端启动stream | 必须传入独立的aclrtStream | 传入nullptr，launch stream由资源上下文内部携带 |
+> | AI Core侧初始化 | hccl.InitV2(contextGM) | hccl.InitV2(contextGM) |
+> | HCCL模板参数 | HCCL_SERVER_TYPE_AICPU | HCCL_SERVER_TYPE_CCU |
+> | 退出机制 | AI Core侧调用Finalize后服务端退出 | AI Core侧调用Finalize后服务端退出 |
+> | rank数 | 必须大于1 | 必须大于1 |
+
+### 14.3 The CCU (A5) host sequence, verbatim
+
+```cpp
+void* ccArgs = nullptr;
+void* ccResCtx = nullptr;
+uint32_t ccResCtxSize = 0U;
+constexpr uint8_t kCcuSchedEngine = 6U; // CCU_SCHED
+const uint8_t ccType = static_cast<uint8_t>(AscendC::HcclCMDType::HCCL_CMD_ALLTOALL);
+char algConfig[] = "sole[mesh]";
+
+Mc2Result ret = Mc2GetCcArgs(&ccArgs);
+ret = Mc2SetCcCommEngine(ccArgs, kCcuSchedEngine);
+ret = Mc2SetCcSrcDataType(ccArgs, HCCL_DATA_TYPE_FP32);
+ret = Mc2SetCcDstDataType(ccArgs, HCCL_DATA_TYPE_FP32);
+ret = Mc2SetCcAlgConfig(ccArgs, algConfig);
+
+ret = Mc2AcquireCcResCtx(comm, ccType, ccArgs, &ccResCtx, &ccResCtxSize);
+(void)Mc2FreeCcArgs(ccArgs);
+
+ret = Mc2CcKernelLaunch(nullptr, ccResCtx, ccResCtxSize);
+
+// 将ccResCtx传入AI Core核函数，并在核函数内调用InitV2和AlltoAll接口。
+all_to_all_kernel<<<1, nullptr, streamAiv>>>(sendBuf, recvBuf, ccResCtx, dataCount);
+```
+
+Note `char algConfig[] = "sole[mesh]";` — the algorithm is selected by a *string*.
+
+### 14.4 The AI CPU (A3) host sequence and the kernel-side client — note `__global__ __vector__`
+
+> 以下示例展示AllGather任务使用AI CPU通信路径时的调用顺序。**AI CPU服务端会阻塞等待AI Core客户端消息，因此aicpuStream与streamAiv必须为两条不同的任务流，且建议先同步AI Core任务流、再同步AI CPU任务流。**
+
+```cpp
+void* ccArgs = nullptr;
+void* ccResCtx = nullptr;
+uint32_t ccResCtxSize = 0U;
+constexpr uint8_t kAicpuTsEngine = 2U; // AICPU_TS
+const uint8_t ccType = static_cast<uint8_t>(AscendC::HcclCMDType::HCCL_CMD_ALLGATHER);
+
+Mc2Result ret = Mc2GetCcArgs(&ccArgs);
+ret = Mc2SetCcCommEngine(ccArgs, kAicpuTsEngine);
+ret = Mc2SetCcSrcDataType(ccArgs, HCCL_DATA_TYPE_FP32);
+ret = Mc2SetCcDstDataType(ccArgs, HCCL_DATA_TYPE_FP32);
+
+ret = Mc2AcquireCcResCtx(comm, ccType, ccArgs, &ccResCtx, &ccResCtxSize);
+(void)Mc2FreeCcArgs(ccArgs);
+
+ret = Mc2CcKernelLaunch(aicpuStream, ccResCtx, ccResCtxSize);
+
+all_gather_kernel<<<1, nullptr, streamAiv>>>(sendBuf, recvBuf, ccResCtx, sendCount);
+```
+
+> AI Core核函数中的AI CPU客户端示例片段如下：
+
+```cpp
+__global__ __vector__ void all_gather_kernel(
+    __gm__ void* sendBuf, __gm__ void* recvBuf, __gm__ void* contextGM, uint64_t sendCount)
+{
+    if (g_coreType != AscendC::AIV) {
+        return;
+    }
+    AscendC::InitSocState();
+    AscendC::Hccl<AscendC::HcclServerType::HCCL_SERVER_TYPE_AICPU> hccl;
+    hccl.InitV2((GM_ADDR)contextGM, nullptr);
+    AscendC::HcclHandle handleId = hccl.AllGather<true>(
+        (GM_ADDR)sendBuf, (GM_ADDR)recvBuf, sendCount,
+        AscendC::HcclDataType::HCCL_DATA_TYPE_FP32, 0);
+    hccl.Wait(handleId);
+    AscendC::SyncAll<true>();
+    hccl.Finalize();
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+```
+
+Three things in nine lines: (a) the kernel is declared **`__global__ __vector__`**, not
+`__global__ __aicore__` — a third spelling of the core-type declaration, alongside the
+`KERNEL_TYPE_*` macros and `[[bisheng::core_ratio(a, b)]]` from §10.1; (b)
+`AscendC::InitSocState()` is called before touching HCCL; (c) `hccl.InitV2(contextGM, nullptr)` —
+the tiling pointer can be `nullptr` when the MC2 resource context already carries the algorithm.
+
+## Relevance
+
+The engine numbers are the useful residue: `commEngine` is `2 = AICPU_TS`, `5 = CCU_MS`,
+`6 = CCU_SCHED`. On A3 only `2` exists, which closes the question of whether we can get a CCU-like
+in-fabric scheduler on our part: we cannot.
+
+The structural cost is now explicit: on A3, `AscendC::Hccl` requires **a second stream carrying a
+blocking AI CPU server kernel** (`Mc2CcKernelLaunch(aicpuStream, ...)`, and 「AI CPU服务端会阻塞等待
+AI Core客户端消息」). For a TPOT 2.x ms target at batch=1 that is a persistent AI CPU thread
+spinning for the whole decode, plus a cross-processor handshake per all-reduce, plus the 63-Prepare
+cap from §13.3. Against §12's `aclshmemx_mte_atomic_add` — which is an MTE2 instruction and needs
+no server at all — the MC2 route is strictly heavier for our case. Its advantage is that it
+handles algorithm selection and multi-node; we need neither.
+
+`__global__ __vector__` is the actionable syntactic item: it is a per-kernel core-type qualifier
+used in current first-party docs, and the obvious cube-side counterpart to test against our
+`KERNEL_TYPE_AIC_ONLY` rejection.
+
 
 ---
 

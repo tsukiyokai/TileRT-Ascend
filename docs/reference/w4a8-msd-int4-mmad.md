@@ -1933,3 +1933,437 @@ a parallel pass established from Huawei's own `matmul_int4` README. Not duplicat
   the cube and apply scales in the vector unit; only the A8W4 one does not (§2.4). Row 3 even
   keeps the int32 bias resident in the bias table (`datoBiasBT_`) rather than adding it in UB,
   which is the natural place for our `8*sum(w)` if we take the int32 route.
+
+---
+
+## 8. How CANN schedules pre/mid/post as one kernel — the MSD pipeline, and the host tiling
+
+Same repo and commits as §2. This section is here because the three-stage structure is the part
+of MSD that is *not* about W4A8 at all — it is a worked example of a software-pipelined
+multi-stage MIX kernel, which is what our megakernel has to be.
+
+```
+gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_pipeline.h   (235 lines)
+gmm/grouped_matmul_swiglu_quant_v2/op_host/op_tiling/grouped_matmul_swiglu_quant_v2_base_tiling.cpp
+gmm/grouped_matmul_swiglu_quant_v2/op_host/op_tiling/grouped_matmul_swiglu_quant_v2_tiling.h
+```
+
+### 8.1 The three-stage loop, verbatim
+
+```cpp
+template <class mmType>
+class GMMSwigluQuantPipelineSchedule {
+private:
+    typename mmType::MT &mm;
+    TPipe *pipe;
+    const GMMSwigluQuantV2BaseParams *__restrict gmmSwigluQuantV2BaseParams;
+    const GMMSwigluQuantV2 *__restrict gmmSwigluQuantV2;
+    // WorkSpaceSplitConfig控制Workspace切割方式的结构体;
+    WorkSpaceSplitConfig workspaceSplitConfig;
+    WorkSpaceSplitConfig tempWorkspaceSplitConfig;
+    ...
+    // 前处理GMMA8W4PreProcess类
+    GMMA8W4PreProcess preProcess;
+    // 中间处理GMMA8W4MidProcess类
+    GMMA8W4MidProcess<mmType> midProcess;
+    // 后处理GMMA8W4PostProcess类
+    GMMA8W4PostProcess postProcess;
+```
+
+```cpp
+__aicore__ inline void GMMSwigluQuantPipelineSchedule<mmType>::Process()
+{
+    // 1.对每次workspace切分做大循环。
+    preProcess.Init(gmAddrParams, gmmSwigluQuantV2BaseParams);
+    midProcess.Init(gmAddrParams, gmmSwigluQuantV2BaseParams);
+    postProcess.Init(gmAddrParams, gmmSwigluQuantV2BaseParams, gmmSwigluQuantV2);
+
+    // 1.前处理提前下发一次
+    preProcess.Process(workspaceSplitConfig, 0, pipe);
+    for (int64_t workspaceSplitLoopIdx = 0; workspaceSplitLoopIdx < workspaceSplitConfig.loopCount;
+         workspaceSplitLoopIdx++) {
+        // 更新workspaceSplitConfig
+        UpdateWorkSpaceSplitConfig(workspaceSplitConfig, workspaceSplitLoopIdx);
+        if ASCEND_IS_AIV {
+            pipe->Reset();
+        }
+
+        SyncAll<false>();
+        // 2.第n次中处理 && 第n+1次前处理 && 第n-1次后处理 并行
+        midProcess.Process(workspaceSplitConfig, workspaceSplitLoopIdx);
+
+        preProcess.Process(workspaceSplitConfig, workspaceSplitLoopIdx + 1, pipe);
+        if ASCEND_IS_AIV {
+            pipe->Reset();
+            SyncAll<true>();
+        }
+        postProcess.Process(tempWorkspaceSplitConfig, workspaceSplitLoopIdx - 1, pipe);
+        // 3.第n-1次后处理需要保留第n次的切分数据
+        tempWorkspaceSplitConfig = workspaceSplitConfig;
+        // reset
+        if ASCEND_IS_AIV {
+            pipe->Reset();
+        }
+        SyncAll<false>();
+        // 3.前一次后处理 && 后一次MM 并行
+    }
+    // reset
+    if ASCEND_IS_AIV {
+        pipe->Reset();
+    }
+    SyncAll<false>();
+    // // 4.最后一次后处理
+    postProcess.Process(workspaceSplitConfig, workspaceSplitConfig.loopCount - 1, pipe);
+    if ASCEND_IS_AIV {
+        pipe->Destroy();
+    }
+}
+```
+
+Everything load-bearing is in that one function:
+
+- **Three stages, one `<<< >>>`, software-pipelined at depth 1**: iteration `n` runs `mid(n)` on
+  the AIC while the AIV runs `pre(n+1)` and then `post(n-1)`. `pre` is peeled before the loop and
+  `post` is peeled after it.
+- **`SyncAll<false>()` is the only phase barrier**, used three times per iteration (before `mid`,
+  after `post`, and once more at loop exit). No `CrossCoreSetFlag` anywhere in this scheduler —
+  the per-stage classes guard themselves with `if ASCEND_IS_AIV` / `if ASCEND_IS_AIC`.
+- **`SyncAll<true>()` appears exactly once**, on the AIV only, between `pre(n+1)` and `post(n-1)` —
+  the two AIV stages that share UB.
+- **`pipe->Reset()` is called on the AIV before every stage** and `pipe->Destroy()` at the end.
+  Each of `pre`/`post` calls `pipe->InitBuffer(...)` itself from inside its own `Process`, so the
+  whole UB is re-partitioned per stage rather than statically divided three ways. This is the
+  same trick as §3.2's `tPipe.Reset(); tPipe.Destroy(); tPipe.Init();`, used per-iteration.
+- **The workspace is double-buffered by loop parity**, which is what makes the overlap safe —
+  from §2.2 and §2.3: `xGM = (workspaceSplitLoopIdx % 2 == 0 ? xGM1 : xGM2);` and
+  `mmOutGM = (workspaceSplitLoopIdx % 2 == 0 ? mmOutGM1 : mmOutGM2);`.
+- **Each stage no-ops itself out of range** rather than being guarded by the caller:
+  `if (workspaceSplitLoopIdx >= workspaceSplitConfig.loopCount || workspaceSplitLoopIdx < 0) { return; }`,
+  which is how the `n+1` and `n-1` indices are allowed to run off the ends.
+
+The loop bound, from `InitWorkSpaceSplitConfig`:
+
+```cpp
+    workspaceSplitConfig.loopCount = Ceil(workspaceSplitConfig.M, gmmSwigluQuantV2BaseParams->mLimit);
+    workspaceSplitConfig.notLastTaskSize = gmmSwigluQuantV2BaseParams->mLimit;
+    workspaceSplitConfig.lastLoopTaskSize =
+        workspaceSplitConfig.M - (workspaceSplitConfig.loopCount - 1) * gmmSwigluQuantV2BaseParams->mLimit;
+```
+
+### 8.2 The host tiling — `mLimit`, the workspace budget, and the A8W4 base block
+
+`grouped_matmul_swiglu_quant_v2_tiling.h`, verbatim:
+
+```cpp
+constexpr uint32_t SYS_WORKSPACE_SIZE = static_cast<uint32_t>(16 * 1024 * 1024);
+constexpr int64_t USER_WORKSPACE_LIMIT = static_cast<int64_t>(64 * 1024 * 1024);
+constexpr int64_t DOUBLE_WORKSPACE_SPLIT = 2;
+...
+constexpr int64_t DOUBLE_ROW = 2;
+...
+constexpr int64_t A8W4_BASEM = 128;
+constexpr int64_t A8W4_BASEK = 256;
+constexpr int64_t A8W4_BASEN = 256;
+constexpr int64_t SIZE_OF_HALF_2 = 2;
+```
+
+`grouped_matmul_swiglu_quant_v2_base_tiling.cpp`, verbatim — note the three branches and that the
+A8W8 one is the only one sized in `int32_t`:
+
+```cpp
+    usrWorkspaceLimit_ = USER_WORKSPACE_LIMIT;
+    mLimit_ = 0;
+    if (isA8W4MSD_) {
+        mLimit_ =
+            ((usrWorkspaceLimit_ / DOUBLE_WORKSPACE_SPLIT) / (k_ * sizeof(int8_t) + DOUBLE_ROW * n_ * SIZE_OF_HALF_2));
+    } else if (isA4W4_) {
+        mLimit_ = ((usrWorkspaceLimit_ / DOUBLE_WORKSPACE_SPLIT) / (n_ * SIZE_OF_HALF_2));
+    } else {
+        mLimit_ = ((usrWorkspaceLimit_ / DOUBLE_WORKSPACE_SPLIT) / INT32_DTYPE_SIZE) / n_;
+    }
+
+    OP_CHECK_IF(
+        mLimit_ <= 0,
+        OPS_REPORT_VECTOR_INNER_ERR(context_->GetNodeName(), "mLimit_ is %ld, must be greater than 0.", mLimit_),
+        return ge::GRAPH_FAILED);
+    tilingData_.gmmSwigluQuantV2BaseParams.set_mLimit(mLimit_);
+
+    DynamicTilingSingleN(context_, blockDim_, A8W4_BASEM, A8W4_BASEN, A8W4_BASEK);
+
+    if (isA8W4MSD_) {
+        int workSpaceMTemp = mLimit_ * DOUBLE_WORKSPACE_SPLIT;
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset1(workSpaceMTemp * k_ * sizeof(int8_t));
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset2(DOUBLE_ROW * workSpaceMTemp * n_ * SIZE_OF_HALF_2);
+        workspaceSize_ =
+            SYS_WORKSPACE_SIZE +                     // 系统预留16MB
+            (workSpaceMTemp * k_ * sizeof(int8_t)) + // 第一阶段 预处理左矩阵 (mLimit_, K) * int8 * 2(double WorkSpace)
+            (DOUBLE_ROW * workSpaceMTemp * n_ *
+             SIZE_OF_HALF_2); // 第二阶段 矩阵乘结果 (2 * mLimit_, N) * fp16 * 2(double WorkSpace)
+    } else if (isA4W4_) {
+        int workSpaceMTemp = mLimit_ * DOUBLE_WORKSPACE_SPLIT;
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset1(mLimit_ * n_ * SIZE_OF_HALF_2);
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset2(0);
+        workspaceSize_ = SYS_WORKSPACE_SIZE + (workSpaceMTemp * n_ * SIZE_OF_HALF_2);
+    } else {
+        int workSpaceMTemp = (mLimit_ * DOUBLE_WORKSPACE_SPLIT > m_ ? m_ : mLimit_ * DOUBLE_WORKSPACE_SPLIT);
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset1(0);
+        tilingData_.gmmSwigluQuantV2BaseParams.set_workSpaceOffset2(0);
+        workspaceSize_ = SYS_WORKSPACE_SIZE + (workSpaceMTemp * n_ * sizeof(int32_t));
+    }
+
+    isSplitWorkSpace_ = m_ > mLimit_ * DOUBLE_WORKSPACE_SPLIT;
+```
+
+Note the comment 「第一阶段 预处理左矩阵 (mLimit_, K) * int8」: the split A matrix is accounted as
+`mLimit × K` *bytes*, i.e. `2 × mLimit` rows of `K` int4 — the M-doubling shows up in the byte
+count as "one int8 per output element" and nowhere else. The mm result is explicitly
+「(2 * mLimit_, N) * fp16」.
+
+### Relevance
+
+- **This is the closest thing in public CANN to the structure our per-layer megakernel needs**: N
+  stages in one launch, `SyncAll<false>()` as the phase boundary, `pipe->Reset()` to re-partition
+  UB per stage, parity-double-buffered GM between stages, and each stage self-guarding on
+  `ASCEND_IS_AIV`/`ASCEND_IS_AIC` plus an out-of-range early return so the skewed indices are
+  free. Zero `CrossCoreSetFlag` in the scheduler — which, given our flag-budget findings in
+  `ascend-fusion-mechanics.md` §38-§41, is the cheapest discipline available.
+- **`mLimit` for A8W4-MSD is `(32 MB) / (K + 4N)`** bytes-wise, with 64 MB of user workspace split
+  in two. For GLM-5.2 expert shapes that is thousands of rows, so at batch=1 decode
+  `loopCount == 1` and the whole three-stage pipeline degenerates to `pre; mid; post` with three
+  `SyncAll<false>()` barriers and no overlap at all. **CANN's pipeline buys us nothing at our
+  shape** — another reason the vendor operator is not tuned for our regime, and a reason to fuse
+  across *layers* rather than across M-chunks.
+- **`A8W4_BASEM = 128, A8W4_BASEK = 256, A8W4_BASEN = 256`** are the host-side defaults, against
+  the `// 8, 256, 512 --> 514us` comment left in the v1 kernel (§2.2). `baseM = 128` on 2M rows is
+  64 logical tokens; at batch=1 we want `baseM = 2` and 126/128 of that tile is waste.
+- **The two mm-workspace formulas price §2.4 exactly.** A8W8 is `mLimit * n_ * sizeof(int32_t)`
+  = 4 B per logical output element; A8W4-MSD is `DOUBLE_ROW * mLimit * n_ * SIZE_OF_HALF_2` = also
+  4 B per logical output element, as two fp16 halves. They are already equal. An int32 MSD would
+  be `DOUBLE_ROW * mLimit * n_ * 4` = 8 B per logical output, i.e. **exactly 2x the mm workspace
+  and 2x the cube→GM and GM→UB traffic on that buffer** — which is the real price of the §2.4
+  accuracy fix, and the thing to measure against the 16x error amplification it removes. At
+  batch=1 decode `loopCount == 1` and `2M` is single digits, so the absolute bytes are negligible;
+  the question is purely whether the extra L2 traffic shows up in the kernel time.
+
+---
+
+## 9. What CANN actually validates for A8W4-MSD — and what it does not
+
+Same repos and commits as §2 and §5. This section is short because the finding is an absence, and
+the absence is load-bearing for question 3 (accuracy cost).
+
+### 9.1 A3 is documented as supported
+
+`gmm/grouped_matmul_swiglu_quant_v2/docs/aclnnGroupedMatmulSwigluQuantV2.md` gates its sections
+with HTML comments naming the product line. The 「MSD场景A8W4」 formula block sits inside:
+
+```
+  <!-- npu="A3,910b" id8 -->
+  - <term>Atlas A3 训练系列产品/Atlas A3 推理系列产品</term>、<term>Atlas A2 训练系列产品/Atlas A2 推理系列产品</term>：
+```
+
+and the operator's own support list reads, verbatim:
+
+> <!-- npu="950" id1 -->
+> - <term>Ascend 950PR/Ascend 950DT</term>：支持
+>
+> <!-- npu="A3" id2 -->
+> - <term>Atlas A3 训练系列产品/Atlas A3 推理系列产品</term>：支持
+>
+> <!-- npu="910b" id3 -->
+> - <term>Atlas A2 训练系列产品/Atlas A2 推理系列产品</term>：支持
+
+So A8W4-MSD is a documented A3 feature, not an A2-only one.
+
+### 9.2 The only published MSD test case list is on A2, and it is tiling-only
+
+`ops-nn/matmul/quant_batch_matmul_v4/tests/ut/op_host/test_quant_batch_matmul_v4_a8w4_tiling.csv`,
+the whole file (4 lines including the header):
+
+```
+socVersion,caseName,blockDim,tilingResult,tilingKey
+Ascend910B4,UT-A8W4-MSD-ND-Testcase-0_16_256_256_0_0_256_ND_ND_INT8_INT4_NULL_FP32_UINT64_NULL_FP32_BF16_20_40,20,GRAPH_SUCCESS,24
+Ascend910B4,UT-A8W4-MSD-ND-Testcase-1_16_256_256_0_0_256_ND_ND_INT8_INT4_NULL_FP32_UINT64_NULL_FP32_FP16_20_40,20,GRAPH_SUCCESS,24
+Ascend910B4,UT-A8W4-MSD-ND-Testcase-2_16_256_256_0_0_0_ND_ND_INT8_INT4_NULL_FP32_UINT64_NULL_FP32_FP16_20_40,1,GRAPH_SUCCESS,20
+```
+
+```cpp
+INSTANTIATE_TEST_CASE_P(MMA8W4MSD, TestQuantBatchMatmulV4TilingMsd, testing::ValuesIn(GetParams()));
+```
+
+Decoded: `M=16, K=256, N=256`, `[gsM, gsN, gsK] = [0, 0, 256]` for cases 0-1 and
+`[0, 0, 0]` for case 2, `x1 = INT8`, `x2 = INT4`, `x1Scale = FP32`, `x2Scale = UINT64`,
+`yOffset = FP32`, `out = BF16` then `FP16` then `FP16`. **Tiling key 24 for the per-group (K-G)
+path, 20 for the per-channel (K-C) path.** `blockDim` 20 for K-G, 1 for K-C. `socVersion` is
+`Ascend910B4` on every row. The assertion is `GRAPH_SUCCESS` and a tiling key — no output values
+are compared.
+
+### 9.3 There is no published numeric test for A8W4-MSD at all
+
+Searched, and found nothing:
+
+- `ops-transformer/gmm/*/tests/st/` contains exactly
+  `aclnnGroupedMatmulV4_NoQuant`, `aclnnGroupedMatmulV4_SplitK`, `aclnnGroupedMatmulV5_A8W8O16`,
+  `aclnnGroupedMatmulV5_A8W8O16AXIS`, `aclnnGroupedMatmulV5_A8W8O8`,
+  `aclnnGroupedMatmulSwigluQuantV2_A8W8`, `aclnnGroupedMatmulSwigluQuant`,
+  `aclnnGroupedMatmulAdd`, `aclnnGroupedMatmulAddV2`. **No A8W4 directory.**
+- No `rtol` / `atol` / `EXPECT_NEAR` / tolerance constant appears in any A8W4 or MSD test in either
+  repo.
+- No Python golden-reference implementation of the split exists in either tree (no `.py` under
+  `gmm/` matches `a8w4`, `high_4bit`, or `assist`).
+
+### Relevance
+
+- **The `16*high + low` recombination has no published accuracy number, and CANN ships no numeric
+  test for it.** §1 asserts 「数值与直接INT8×INT4乘法结果一致」; §2.4 shows the implementation
+  cannot be; and there is no test in the repo that would catch the difference. So the right posture
+  is: trust the *identity* (which is exact and we verified it ourselves), do not trust the
+  *implementation claim*, and generate our own golden with an int64 numpy reference. Nobody else's
+  tolerance is available to borrow.
+- **Tiling keys to look for in a profile**: 24 = A8W4-MSD per-group (K-G), 20 = A8W4-MSD
+  per-channel (K-C) on `QuantBatchMatmulV4`; 2 = A8W4-MSD on `GroupedMatmulSwigluQuant[V2]`
+  (§2.0), 4 and 5 = A4W4, 0 and 1 = A8W8.
+- **The one published shape is `M=16, K=256, N=256`.** That is a tiling smoke test, not a
+  performance point. Nothing in the public test corpus exercises our regime (M of 1-8 per expert,
+  K and N in the thousands) or our chip.
+
+---
+
+## 10. The L1-resident variant — load the split A once, loop N against it
+
+Repository: `https://gitcode.com/cann/ops-transformer`, same clone as §2.
+Path: `gmm/grouped_matmul_finalize_routing/op_kernel/grouped_matmul_finalize_routing_antiquant_a8w4_msd_l1_opt.h`
+
+A fourth A8W4-MSD implementation, in `GroupedMatmulFinalizeRouting`, with one difference from the
+other three: it stages the split A matrix in **L1** and feeds `SetTensorA` from there, so A is
+read from GM exactly once per M-tile instead of once per (N-tile x quant-group). At our shape A is
+tiny and W is enormous, which makes this the right structure for us and the other three wrong.
+
+The L1 allocation — note the `/2` and its comment, and that this is cube-only:
+
+```cpp
+    TSCM<TPosition::GM, 1> xL1Queue;
+```
+
+```cpp
+__aicore__ inline void GMMA8W4MSDL1OptCompute<mmType>::InitMMBuffer()
+{
+    if ASCEND_IS_AIV {
+        return;
+    }
+    pipe->InitBuffer(xL1Queue, 1, (tiling->matmulTiling.baseM * tiling->k) / 2); // divide size by 2 to get sizeof(int4b_t)
+}
+```
+
+The GM→L1 load, with ND2NZ done on the fly by `DataCopy`'s `Nd2NzParams` overload — every `d`
+dimension halved because the element is int4:
+
+```cpp
+__aicore__ inline void GMMA8W4MSDL1OptCompute<mmType>::CopyInA1(uint64_t xOffset, uint32_t row, uint32_t col, LocalTensor<int4b_t> a1Local)
+{
+    Nd2NzParams nd2nzParams;
+    nd2nzParams.ndNum = 1;
+    nd2nzParams.nValue = row;
+    nd2nzParams.dValue = col / 2;
+    nd2nzParams.srcNdMatrixStride = 0;
+    nd2nzParams.srcDValue = col / 2;
+    nd2nzParams.dstNzC0Stride = Ceil(row, 16) * 16;
+    nd2nzParams.dstNzNStride = 1;
+    nd2nzParams.dstNzMatrixStride = 0;
+
+    DataCopy(a1Local, xGm[xOffset], nd2nzParams);
+    xL1Queue.EnQue(a1Local);
+    a1Local = xL1Queue.DeQue<int4b_t>();
+}
+```
+
+And the loop that pays for it — one `CopyInA1` outside, then `baseN` tiles x `quantGroupNum`
+`Iterate`s all reading A out of L1:
+
+```cpp
+__aicore__ inline void GMMA8W4MSDL1OptCompute<mmType>::MMComputeSingleN(uint32_t groupIdx, MNConfig& mnConfig,
+                                                                        uint32_t singleNOffset, uint32_t curSingleN, uint32_t curSingleM)
+{
+    uint64_t xOffset = (static_cast<uint64_t>(mnConfig.offsetM) + mnConfig.mIdx * mnConfig.singleM) * tiling->k;
+    LocalTensor<int4b_t> xL1LocalInt4 = xL1Queue.AllocTensor<int4b_t>();
+    CopyInA1(xOffset, curSingleM, tiling->k, xL1LocalInt4);
+
+    uint32_t baseNCurSingleN = Ceil(curSingleN, mnConfig.baseN);
+
+    for (uint32_t baseNIdx = 0; baseNIdx < baseNCurSingleN; baseNIdx++) {
+        if (baseCubeCount % mnConfig.baseNEachSingleN == 0) { // 进入新一轮 更新workspace从起点开始
+            mnConfig.workSpaceOffset = mnConfig.baseM * mnConfig.singleN * coreIdx;
+        }
+        if (baseCubeCount >= mnConfig.baseNEachSingleN) {
+            CrossCoreWaitFlag(SYNC_AIV_TO_AIC);
+        }
+        uint64_t weightOffset;
+        if constexpr (mmType::BT::format == CubeFormat::NZ) {
+            weightOffset = (static_cast<uint64_t>(groupIdx)) * tiling->n * tiling->k + singleNOffset * tiling->k + baseNIdx * mnConfig.baseN * tiling->k;
+        } else {
+            weightOffset = (static_cast<uint64_t>(groupIdx)) * tiling->n * tiling->k + singleNOffset + baseNIdx * mnConfig.baseN;
+        }
+
+        uint32_t curBaseN = mnConfig.baseN;
+        if (unlikely(baseNIdx == baseNCurSingleN - 1)) {
+            curBaseN = curSingleN - baseNIdx * mnConfig.baseN;
+        }
+        mm.SetSingleShape(curSingleM, curBaseN, quantGroupSize);
+        GlobalTensor<int4b_t> weightSlice;
+        for (uint32_t loopK = 0; loopK < tiling->quantGroupNum; loopK++) {
+            mm.SetTensorA(xL1LocalInt4[loopK * quantGroupSize]); // Copy x from L1
+            if constexpr (mmType::BT::format == CubeFormat::NZ) {
+                weightSlice = weightGm[weightOffset + loopK * quantGroupSize * 64];
+            } else {
+                weightSlice = weightGm[weightOffset + loopK * quantGroupSize * tiling->n];
+            }
+            if (mnConfig.blockDimM == 1) {
+                weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+            }
+            mm.SetTensorB(weightSlice);
+            mm.SetQuantVector(scaleGm[groupIdx * tiling->n * tiling->quantGroupNum + loopK * tiling->n + singleNOffset + baseNIdx * mnConfig.baseN]);
+            mm.Iterate();
+            mm.GetTensorC(mmOutGm[mnConfig.workSpaceOffset], loopK == 0 ? 0 : 1, true);
+        }
+        mm.End();
+        mnConfig.workSpaceOffset += mnConfig.baseM * mnConfig.baseN;
+        CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);  // 2: mode为2, group内同步
+        baseCubeCount++;
+    }
+    xL1Queue.FreeTensor(xL1LocalInt4);
+}
+```
+
+Its `cT` is, predictably, `half`:
+
+```cpp
+class GMMA8W4MSDL1OptCompute {
+public:
+    using cT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
+```
+
+and it carries the full `withOffset` / `xRowSum` asymmetric path from §3.5, plus a
+`VectorAtomicProcess` for the finalize-routing scatter-add.
+
+### Relevance
+
+- **This is the structure to copy for batch=1 decode, not §2's or §3's.** At `2M = 16` and
+  `K = 7168` the split A is `16 * 7168 / 2 = 57344 B = 56 KB`, which sits in A3's 512 KB L1 with
+  room to spare — so A can be loaded once per expert and every `baseN` tile and every quant group
+  reads it from L1. The other three implementations re-issue `SetTensorA(xGM[...])` per
+  `(N-tile, quant-group)` and let the hardware/L2 absorb the repetition. At tiny M the A traffic is
+  negligible either way in *bytes*, but the per-`Iterate` MTE2 setup is not negligible in a
+  2.x ms budget, and holding A in L1 also removes it from contention with the weight stream, which
+  is the only thing that should be moving.
+- **`DataCopy` with `Nd2NzParams` does GM-ND → L1-NZ for `int4b_t` directly.** Every `d`-axis
+  field is halved (`dValue = col/2`, `srcDValue = col/2`) and `dstNzC0Stride = Ceil(row,16)*16`.
+  That is the exact incantation; it is not documented anywhere we found, only shown here.
+- **`TSCM<TPosition::GM, 1>`** is the queue type that lets a `LocalTensor<int4b_t>` in L1 be passed
+  to `SetTensorA`. Worth noting because `TSCM`'s first template argument being `TPosition::GM` is
+  counter-intuitive.
+- **`mm.End()` is called per N tile**, not per expert — relevant to the `Matmul` object lifetime
+  question in `ascend-fusion-mechanics.md` §41.
+- **Same credit-window handshake as §5**: `CrossCoreWaitFlag(SYNC_AIV_TO_AIC)` gated on
+  `baseCubeCount >= baseNEachSingleN`, then `CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV)` with
+  the comment 「2: mode为2, group内同步」. Depth is `baseNEachSingleN`, i.e. the number of N tiles
+  per `singleN` — a data-derived credit depth rather than a constant.
