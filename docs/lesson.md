@@ -408,3 +408,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `cann_model.py` has the same md5 and take its bench, then patch that in
     place. Minimal patches to the tree's own files, never whole-file
     replacement from the repository.
+
+53. The round is 55x its own memory floor, and two thirds of it is neither
+    kernel. One decode round moves 1618 MB a die -- 1249 MB of W4 weights at
+    TP16 plus a 368 MB unshardable MLA latent at 8K -- which is 1.011 ms at
+    1600 GB/s against a measured 55.424 ms. The attention kernel at 89.4 µs a
+    layer and the vendor's grouped matmuls at 157.2 µs account for 19.2 ms of
+    it across seventy-eight layers; 36.2 ms is something else. So the target
+    is not against physics, it is 14.8x the floor, and the levers that matter
+    are not the two kernels: replacing the MoE with my fused one takes 19.2 ms
+    to 9.9 ms, nine milliseconds off fifty-five. Compute the floor before
+    choosing what to optimise.
