@@ -686,3 +686,10 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     weights and the fixpipe. The discipline that caught the last two was
     refusing a cross-process comparison, which is worth more than any of the
     four numbers.
+
+76. Fusing layers means interchanging the loops, not nesting them. Wrapping the
+    whole five-stage body in a layer loop made eight layers cost 6.15x one
+    launch, because the four grid barriers a layer become 4N. The saving was 23
+    percent -- the launch and the entry. Stage-major across layers takes the
+    barriers to four for the whole group, which is the only form of cross-layer
+    fusion the measurements support.
