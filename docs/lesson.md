@@ -730,7 +730,7 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     package does not deregister it, leaving 116.376 us and dragging the other
     two operators between states.
 
-80. The round is the kernel count times 28.8 us. A single elementwise multiply
+80. [Corrected by 82.] The round is the kernel count times 28.8 us. A single elementwise multiply
     over twelve elements costs 28.824 us on one die at this batch -- 8.5x the
     3.384 us an empty kernel suggested -- and a layer issues about 25 kernels.
     25 x 28.8 is 720 us against the round's measured 710 us a layer, so the
@@ -752,3 +752,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     measurements were right and only one answers the question, and which one
     that is became clear only after the per-kernel floor was measured at
     28.824 us for a twelve-element multiply.
+
+82. The per-kernel floor is eager dispatch, and the engine runs a graph. One
+    twelve-element multiply costs 11.386 us a call eager and 1.064 us under
+    captured replay, eleven times less. So lesson 80's model -- the round as
+    launch count times a 28.8 us floor -- is wrong, and its agreement with the
+    round's 710 us a layer was a coincidence of two wrong numbers. In a graph,
+    25 kernels a layer cost 27 us, under four percent. The 8.48 ms the MoE
+    kernel saves is real but its mechanism is the three HBM round trips the
+    vendor chain makes for its intermediates, not the three launches: those are
+    worth 0.25 ms. The case for one kernel over a chain is residency, which is
+    the classical argument, reached after measuring the wrong quantity twice.
