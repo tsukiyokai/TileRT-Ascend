@@ -82,3 +82,33 @@ that is on the device. Their combined effect on a 50.7 ms round is bounded by
 that third.
 
 The host side has never been measured at all.
+
+## Correction: the capture holds three rounds, not three requests
+
+Each `sk_*_full_model_start_static` is called three times, and a layer's super
+kernel runs once a round. So the capture holds **three rounds** -- consistent
+with its `max_tokens: 6` -- and the previous section divided its call counts by
+a request's 188 rounds instead.
+
+Redone per round:
+
+    78 super kernels at 210 us                        16.4 ms
+    21.3 collectives at 858 us (64 over three)        18.3 ms
+    81 attention calls at 37.46 us (244 over three)    3.0 ms
+    530 casts at 2.71 us (1590 over three)             1.4 ms
+    accounted                                        ~39.1 ms
+
+Against a measured round of 50.710 ms, that leaves about 12 ms rather than 34.
+
+## Which puts the collectives back as the largest single item
+
+18.3 ms a round, more than the super kernels themselves. The claim that they
+are "0.11 a round, not 34 ms of them" used 188 as the divisor for a capture
+containing three rounds.
+
+So the ordering of today's levers reverses again, and this time with the
+arithmetic checked: AIV acts on the largest item in the round. At 1.5 to 1.85x
+on the collectives it is worth 6 to 8 ms a round by itself.
+
+The remaining 12 ms is the host side the new instrumentation measures, and it
+is a quarter of the round rather than two thirds.

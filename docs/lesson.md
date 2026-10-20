@@ -1796,9 +1796,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      measured. The best arm's own record: 188 rounds at a p50 of 50.710 ms,
      each `advance_mtp_n` carrying `rounds: 1`, so that is one round entire.
      The kernel census puts 78 SuperKernels at 210 us, 16.4 ms. The missing 34
-     ms is not MTP (the arm runs `mtp None`, no draft graph) and not the
-     standalone collectives (64 over three requests is 0.11 a round). What
-     remains is the host: the drafter, the acceptance match, the Gloo
-     broadcast, and whatever happens between replays. Which bounds every lever
-     measured today -- AIV, the bank narrowing, attention redundancy all act on
-     the 16.4 ms that is on the device.
+     ms figure was wrong: each sk_* is called three times and a layer's super
+     kernel runs once a round, so the capture holds three rounds, not three
+     requests, and dividing its 64 collectives by 188 gave 0.11 a round instead
+     of 21.3. Per round the capture accounts for 16.4 ms of super kernels, 18.3
+     of collectives, 3.0 of attention and 1.4 of casts -- about 39 against a
+     measured 50.7, leaving 12 ms for the host rather than 34. The collectives
+     are the largest single item, which puts AIV first among today's levers at
+     6 to 8 ms a round.
