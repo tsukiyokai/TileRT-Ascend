@@ -1804,3 +1804,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      measured 50.7, leaving 12 ms for the host rather than 34. The collectives
      are the largest single item, which puts AIV first among today's levers at
      6 to 8 ms a round.
+
+174. A round makes 1108 eager aclnn calls outside its graph, and their dispatch
+     is the residual. Splitting the capture's kernels by name family gives, a
+     round: 43 collectives at 36.62 ms of device time, 637 captured super
+     kernel calls at 33.58, 1108 eager aclnn calls at 7.40, and 81 others. At
+     11.386 us of eager dispatch those 1108 calls cost 12.62 ms where graph
+     replay would cost 1.18 -- 11.44 ms a round, against the round's
+     unaccounted 12. It also corrects the layer figure: the super kernel is 637
+     calls totalling 33.58 ms a round, not 78 at 210 us. And device time now
+     sums to 77.6 ms against a measured round of 50.710, so the streams overlap
+     and device totals cannot be added into a round budget without knowing by
+     how much.
