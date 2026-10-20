@@ -110,6 +110,38 @@ __aicore__ inline void BeforeStore()
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
 }
 
+/** Order a load into UB against the scalar read that follows it.
+ *
+ * A `GetValue` is a scalar-unit read, so the edge is `MTE2_S` and not
+ * `MTE2_V` -- the vector edge says nothing about when the scalar unit may
+ * look. `Narrow` reads its per-row scale with `GetValue` straight after the
+ * copy that brings it in, and subblock one goes there with a cold buffer
+ * where subblock zero has just run `Activate` on the same tensors. That is
+ * why half the columns were wrong and the other half exact: 24571 of 24576 in
+ * columns 3072 and above, 0 of 24576 below.
+ */
+__aicore__ inline void AfterLoadForScalar()
+{
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+}
+
+/** Order a load against the vector work it is about to overwrite.
+ *
+ * The reverse direction, and the one a reused staging buffer needs. `MTE2_V`
+ * says the data has arrived; `V_MTE2` says the consumer is finished and the
+ * buffer may be refilled. Nothing in this kernel stalls MTE2, so without it
+ * the next load runs ahead and clobbers what its consumer has not read --
+ * which is how one `staging` tensor served two consecutive loads in
+ * `Combine` and produced a row maximum that disagreed with the reference
+ * while the product feeding it was exact.
+ */
+__aicore__ inline void BeforeLoad()
+{
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+}
+
 /** Order a store against the vector work that overwrites what it read. */
 __aicore__ inline void AfterStore()
 {
@@ -362,12 +394,14 @@ __aicore__ inline void Combine(LocalTensor<float>& into,
     PipeBarrier<PIPE_V>();
     Muls(into, into, 16.0F, span);
     PipeBarrier<PIPE_V>();
+    BeforeLoad();
     DataCopy(staging, product[low], span);
     AfterLoad();
     Cast(spare, staging, RoundMode::CAST_NONE, span);
     PipeBarrier<PIPE_V>();
     Add(into, into, spare, span);
     PipeBarrier<PIPE_V>();
+    BeforeLoad();
     DataCopy(spare, bias[at], span);
     AfterLoad();
     Add(into, into, spare, span);
@@ -408,6 +442,7 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
     DataCopy(scale, scale_global, GATE_UP);
     DataCopy(token, token_global, SCALE_SPAN);
     AfterLoad();
+    AfterLoadForScalar();
 
     for (int64_t row = 0; row < ROWS; ++row) {
         Combine(held.value, held.work, product_global, staging, bias_global,
@@ -439,9 +474,17 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
         Muls(held.value, activation[row * HALF], 1.0F / quantum, HALF);
         PipeBarrier<PIPE_V>();
         // Round to an integer before splitting, so both halves are exact.
-        Cast(held.half_value, held.value, RoundMode::CAST_RINT, HALF);
-        PipeBarrier<PIPE_V>();
-        Cast(held.value, held.half_value, RoundMode::CAST_NONE, HALF);
+        //
+        // One cast, both operands float. A `RoundMode` is a tie-break over
+        // the DESTINATION type's representable set, not an instruction to
+        // take an integer: float to half with CAST_RINT rounds to the nearest
+        // half, and only float to float rounds to an integer. The two-step
+        // version here computed ToHalf(x), which leaves the low nibble in
+        // [-8, 8) as a real -- so whenever x mod 16 reaches 15.5 the stored
+        // nibble is +8 and the INT4 cast saturates it to 7, one code unit
+        // short. The band that bites is x in [-0.5, 0), and a SwiGLU output
+        // measured against its own row maximum crowds exactly there.
+        Cast(held.value, held.value, RoundMode::CAST_RINT, HALF);
         PipeBarrier<PIPE_V>();
         SplitHalves(held, HALF);
         Emit(held.half_value, held.code, held.value, middle_high,
@@ -485,7 +528,7 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
     out_global.SetGlobalBuffer(out, ROWS * HIDDEN);
 
     DataCopy(row_scale, middle_global, SCALE_SPAN);
-    AfterLoad();
+    AfterLoadForScalar();
 
     for (int64_t row = 0; row < ROWS; ++row) {
         const float of_row = row_scale.GetValue(row);

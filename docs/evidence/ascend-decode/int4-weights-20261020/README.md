@@ -369,3 +369,63 @@ the down projection. The quantised intermediate reads
 plausible but unchecked against the reference. The method that found this
 defect finds that one too: print the reference's own value for the stage and
 compare.
+
+
+## Correct, at every shape, and four defects deep
+
+| experts | blocks | wall, µs | against the reference | INT8 form |
+|---|---|---|---|---|
+| 4 | 4 | 36.995 | 0 of 49152 | 38.761 |
+| 8 | 8 | 38.149 | 0 of 98304 | 40.000 |
+| 16 | 16 | **40.299** | **0 of 196608** | 41.990 |
+| 44 | 22 | 73.116 | 0 of 540672 | 74.555 |
+
+Four defects, each silent, each found by a different instrument.
+
+**The store's byte count.** `DataCopy` with an element count on a type whose
+`sizeof` is one and whose data is four bits writes twice as far as asked, so
+each tile overran the next and the last spilled exactly 1024 bytes past the
+region -- the duplicate that appeared 6144 bytes in and again 6144 further on.
+`DataCopyPad` with `span / 2` bytes. Found by dumping raw bytes at both
+candidate offsets, which was the one link six rounds of elimination never
+checked.
+
+**The rounding.** `Cast(half, float, CAST_RINT)` then
+`Cast(float, half, CAST_NONE)` does not round to an integer. A `RoundMode` is
+a tie-break over the *destination type's* representable set: float to half
+with `CAST_RINT` rounds to the nearest half, and only float to float rounds to
+an integer. The pair computed `ToHalf(x)` -- the host harness's own helper,
+defined and never called -- which leaves the low nibble in [−8, 8) as a real,
+so whenever `x mod 16` reached 15.5 the stored nibble was +8 and the INT4 cast
+saturated it to 7, one code unit short. The band that bites is x in [−0.5, 0),
+and a SwiGLU output measured against its own row maximum crowds exactly there.
+One line: `Cast(value, value, CAST_RINT)`, both operands float. Found by
+simulating the kernel rather than the specification -- the device's print read
+−9 at exactly the two columns whose reference code is 0, where saturation
+predicts −9, wrapping −24 and a correct split −8.
+
+**The reverse edge.** `Combine` loads two INT32 halves into one `staging`
+tensor back to back. `MTE2_V` says the data has arrived; `V_MTE2` says the
+consumer has finished and the buffer may be refilled. Nothing in this kernel
+stalls MTE2, so it ran ahead and the second load clobbered what the first
+cast had not read. Adding `V_MTE2` made the row scales match the reference
+exactly -- 0.00145008 and 0.000781054 -- and took the deviation from 49066 to
+24571.
+
+**The scalar edge.** A `GetValue` is a scalar-unit read, so an MTE2 load
+followed by one needs `MTE2_S`, not `MTE2_V`; the vector edge says nothing
+about when the scalar unit may look. `Narrow` reads its per-row scale that way
+immediately after the copy. Subblock zero got away with it because `Activate`
+had just run on the same tensors; subblock one arrived with a cold buffer.
+Localised by counting deviations per subblock rather than in total: columns
+0 to 3071 read 0 of 24576 and columns 3072 to 6143 read 24571 of 24576.
+
+## What it is worth, honestly
+
+4.0 to 4.6% against the INT8 kernel at the same shapes -- 40.299 against
+41.990 at sixteen experts -- not the 21% the incorrect version appeared to
+give. Halving the weight bytes buys 4%, which is the scalar-bound diagnosis
+confirmed once more: bytes are not what binds this kernel. The INT4 form still
+matters for production, because the INT8 form needs 302 MB a layer of widened
+weights and a full model does not fit, but it is not the 2x the byte count
+promised.

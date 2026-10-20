@@ -41,7 +41,7 @@ constexpr int64_t SCALE_STRIDE = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
                                  * BLOCK_FLOATS;
 constexpr size_t TILING_BYTES = 256;
 // One tile of INT4 a expert, which is how wide the kernel's stages work.
-constexpr int64_t TILE_BYTES = 1024;
+constexpr int64_t TILE_BYTES = 2048 / 2;  // one tile of INT4
 
 void Check(aclError status, const char* what)
 {
@@ -309,7 +309,8 @@ int main(int argc, char** argv)
         }
         std::printf("\n  16*high+low");
         for (int64_t at = 0; at < 8; ++at) {
-            std::printf(" %4d", 16 * nibble(at) + nibble(ROWS * HIDDEN + at));
+            std::printf(" %4d", 16 * nibble(at)
+                                + nibble(ROWS * HIDDEN + at) + 8);
         }
         // Where did the low halves actually land? Searching for them beats
         // guessing why they are not where they were addressed.
@@ -392,7 +393,8 @@ int main(int argc, char** argv)
             };
             std::printf("\n  intermediate 16*high+low, first 8:");
             for (int64_t at = 0; at < 8; ++at) {
-                std::printf(" %4d", 16 * four(at) + four(ROWS * HALF + at));
+                std::printf(" %4d", 16 * four(at)
+                                    + four(ROWS * HALF + at) + 8);
             }
             std::printf("\n  its row scale: %g %g", middle_scale_host[0],
                         middle_scale_host[1]);
@@ -438,6 +440,11 @@ int main(int argc, char** argv)
 
     int64_t wrong = 0;
     int64_t untouched = 0;
+    std::vector<int64_t> deviating_row(ROWS, 0);
+    // Narrow splits the 6144 columns between the two vector subblocks, so
+    // count the halves separately to say which subblock is wrong.
+    int64_t deviating_low_half = 0;
+    int64_t deviating_high_half = 0;
     std::vector<float> activation(HALF);
     std::vector<int8_t> code(HALF);
     for (int64_t expert = 0; expert < experts; ++expert) {
@@ -494,7 +501,14 @@ int main(int argc, char** argv)
                 untouched += (got == SENTINEL);
                 const int32_t slack = static_cast<int32_t>(got)
                                       - static_cast<int32_t>(ToBf16(want));
-                wrong += (slack > 1 || slack < -1);
+                const bool bad = (slack > 1 || slack < -1);
+                wrong += bad;
+                deviating_row[row] += bad;
+                if (column < HIDDEN / 2) {
+                    deviating_low_half += bad;
+                } else {
+                    deviating_high_half += bad;
+                }
             }
         }
     }
@@ -504,6 +518,17 @@ int main(int argc, char** argv)
     std::printf("against the host reference, 1 ulp allowed: %lld of %lld "
                 "(%lld untouched)\n", (long long)wrong, (long long)total,
                 (long long)untouched);
+    for (int64_t row = 0; row < ROWS; ++row) {
+        std::printf("  row %lld deviating: %lld of %lld\n", (long long)row,
+                    (long long)deviating_row[row],
+                    (long long)(experts * HIDDEN));
+    }
+    std::printf("  columns 0..3071 (subblock 0): %lld of %lld\n"
+                "  columns 3072..6143 (subblock 1): %lld of %lld\n",
+                (long long)deviating_low_half,
+                (long long)(experts * ROWS * HIDDEN / 2),
+                (long long)deviating_high_half,
+                (long long)(experts * ROWS * HIDDEN / 2));
 
     for (int round = 0; round < rounds; ++round) {
         timespec begin;

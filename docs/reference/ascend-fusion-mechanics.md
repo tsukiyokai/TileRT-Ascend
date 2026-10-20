@@ -21362,3 +21362,163 @@ interval is empty — so the activation itself differs, per column, by −6% to 
 the row maximum moves by +14.4% and +70.8%. A per-column perturbation of varying sign and relative size that no
 deterministic formula error produces is stale or partially-arrived data, which is the signature this section is
 about.
+
+## 59. ★★★ `RoundMode` on a `Cast` names the destination's representable set, not the integers — and the nibble-split identity that depends on it, with the sub-byte saturation table
+
+A `Cast` with `RoundMode::CAST_RINT` does not round to an integer unless the destination type is integral or the
+conversion is `float → float`. For `float → half` it rounds onto the half grid. The two cases differ in exactly one
+word of the vendor's prose, their worked examples use the same input and the same mode and disagree, and a
+quantisation epilogue that reaches for the wrong one of the two is silently off by one code unit on a few percent
+of its outputs. Paths below are relative to `/home/shanshan/repo/cann/asc-devkit/` (CANN 9.2.0, HEAD `6a51d0b`).
+
+### 59.1 The two statements, side by side, from one page
+
+`docs/zh/api/SIMD-API/basic_api/data_structures/precision_conversion.md:520-524` — `float → half`:
+
+> ### float → half
+>
+> 将源值按照精度舍入模式**取到half所能表示的数**，以half格式存入目的操作数中。
+>
+> **示例**：输入：$0.5 + 2^{-12}$ …
+> - **CAST_RINT模式**舍入得尾数`0000000000`，$E_v = 14$，$M_v = 0$，最终结果为$0.5$。
+
+`:575-583` — `float → float`:
+
+> ### float → float
+>
+> 将源值按照精度舍入模式**取整**，仍以float格式存入目的操作数中。
+>
+> **示例**：输入：$0.5$。
+> - **CAST_RINT模式**输出：$0.0$。
+> - **CAST_FLOOR模式**输出：$0.0$。
+> - **CAST_CEIL模式**输出：$1.0$。
+> - **CAST_ROUND模式**输出：$1.0$。
+> - **CAST_TRUNC模式**输出：$0.0$。
+
+取到…所能表示的数 against 取整. Input 0.5, mode `CAST_RINT`: `float → half` yields 0.5, `float → float` yields 0.0.
+The enum's own wording says the same thing in bit terms — `:19-20`:
+
+> | CAST_NONE | 当转换过程存在精度损失时，按CAST_RINT模式处理；当不存在精度损失时，不进行舍入。 |
+> | CAST_RINT | 向最近的偶数舍入。<br>• 若待舍入部分的首位为0，则不进位。<br>• 若待舍入部分的首位为1且后续位不全为0，则进位。<br>• 若待舍入部分的首位为1且后续位全为0：当非舍入部分的末位为0，则不进位；当非舍入部分的末位为1，则进位。 |
+
+待舍入部分 is "the part that cannot be kept", which is the mantissa tail for a narrowing float conversion and the
+fractional part for an integral one. The mode is a tie-break rule over the destination's grid, nothing more.
+
+The dtype table in `Cast.md` corroborates this structurally, and is the quickest way to tell which kind a row is:
+`:163` is `| float | half | CAST_RINT/CAST_FLOOR/CAST_CEIL/CAST_ROUND/CAST_TRUNC/CAST_ODD/CAST_NONE |` — it carries
+`CAST_ODD` (Von Neumann rounding, a mantissa-level mode) and `CAST_NONE`, so it is a precision conversion; `:166`
+is `| float | float | CAST_RINT/CAST_FLOOR/CAST_CEIL/CAST_ROUND/CAST_TRUNC |` — the five integral modes and **no**
+`CAST_NONE`, because an unrounded `float → float` would be a no-op, so it is the 取整 form. Reading a row's mode
+list tells you which semantics you are getting.
+
+For completeness, the integral cases this interacts with — `:230-238` and `:561`:
+
+> ### half → int4b_t
+>
+> 将源值按照精度舍入模式取整，以int4b_t格式存入目的操作数中。
+>
+> **示例**：输入：$1.5$，小数部分需要舍入。
+> - **CAST_RINT模式**输出：$2$。
+
+### 59.2 Overflow on a sub-byte destination saturates, and the table proves it rather than merely allowing it
+
+`precision_conversion.md:30`:
+
+> 当源值超出目标类型的表示范围时溢出，溢出默认按照**饱和模式**处理。
+
+The mode bit is `CTRL[59]` (`impl/basic_api/kernel_operator_common_intf_impl.h:236-240`,
+`impl/basic_api/kernel_macros.h:110`), flippable with `SetSaturationFlag<SaturationMode::CAST>`. Caveat worth
+carrying: `InitSocStateImpl` does not program `CTRL[59]` on 2201, so on A2/A3 the saturating default is
+documentary rather than pinned in repo code.
+
+The type-specific confirmation is 表32 in
+`docs/zh/api/appendix/memory_vector_compute_interface_boundary_value_summary.md:1365-1370`:
+
+> | src数据类型/dst数据类型 | src输入数据 | dst输出数据（INF/NAN模式） | dst输出数据（饱和模式…） |
+> | half/int4b_t | MAX | 7 | 7 |
+> | half/int4b_t | MIN | -8 | -8 |
+> | half/int4b_t | +0/-0 | 0 | 0 |
+> | half/int4b_t | nan | 0 | 0 |
+> | half/int4b_t | +inf | 7 | 7 |
+> | half/int4b_t | -inf | -8 | -8 |
+
+The `+inf → 7` and `-inf → -8` rows discriminate saturation from wrapping outright rather than being merely
+consistent with it: an infinity has no modular residue, so a wrapping implementation could not produce 7. Both
+columns agree, so the result does not depend on the mode bit. And `half → int8_t` at
+`precision_conversion.md:244-252` tabulates the **order** of the two operations — input $2^7 - 0.5$ under
+`CAST_RINT` gives $2^7 - 1$, i.e. round first, then clamp; a wrapping implementation would have given −128.
+
+### 59.3 ★ The consequence for an activation split into two INT4 nibbles
+
+The MSD split `high = floor(x/16)`, `low = x - 16*floor(x/16) - 8` is exact and its recombination is faithful —
+but only for *integral* x, and the faithfulness and the representability are two different claims.
+
+Faithfulness holds for every real x: write `m = 16*floor(x/16)` and `r = x - m`, so `r ∈ [0, 16)`; both `m` and 8
+are even, round-half-to-even commutes with translation by an even integer, so `m + rint(r - 8) + 8 = rint(m + r)
+= rint(x)`. A recombination `16*high + low + 8` therefore returns `rint(x)` whatever x is.
+
+Representability does not. `low = r - 8 ∈ [-8, 8)` as a real number, and the packing `Cast`s round it, so the
+stored nibble is `rint(r - 8)`, which is **+8 exactly when `r >= 15.5`** — outside signed INT4. The escape set is
+`x ∈ ⋃ₖ [16k + 15.5, 16k + 16)`, one thirty-second of the line, and by §59.2 the nibble saturates to 7, costing
+exactly one unit in the recombined value. (Were `CTRL[59]` flipped to wrapping it would cost 16.)
+
+Two things make this worse than 1/32 in practice. First, the band at `k = -1` is `x ∈ [-0.5, 0)` — **every small
+negative value escapes**, and a SwiGLU output measured against its own row maximum concentrates near zero.
+Second, the escape is invisible: no assert, no log, and the saturated nibble is a perfectly legal INT4.
+
+Measured, on a uniform sweep of `x ∈ [-127, 127]` at 2e6 samples, with the low half rounded then saturated:
+**2.9528% of x escape [-8, 7]** and **2.0751% of recombinations differ from `nearbyint(x)`**, always by exactly 1.
+Feeding the same chain an integral x gives **0 and 0**.
+
+The operational rule: **round to an integer before splitting, and do it with a conversion whose destination is
+integral or `float → float`.** A `float → half → float` round trip is not that conversion; it lands on the half
+grid, whose spacing at magnitude 64 is 0.0625, so the value entering the split is not an integer and 1/32 of the
+column space escapes. One `Cast(dst, src, RoundMode::CAST_RINT, n)` with both operands `float` is the instrument,
+lowers to `vconv_f322f32r` (`impl/basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:508-545`), and may be done
+in place — 100% source/destination overlap is the sanctioned overlap case
+(`docs/zh/api/SIMD-API/general_description_and_constraints.md:70`: 「单次迭代内：源操作数与目的操作数必须100%完全
+重叠」). A `float → int32 → float` pair through an existing int32 staging buffer is the alternative.
+
+## Relevance
+
+This is the second of the two defects in `tests/glm52/routed_int4/routed_int4_kernel.cpp`, and the only one whose
+effect could be predicted exactly before the next device run. Kernel lines 441-444 read
+
+```cpp
+        // Round to an integer before splitting, so both halves are exact.
+        Cast(held.half_value, held.value, RoundMode::CAST_RINT, HALF);
+        PipeBarrier<PIPE_V>();
+        Cast(held.value, held.half_value, RoundMode::CAST_NONE, HALF);
+```
+
+and by §59.1 that computes `ToHalf(x)`, not `rint(x)` — which is, verbatim, the host harness's own `ToHalf` helper
+at `routed_int4_main.cpp:61-72`, a function the reference defines and never calls. The comment states the right
+intent and the code performs a width change instead of a rounding. The first split is unaffected because its input
+is an INT8 and therefore already integral; only the requantisation of the SwiGLU output goes through a non-integral
+value, which is exactly where the chain diverges.
+
+Quantified at `experts=4`, `ROWS_PER_EXPERT=2`, with the row quantum correct and the low half saturating:
+**46 of 1024 intermediate codes wrong** (41 from the escape, 5 from `ToHalf` crossing a half-integer and changing
+`rint`), each by one unit, and **23572 of 49152 outputs outside the harness's one-bf16-ulp tolerance**, with slack
+histogram `|0|..|6|, >=7` = `10971 14609 7358 4101 2455 1671 1170 6817`. Substituting the single `float → float`
+`Cast` takes all of those to zero. Two independently written simulators — one auditing the kernel, one auditing the
+device numbers — produced those five figures and that seven-bin histogram digit for digit, which is the strongest
+corroboration available without hardware.
+
+The device print recorded in `docs/evidence/ascend-decode/int4-weights-20261020/README.md` carries the escape's
+fingerprint directly, and this is what identified it. For expert 0 row 0 the reference codes are
+`-1 0 4 -5 5 14 1 0`, so a correct kernel's `16*high + low` print would be `-9 -8 -4 -13 -3 6 -7 -8`; the device
+printed `-9 -9 -5 -13 -2 5 -7 -9`. The model's escape set for that row is columns 1 and 7 — the two columns whose
+reference code is 0, hence whose `x ∈ [-0.5, 0)` — and the device printed `-9` rather than `-8` at precisely
+columns 1 and 7. Saturation predicts `-9` there; wrapping predicts `-24`; a correct split predicts `-8`. Nothing
+else in the hypothesis space produces `-9` at those two positions and nowhere else.
+
+One caution, because it is what keeps this from closing the case. A sweep of the quantum over `[0.0005, 0.004]` at
+3.5e6 points, running the full device model, reaches at best **7 of 8** agreement with that print (at
+`q = 0.001512329`) and **never 8 of 8** — so the recorded run also had a wrong row maximum, which the escape model
+cannot supply. The two reported row scales `0.00165845` and `0.0013341` match neither the reference pair
+`0.00145008` / `0.000781054` nor each other's ratio under any single-fault rescaling. The `float → float` `Cast`
+is a complete and provable fix for the codes; it is not a fix for the quantum, which is §58's territory. The
+discriminating measurement is to re-read the two row scales after the `Cast` change: if they read
+`0.00145008` and `0.000781054`, the remaining deviation should land on **23572** and the synchronisation edges are
+latent; if they still disagree, §58's `V_MTE2` gap is live.
