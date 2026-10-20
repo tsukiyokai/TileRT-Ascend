@@ -93,3 +93,22 @@ single constant with a measurable consequence.
 
 That is a far better position than six excluded arithmetic candidates, and it
 came from varying the shape rather than the inputs.
+
+## And the two per-row constants are both correct
+
+`STRIDE = M_TILE / 2 = 8` with `M_TILE = 16`, and the recombination is
+`C[r] = 16 * C'[r] + C'[STRIDE + r]` -- the comment at the top of the kernel.
+So `Split` writes a row's high nibbles at `r` and its low nibbles at `8 + r`,
+and the cube's M=16 matmul covers both. At one row that is rows 0 and 8; at
+four rows it is 0 to 3 and 8 to 11. Correct in both cases, and correct for any
+row count up to eight.
+
+`SCALE_SPAN` is `ceil(STRIDE / BLOCK_FLOATS) * BLOCK_FLOATS = 8`, and the
+vendor comparison builds its per-token scales as
+`token_scale.reshape(EXPERTS, 8)[:, :ROWS]`. Consistent.
+
+So both per-row constants are right and the 32 percent at four rows is still
+unexplained. What the bisection establishes is where to look -- the multi-row
+path -- not which line. The honest state is a localised defect with its two
+obvious causes excluded, which is better than six excluded arithmetic
+candidates and not yet a diagnosis.

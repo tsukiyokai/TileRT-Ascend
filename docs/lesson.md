@@ -1328,6 +1328,9 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      measurement: one expert and one row agree to 1.0 percent, one expert and
      four rows differ by 32, many experts at one row by 7. So the defect is in
      handling more than one row, which no input sweep could have shown -- every
-     one of them held the shape fixed at sixteen experts and one row. Two
-     per-row quantities remain, and the scale slots were already checked, so
-     the M-axis offset is one constant away.
+     one of them held the shape fixed at sixteen experts and one row. Both
+     per-row constants then checked out on reading -- STRIDE is 8 with M_TILE
+     16, and the recombination C[r] = 16 C'[r] + C'[STRIDE + r] is correct for
+     any row count up to eight, while SCALE_SPAN matches what the comparison
+     builds. So the bisection says where to look, not which line, and
+     localising is not diagnosing.
