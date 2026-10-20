@@ -1434,3 +1434,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      us a layer, which is 50 percent below eager but only 25 percent below the
      213.9 us a captured layer replays at -- and the engine already captures.
      The remaining gap is 54.5 us a layer, 4.25 ms a round, device-side.
+
+145. Capture helps a layer's small operators half as much as it helps
+     attention, which is the premise the fold needed. Timed one at a time on
+     one die, the ratio of graph replay to eager is 0.338 for attention and
+     0.49 to 0.72 for the six small items -- and 1.019 for the fused input
+     projection, which capture does not touch at all. Their in-graph total is
+     272.82 us against attention's 81.26. The absolute figures are unusable
+     because each operator timed alone pays its own synchronisation and replay
+     launch, summing to 636.87 eager against the layer account's 317.476; the
+     ratios are the finding. An operator a graph cannot speed up is one whose
+     cost sits in the kernel, where only a fold reaches it.
