@@ -95,7 +95,22 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
 
-## 2026-10-21 三条杠杆复核，两条翻转
+## 2026-10-21 定案：一轮的代价在算子边界，不在算术也不在下发
+
+- 每 kernel 下发地板：eager 11.4 µs、**图回放 1.064 µs**。引擎跑图，所以下发只
+  占一层 710 µs 的 4%，剩下是设备时间。
+- MoE 矩阵乘与行数几乎无关（16 行 146 µs、256 行 151 µs），所以那 12.3 ms 不是
+  算术。
+- 真正可省的是**算子边界的 HBM 往返**：vendor 四次下发 181.172 µs 对单 kernel
+  72.463 µs，省 **8.48 ms/轮**。
+- 跨层融合封顶 23%（嵌套 8 层 6.15x，交换因 scratch 复用而 N²，构造无效）。
+- 自定义算子包：CANN 自带 grouped matmul 66.813 µs 最快，owner overlay 97.362、
+  vllm-ascend 包 123.985、两者 104.929。但该包在 norm 与 gating 上快 22%，所以
+  整体 unset 净 1.4 ms，精确回落需正确的取消注册（删文件无效）。
+- 起草侧：自适应提案宽度（上轮接受数的两倍）省 **9.7% TPOT**；树在编辑率 0.02
+  下接受 14.510，2.x 条件可达。
+
+## 2026-10-21 三条杠杆复核，两条翻转（口径已被上节修正）
 
 - MoE 单 kernel：cube 半边从 UB 读 group count（该核无 UB 访问权）而跳过全部
   专家，79.206 µs 测的是空转。修好后 365.887 µs 对 vendor 157.176，**慢
