@@ -843,3 +843,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     regardless of size, so the last factor of two must come from doing less a
     round rather than from merging more: fewer layers per token, or more tokens
     accepted per evaluation.
+
+90. The checkpoint shipped a trained draft head and nobody loaded it.
+    `num_hidden_layers: 78` with `num_nextn_predict_layers: 1`, and the weight
+    index carries layers 0 to 78 -- 79 of them. Layer 78 is the MTP head. The
+    engine passes `speculative_config=None` and refuses a drafter at
+    `cann_model.py:263`, so every acceptance figure measured here comes from a
+    host-side suffix automaton that can only repeat what it has seen, which is
+    why acceptance falls from 10.020 to 1.824 as the edit rate goes from 0.02
+    to 0.20. A trained head predicts instead of recalling. One extra layer a
+    round is 1.3 percent, and acceptance of 15 against today's 9.288 is the
+    difference between 4.9 ms and 2.4.

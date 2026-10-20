@@ -35,6 +35,19 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 合计约 53 ms，未归属 2 ms。地板是 HBM 1.011 ms/轮，所以目标不受物理限制，
 问题全在固定开销。[地板](evidence/ascend-decode/round-roofline-20261020/README.md)
 
+## 最大的未动杠杆：checkpoint 自带的 MTP 层
+
+`num_hidden_layers: 78` 而权重索引含 **0..78 共 79 层**，第 78 层就是
+`num_nextn_predict_layers: 1` 那个训练过的草稿头。引擎从未加载它
+（`cann_model.py:152` 传 `speculative_config=None`，263 行直接拒绝 drafter），
+所以至今所有接受率都来自宿主侧后缀自动机——它只能复述见过的内容，改写段必盲。
+代价是每轮多一层（78 的 1.3%）。
+[证据](evidence/ascend-decode/mtp-layer-unused-20261021/README.md)
+
+    一轮 35.1 ms（边界合并后）
+    接受 9.288（自适应树）        TPOT 4.9 ms
+    接受 15（MTP 的常见量级）     TPOT ≈ 2.4 ms  ← 目标
+
 ## 已建成、未进引擎
 
 | 杠杆 | ms | 状态 |
