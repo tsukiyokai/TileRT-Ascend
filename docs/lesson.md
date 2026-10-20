@@ -1720,3 +1720,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      Since every comparison here is checked for bit-exactness, the engine sets
      both. And the earlier knob sweep tested HCCL_DETERMINISTIC=false and read
      it as no improvement: the useful direction was the one not tried.
+
+167. The AIV knob was already in this repository -- `run_phases.sh:38` and
+     `profile_cast_sites.sh:24` export it, and `a3-calibration/hccl_latency.cpp`
+     sweeps it -- so today's work quantified and defaulted it rather than
+     discovering it. What is new: the gain's size at decode shapes, its
+     attribution to the per-call floor (1.83x at two ranks, where there is no
+     fan-out), the three-layer cost decomposition, and that AIV is not
+     reproducible by default. And the first thing to check when a knob turns
+     out to be older than the finding is whether the baseline already had it:
+     nothing under lever84-20261020 carries any HCCL variable, so the 9.3794 ms
+     was measured on the AI CPU path and the gain is still ahead rather than
+     already counted.

@@ -162,3 +162,25 @@ reproducibility is not optional and the engine sets both.
 
 An earlier sweep tested `HCCL_DETERMINISTIC=false` and read it as no
 improvement. The useful direction was the one not tried.
+
+## The knob was already known here; what is new is the measurement and the default
+
+`tests/glm52/run_phases.sh:38` and `tests/glm52/profile_cast_sites.sh:24`
+already `export HCCL_OP_EXPANSION_MODE=AIV`, and
+`tests/a3-calibration/hccl_latency.cpp` carries it in a list of HCCL variables
+it sweeps. So this page does not discover the mode.
+
+What it adds: the size of the gain at decode shapes (1.6 to 1.9x on all three
+collectives), its attribution to the per-call floor rather than fan-out (1.83x
+at two ranks, where there is no fan-out), the three-layer decomposition of a
+collective's cost, and that AIV is **not reproducible** by default with
+determinism costing 6 to 8 percent.
+
+And it matters that the arm which produced the project's best TPOT did not set
+it: nothing under `lever84-20261020` carries any HCCL variable. So the 9.3794
+ms was measured on the AI CPU path and the gain is still ahead rather than
+already counted -- which is the first thing to check when a knob turns out to
+be older than the finding.
+
+Setting it in `CannModel.__init__` rather than in a launcher is the point: it
+stops depending on which script remembers to export it.
