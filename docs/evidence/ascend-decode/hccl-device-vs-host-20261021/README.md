@@ -43,3 +43,44 @@ So the lever is not fewer calls -- it is **not waiting between them**. Whether
 the engine's decode already issues its collectives back to back, or inserts a
 synchronisation each time, is the measurement that follows, and it is a reading
 of the engine rather than a sweep.
+
+## Correction: the engine's own collectives are 858 us on the device, not 10
+
+From `profile-rope-20261018`'s `kernel_details.csv`, rank 1:
+
+    hcom     64 kernels    54.94 ms    858.36 us each
+    other  5544 kernels   179.14 ms     32.31 us each
+      hcom_allGather  34 calls   882.45 us each
+      hcom_allReduce  30 calls   831.06 us each
+
+Eighty times the native calibration's 10.74 us. So the reversal above -- that
+the cost is host-side and amortises when calls are not serialised -- does not
+follow for the engine. Its collectives cost that much *on the device*.
+
+## And the spread says there is a straggler, without separating it
+
+The same count of calls on every rank, with very different totals:
+
+    rank  1    64 calls    54.94 ms    858 us each
+    rank 14    64 calls   140.18 ms   2190 us each
+    rank 12    64 calls   219.14 ms   3424 us each
+    spread 54.94 to 219.14 ms, ratio 3.99
+
+A collective's Duration includes time blocked on peers, so a fourfold spread
+means arrival times differ widely. But the fastest rank still reports 858 us a
+call, and a collective synchronises everyone -- so even the earliest arrival
+waits for the last. The spread therefore establishes that a straggler exists
+and does **not** isolate what the operation itself costs.
+
+## Where this leaves the 374 us a layer
+
+Unattributed again, honestly. Three readings have now been tried: torch-level
+per-call cost (183 to 296 us, which the native tool shows is mostly host), the
+native device cost (10.74 us, which the engine does not match), and the
+engine's own profile (858 us a call, which includes peer waiting). None of them
+is a measurement of the work.
+
+What would separate them is a capture with per-rank arrival timestamps at each
+collective, which is what `--arrival` style instrumentation gives and this
+profile does not carry. That is the next measurement, and it needs the machine
+the arms are queued on.

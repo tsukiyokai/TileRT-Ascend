@@ -1744,3 +1744,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      bandwidth nor participants nor host dispatch" rested on a compute kernel's
      1.064 us replay issue, which is a different host path. The direction
      reverses with it: not fewer calls but no wait between them.
+
+169. Three readings of the collective cost, none of them the work. The
+     torch-level per-call figure is 183 to 296 us and the native calibration
+     shows that is mostly host issue, amortising twelvefold in a chain. The
+     native device figure is 10.74 us. The engine's own profile says 858 us a
+     call on the device -- eighty times the native number -- and the totals per
+     rank spread 3.99x at an identical call count, which proves a straggler but
+     cannot isolate it, because a collective synchronises everyone and even the
+     earliest arrival waits for the last. So the 374 us a layer is unattributed
+     again. Each reading was used to overturn the one before it, and each was a
+     different scope: that is the error to stop repeating, not any one of the
+     numbers.
