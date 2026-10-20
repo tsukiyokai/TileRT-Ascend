@@ -1,4 +1,4 @@
-"""Send a layer's routed experts to the hand-written kernel.
+"""Send a layer's routed experts to the hand-written INT4 kernel.
 
 The kernel replaces what `GroupedMatmulSwigluQuantV2` and `GroupedMatmul` do
 together, and those are reached through different packages -- the first
@@ -10,25 +10,17 @@ caller is reachable because the MoE body is already an opaque custom op, so
 the quant method is re-entered on every eager invocation and once during
 capture.
 
-The weights need no rearrangement. `w13_weight` arrives as
-`(256, 128, 6144)` INT8 with two nibbles a byte, which unpacks to
-`(256, 256, 6144)` -- `[expert][N][K]`, which is what the kernel reads -- and
-`w2_weight (256, 3072, 128)` unpacks to `(256, 6144, 128)`. The scales are
-already FP32 per output channel. Widening INT4 into INT8 containers is
-lossless and yields the identical `mad`, so no MSD correction is needed on
-this path either.
-
-What it costs is memory: 302 MB a layer of widened weights, so the whole model
-would want 22.65 GB that a 64 GB part at utilisation 0.78 does not have. This
-is a per-layer experiment by construction, which is why `install` takes the
-layers to convert.
+Nothing about the weights is rearranged. The checkpoint stores packed INT4
+codes -- `w13_weight (256, 128, 6144)` is `[expert][N][K/2]` and
+`w2_weight (256, 3072, 128)` is `[expert][K][N/2]` -- which is what the kernel
+reads, and `w13_scale_bias` and `w2_scale_bias` are the per-output-channel
+FP32 correction the asymmetric quantisation needs, added once after the MSD
+recombination and before the activation scale.
 """
 import ctypes
 import os
 
-LIBRARY_DIR = os.environ.get(
-    "TILERT_ROUTED_LIB_DIR", "/workspace/src/routed-so",
-)
+LIBRARY_DIR = os.environ.get("TILERT_ROUTED_LIB_DIR", "/workspace/src/int4-so")
 EXPERTS_PER_RANK = 16
 BLOCKS = 16
 
@@ -37,37 +29,18 @@ def _load():
     """Bring in the kernel's library, before torch sees the operator.
 
     `libascendcl` is a runtime dependency of the kernel object, and loading
-    the extension with `RTLD_GLOBAL` first is what lets `load_library` resolve
-    it.
+    the extension with `RTLD_GLOBAL` first is what lets `load_library`
+    resolve it.
     """
     import torch
 
-    ctypes.CDLL(f"{LIBRARY_DIR}/routed_expert_torch.so",
-                mode=ctypes.RTLD_GLOBAL)
-    torch.ops.load_library(f"{LIBRARY_DIR}/routed_expert_torch.so")
-
-
-def _unpack(packed):
-    """Two INT4 nibbles a byte to one INT8 an element, low nibble first.
-
-    The checkpoint's packing contract: byte `i` holds element `2i` in its low
-    nibble and `2i + 1` in its high one, and a row of an `(M, N)` tensor
-    starts at byte `r * N / 2`.
-    """
-    import torch
-
-    low = (packed & 0x0F).to(torch.int8)
-    high = ((packed >> 4) & 0x0F).to(torch.int8)
-    low = torch.where(low > 7, low - 16, low)
-    high = torch.where(high > 7, high - 16, high)
-    widened = torch.stack((low, high), dim=-1)
-    return widened.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    ctypes.CDLL(f"{LIBRARY_DIR}/routed_int4_torch.so", mode=ctypes.RTLD_GLOBAL)
+    torch.ops.load_library(f"{LIBRARY_DIR}/routed_int4_torch.so")
 
 
 def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
     """Point `layers`' routed experts at the kernel; return how to undo it.
 
-    `layers` are the MoE layer objects whose quant method is to be replaced.
     The replacement is per object rather than per class, so the layers left
     out keep the vendor path and the comparison is within one run.
     """
@@ -77,32 +50,24 @@ def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
     undo = []
     for layer in layers:
         method = layer.quant_method
-        gate_up = _unpack(method.w13_weight.data).contiguous()
-        down = _unpack(method.w2_weight.data).contiguous()
-        gu_scale = method.w13_weight_scale.data.squeeze(-1).contiguous()
-        down_scale = method.w2_weight_scale.data.squeeze(-1).contiguous()
+        held = (method.w13_weight.data, method.w13_scale_bias.data.squeeze(-1),
+                method.w13_weight_scale.data.squeeze(-1), method.w2_weight.data,
+                method.w2_scale_bias.data.squeeze(-1),
+                method.w2_weight_scale.data.squeeze(-1))
         original_first = method.apply_gmm1_act_quant
         original_second = method.apply_gmm2
 
-        def quantise(compute, _method=method):
-            """The tree's own activation quantisation, reused as it is."""
-            return _method._quant_hidden_states(compute.hidden_states,
-                                                compute.dynamic_scale)
-
-        def first(compute, _gate_up=gate_up, _down=down,
-                  _gu_scale=gu_scale, _down_scale=down_scale, _layer=layer):
+        def first(compute, _held=held, _layer=layer, _method=method):
             """Do the whole chain, and leave the second call a hand-back.
 
-            The signature is the tree's own: one `MoEMlpComputeInput`
-            carrying the permuted activation and its per-token scale. The
-            vendor path splits the chain across two methods with a
+            The vendor path splits it across two methods with a
             global-memory round trip between them; this does both and
             remembers the result for the second to return.
             """
-            rows, token_scale = quantise(compute)
+            rows, token_scale = _method._quant_hidden_states(
+                compute.hidden_states, compute.dynamic_scale)
             _layer._tilert_output = torch.ops.tilert.routed_experts(
-                rows, _gate_up, _gu_scale, _down, _down_scale, token_scale,
-                experts, blocks)
+                rows, *_held, token_scale, experts, blocks)
             return _layer._tilert_output, token_scale
 
         def second(compute, hidden_states, act_out_scale, _layer=layer):

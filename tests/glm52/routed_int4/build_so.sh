@@ -28,22 +28,22 @@ torch_incs="-I $SP/torch/include -I $SP/torch/include/torch/csrc/api/include"
 torch_incs="$torch_incs -I $SP/torch_npu/include"
 
 /opt/ascend/cann-9.2.0/bin/bisheng -xcce --npu-arch=dav-2201 -std=c++17 -O2 \
-  -fPIC $device_incs -c "$here/routed_expert_kernel.cpp" \
+  -fPIC $device_incs -c "$here/routed_int4_kernel.cpp" \
   -o "$out/kernel.o" > "$out/kernel.log" 2>&1
-g++ -std=c++17 -O2 -fPIC $host_incs -c "$here/routed_tiling.cpp" \
+g++ -std=c++17 -O2 -fPIC $host_incs -c "$here/routed_int4_tiling.cpp" \
   -o "$out/tiling.o" > "$out/tiling.log" 2>&1
 g++ -std=c++17 -O2 -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 \
-  $torch_incs $host_incs -c "$here/routed_expert_binding.cpp" \
+  $torch_incs $host_incs -c "$here/routed_int4_binding.cpp" \
   -o "$out/binding.o" > "$out/binding.log" 2>&1
 g++ -shared "$out/kernel.o" "$out/tiling.o" "$out/binding.o" \
-  -o "$out/routed_expert_torch.so" \
+  -o "$out/routed_int4_torch.so" \
   -L"$H/lib64" -L/opt/ascend/cann-9.2.0/lib64 \
   -L"$SP/torch/lib" -L"$SP/torch_npu/lib" \
   -ltiling_api -lplatform -lascendcl -lruntime -lunified_dlog -lc_sec \
   -lregister -lprofapi -ltorch -ltorch_cpu -lc10 -ltorch_npu \
   > "$out/link.log" 2>&1
 
-[ -f "$out/routed_expert_torch.so" ] && echo "built $out/routed_expert_torch.so" || {
+[ -f "$out/routed_int4_torch.so" ] && echo "built $out/routed_int4_torch.so" || {
   echo "build failed"
   for log in kernel tiling binding link; do
     printf -- "--- %s\n" "$log"

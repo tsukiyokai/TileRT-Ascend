@@ -31,7 +31,7 @@ sanitize=${SANITIZE:+--cce-enable-sanitizer}
 debug=${DEBUG:+-g}
 arch=${ARCH:---npu-arch=dav-2201}
 # Which of the two differences from the routed kernel is at fault.
-shape="-DAS_MIX=${AS_MIX:-0} -DCUBE_ONLY=${CUBE_ONLY:-0} -DLOW_AT=${LOW_AT:-256} -DSPAN_K=${SPAN:-256}"
+shape="-DAS_MIX=${AS_MIX:-0} -DCUBE_ONLY=${CUBE_ONLY:-0} -DLOW_AT=${LOW_AT:-256} -DSPAN_K=${SPAN:-256} -DGATED=${GATED:-0}"
 # K of the probe tile, so the ordering of fractals along K is observable.
 host_incs="-I $H/tikcpp/tikcfw -I $H/tikcpp/tikcfw/lib -I $H/tikcpp/tikcfw/impl"
 host_incs="$host_incs -I $H/tikcpp/tikcfw/interface"

@@ -20,39 +20,44 @@ And the bias is not zero. Reading the shard directly:
       first 16 values, 16 nonzero:
       [-0.001393, 0.076904, 0.000794, 0.017286, 0.001723, 0.025291, ...]
 
-## What that makes of the zero-mismatch results
+## What it does and does not make of the zero-mismatch results
 
-The INT8 kernel reports 0 of 49152 at 4/4, 8/8, 16/16 and 44/22, and the INT4
-kernel 0 of 540672 after its four defects were fixed. Both were checked
-against a host reference written from the same reading of the format that the
-kernels implement: symmetric dequantisation, `Σ(x·q)·s`. So the agreement is
-real and says what it says -- the kernel computes what the reference computes
--- and that is a statement about consistency. It is not a statement about the
-format. Both sides omit the offset.
+My first reading was that the kernels and the host reference shared the
+omission, so their agreement was vacuous. That was wrong, and the correction
+is the useful part.
 
-The vendor does not. `_get_mlp_scale_bias` returns `w13_scale_bias` and
-`w2_scale_bias`, and they are passed as `weight_assist_matrix` to
-`grouped_matmul_swiglu_quant_v2` and as `bias` to `npu_grouped_matmul` --
-per output channel in both, added after dequantisation.
+`reference_weights.py` carries the term and documents the convention:
+`"w4_scale_bias": "Checkpoint correction added once after 16H+L"`, read as
+`prefix + ".scale_bias"`, and applied in `w4_msd_product` as
 
-## The fix, and what remains unverified
+    result = 16 * high_scaled + low_scaled
+    result = result + correction
+    return (result * activation_scale).to(output_dtype)
 
-A column add on the accumulator after dequantisation, one FP32 value an output
-channel. The vector pipe is at 1.3% utilisation against a scalar pipe at
-62.5%, so the arithmetic is free; what it costs is a buffer for the bias and
-the loads to fill it.
+-- after the MSD recombination, before the activation scale. The INT4 kernel
+carries it too: `gu_bias` and `down_bias` are in its launch signature and it
+loads them. So the INT4 zero-mismatch results stand, and the convention never
+needed a device run to settle; it was in the tree.
 
-What is verified here is that the term exists, is nonzero, and is absent from
-my kernels. What is not verified is the exact convention -- whether the vendor
-adds it to the dequantised product as `npu_grouped_matmul`'s documented `bias`
-contract implies, or folds it some other way, and whether `weight_offset`
-needs separate handling beyond it. Both questions are answered by one run
-against the vendor operator on a single die, which is the next device work
-this path needs; guessing the convention would repeat exactly the error this
-page records.
+What lacks the term is the INT8 kernel alone, and the binding I had just
+written called it. That is the finding: the integration was wired to the one
+kernel of the three that cannot serve this checkpoint.
+
+## Where that leaves the integration
+
+On the INT4 kernel, which is the better target anyway for a reason that has
+nothing to do with the bias. The INT8 path needs the packed codes widened,
+302 MB a layer, 22.65 GB over 75 layers against a 64 GB part already holding
+50 -- which is what made it a per-layer experiment. The INT4 kernel reads the
+checkpoint's codes as they are, so the memory blocker retires with the
+rewiring, and it was already 4.0 to 4.6% faster.
+
+`routed_int4_binding.cpp` and its `build_so.sh` now target it, with the two
+bias tensors in the operator signature and the MSD scratch -- `stacked`,
+`stacked_low`, `witness` and the Matmul workspace -- resident per row count.
+It builds.
 
 ## The shape this also settled
-
 `replay_cann_gmm1.py` asserts the frozen trace's `group_counts` is `(256,)`
 with every entry 0 or 1, and `dispatch_a8` is `(8, 6144)`. So at M1 a rank
 sees one row per active expert and eight active experts -- a single token

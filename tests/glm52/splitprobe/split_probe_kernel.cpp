@@ -47,6 +47,14 @@ extern "C" __global__ __aicore__ void split_probe(__gm__ int8_t* source,
     if ASCEND_IS_AIC {
         return;
     }
+#if GATED
+    // The routed kernel runs its split on one subblock only. If a gated
+    // vector op inherits the wrong mask or repeat state, both of that
+    // kernel's defects follow.
+    if (GetSubBlockIdx() != 0) {
+        return;
+    }
+#endif
 #endif
     TPipe pipe;
     TBuf<TPosition::VECCALC> narrow_buffer;
