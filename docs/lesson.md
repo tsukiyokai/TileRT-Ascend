@@ -1877,3 +1877,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      blocking under `actual_seq_kvlen=[2048] * width`, and the gate is correct
      under a bit-exact criterion and unnecessary under a tolerance -- a
      decision, not a defect.
+
+180. The super kernel's 33.58 ms a round is a flat tail with one outlier. 637
+     distinct kernels, each called once a round, averaging 52.7 us -- and
+     `sk_1277_full_model_start_aiv_all_reduce_float_` at 3282.3 us a call, a
+     tenth of all super kernel time in one call. Against 858 us for a
+     standalone collective in the same capture and 177 to 187 us for a
+     sixteen-rank all_reduce at decode sizes under AIV, that is four to
+     eighteen times more than the collective it wraps, so either it carries
+     more than one or the fusion costs more than its parts. Nine of the next
+     ten are AddRmsNorm at 208 to 215 us, a merge already taken. Twenty percent
+     of super kernel time is in kernels whose names carry a collective, which
+     is where AIV lands inside the super kernel rather than beside it.
