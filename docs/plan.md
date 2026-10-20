@@ -12,8 +12,13 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 
     round = 45.88 ms + 0.814 ms 一行
 
-固定项与宽度无关，单独决定可达性：**即使每轮全收**，宽度 12 的 TPOT 地板是
-4.637 ms、宽度 32 是 2.248。所以起草器不是主线，固定成本才是。
+固定项不是地板，是**每层下发次数 × 28.8 µs**：12 个元素的一次标量乘就要
+28.824 µs，一层约 25 个 kernel，25 × 28.8 = 720 µs 对实测 710 µs/层。所以
+
+    TPOT = 每层 kernel 数 × 28.8 µs × 78 / 接受数
+
+25 个、接受 5.44 给出 10.3 ms（实测 9.3794）。到 2.x ms 需降到约 5 个/层。
+[地板](evidence/ascend-decode/kernel-count-floor-20261021/README.md)
 [代价模型](evidence/ascend-decode/round-cost-model-20261020/README.md)
 
 一轮 55.424 ms 的构成，逐项实测：
@@ -34,11 +39,11 @@ vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 
 | 杠杆 | ms | 状态 |
 |---|---|---|
-| 路由置换吸收 | 7.1 | 替掉 init_routing 45.772 + finalize_routing 55.979 |
+| MoE 单 kernel | 8.48 | 四次下发 181.172 µs 压成一次 72.463 |
 | 单边规约 | 6.5 | 十六卡正确，32.488 µs 对 HCCL 201.995 |
-| MoE 单 kernel | −16.3 | 256 专家 365.887 µs 对 vendor 157.176，慢 2.33x |
+| 算子派发回落 | 1.4 | CANN 自带 grouped matmul 快 38 µs/层，净值已扣 norm/gating 损失 |
 
-前两项合计 13.6 ms，折算 TPOT 约 8.0 ms。两项共用同一个交付点：
+合计 16.4 ms，折算 TPOT 约 6.9 ms。前两项共用同一个交付点：
 `AscendMoERunner._forward_entry`（`fused_moe.py:135`，实例属性），它收未置换的
 hidden states 与 router logits、产出 `(shared_out, fused_out)`，所以 gating、
 置换、两组专家、合并、共享路径的 reduce-scatter 全在界内。

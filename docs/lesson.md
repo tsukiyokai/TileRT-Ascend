@@ -743,3 +743,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     third reason tried and the first that measures: not to beat the vendor's
     arithmetic, not to fuse across layers (capped at 23 percent), but to
     collapse 25 launches within a layer into a handful.
+
+81. The unit of comparison is the launch. This kernel was measured three ways
+    and withdrawn twice: 1.98x faster (nothing ran), 2.33x slower against one
+    vendor operator at 256 experts, 8.3 percent behind at the decode shape.
+    Priced against what it actually replaces -- four vendor launches against
+    one -- it saves 8.48 ms a round, 181.172 us against 72.463. All the
+    measurements were right and only one answers the question, and which one
+    that is became clear only after the per-kernel floor was measured at
+    28.824 us for a twelve-element multiply.
