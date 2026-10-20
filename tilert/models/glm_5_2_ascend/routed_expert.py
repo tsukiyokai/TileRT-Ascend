@@ -84,20 +84,29 @@ def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
         original_first = method.apply_gmm1_act_quant
         original_second = method.apply_gmm2
 
-        def fused(rows, token_scale, _gate_up=gate_up, _down=down,
-                  _gu_scale=gu_scale, _down_scale=down_scale):
-            return torch.ops.tilert.routed_experts(
+        def quantise(compute, _method=method):
+            """The tree's own activation quantisation, reused as it is."""
+            return _method._quant_hidden_states(compute.hidden_states,
+                                                compute.dynamic_scale)
+
+        def first(compute, _gate_up=gate_up, _down=down,
+                  _gu_scale=gu_scale, _down_scale=down_scale, _layer=layer):
+            """Do the whole chain, and leave the second call a hand-back.
+
+            The signature is the tree's own: one `MoEMlpComputeInput`
+            carrying the permuted activation and its per-token scale. The
+            vendor path splits the chain across two methods with a
+            global-memory round trip between them; this does both and
+            remembers the result for the second to return.
+            """
+            rows, token_scale = quantise(compute)
+            _layer._tilert_output = torch.ops.tilert.routed_experts(
                 rows, _gate_up, _gu_scale, _down, _down_scale, token_scale,
                 experts, blocks)
+            return _layer._tilert_output, token_scale
 
-        def first(*arguments, _fused=fused, **named):
-            """Do the whole chain here and leave the second call a no-op."""
-            rows, token_scale = arguments[0], arguments[1]
-            layer._tilert_output = _fused(rows, token_scale)
-            return layer._tilert_output
-
-        def second(*arguments, **named):
-            return layer._tilert_output
+        def second(compute, hidden_states, act_out_scale, _layer=layer):
+            return _layer._tilert_output
 
         method.apply_gmm1_act_quant = first
         method.apply_gmm2 = second
