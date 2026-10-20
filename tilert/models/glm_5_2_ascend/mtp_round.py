@@ -41,7 +41,7 @@ class MtpRoundExecutor:
     ):
         if width not in (2, 4, 6, 8, 12, 16, 24, 32):
             raise ValueError("MTP rounds require width 2, 4, 8 or 16")
-        if target.capacity != draft.capacity:
+        if draft is not None and target.capacity != draft.capacity:
             raise ValueError("Main and MTP cache capacities must match")
         self.target = target
         self.draft = draft
