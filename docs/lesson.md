@@ -729,3 +729,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     per-operator fact -- and trimming the grouped matmul out of a copy of the
     package does not deregister it, leaving 116.376 us and dragging the other
     two operators between states.
+
+80. The round is the kernel count times 28.8 us. A single elementwise multiply
+    over twelve elements costs 28.824 us on one die at this batch -- 8.5x the
+    3.384 us an empty kernel suggested -- and a layer issues about 25 kernels.
+    25 x 28.8 is 720 us against the round's measured 710 us a layer, so the
+    round is launches and the arithmetic is noise. That is why every operator
+    today measured 30 to 70 us whatever its shape, why sixteen times the rows
+    moved the grouped matmul 2.8 percent, and what the 45.88 ms fixed term is.
+    TPOT = kernels a layer x 28.8 us x 78 / accepted, which gives 10.3 ms at 25
+    kernels and 5.44 accepted against the measured 9.38. Reaching 2.x ms needs
+    about five kernels a layer. The megakernel is therefore necessary, for the
+    third reason tried and the first that measures: not to beat the vendor's
+    arithmetic, not to fuse across layers (capped at 23 percent), but to
+    collapse 25 launches within a layer into a handful.
