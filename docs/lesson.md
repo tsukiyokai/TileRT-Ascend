@@ -1109,3 +1109,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the remaining twenty the way six already are is worth about 17 ms a round
      and the mechanism is already in the compiler -- so the question is what
      condition decides which form it emits, which is answerable by reading.
+
+115. Check the configuration before quoting numbers from two experiments. The
+     absorption lever took its call count from a capture whose round is 52.8 ms
+     and met its refutation in an ablation whose round is 16.6 -- the same day
+     on the same machine, three times apart -- and a 16.6 ms round cannot hold
+     the 17.56 ms of collectives the lever is built on. The within-capture
+     ratio survives: absorbed 30 us against standalone 858, measured side by
+     side. The 17 ms does not, because it multiplies a per-call difference from
+     one configuration by a count from another.
