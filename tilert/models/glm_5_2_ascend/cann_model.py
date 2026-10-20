@@ -178,7 +178,7 @@ class CannModel:
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
-        index_topk=None, plain_moe_combine=False,
+        index_topk=None, plain_moe_combine=False, routed_kernel=False,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
@@ -241,6 +241,17 @@ class CannModel:
             self.worker.init_device()
             if self.worker.device != self.device:
                 raise ValueError("Worker remapped the requested physical NPU")
+            if routed_kernel:
+                # Before the weights load, because the hook has to see them
+                # in the checkpoint's own packing and `load_model` converts
+                # them to fractal NZ on the way in.
+                from .routed_expert import install_before_conversion
+                from vllm_ascend.quantization.methods.w4a8.w4a8 import (
+                    AscendW4A8DynamicFusedMoEMethod,
+                )
+
+                self._routed_kernel_hook = install_before_conversion(
+                    AscendW4A8DynamicFusedMoEMethod)
             self.worker.load_model()
             self.runner = self.worker.model_runner
             self.model = self.runner.get_model()
@@ -258,6 +269,24 @@ class CannModel:
             from .moe_combine import install
 
             self._restore_combine = install()
+        if routed_kernel:
+            self._install_routed_kernel()
+
+    def _install_routed_kernel(self):
+        """Send the routed experts to the hand-written kernel.
+
+        Installed by wrapping the quant method's weight conversion, because
+        the kernel reads the checkpoint's own nibble packing and the
+        conversion to fractal NZ has already happened by the time this object
+        exists. The wrapper has to be in place before the model loads, so this
+        raises if it is not -- a silent miss would run the vendor path and
+        report the kernel's number.
+        """
+        restore, installed = self._routed_kernel_hook
+        if not installed:
+            raise RuntimeError("the routed kernel hook took no layer; it must "
+                               "be installed before the model loads")
+        self._restore_routed = restore
 
     def _install_tp_sum(self):
         from vllm.distributed import get_tp_group

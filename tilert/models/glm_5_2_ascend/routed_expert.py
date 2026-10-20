@@ -120,6 +120,33 @@ def _load():
     torch.ops.load_library(f"{LIBRARY_DIR}/routed_int4_torch.so")
 
 
+def install_before_conversion(quant_class, experts=EXPERTS_PER_RANK,
+                              blocks=BLOCKS):
+    """Take the weights while they are still ND, then install per layer.
+
+    `install` needs the checkpoint's own nibble packing, and
+    `process_weights_after_loading` casts both weights to fractal NZ for the
+    vendor's operator -- a five-dimensional layout this kernel would read as
+    ND and be silently wrong about. The conversion runs during model load,
+    before any hook in `cann_model` can reach the layers, so the only place to
+    stand is inside that method: repack first, convert after.
+    """
+    original = quant_class.process_weights_after_loading
+    installed = []
+
+    def taking(self, layer):
+        install([layer], experts=experts, blocks=blocks)
+        installed.append(layer)
+        return original(self, layer)
+
+    quant_class.process_weights_after_loading = taking
+
+    def restore():
+        quant_class.process_weights_after_loading = original
+
+    return restore, installed
+
+
 def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
     """Point `layers`' routed experts at the kernel; return how to undo it.
 

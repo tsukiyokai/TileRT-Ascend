@@ -149,6 +149,10 @@ def arguments():
                              " hash-tuple tail lookup, matching the longest"
                              " tail with any continuation and taking the most"
                              " frequent one at each step")
+    parser.add_argument("--routed-kernel", action="store_true",
+                        help="Send the routed experts to the hand-written"
+                             " INT4 kernel, which replaces four vendor"
+                             " launches with one")
     parser.add_argument("--onesided-reduce",
                         help="Config-store endpoint, e.g."
                              " tcp://127.0.0.1:9421, replacing the TP sum"
@@ -383,6 +387,7 @@ def run(args, report):
                        index_topk=args.index_topk,
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
+                       routed_kernel=args.routed_kernel,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
                        hoist_metadata=args.hoist_metadata,
