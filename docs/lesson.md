@@ -1928,3 +1928,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      pointers formed, because the index kept one position a key and the query
      rejected the context's own tail with nowhere to fall back to -- second time
      today a broken index read exactly like a failed mechanism.
+
+184. Raising the gather_fia gate would be slower, which closes it as a lever
+     and keeps attention unattacked. One die, the gathered 2048-row path
+     against the full 8192-row cache: 0.85x at width 4, 0.81 at 12, 0.76 at 24
+     -- slower everywhere and worsening with width. The bytes explain it:
+     selecting 2048 rows reads them per query row, so width 12 moves 28 MB
+     where the full cache is 9.4 MB read once and shared. Quartering the logit
+     count while quadrupling the read loses, because at twelve rows attention
+     is read-dominated. So the gate is not only numerically right, it protects
+     a path 19 percent slower at the width the drafters want.

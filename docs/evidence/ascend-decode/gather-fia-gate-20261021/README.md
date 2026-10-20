@@ -79,3 +79,35 @@ The project's own numerics gate is what decides. If it accepts a bf16 ULP on
 the attention output -- and the W4A8C8 checkpoint's own quantisation is far
 coarser -- then `GATHER_FIA_MAX_WIDTH` can be raised and the gathered path
 becomes available at the widths the drafters actually want, 12 to 24.
+
+## And raising the gate would be slower anyway
+
+Attention is 308.97 us of a TP16 layer's compute, the largest item with no
+lever, and the gathered path reads only the 2048 rows `topk_indices` selects
+against the full 8192. One die:
+
+| width | full 8192 | gathered 2048 | ratio |
+|---|---|---|---|
+| 4 | 183.07 | 214.30 | 0.85 |
+| 8 | 193.27 | 229.54 | 0.84 |
+| 12 | 196.23 | 243.57 | 0.81 |
+| 16 | 198.91 | 251.83 | 0.79 |
+| 24 | 194.90 | 257.88 | 0.76 |
+
+The gathered path is slower at every width and worsens as the width grows.
+
+The reason is the bytes. Selecting 2048 rows reads them **per query row**, so
+the total is `width x 2048 x 576 x 2` -- 28 MB at width 12 -- where the full
+cache is 9.4 MB read once and shared by every row. At twelve rows attention is
+dominated by that read, so quartering the logit count while quadrupling the read
+loses.
+
+## Which closes both threads at once
+
+The width-six gate is not only numerically right, it protects a path that is
+already 19 percent slower at width 12. So `--gather-fia-max-width` stays at its
+default, and the lever it looked like does not exist.
+
+And attention's 309 us a layer keeps its standing as the compute half's largest
+item with nothing yet aimed at it -- now with one more candidate measured and
+excluded.
