@@ -181,3 +181,58 @@ This is the megakernel's target stated in numbers, and it is not the boundary
 the closed brick tested. That brick fused publication with its consumer and
 measured 162.141 against 162.781 µs — a communication boundary, with the
 vector launches left in place on both arms.
+
+## The shared expert cannot join the routed bank
+
+`QuantBatchMatmulV3` is the largest recoverable floor in the round: 254 calls,
+3.810 ms, of which 2.603 is floor — 68% structure, and its down projection is
+15.311 µs against a 13.58 µs MIX_AIC floor, 89%. Three of those calls a layer
+are the shared expert's own dense path, `6144 → 256`, swiglu to 128, then
+`128 → 6144`, followed by the scale-and-add. 64.0 µs a layer, 4.8 ms a round.
+
+The shared expert is dimensionally one more expert: `n_shared_experts = 1` at
+`moe_intermediate_size = 2048`, the same 128 columns a rank that each routed
+expert carries. So appending it to the bank as group 256 looked free.
+
+It is not. `check_shared_expert_layout.py` reads the tensor headers, which
+settle it in seconds without a device:
+
+| layer 4 | shared | routed expert 0 |
+|---|---|---|
+| `gate_proj.weight` | (2048, 6144) I8 | (1024, 6144) I8 |
+| `down_proj.weight` | (6144, 2048) I8 | (3072, 2048) I8 |
+| `*.weight_scale` | (2048, 1) F32 | (2048, 1) F32 |
+| `gate_proj.scale_bias` | absent | (2048, 1) F32 |
+| `down_proj.scale_bias` | absent | (6144, 16) F32 |
+
+The routed weight is half the rows because it is W4 packed two to a byte; the
+shared weight is W8. And the shared expert has no `scale_bias`, which is the
+W4A8 MSD correction. Joining the bank would mean requantising W8 to W4 — a
+different model, not a different schedule. Route closed at the layout, before
+any kernel work.
+
+## The megakernel's target, in calls a layer
+
+Acceptance is at its ceiling: the copy replay gives 147 rounds at width 32 and
+144 at width 64 through 256, so A saturates near 7.1. With A fixed, 2 ms a
+token allows a 13.92 ms round against an 11.512 ms launch floor.
+
+That sets the engineering target in the only unit that matters here. A layer
+issues 6.5 MIX_AIC calls; the floor budget for a 13.92 ms round with room left
+for arithmetic is one to two. The per-layer sequence to collapse:
+
+| layer stage | calls now | core |
+|---|---|---|
+| MlaPrologV3 | 1 | MIX_AIC |
+| SparseFlashAttention | 1 | MIX_AIC |
+| O projection, `QuantBatchMatmulV3` | 1 | MIX_AIC |
+| router `MatMulV3`, `MoeGatingTopK`, `MoeInitRoutingV3` | 3 | AI_CORE, AIV, MIX_AIV |
+| `GroupedMatmulSwigluQuantV2` | 1 | MIX_AIC |
+| `GroupedMatmul` | 1 | MIX_AIC |
+| shared expert, two `QuantBatchMatmulV3` plus dequant | 3 | AI_CORE, MIX_AIC |
+| combine and norm, `Muls`/`ForeachAddList`/`Cast`/`AddRmsNormBias` | 6 | AIV |
+
+The two grouped matmuls are the first brick: the intermediate between them is
+64 rows by 128 columns of INT8 plus its scales, 8 KiB, which never needs to
+leave on-chip storage. Fusing them removes one MIX_AIC call a layer, 13.58 µs
+of floor, 1.02 ms a round, and the HBM round trip with it.
