@@ -79,3 +79,39 @@ The round is compute plus collectives, both now measured: 214 us a layer in a
 graph and 374 us a layer of collective latency. The bank narrowing takes 59.4
 from the first. Nothing measured today takes anything from the second, and its
 three mechanisms are each closed by a measurement rather than by argument.
+
+## The fourth exit: 193 us of it is independent of the rank count
+
+One all_reduce of 144 KB, one world size a run:
+
+| ranks | us |
+|---|---|
+| 2 | 193.60 |
+| 4 | 193.11 |
+| 8 | 238.27 |
+| 16 | 296.21 |
+
+Two ranks already cost 193 us. So the rank count explains 103 of the 296, and
+**193 us is a fixed per-call cost** -- not bandwidth, not topology, not the
+number of participants.
+
+## Which explains why capture cannot touch it
+
+A kernel's issue under graph replay is 1.064 us, measured earlier in this
+project. A collective's fixed cost is 193, a hundred and eighty times that. So
+the collective's overhead does not sit on the path a graph captures, and the
+0.877 capture ratio of the operators around it is the same story: what capture
+removes is host dispatch, and this is not host dispatch.
+
+## And it prices the one structural alternative
+
+Dropping to eight ranks would save 58 us a call and to four 103 us, at the cost
+of doubling or quadrupling the per-rank compute. At batch one that trade is
+less lopsided than it looks, because every operator is flat in rows and the
+grouped matmul's cost follows its bank -- a rank holding twice the experts pays
+7.53 us each for twice as many. Sixteen experts at 7.53 is 120 us a layer; at
+TP8 a rank would hold thirty-two.
+
+So the trade is 58 us of collective against roughly 120 us of bank, and it
+loses. TP16 is the right rank count for this workload, which is now measured
+rather than assumed -- and the 193 us floor is what no rank count avoids.

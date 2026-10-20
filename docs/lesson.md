@@ -1633,3 +1633,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      messages (flat, no), explicit overlap (worse), fewer calls (mostly spent,
      0.26 standalone a layer). The round is 214 us a layer of compute and 374
      of collective latency, and the narrowing takes 59.4 from the first only.
+
+160. A collective's cost is mostly a fixed per-call floor, not the rank count.
+     One all_reduce of 144 KB: 193.60 us at two ranks, 193.11 at four, 238.27
+     at eight, 296.21 at sixteen. Two ranks already pay 193, so the rank count
+     explains 103 of the 296 and 193 is fixed. That floor is a hundred and
+     eighty times a kernel's 1.064 us issue under graph replay, which is why
+     capture cannot touch it -- what capture removes is host dispatch and this
+     is not host dispatch. It also prices the rank-count alternative: dropping
+     to TP8 saves 58 us a call but doubles a rank's expert bank, and the bank
+     costs 7.53 us an expert, so sixteen more experts cost 120 against 58
+     saved. TP16 is right for this workload by measurement, and the 193 us
+     floor is what no rank count avoids.
