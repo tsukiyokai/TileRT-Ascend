@@ -74,6 +74,9 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [Combine, re-run](evidence/ascend-decode/free-machine-20261020/README.md) | Same tree and flags, launcher current so each arm keeps its own static-kernel cache. Steady-state means: base-a11.0441／combine-a10.9402, base-b11.1460／combine-b10.8769. | `--plain-moe-combine` is real: −0.104 and −0.269ms, mean −0.19 against the predicted −0.21, and inside each pair every combine request beats every base request, ten of ten. Lowest single request10.8528ms. The 0.102ms between base-a and base-b is the between-arm noise, so quote 0.1–0.3ms. |
 
+| 10-20 | [Handshake modes](evidence/ascend-decode/handshake-20261020/README.md) | Four reverse modes × three set-and-wait patterns × one and four rounds, each variant its own process under a timeout. | Reverse modes0 and1 deadlock in every pattern; mode2 is live only when both subblocks set and the cube waits once; mode3 is live in all three. Markers are unreliable (scalar store from a vector core); liveness is the measurement. |
+| 10-20 | [Routed experts, one kernel](evidence/ascend-decode/routed-kernel-20261020/README.md) | Expert-axis split, no grid barrier, hand-written AscendC on one die of a3-187. Sixteen experts on sixteen blocks is the per-rank shape at TP16. | 49.3–49.8µs a layer against the vendor's165.2 =3.3x, within12% of the45µs byte floor; 3.71ms a round against12.39, saving 8.68 ⇒1.24ms TPOT at acceptance7. Correct at every configuration up to44 experts／22 blocks: 0 of540672. Not integrated; rows an expert fixed at2. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

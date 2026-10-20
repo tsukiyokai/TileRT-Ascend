@@ -257,3 +257,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     diff the launcher and the engine the tree will actually run against the
     repository, the same way an arm's flags have to be checked against the
     tree rather than the repo.
+
+40. A handshake that was never load-bearing was never tested. The shared
+    expert's chain set a cross-core flag from the vector side to the cube, and
+    it worked -- but the ordering came from the `SyncAll` that followed, so the
+    flag's mode was free to be wrong. The routed experts made that direction
+    carry a real dependency and the first launch hung with no output at all.
+    A sweep settled it in two minutes:
+    [reverse modes 0 and 1 are dead in every pattern, mode 2 admits exactly
+    one, mode 3 admits all three](evidence/ascend-decode/handshake-20261020/README.md).
+    When a mechanism moves from decoration to load-bearing, test it in
+    isolation first -- one process a variant under a timeout, where finishing
+    is the measurement.
