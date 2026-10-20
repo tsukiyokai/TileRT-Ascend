@@ -693,3 +693,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     percent -- the launch and the entry. Stage-major across layers takes the
     barriers to four for the whole group, which is the only form of cross-layer
     fusion the measurements support.
+
+77. Cross-layer fusion is capped at 23 percent, not an order of magnitude.
+    Nesting eight layers in one launch costs 6.15x one launch while multiplying
+    the grid barriers by eight: if barriers dominated, the scaling would exceed
+    linear, and it is below. So 77 percent of a layer's cost is the per-layer
+    work itself, accumulating linearly, and only the launch and the entry can
+    be shared. The loop interchange that should have taken the barriers from 4N
+    to four measured about N squared instead, because the layers crowded one
+    reused scratch -- the second configuration today that could not answer the
+    question it was built for. The honest ceiling for one launch over many
+    layers is the 23 percent nesting already collects.
