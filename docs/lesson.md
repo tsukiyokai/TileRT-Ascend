@@ -1584,3 +1584,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      arrives as counts or cumulative counts, an empty slot is a zero or a
      repeat, and a negative step is now an assertion rather than a case read
      silently as empty.
+
+156. Composing the measured levers puts the conservative cell at 2.81 ms. The
+     acceptance ceiling of 4.289 is the offline corpus's, which reads 21
+     percent below the engine's own measured 5.441, so it belongs in the
+     conservative column rather than as the ceiling. A layer replayed in a
+     graph is 213.913 us and the bank narrowing takes 59.4 of that, leaving
+     154.5: at 4.289 accepted that is 2.81 ms, inside the target, and the
+     day's earlier floor of 3.69 was computed before the narrowing existed.
+     What it rests on is named -- that the engine's own layer can be brought to
+     the synthetic layer's cost, where it currently fits 588 us, 2.7 times the
+     graph figure, with the difference unexplained.

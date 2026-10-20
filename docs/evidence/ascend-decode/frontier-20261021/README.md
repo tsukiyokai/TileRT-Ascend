@@ -84,3 +84,40 @@ That last figure is the one worth carrying: **3.60 ms**, compute-only, best
 measured drafter, zero row cost, zero collectives. The target is below it, so
 2.9 ms needs acceptance above 8.5 at that floor -- which only the copy oracle
 reaches, and the oracle is not a drafter.
+
+## Redone with the narrowing, and the conservative cell reaches 2.x
+
+The acceptance ceiling of 4.289 came from the offline corpus, which reads 21
+percent below the engine's own measured 5.441 at width 12. So it is a floor on
+the ceiling rather than the ceiling, and the right way to use it is as the
+conservative column.
+
+| per layer | tree 4.289 | lookup 5.441 | automaton 6.872 |
+|---|---|---|---|
+| the layer's parts, warm 317.5 | 5.77 | 4.55 | 3.60 |
+| the same layer in a graph 213.9 | 3.89 | 3.07 | 2.43 |
+| its profiled device-busy 202.5 | 3.68 | 2.90 | 2.30 |
+| **in a graph, after the narrowing 154.5** | **2.81** | 2.22 | 1.75 |
+
+The last row subtracts the 59.4 us a layer the bank narrowing measured in a
+graph. At the most conservative acceptance this project has -- the offline
+tree's saturated 4.289, below the engine's own figure -- it gives **2.81 ms**.
+
+So the day's earlier conclusion inverts. The floor of 3.69 ms was computed
+before the narrowing existed; with it, the conservative cell is inside the
+target.
+
+## What this rests on, named
+
+Measured: 213.913 us a layer replayed in a graph on one die; 59.4 us a layer
+saved by narrowing, also in a graph; 4.289 accepted offline and 5.441 measured
+end to end by the engine.
+
+Assumed: that the engine's own layer replays at the synthetic layer's cost --
+which is the open question the queued steady-state capture answers, and the
+same assumption the earlier `graph-closes-gap` page turned on. The engine
+currently fits 588 us a layer, 2.7 times the graph figure, and nothing has yet
+explained the difference.
+
+So 2.81 ms is what the measured levers compose to, and whether the engine can
+be brought to the graph figure is the one thing still untested.
