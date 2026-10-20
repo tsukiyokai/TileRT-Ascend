@@ -646,6 +646,12 @@ __aicore__ void routed_int4_fused(
     // where its own stage does nothing, which also makes the empty-expert
     // case structural rather than a convention to remember.
     Workspace held;
+    // The cube half reads the counts as well. Without them it ran a full
+    // matmul for every expert, and at the engine's 256 experts a round only
+    // about seventy hold rows -- which is why 256 experts cost 583 us where
+    // sixteen cost 47.
+    TBuf<TPosition::VECCALC> cube_group_buffer;
+    LocalTensor<int32_t> cube_group;
     Matmul<APacked, BPacked, CProduct, BiasNone> gate_mm;
     Matmul<APacked, BPacked, CProduct, BiasNone> down_mm;
     TCubeTiling gate_cube;
@@ -655,6 +661,13 @@ __aicore__ void routed_int4_fused(
         LoadTiling(down_cube, down_tiling);
         gate_mm.Init(&gate_cube, &pipe);
         down_mm.Init(&down_cube, &pipe);
+        pipe.InitBuffer(cube_group_buffer,
+                        (MAX_EXPERTS + SLACK) * sizeof(int32_t));
+        cube_group = cube_group_buffer.Get<int32_t>();
+        GlobalTensor<int32_t> cube_count;
+        cube_count.SetGlobalBuffer(group_count, MAX_EXPERTS);
+        DataCopy(cube_group, cube_count, MAX_EXPERTS);
+        AfterLoadForScalar();
     }
     GlobalTensor<int32_t> count_global;
     GlobalTensor<int32_t> start_global;
@@ -678,81 +691,91 @@ __aicore__ void routed_int4_fused(
         AfterLoadForScalar();
     }
 
-    for (int64_t step = 0; step < per_block; ++step) {
-        // The halves index blocks differently -- a cube block pairs with two
-        // vector subblocks -- so each works out its own expert and they meet
-        // on the same one. `ASCEND_IS_AIC` is a macro for an `if`, not an
-        // expression, so each half computes its own.
-        int64_t expert = 0;
-        if ASCEND_IS_AIC {
-            expert = GetBlockIdx() * per_block + step;
-        }
-        if ASCEND_IS_AIV {
-            expert = (GetBlockIdx() / 2) * per_block + step;
-        }
-        const bool mine = expert < experts;
-        int64_t rows_held = 0;
-        int64_t taken_from = 0;
-        if ASCEND_IS_AIV {
-            if (mine) {
-                rows_held = held.group.GetValue(expert);
-                taken_from = held.start.GetValue(expert);
-            }
-            if (mine && rows_held > 0 && sub == 0) {
-                Split(held, rows,
-                      Nibbles(stacked, expert * M_TILE * HIDDEN),
+    // Stage-major, not expert-major. Expert-major cost four barriers a round,
+    // so sixteen rounds at the engine's 256 experts cost sixty-four, and the
+    // sparse case came out slower than the dense one -- an empty expert
+    // skipped its arithmetic and still arrived at every barrier. All the
+    // scratch is sized per expert, so every expert's intermediate can be live
+    // at once and the barriers drop to one a stage.
+    if ASCEND_IS_AIV {
+        if (sub == 0) {
+            for (int64_t step = 0; step < per_block; ++step) {
+                const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
+                if (expert >= experts || held.group.GetValue(expert) == 0) {
+                    continue;
+                }
+                Split(held, rows, Nibbles(stacked, expert * M_TILE * HIDDEN),
                       Nibbles(stacked_low, expert * M_TILE * HIDDEN),
-                      Nibbles(witness, expert * TILE), rows_held, taken_from);
-                Publish();
+                      Nibbles(witness, expert * TILE),
+                      held.group.GetValue(expert),
+                      held.start.GetValue(expert));
             }
+            Publish();
         }
-        SyncAll<false>();
-        if ASCEND_IS_AIC {
-            if (mine) {
-                Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
-                        Nibbles(gate_up, expert * GATE_UP * HIDDEN),
-                        partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
-                        gu_tiling);
-                Publish();
+    }
+    SyncAll<false>();
+
+    if ASCEND_IS_AIC {
+        for (int64_t step = 0; step < per_block; ++step) {
+            const int64_t expert = GetBlockIdx() * per_block + step;
+            if (expert >= experts || cube_group.GetValue(expert) == 0) {
+                continue;
             }
+            Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
+                    Nibbles(gate_up, expert * GATE_UP * HIDDEN),
+                    partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
+                    gu_tiling);
         }
-        SyncAll<false>();
-        if ASCEND_IS_AIV {
-            if (mine && rows_held > 0 && sub == 0) {
-                Activate(rows_held, held,
+        Publish();
+    }
+    SyncAll<false>();
+
+    if ASCEND_IS_AIV {
+        if (sub == 0) {
+            for (int64_t step = 0; step < per_block; ++step) {
+                const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
+                if (expert >= experts || held.group.GetValue(expert) == 0) {
+                    continue;
+                }
+                Activate(held.group.GetValue(expert), held,
                          partial + expert * M_TILE * GATE_UP,
                          gu_bias + expert * GATE_UP,
                          gu_scale + expert * GATE_UP,
                          token_scale + expert * SCALE_SPAN,
                          Nibbles(middle, expert * M_TILE * HALF),
                          middle_scale + expert * SCALE_SPAN);
-                Publish();
             }
+            Publish();
         }
-        SyncAll<false>();
-        if ASCEND_IS_AIC {
-            // One matmul a round rather than two, to see whether the limit
-            // counts rounds or `Matmul` instantiations: five rounds of two
-            // is ten, so if the ceiling moves to ten rounds the TPipe is
-            // what runs out.
-            if (mine) {
-                Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
-                        Nibbles(down, expert * HIDDEN * HALF),
-                        wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
-                        down_tiling);
-                Publish();
+    }
+    SyncAll<false>();
+
+    if ASCEND_IS_AIC {
+        for (int64_t step = 0; step < per_block; ++step) {
+            const int64_t expert = GetBlockIdx() * per_block + step;
+            if (expert >= experts || cube_group.GetValue(expert) == 0) {
+                continue;
             }
+            Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
+                    Nibbles(down, expert * HIDDEN * HALF),
+                    wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
+                    down_tiling);
         }
-        SyncAll<false>();
-        if ASCEND_IS_AIV {
-            if (mine && rows_held > 0) {
-                Narrow(rows_held, taken_from, held,
-                       wide + expert * M_TILE * HIDDEN,
-                       down_bias + expert * HIDDEN,
-                       down_scale + expert * HIDDEN,
-                       middle_scale + expert * SCALE_SPAN,
-                       out, from, from + share);
+        Publish();
+    }
+    SyncAll<false>();
+
+    if ASCEND_IS_AIV {
+        for (int64_t step = 0; step < per_block; ++step) {
+            const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
+            if (expert >= experts || held.group.GetValue(expert) == 0) {
+                continue;
             }
+            Narrow(held.group.GetValue(expert), held.start.GetValue(expert),
+                   held, wide + expert * M_TILE * HIDDEN,
+                   down_bias + expert * HIDDEN, down_scale + expert * HIDDEN,
+                   middle_scale + expert * SCALE_SPAN, out, from,
+                   from + share);
         }
     }
     PipeBarrier<PIPE_ALL>();

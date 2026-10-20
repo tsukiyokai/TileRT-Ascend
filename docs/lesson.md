@@ -552,3 +552,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     hypotheses preceded it, nine of them arithmetic about buffer sizes. When a
     file carries a hard-won comment about a resource, check every consumer of
     that resource before looking anywhere else.
+
+64. Count the barriers, not the arithmetic. At the engine's 256 experts the
+    kernel spent 214.5 µs where the vendor spends 157, and the sparse routing
+    was slower than the dense one -- an expert with no rows skipped its
+    matmuls and still arrived at all four of its round's barriers, sixty-four
+    of them over sixteen rounds. Since the scratch is sized per expert, every
+    intermediate can be live at once, so the loops inverted: stage outside,
+    expert inside, four barriers a launch at any expert count. 214.5 to
+    79.206 µs, and 1.98x the vendor rather than 0.73x. A fused kernel's cost
+    is its synchronisation before it is its arithmetic, and the sparse-slower-
+    than-dense inversion is the signature.
