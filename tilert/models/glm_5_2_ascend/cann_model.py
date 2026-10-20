@@ -100,7 +100,8 @@ class CannStep:
 
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
                   *, compile_target=False, super_kernel=False,
-                  expert_parallel=False, graph_width=4, index_topk=None):
+                  expert_parallel=False, graph_width=4, index_topk=None,
+                  mtp_tokens=0):
     """Construct TP16 config, optionally compiling the M4 target backbone.
 
     ``expert_parallel`` reshards the 256 routed experts over the sixteen
@@ -149,7 +150,11 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
             "max_cudagraph_capture_size": graph_width,
             "custom_ops": ["all"],
         } if compile_target else {},
-        speculative_config=None, kv_transfer_config=None,
+        speculative_config=(
+            {"method": "mtp", "num_speculative_tokens": mtp_tokens,
+             "model": str(Path(checkpoint).resolve())}
+            if mtp_tokens else None),
+        kv_transfer_config=None,
         additional_config={
             "enable_flashcomm1": False, "enable_dsa_cp": False,
             "enable_shared_expert_dp": False,
@@ -179,6 +184,7 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
+        mtp_tokens=0,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
@@ -230,7 +236,7 @@ class CannModel:
             self.checkpoint, capacity, gpu_memory_utilization,
             compile_target=compile_target, super_kernel=super_kernel,
             expert_parallel=expert_parallel, graph_width=graph_width,
-            index_topk=index_topk,
+            index_topk=index_topk, mtp_tokens=mtp_tokens,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
@@ -260,7 +266,7 @@ class CannModel:
 
                 install_fp32_head(self.model.lm_head,
                                   self.model.logits_processor)
-            if self.runner.drafter is not None:
+            if self.runner.drafter is not None and mtp_tokens == 0:
                 raise ValueError("Target must not load a draft model")
             self._bind_cache()
         self._allocate_inputs()

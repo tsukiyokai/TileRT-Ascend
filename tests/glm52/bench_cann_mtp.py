@@ -149,6 +149,10 @@ def arguments():
                              " hash-tuple tail lookup, matching the longest"
                              " tail with any continuation and taking the most"
                              " frequent one at each step")
+    parser.add_argument("--mtp-tokens", type=int, default=0,
+                        help="Draft with the checkpoint's own MTP head,"
+                             " layer 78 of the same weights, proposing this"
+                             " many tokens a round")
     parser.add_argument("--routed-kernel", action="store_true",
                         help="Send the routed experts to the hand-written"
                              " INT4 kernel, which replaces four vendor"
@@ -388,6 +392,7 @@ def run(args, report):
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
                        routed_kernel=args.routed_kernel,
+                       mtp_tokens=args.mtp_tokens,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
                        hoist_metadata=args.hoist_metadata,
