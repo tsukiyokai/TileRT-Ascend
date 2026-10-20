@@ -1157,3 +1157,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      permit, since it only calls `target.verify`. Hard-coded depths are what
      make a model un-shrinkable, and shrinking it is what lets a shared machine
      be used at all.
+
+119. The truncated-backbone route ends on two constraints that oppose each
+     other. Nine in all, seven cleared: the tree not reaching the container,
+     the loader walking every tensor the index lists, our cache bind expecting
+     78 main and 21 indexer layers, our MTP guard requiring depth 78, vLLM's
+     MTP completeness check, our check that the official loader loaded the MTP
+     head, the cache's eight uses of the draft engine, and the bench record's
+     four snapshots. The two left: truncation needs dummy weights because the
+     loader walks the full index, and dummy weights cannot satisfy the injected
+     prefix because its first token was computed with the real ones. Forcing
+     either would weaken a real guarantee for the sake of a measurement. Five
+     of the seven were our own hard-coded depths, which is what makes a model
+     impossible to shrink for any purpose at all.

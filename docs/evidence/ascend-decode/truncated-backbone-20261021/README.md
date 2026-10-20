@@ -30,6 +30,40 @@ followed, in order:
    (`cann_mtp.py:179`). Under truncation it did not, and cannot: the
    checkpoint's MTP head is layer 78.
 
+7. **The cache's eight uses of the draft engine** -- both inject paths, the
+   finish truncation, the reset. Cleared with guards; the drafted round never
+   needed one.
+8. **The bench record's four position snapshots.** Cleared with a property
+   that yields None.
+9. **The injected prefix's first token.** `start_mtp` checks that the target's
+   first output token matches the prefix the capture case recorded, and under
+   `load_format="dummy"` the random weights produce a different one. This is a
+   real consistency guarantee, not a literal.
+
+## Where the route ends
+
+Nine constraints, seven cleared. The two that remain are structural and they
+pull in opposite directions:
+
+- Truncation needs dummy weights, because the loader walks every tensor the
+  checkpoint index lists.
+- Dummy weights cannot satisfy the injected prefix, because the prefix's first
+  token was computed with the real ones.
+
+Using real weights with a truncated model would need the loader to skip the
+layers the model does not have, and dropping the prefix check would weaken a
+guarantee that exists to catch a genuine class of error. Neither is worth doing
+for a measurement, so the route is closed here rather than forced.
+
+## What the attempt was worth
+
+Seven constraints cleared, all committed, none of them touching the
+untruncated path. Five were our own hard-coded depths or unguarded
+assumptions, and they are the kind that make a model impossible to shrink for
+any reason -- a smaller arm, a faster test, a shared machine. The map is
+recorded so the next attempt, if the reason is good enough, starts at the two
+that matter.
+
 ## What the sixth constraint says about the route
 
 The sixth is not a literal to relax -- it is the route's real obstacle.
