@@ -152,28 +152,32 @@ void* CurrentStream()
  * and before the activation scale, which is the convention the host reference
  * documents.
  */
-at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
+at::Tensor RoutedExperts(const at::Tensor& hidden,
+                         const at::Tensor& norm_weight,
+                         const at::Tensor& gate_up,
                          const at::Tensor& gu_bias, const at::Tensor& gu_scale,
                          const at::Tensor& down, const at::Tensor& down_bias,
                          const at::Tensor& down_scale,
                          const at::Tensor& token_scale, int64_t experts,
                          int64_t blocks)
 {
-    TORCH_CHECK(rows.dtype() == at::kChar, "rows must be INT8");
+    TORCH_CHECK(hidden.dtype() == at::kBFloat16, "hidden must be BF16");
+    TORCH_CHECK(norm_weight.dtype() == at::kBFloat16,
+                "norm_weight must be BF16");
     TORCH_CHECK(gate_up.dtype() == at::kChar, "gate_up must be packed INT4");
     TORCH_CHECK(down.dtype() == at::kChar, "down must be packed INT4");
     TORCH_CHECK(gu_bias.dtype() == at::kFloat, "gu_bias must be FP32");
     TORCH_CHECK(down_bias.dtype() == at::kFloat, "down_bias must be FP32");
 
-    TORCH_CHECK(rows.size(0) == experts * ROWS, "rows must be ",
-                experts * ROWS, ", the kernel is built for ", ROWS,
+    TORCH_CHECK(hidden.size(0) == experts * ROWS, "hidden must be ",
+                experts * ROWS, " rows, the kernel is built for ", ROWS,
                 " an expert");
-    at::Tensor out = at::empty({rows.size(0), HIDDEN},
-                               rows.options().dtype(at::kBFloat16));
+    at::Tensor out = at::empty({hidden.size(0), HIDDEN}, hidden.options());
     Resident& held = Resident::Instance(experts);
     routed_int4_launch(
         static_cast<uint32_t>(blocks), CurrentStream(), held.sync_base(),
-        rows.data_ptr(), held.stacked(), held.stacked_low(),
+        hidden.data_ptr(), norm_weight.data_ptr(),
+        held.stacked(), held.stacked_low(),
         gate_up.data_ptr(), gu_bias.data_ptr<float>(),
         gu_scale.data_ptr<float>(), down.data_ptr(),
         down_bias.data_ptr<float>(), down_scale.data_ptr<float>(),
@@ -189,9 +193,10 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
 TORCH_LIBRARY(tilert, library)
 {
     library.def(
-        "routed_experts(Tensor rows, Tensor gate_up, Tensor gu_bias, "
-        "Tensor gu_scale, Tensor down, Tensor down_bias, Tensor down_scale, "
-        "Tensor token_scale, int experts, int blocks) -> Tensor");
+        "routed_experts(Tensor hidden, Tensor norm_weight, Tensor gate_up, "
+        "Tensor gu_bias, Tensor gu_scale, Tensor down, Tensor down_bias, "
+        "Tensor down_scale, Tensor token_scale, int experts, int blocks) "
+        "-> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(tilert, PrivateUse1, library)
