@@ -203,11 +203,12 @@ def arguments():
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0,1]")
     return args
-
+    parser.add_argument("--narrow-bank", action="store_true",
+                        help="hand the grouped matmul only the "
+                             "experts a round's rows touched")
 
 def drive(backend, first, args):
     from tilert.pd_vllm.ascend_server import create_session
-
     timed = TimedBackend(backend)
     session = create_session(timed, args.width, (),
                              rounds_per_command=args.rounds_per_command)
@@ -225,7 +226,6 @@ def drive(backend, first, args):
             capture = None
             if args.profile_last and last:
                 import torch_npu
-
                 capture = torch_npu.profiler.profile(
                     activities=[torch_npu.profiler.ProfilerActivity.NPU],
                     on_trace_ready=(
@@ -237,11 +237,9 @@ def drive(backend, first, args):
                                 torch_npu.profiler.ProfilerLevel.Level1))))
                 capture.__enter__()
                 report["profiled"] = True
-
             def deliver(token):
                 tokens.append(int(token))
                 clocks.append(perf_counter_ns())
-
             try:
                 session.inject(PrefixRequest(f"mtp-bench-{number}",
                                              PREFIX_LENGTH))
@@ -258,7 +256,6 @@ def drive(backend, first, args):
                     # leaving it out would hand the next session a directory it
                     # has to remember to process.
                     import torch_npu
-
                     torch_npu.profiler.profiler.analyse(
                         profiler_path=str(args.output / "capture"))
                 records.append({
@@ -280,7 +277,6 @@ def drive(backend, first, args):
                 operation["end_ns"] - operation["start_ns"]
             )
     return records
-
 
 def validate_local(report, args):
     """Check saved local state, then return the rank-independent history."""
@@ -354,7 +350,6 @@ def validate_local(report, args):
         validate_delivery(report["requests"], histories, args)
     return histories
 
-
 def validate_delivery(requests, histories, args):
     if len(requests) != len(histories):
         raise ValueError("Missing callback timing records")
@@ -408,7 +403,6 @@ def validate_delivery(requests, histories, args):
                 raise ValueError("Backend operation clocks are not monotonic")
             previous = op["end_ns"]
 
-
 def run(args, report):
     import torch
     import torch.distributed as distributed
@@ -420,7 +414,6 @@ def run(args, report):
     from tilert.models.glm_5_2_ascend.tp_runtime import (
         CoordinatedBackend, RankExecutor, TorchControlChannel,
     )
-
     rank = report["rank"]
     if (int(os.environ["WORLD_SIZE"]) != 16
             or int(os.environ["LOCAL_RANK"]) != rank):
@@ -445,6 +438,7 @@ def run(args, report):
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
                        routed_kernel=args.routed_kernel,
+                       narrow_bank=args.narrow_bank,
                        mtp_tokens=args.mtp_tokens, layers=args.layers,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
@@ -704,7 +698,6 @@ def run(args, report):
             draft.close()
         target.shutdown()
 
-
 def main():
     args = arguments()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -748,7 +741,6 @@ def main():
     print(json.dumps({"rank": report["rank"], "passed": passed,
                       "output": str(args.output)}))
     return int(not passed)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

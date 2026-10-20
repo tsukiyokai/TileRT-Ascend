@@ -208,6 +208,7 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
+        narrow_bank=False,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
@@ -301,6 +302,32 @@ class CannModel:
             self._restore_combine = install()
         if routed_kernel:
             self._install_routed_kernel()
+        if narrow_bank:
+            self._install_narrow_bank()
+
+    def _install_narrow_bank(self):
+        """Hand the grouped matmul only the experts a round's rows touched.
+
+        The operator's cost follows the bank rather than the rows -- 7.53 us an
+        expert over a 55.57 intercept on one die, flat in rows -- and at batch
+        one a rank of sixteen sees two to five of its own experts touched. In a
+        graph the full bank is 180.61 us against 121.17 for six, and a
+        scattered six costs what a consecutive six does.
+        """
+        from .narrow_bank import install
+
+        # One quant method may serve every layer, so the installs are
+        # deduplicated by identity -- wrapping the same object twice would
+        # narrow an already-narrowed group list.
+        methods = {}
+        for _, layer in self.model.model.layers.items():
+            method = getattr(getattr(layer, "mlp", None), "quant_method", None)
+            if method is not None:
+                methods.setdefault(id(method), method)
+        if not methods:
+            raise RuntimeError("no MoE quant method to narrow")
+        self._restore_narrow = [install(method)
+                                for method in methods.values()]
 
     def _install_routed_kernel(self):
         """Send the routed experts to the hand-written kernel.
