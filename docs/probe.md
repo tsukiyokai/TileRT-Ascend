@@ -94,3 +94,26 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
+
+## 2026-10-21 三条杠杆复核，两条翻转
+
+- MoE 单 kernel：cube 半边从 UB 读 group count（该核无 UB 访问权）而跳过全部
+  专家，79.206 µs 测的是空转。修好后 365.887 µs 对 vendor 157.176，**慢
+  2.33x**，杠杆由 +5.8 翻成 −16.3 ms。
+- 路由置换吸收：decode 真实形状（12 token × top-8 = 96 行）下 vendor 这对只要
+  53.226 µs，不是记录的 101.751，上限由 7.1 降到 **≤4.15 ms**；最朴素的 torch
+  替换慢 2.93x（`index_add_` 一项 131.957 µs）。
+- 单边规约：未复核，正确性依据是十六卡精确值比对（判据能失败），仍成立 6.5 ms。
+
+## 2026-10-21 MoE 矩阵乘是固定税
+
+16 行 146.431 µs、256 行 150.565 µs——16 倍工作量多 2.8%。所以那 12.3 ms 不到
+3% 是算术，与宿主下发、路由同属每层固定税。更快的矩阵乘只能买 3%，所以手写
+kernel 的 2.33x 劣势无关紧要，它的价值只在**一次下发覆盖多层**。两次独立调用是
+单次的 1.978 倍，线性，正是融合要收的部分。
+
+## 2026-10-21 vendor 算子的成本依赖进程状态
+
+同一算子同一形状：干净进程 61.617 µs，某种混合态 153.325 µs，两个时钟一致到
+1%。加载 kernel 库、跑过 kernel、建过通信域**全部排除**。引擎记的 157.2 µs 属
+于慢档，而干净进程能跑 61.6——找出引擎落入慢档的条件约值 7 ms，不需写 kernel。

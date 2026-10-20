@@ -27,3 +27,26 @@ the operator is fixed cost was also mixed, so its conclusion holds.
 
 A baseline is a property of the process, not of the operator. Record which
 state it was taken in, and compare only within one state.
+
+## Neither candidate explains it
+
+2026-10-21, each turned on separately against the same measurement:
+
+    baseline                           62.287 us
+    after loading the kernel library   60.309 us
+    after running the kernel once      61.161 us
+    baseline                           68.891 us
+    after building a domain            66.478 us
+
+So loading the library, running the kernel and building a communication domain
+are all innocent. The 153.325 us state remains unexplained, and the remaining
+difference between the two probes is that the slow one had already built a
+second fractal-NZ weight bank and run the full two-stage vendor chain.
+
+## The opening this leaves
+
+The engine records 157.2 us a layer, which is the slow state. A clean process
+runs the same operator at 61.6. If the condition that puts the engine in the
+slow state can be found and avoided, that is about 90 us a layer -- near 7 ms
+a round -- without writing a kernel. Larger than any lever measured today and
+reachable from a single die.
