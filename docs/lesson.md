@@ -575,3 +575,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `torch.empty(num_experts, hidden_sizes, 16 // self.tp_size)`. A single-die
     probe with random weights cannot see this; it needed the real checkpoint
     and the real TP.
+
+66. A criterion that cannot fail for the right reason validates nothing.
+    Every kernel check today reported "finite, nonzero, the right rows
+    written", and the configuration they all ran in -- random weights with
+    random scales -- produced an absmax of 2.4e-17, which satisfies all three
+    and is arithmetically dead. Varying the weights and scales separately
+    showed only one healthy combination, so the failure is dynamic range: the
+    middle quantisation normalises by a per-row max and then three scales
+    around 1e-4 multiply, against bfloat16's smallest normal of 1.2e-38. The
+    vendor avoids it by dequantising inside L0C through the fixpipe, a
+    mechanism this project had filed as an optimisation and which is a
+    correctness prerequisite. Timing measurements survive; the correctness
+    claims behind them do not, and they are withdrawn.
