@@ -96,4 +96,8 @@ microbench 固定实际权重分片与 M=1／4，预热 100 轮、测量 1000 �
 
 同一会话交替 A/B 并配对，保留重复控制臂；约 0.2 ms/round 的效应须对照 run 间漂移。采短 trace 与无 profiler 计时分开；按实际 critical path 与逐流计算并集核对相位，重叠工作只计一次。[归属依据](evidence/ascend-decode/phase-attribution-20261019/README.md)
 
+按需求分层，先跑能决断的最便宜那层:单 die 数百 MiB 的配对算子微基准(满载也能跑,秒级)；16 die 无模型的集合通信／协议筛选(分钟级)；16 die 载模型的接受数、专家并集与请求 TPOT(只有这层要排队)。闸门拒绝时把等待限在几十分钟而不是一整天,拒绝的时间花在第一层上——2026-10-20 两个 driver 重试 163 次、空等 11.5 小时,全程零产出;同一天单 die 微基准几秒就定了 MoE combine。
+
+需要整机的队列保持短且按决断力排序:先 `--plain-moe-combine` 配对(纯轮耗时、逐位一致、无接受数混淆)，再 unigram 配对(接受数与专家并集)，再宽度 8／16，最后 one-sided 归约首次端到端(可能直接在 aclshmem 初始化失败,故排最后)。每臂只回答一个问题,其余删掉。
+
 实验结果见 [probe.md](probe.md)，可复用结论见 [lesson.md](lesson.md)，发射与取证步骤见 [workflow.md](workflow.md)。

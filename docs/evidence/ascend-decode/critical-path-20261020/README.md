@@ -95,6 +95,22 @@ and `enable_super_kernel` is on. `--plain-moe-combine` substitutes the plain
 add; both are an elementwise BF16 add, so it is bit-exact. 75 MoE layers,
 about 1.4 ms a round.
 
+Confirmed on device, one shared die, no model loaded, seconds to run — the
+capture is not the only witness. `bench_kernel_floor.py` samples both
+spellings in every batch, so they are paired by construction
+([record](combine-floor-die1.json)):
+
+| median µs | 1 row | 8 rows | 32 rows |
+|---|---|---|---|
+| plain add | 9.176 | 9.520 | 9.681 |
+| multi-tensor add | 38.704 | 38.490 | 38.318 |
+
+Flat in rows on both sides, and `torch.equal` holds on the result. This
+instrument is wall time a call with one synchronize a batch, so its absolutes
+carry host issue — `empty_like` alone costs 4.680 µs — and its 28.97 µs
+difference is an upper bound. The capture's device-side difference, 19.46 µs,
+is the one to price: 1.46 ms a round over 75 layers.
+
 This is the megakernel's target stated in numbers, and it is not the boundary
 the closed brick tested. That brick fused publication with its consumer and
 measured 162.141 against 162.781 µs — a communication boundary, with the

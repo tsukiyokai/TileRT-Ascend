@@ -179,3 +179,32 @@ leaving the driver running.
 Ship a file with `scp` then `docker cp <file>`, and compare md5 on both sides.
 `docker cp /dev/stdin` once truncated a driver to 15 bytes, and `bash -n`
 passed on the fragment.
+
+## 2026-10-20: do not squat on the gate
+
+Two drivers retried the occupancy gate 150 and 13 times. Between 22:04 and
+09:36 a co-tenant held 60.2 GiB a die against the 47 the gate wants, and all
+three hosts read 59–62 of 64 GiB a die. Nothing ran for eleven and a half
+hours. Re-arming for 400 attempts was the same mistake with a bigger number:
+a retry loop is not progress, it is a bet that someone else will finish, and
+it reports nothing while it waits.
+
+Sort an experiment by what it actually needs, and run the cheapest tier that
+can still decide something:
+
+- One shared die, a few hundred MiB, no model. Paired microbenchmarks of a
+  single operator. These run under full occupancy, in seconds, and they
+  confirmed the MoE combine's 4x and its flatness in rows on the same day the
+  whole fleet was unavailable.
+- Sixteen dies, no model. Collective and protocol screens, minutes.
+- Sixteen dies with the model resident. Acceptance, expert union, request
+  TPOT. Only this tier needs the gate.
+
+The last tier's queue must be short and ordered by what it decides, not by
+what is convenient to append. Fourteen arms is an hour or two of exclusive
+machine; a co-tenant's window will not be that long. Carry the arms that
+settle one question each and drop the rest.
+
+When the gate refuses, bound the wait to something a real window would
+satisfy — tens of minutes, not a working day — and spend the refusal on the
+first tier instead.

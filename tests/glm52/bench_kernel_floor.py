@@ -32,6 +32,8 @@ def operations(device):
     table = torch.ones(8192, HIDDEN, device=device, dtype=torch.bfloat16)
     index = torch.zeros(1, device=device, dtype=torch.int64)
     big = torch.ones(1, 4 * HIDDEN, device=device, dtype=torch.bfloat16)
+    wide = torch.ones(8, HIDDEN, device=device, dtype=torch.bfloat16)
+    widest = torch.ones(32, HIDDEN, device=device, dtype=torch.bfloat16)
     return {
         "add_1_element": lambda: scalar + scalar,
         "add_1_row": lambda: row + row,
@@ -39,7 +41,25 @@ def operations(device):
         "rms_norm_1_row": lambda: torch_npu.npu_rms_norm(row, gamma)[0],
         "index_select_1_row": lambda: table.index_select(0, index),
         "empty_like_1_row": lambda: torch.empty_like(row),
+        # The MoE combine's two spellings. vLLM-Ascend reaches the
+        # multi-tensor kernel for a list of one; a capture puts it at 21.282 us
+        # against the plain add's 1.820 at the same shape, and flat in rows.
+        "foreach_add_1_row": lambda: torch._foreach_add([row], [row]),
+        "add_8_rows": lambda: wide + wide,
+        "foreach_add_8_rows": lambda: torch._foreach_add([wide], [wide]),
+        "add_32_rows": lambda: widest + widest,
+        "foreach_add_32_rows": lambda: torch._foreach_add([widest], [widest]),
+        # Two kernels: the FP32 bracket the engine wraps each TP reduction in.
+        "cast_round_trip_8_rows": lambda: wide.float().bfloat16(),
     }
+
+
+def combine_agrees(device):
+    """Does the plain add give the multi-tensor kernel's result exactly?"""
+    left = torch.randn(8, HIDDEN, device=device, dtype=torch.bfloat16)
+    right = torch.randn(8, HIDDEN, device=device, dtype=torch.bfloat16)
+    fused = torch._foreach_add([left], [right])[0]
+    return bool(torch.equal(fused, left + right))
 
 
 def batch_mean_us(call, calls):
@@ -75,8 +95,9 @@ def measure(args, report):
          "p90_us": sorted(values)[-1 - len(values) // 10]}
         for name, values in samples.items()
     ]
+    report["combine_bit_exact"] = combine_agrees(device)
     report["status"] = "pass"
-    return True
+    return report["combine_bit_exact"]
 
 
 def arguments():
