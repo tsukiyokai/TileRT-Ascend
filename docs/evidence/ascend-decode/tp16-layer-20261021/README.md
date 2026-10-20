@@ -75,3 +75,36 @@ bound, which is real and not sufficient. The target needs the reduce count
 halved **and** the compute at the engine's fused figure **and** the drafting at
 its measured ceiling, all three at once -- which is the first time this session
 has priced them together rather than one at a time.
+
+## The bank narrowing, priced inside the layer
+
+Same arrangement, with the MoE's bank cut from sixteen experts to the two a
+round touches:
+
+    attention and its projections   308.97 us
+    the MoE, 16 experts             198.88
+    the MoE, 2 experts              108.66
+    compute only, no collective     485.01
+    with two all_reduce calls       852.05
+    the same, bank narrowed         760.68
+    the collectives cost            367.04
+    narrowing saves a layer          91.37
+    a round of 78 layers             66.46 ms, narrowed 59.33
+
+**91.37 us a layer, 7.13 ms a round** -- half again what the standalone
+measurement priced at 4.63, because the layer's MoE runs the full bank at
+198.88 us and two experts cost 108.66.
+
+## And the compute splits two to one toward attention
+
+    attention and its projections   308.97 us   64% of compute
+    the MoE                         198.88      41%
+
+(They overlap slightly, so the shares exceed one.) The compute half's weight is
+on the attention side, not the experts -- which is where the attention
+redundancy dial points, though that one trades memory for a collective rather
+than for compute.
+
+So the day's two compute levers act on different halves: the bank narrowing
+takes 91 us from the MoE's 199, and nothing yet takes anything from attention's
+309.
