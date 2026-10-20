@@ -549,7 +549,8 @@ def run(args, report):
                         "counters_before": counters_before,
                         "counters_after": asdict(compilation_counter),
                         "artifacts_sha256": artifacts,
-                        "draft_do_not_compile": draft.model.do_not_compile,
+                        "draft_do_not_compile": (None if draft is None
+                                                 else draft.model.do_not_compile),
                         "draft_mode": str(
                             draft.config.compilation_config.mode,
                         ),
@@ -612,7 +613,8 @@ def run(args, report):
         report.update(
             status="completed", rank_requests=engine.requests,
             command_serial=executor.serial, closed=executor.closed,
-            final_positions=[target.position, draft.position],
+            final_positions=[target.position,
+                             None if draft is None else draft.position],
             draft_graph_state=None if draft.graph is None else {
                 "captures": draft.graph.capture_count,
                 "replays": draft.graph.replay_count,
