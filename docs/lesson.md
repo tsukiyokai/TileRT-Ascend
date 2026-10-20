@@ -662,3 +662,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     baseline understates what the engine pays and any mixed-probe baseline
     overstates what a clean kernel would. Compare only within one state, and
     record which state it was.
+
+74. The round's fixed term is a property of the process, not of the operators.
+    Measured in one clean process at the decode shape, the MoE matmul, both
+    halves of the routing, the norm with its quantisation and a local
+    reduction sum to 15.38 ms a round, against about 40 ms for the same items
+    in the engine's accounting -- and the MoE matmul alone has been measured at
+    61.6 us clean against 153.3 mixed. So the 45.88 ms fixed term that makes
+    2.x ms look unreachable is not a floor; it is the cost of whatever state
+    the engine is in. A clean-state round would be near 18 ms and a TPOT near
+    3.3 at the acceptance already achieved. Six candidate causes are ruled out:
+    loading the kernel library, running the kernel, building a communication
+    domain, a second resident NZ weight bank, the full two-stage vendor chain,
+    and constant versus random codes.
