@@ -272,7 +272,19 @@ class CannModel:
 
                 self._routed_kernel_hook = install_before_conversion(
                     AscendW4A8DynamicFusedMoEMethod)
-            self.worker.load_model()
+            if layers:
+                # A truncated backbone has no MTP layer at its own depth --
+                # the checkpoint's is layer 78 -- and the completeness check
+                # fires before `load_format` is consulted, so dummy weights do
+                # not satisfy it. vLLM supplies the scope that waives it.
+                from vllm.model_executor.model_loader.mtp_validation import (
+                    disable_mtp_completeness_check,
+                )
+
+                with disable_mtp_completeness_check():
+                    self.worker.load_model()
+            else:
+                self.worker.load_model()
             self.runner = self.worker.model_runner
             self.model = self.runner.get_model()
             if self.fp32_head:
