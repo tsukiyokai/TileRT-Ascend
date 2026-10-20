@@ -10,12 +10,19 @@ caller is reachable because the MoE body is already an opaque custom op, so
 the quant method is re-entered on every eager invocation and once during
 capture.
 
-Nothing about the weights is rearranged. The checkpoint stores packed INT4
-codes -- `w13_weight (256, 128, 6144)` is `[expert][N][K/2]` and
-`w2_weight (256, 3072, 128)` is `[expert][K][N/2]` -- which is what the kernel
-reads, and `w13_scale_bias` and `w2_scale_bias` are the per-output-channel
-FP32 correction the asymmetric quantisation needs, added once after the MSD
-recombination and before the activation scale.
+Nothing about the weights is rearranged, but when they are taken matters.
+The checkpoint stores packed INT4 codes -- `w13_weight (256, 128, 6144)` is
+`[expert][N][K/2]` and `w2_weight (256, 3072, 128)` is `[expert][K][N/2]` --
+which is what the kernel reads, and `w13_scale_bias` and `w2_scale_bias` are
+the per-output-channel FP32 correction the asymmetric quantisation needs,
+added once after the MSD recombination and before the activation scale.
+
+`process_weights_after_loading` then casts both weights to fractal NZ, because
+the vendor's fused operator dispatches to `aclnnGroupedMatmulSwigluQuantWeightNzV2`
+and that variant requires five-dimensional storage. A kernel that reads ND
+would read NZ bytes as ND and be silently wrong, so `install` must be called
+while the weights are still as loaded, and it holds its own reference to them
+-- which costs what the weights cost, once a converted layer.
 """
 import ctypes
 import os
@@ -50,10 +57,12 @@ def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
     undo = []
     for layer in layers:
         method = layer.quant_method
-        held = (method.w13_weight.data, method.w13_scale_bias.data.squeeze(-1),
-                method.w13_weight_scale.data.squeeze(-1), method.w2_weight.data,
-                method.w2_scale_bias.data.squeeze(-1),
-                method.w2_weight_scale.data.squeeze(-1))
+        held = (method.w13_weight.data.clone(),
+                method.w13_scale_bias.data.squeeze(-1).clone(),
+                method.w13_weight_scale.data.squeeze(-1).clone(),
+                method.w2_weight.data.clone(),
+                method.w2_scale_bias.data.squeeze(-1).clone(),
+                method.w2_weight_scale.data.squeeze(-1).clone())
         original_first = method.apply_gmm1_act_quant
         original_second = method.apply_gmm2
 

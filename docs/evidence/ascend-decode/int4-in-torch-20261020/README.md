@@ -53,3 +53,46 @@ reads the define, and `build_so.sh` passes `CAPACITY` to both objects.
 
 The per-row-count `Resident` map was generality for a kernel that has one row
 count by construction. Removed.
+
+
+## What trying to call the vendor operator taught, having not called it
+
+The numerics comparison did not run: `npu_format_cast` to NZ wants the GE
+graph compiler up, and it does not come up in a bare interpreter. What the
+attempt established is worth more than the comparison would have been at this
+stage.
+
+The operator's declaration, in full:
+
+    _C_ascend::grouped_matmul_swiglu_quant_v2(
+      Tensor x, Tensor[] weight, Tensor[] weight_scale, Tensor x_scale,
+      Tensor group_list, Tensor? smooth_scale=None,
+      Tensor[]? weight_assist_matrix=None, Tensor? bias=None,
+      int? dequant_mode=0, int? dequant_dtype=0, int? quant_mode=0,
+      int? quant_dtype=0, bool transpose_weight=False,
+      int group_list_type=0, int[2] tuning_config=[], float swiglu_limit=0.)
+      -> (Tensor output, Tensor output_scale)
+
+So `weight`, `weight_scale` and `weight_assist_matrix` are lists, and the
+correction is per expert.
+
+And the call dispatches to `aclnnGroupedMatmulSwigluQuantWeightNzV2`, which
+rejects anything but five-dimensional storage: the vendor path runs on
+fractal-NZ weights. `process_weights_after_loading` is where that happens, via
+`maybe_trans_nz`. Which means that by the time `install` would have run inside
+the engine, `w13_weight` and `w2_weight` are NZ int32, not the checkpoint's ND
+int8 -- and a kernel reading ND would have read NZ bytes as ND and produced
+garbage, with nothing in the build or the dispatch to say so. The module now
+holds its own references to the weights as loaded and documents that it must
+be installed before the cast.
+
+Also confirmed, and useful: the packings agree. `_pack_to_int32` is a
+`view(torch.int32)` over an int8 tensor that already holds two nibbles a byte,
+low nibble first, which is exactly what this kernel reads. Nothing needs
+repacking; only the format cast stands between the two.
+
+## What the numerics comparison still needs
+
+A process with the GE compiler up -- which the engine has, so the comparison
+belongs inside a single-rank engine run rather than in a standalone probe.
+That is the next device step, and it is still not a whole machine.
