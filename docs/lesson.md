@@ -1860,3 +1860,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      today of one shape -- code appended after the point that consumes it --
      after a check function added below `main` and a check added below the
      `__main__` block. All three entry blocks are now last in their files.
+
+179. The width-six gather_fia gate has no cause anyone can find in the code.
+     `gathered_fia` is fully parameterised in the width -- it comes from
+     `ql_nope.shape[0]` and every reshape and sequence list is built from it --
+     and the topk buffer is sliced by the round's token count with no width
+     limit. The non-contiguity hypothesis fails because `gathered_fia` reshapes
+     the caller's tensor, not a slice of that buffer. So the gate is a recorded
+     observation -- "widths above six failed serial-equivalence checks" --
+     whose failing output nobody kept, and four readings have now found
+     nothing. Re-running the comparison and reading the failure is cheaper than
+     a fifth reading.
