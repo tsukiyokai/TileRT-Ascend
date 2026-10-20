@@ -40,38 +40,28 @@ constexpr int64_t HIDDEN = 6144;
 constexpr int64_t HALF = 128;
 constexpr int64_t GATE_UP = 2 * HALF;
 constexpr int64_t M_TILE = 16;
+constexpr int64_t ROWS = ROWS_PER_EXPERT;
+constexpr int64_t STACKED = 2 * ROWS;
 constexpr int64_t BLOCK_FLOATS = 8;
+constexpr int64_t SCALE_STRIDE = (ROWS + BLOCK_FLOATS - 1)
+                                 / BLOCK_FLOATS * BLOCK_FLOATS;
 constexpr int64_t TILE_BYTES = 2048 / 2;
 constexpr size_t TILING_BYTES = 256;
 constexpr size_t MATMUL_WORKSPACE = 16u << 20;
 
-/** The sync base, the tilings and the scratch, built once a shape.
+/** The sync base, the tilings and the scratch, built once.
  *
  * `rtGetC2cCtrlAddr` and the tiling upload belong outside capture, and every
  * buffer here is shaped by the layer rather than by the call, so one instance
- * serves every invocation at a given row count.
+ * serves every invocation. Rows an expert is `ROWS_PER_EXPERT`, compiled into
+ * the kernel, so there is nothing to infer from the tensor.
  */
 class Resident {
  public:
-    Resident(int64_t experts, int64_t rows)
-        : rows_(rows), scale_stride_((rows + BLOCK_FLOATS - 1)
-                                     / BLOCK_FLOATS * BLOCK_FLOATS)
+    static Resident& Instance(int64_t experts)
     {
-        uint32_t length = 0;
-        TORCH_CHECK(rtGetC2cCtrlAddr(&sync_base_, &length) == 0,
-                    "rtGetC2cCtrlAddr failed");
-        const int64_t stacked_rows = 2 * rows;
-        gate_up_tiling_ = Upload(stacked_rows, GATE_UP, HIDDEN, GATE_UP);
-        down_tiling_ = Upload(stacked_rows, HIDDEN, HALF, HIDDEN);
-        stacked_ = Hold(experts * M_TILE * HIDDEN / 2);
-        stacked_low_ = static_cast<char*>(stacked_) + rows * HIDDEN / 2;
-        partial_ = Hold(experts * M_TILE * GATE_UP * sizeof(int32_t));
-        middle_ = Hold(experts * M_TILE * HALF / 2);
-        middle_scale_ = static_cast<float*>(
-            Hold(experts * scale_stride_ * sizeof(float)));
-        wide_ = Hold(experts * M_TILE * HIDDEN * sizeof(int32_t));
-        witness_ = Hold(experts * TILE_BYTES);
-        workspace_ = Hold(MATMUL_WORKSPACE);
+        static Resident held(experts);
+        return held;
     }
 
     uint64_t sync_base() const { return sync_base_; }
@@ -87,6 +77,24 @@ class Resident {
     void* workspace() const { return workspace_; }
 
  private:
+    explicit Resident(int64_t experts)
+    {
+        uint32_t length = 0;
+        TORCH_CHECK(rtGetC2cCtrlAddr(&sync_base_, &length) == 0,
+                    "rtGetC2cCtrlAddr failed");
+        gate_up_tiling_ = Upload(STACKED, GATE_UP, HIDDEN, GATE_UP);
+        down_tiling_ = Upload(STACKED, HIDDEN, HALF, HIDDEN);
+        stacked_ = Hold(experts * M_TILE * HIDDEN / 2);
+        stacked_low_ = static_cast<char*>(stacked_) + ROWS * HIDDEN / 2;
+        partial_ = Hold(experts * M_TILE * GATE_UP * sizeof(int32_t));
+        middle_ = Hold(experts * M_TILE * HALF / 2);
+        middle_scale_ = static_cast<float*>(
+            Hold(experts * SCALE_STRIDE * sizeof(float)));
+        wide_ = Hold(experts * M_TILE * HIDDEN * sizeof(int32_t));
+        witness_ = Hold(experts * TILE_BYTES);
+        workspace_ = Hold(MATMUL_WORKSPACE);
+    }
+
     static void* Hold(size_t bytes)
     {
         void* block = nullptr;
@@ -108,8 +116,6 @@ class Resident {
         return block;
     }
 
-    int64_t rows_;
-    int64_t scale_stride_;
     uint64_t sync_base_ = 0;
     void* gate_up_tiling_ = nullptr;
     void* down_tiling_ = nullptr;
@@ -123,28 +129,18 @@ class Resident {
     void* workspace_ = nullptr;
 };
 
-/** One `Resident` a row count, since the engine's draft width is fixed. */
-Resident& ResidentFor(int64_t experts, int64_t rows)
-{
-    static std::vector<std::pair<int64_t, Resident*>> held;
-    for (const auto& entry : held) {
-        if (entry.first == rows) {
-            return *entry.second;
-        }
-    }
-    held.emplace_back(rows, new Resident(experts, rows));
-    return *held.back().second;
-}
-
 /** The stream this call is on, asked for without draining it.
  *
- * The draining accessor costs about a millisecond a call on a busy worker
- * against two microseconds for this one, and a cached pointer is worse than
- * either: it has been seen to send kernels onto another thread's stream.
+ * `need_empty` false is the whole point: draining costs about a millisecond a
+ * call on a busy worker against two microseconds, and a cached pointer is
+ * worse than either, having been seen to send kernels onto another thread's
+ * stream. The header also declares `getCurrentNPUStreamNoWait`, which
+ * `libtorch_npu.so` does not export -- it links and then fails at `dlopen` --
+ * so this is the form the op plugin itself uses.
  */
 void* CurrentStream()
 {
-    return c10_npu::getCurrentNPUStreamNoWait();
+    return c10_npu::getCurrentNPUStream().stream(false);
 }
 
 /** One layer's routed experts, gate-up through down, in a single launch.
@@ -169,10 +165,12 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
     TORCH_CHECK(gu_bias.dtype() == at::kFloat, "gu_bias must be FP32");
     TORCH_CHECK(down_bias.dtype() == at::kFloat, "down_bias must be FP32");
 
-    const int64_t per_expert = rows.size(0) / experts;
+    TORCH_CHECK(rows.size(0) == experts * ROWS, "rows must be ",
+                experts * ROWS, ", the kernel is built for ", ROWS,
+                " an expert");
     at::Tensor out = at::empty({rows.size(0), HIDDEN},
                                rows.options().dtype(at::kBFloat16));
-    Resident& held = ResidentFor(experts, per_expert);
+    Resident& held = Resident::Instance(experts);
     routed_int4_launch(
         static_cast<uint32_t>(blocks), CurrentStream(), held.sync_base(),
         rows.data_ptr(), held.stacked(), held.stacked_low(),

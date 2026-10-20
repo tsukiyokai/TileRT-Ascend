@@ -3,6 +3,10 @@
 
 #include <cstdint>
 
+#ifndef ROWS_PER_EXPERT
+#define ROWS_PER_EXPERT 2
+#endif
+
 void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         void* rows, void* stacked, void* stacked_low,
                         void* gate_up,
