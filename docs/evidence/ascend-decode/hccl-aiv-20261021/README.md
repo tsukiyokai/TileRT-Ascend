@@ -75,3 +75,34 @@ applies to the whole round rather than to the 0.26 standalone calls a layer.
 
 And it makes the application trivial: set `HCCL_OP_EXPANSION_MODE=AIV` in the
 engine's environment. No code.
+
+## AIV takes the floor, not the rank scaling
+
+The same all_reduce of 144 KB under both modes, one world size a run:
+
+| ranks | default | AIV | ratio |
+|---|---|---|---|
+| 2 | 214.12 | 117.27 | 1.83x |
+| 4 | 192.15 | 140.93 | 1.36x |
+| 8 | 227.61 | 131.06 | 1.74x |
+| 16 | 295.38 | 183.13 | 1.61x |
+
+AIV is 1.83x faster at **two ranks**, where there is no fan-out to speak of. So
+what it removes is the per-call floor rather than the cost of participants. The
+rank scaling is similar in both: 2 to 16 adds 81 us by default and 66 under
+AIV.
+
+## Which gives the cost three layers, all measured
+
+    transport        37 us   144 KB off a die to pinned host
+    call floor      120 us   AIV, at two ranks, above that transport
+                    200 us   default
+    rank fan-out     70 us   2 to 16, either mode
+
+AIV eats 40 percent of the middle layer. The 120 us that remains is still the
+largest single term, and it is neither the bytes nor the participants nor host
+dispatch -- a kernel's issue under graph replay is 1.064 us.
+
+So the decomposition of this project's largest cost is complete, and what is
+left of it is an intrinsic per-call cost inside HCCL at 120 us with the better
+expansion mode.

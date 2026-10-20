@@ -1674,3 +1674,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      Collectives are 374 us a layer, so this is 11 to 13.6 ms a round for the
      whole round, an order of magnitude above the bank narrowing, and it
      applies with an environment variable and no code.
+
+163. AIV takes the per-call floor, not the rank scaling. The same 144 KB
+     all_reduce: 2 ranks 214.12 default against 117.27 AIV, 1.83x where there
+     is no fan-out; 16 ranks 295.38 against 183.13. Rank scaling is similar in
+     both modes, 81 us from 2 to 16 by default and 66 under AIV. So the cost
+     has three measured layers -- transport 37 us, a call floor of 200 default
+     or 120 under AIV, and about 70 us of fan-out. AIV eats 40 percent of the
+     middle one. The 120 us that remains is the largest single term in this
+     project and is neither bytes nor participants nor host dispatch, where a
+     kernel's issue under graph replay is 1.064 us.
