@@ -1515,3 +1515,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      only ratios are usable. An operator costing 157 us for twelve rows and 2.8
      percent more for two hundred and fifty-six is doing almost none of its
      work on the rows it was given.
+
+151. The grouped matmul's cost follows the bank, not the rows, and that is the
+     first lever this session larger than the gap. One die, 96 rows fixed: 1,
+     2, 4, 8, 16 experts cost 55.57, 54.24, 73.85, 105.51, 168.58 us -- linear
+     at 7.53 us an expert over a 55.57 intercept, predicting 168.6 against
+     168.58 measured, with bandwidth reaching 896 GB/s. So it reads the whole
+     bank at HBM speed whatever it was asked to compute, which is why it is
+     flat in rows. At batch one each row picks eight of 256 experts and a rank
+     owns sixteen, so a round touches two to five of them: narrowing the bank to
+     those is worth 82.8 to 103.1 us a layer, 6.5 to 8.0 ms a round, against
+     the 4.25 needed. Distinct from the closed lever that changed the drafter
+     to route to fewer experts -- this changes no routing and only declines to
+     read experts no row selected.
