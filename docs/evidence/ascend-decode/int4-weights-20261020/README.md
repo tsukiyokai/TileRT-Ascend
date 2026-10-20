@@ -195,9 +195,42 @@ when its destination offset is zero and lands nowhere when it is not:
 - Three addressings fail alike: a `GlobalTensor<int4b_t>` subscript, a
   `__gm__ int4b_t*` offset, and that offset taken through a byte pointer.
 
-The same `DataCopy` at offset zero, with and without `DataCopyParams`, works
-in a plain vector kernel -- six probes above say so -- so the next cut is a
-non-zero destination offset in that isolated probe rather than in this kernel.
+## The write mechanism is exonerated, and the defect splits in two
+
+The isolated probe was made to match the kernel exactly, one factor at a time,
+and every combination lands all 2048 values:
+
+| probe shape | result |
+|---|---|
+| plain vector kernel, offset 256 | 256 of 256 |
+| with `ASCENDC_CUBE_ONLY` | 256 of 256 |
+| as `__mix__(1, 2)`, vector half working | 256 of 256 |
+| both, offsets 256 / 2048 / 6144 / 12288 / 24576 | 256 of 256 each |
+| both, span 2048 at offsets 0 / 2048 / 12288 | 2048 of 2048 each |
+
+So neither the macro, nor the MIX shape, nor the offset, nor the span is at
+fault. The write mechanism is exonerated.
+
+A dedicated witness buffer then separated the last two hypotheses. The low
+half is emitted twice: once to `stacked` at nibble 12288, and once to a buffer
+of its own at offset zero -- the shape proven above. For
+`x = 98, 112, −73, 80, 13, 14, −106, 24` the low halves should be
+`−6, −8, −1, −8, 5, 6, −2, 0`. The witness holds `4, 3, 1, −2, −3, −5, 3, 6`,
+and the place in `stacked` still holds a previous run's residue.
+
+Both are true at once, so there are two defects, not one:
+
+1. The low half in `held.work` is already wrong when it is emitted, while the
+   high half from the same `SplitHalves` call -- `6, 7, −5, 5, 0, 0, −7, 1`,
+   exactly `floor(x / 16)` -- is right.
+2. The copy to `stacked` at a non-zero offset does not land, although the
+   identical copy lands in the probe and the witness copy at offset zero
+   lands here.
+
+The next cut is the one difference left between probe and kernel: the probe's
+vector half runs unconditionally, while `Split` here runs inside
+`if (sub == 0)` on one subblock of a MIX kernel. Both defects would follow
+from a subblock-gated vector op inheriting the wrong mask or repeat state.
 
 ## What the sanitizer was for
 

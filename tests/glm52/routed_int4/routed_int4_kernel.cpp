@@ -204,34 +204,40 @@ __aicore__ inline void SplitHalves(Workspace& held, int64_t span)
     PipeBarrier<PIPE_ALL>();
 }
 
-/** Write `span` INT4 values to `base` offset `at` elements.
+/** Write `span` INT4 values into `sink` at element `at`.
  *
- * The destination is addressed by pointer rather than by subscript. A
- * `GlobalTensor<int4b_t>` subscript counts nibbles in a plain vector kernel
- * and bytes here, under `__mix__` with `ASCENDC_CUBE_ONLY` -- the high half
- * of every split landed and the low half, the only one written at a non-zero
- * offset, never did. `Nibbles` states the unit once.
+ * One tensor over the whole destination, subscripted -- not a fresh tensor
+ * whose base carries the offset. That shape loses the offset: both halves of
+ * a split landed at zero, and which one survived depended on the order the
+ * copies happened to complete, so the high half looked correct for as long
+ * as it won. An isolated probe writing the same two halves through one
+ * tensor and one staging pair lands both, at every offset from 256 to 24576,
+ * under `__mix__` and `ASCENDC_CUBE_ONLY` alike.
  */
 __aicore__ inline void Emit(LocalTensor<half>& staging,
                             LocalTensor<int4b_t>& packed,
                             LocalTensor<float>& source,
-                            __gm__ int4b_t* base, int64_t at, int64_t span)
+                            GlobalTensor<int4b_t>& sink, int64_t at,
+                            int64_t span)
 {
     Cast(staging, source, RoundMode::CAST_RINT, span);
     PipeBarrier<PIPE_V>();
     Cast(packed, staging, RoundMode::CAST_RINT, span);
     PipeBarrier<PIPE_ALL>();
-    GlobalTensor<int4b_t> sink;
-    sink.SetGlobalBuffer(Nibbles(base, at), span);
-    DataCopy(sink, packed, span);
+    DataCopy(sink[at], packed, span);
+    PipeBarrier<PIPE_ALL>();
 }
 
 /** Stack one expert's rows as two INT4 halves. */
 __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
-                             __gm__ int4b_t* stacked)
+                             __gm__ int4b_t* stacked, __gm__ int4b_t* witness)
 {
     GlobalTensor<int8_t> rows_global;
+    GlobalTensor<int4b_t> stacked_global;
+    GlobalTensor<int4b_t> witness_global;
     rows_global.SetGlobalBuffer(rows, ROWS * HIDDEN);
+    stacked_global.SetGlobalBuffer(stacked, M_TILE * HIDDEN);
+    witness_global.SetGlobalBuffer(witness, TILE);
 
     for (int64_t row = 0; row < ROWS; ++row) {
         for (int64_t done = 0; done < HIDDEN; done += TILE) {
@@ -244,10 +250,14 @@ __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
             Cast(held.value, held.half_value, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
             SplitHalves(held, count);
-            Emit(held.half_value, held.code, held.value, stacked,
+            Emit(held.half_value, held.code, held.value, stacked_global,
                  row * HIDDEN + done, count);
-            Emit(held.spare_half, held.spare_code, held.work, stacked,
+            Emit(held.half_value, held.code, held.work, stacked_global,
                  (ROWS + row) * HIDDEN + done, count);
+            if (row == 0 && done == 0) {
+                Emit(held.half_value, held.code, held.work, witness_global, 0,
+                     count);
+            }
             PipeBarrier<PIPE_ALL>();
         }
     }
@@ -312,8 +322,10 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
     GlobalTensor<int32_t> product_global;
     GlobalTensor<float> scale_global;
     GlobalTensor<float> token_global;
+    GlobalTensor<int4b_t> middle_global;
     GlobalTensor<float> out_scale_global;
     GlobalTensor<float> bias_global;
+    middle_global.SetGlobalBuffer(middle, M_TILE * HALF);
     bias_global.SetGlobalBuffer(gu_bias, GATE_UP);
     product_global.SetGlobalBuffer(product, M_TILE * GATE_UP);
     scale_global.SetGlobalBuffer(gu_scale, GATE_UP);
@@ -359,9 +371,9 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
         Cast(held.value, held.half_value, RoundMode::CAST_NONE, HALF);
         PipeBarrier<PIPE_V>();
         SplitHalves(held, HALF);
-        Emit(held.half_value, held.code, held.value, middle, row * HALF,
-             HALF);
-        Emit(held.spare_half, held.spare_code, held.work, middle,
+        Emit(held.half_value, held.code, held.value, middle_global,
+             row * HALF, HALF);
+        Emit(held.half_value, held.code, held.work, middle_global,
              (ROWS + row) * HALF, HALF);
         PipeBarrier<PIPE_ALL>();
         token.SetValue(row, quantum);
@@ -431,8 +443,8 @@ __aicore__ void routed_int4_fused(
     __gm__ float* token_scale,
     __gm__ int32_t* partial, __gm__ int4b_t* middle,
     __gm__ float* middle_scale, __gm__ int32_t* wide, __gm__ bfloat16_t* out,
-    __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling, int64_t experts,
-    int64_t blocks)
+    __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling,
+    __gm__ int4b_t* witness, int64_t experts, int64_t blocks)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     InitSocState();
@@ -481,7 +493,7 @@ __aicore__ void routed_int4_fused(
             // stays core-local.
             if (sub == 0) {
                 Split(held, rows + expert * ROWS * HIDDEN,
-                      Nibbles(stacked, expert * M_TILE * HIDDEN));
+                      Nibbles(stacked, expert * M_TILE * HIDDEN), witness);
                 Publish();
                 CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
             }
@@ -513,7 +525,8 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         float* down_bias, float* down_scale,
                         float* token_scale, void* partial, void* middle,
                         float* middle_scale, void* wide, void* out,
-                        void* gu_tiling, void* down_tiling, int64_t experts)
+                        void* gu_tiling, void* down_tiling, void* witness,
+                        int64_t experts)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
@@ -521,5 +534,6 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
         down_bias, down_scale, token_scale, (__gm__ int32_t*)partial,
         (__gm__ int4b_t*)middle, middle_scale, (__gm__ int32_t*)wide,
         (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)gu_tiling,
-        (__gm__ uint8_t*)down_tiling, experts, blocks);
+        (__gm__ uint8_t*)down_tiling, (__gm__ int4b_t*)witness, experts,
+        blocks);
 }

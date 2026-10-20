@@ -5,24 +5,49 @@
  * an answer that is already wrong in arithmetic. `low` should be
  * `((x + 8) mod 16) - 8` and `high` the exact remainder `(x - low) / 16`.
  */
+#if CUBE_ONLY
+#define ASCENDC_CUBE_ONLY
+#endif
+
 #include "split_probe_kernel.h"
 #include "kernel_operator.h"
+#if CUBE_ONLY
+#include "lib/matmul_intf.h"
+#endif
 
 using namespace AscendC;
 
 namespace {
 
-constexpr int64_t SPAN = 256;
+#ifndef SPAN_K
+#define SPAN_K 256
+#endif
+constexpr int64_t SPAN = SPAN_K;
 constexpr int64_t SLACK = 64;
+#ifndef LOW_AT
+#define LOW_AT 256
+#endif
 
 }  // namespace
 
+#if AS_MIX
+extern "C" __global__ __mix__(1, 2) __aicore__ void split_probe(
+    __gm__ int8_t* source,
+#else
 extern "C" __global__ __aicore__ void split_probe(__gm__ int8_t* source,
+#endif
                                                   __gm__ int32_t* high_out,
                                                   __gm__ int32_t* low_out,
                                                   __gm__ float* trace,
                                                   __gm__ int4b_t* packed)
 {
+#if AS_MIX
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    InitSocState();
+    if ASCEND_IS_AIC {
+        return;
+    }
+#endif
     TPipe pipe;
     TBuf<TPosition::VECCALC> narrow_buffer;
     TBuf<TPosition::VECCALC> value_buffer;
@@ -55,7 +80,9 @@ extern "C" __global__ __aicore__ void split_probe(__gm__ int8_t* source,
     high_global.SetGlobalBuffer(high_out, SPAN);
     low_global.SetGlobalBuffer(low_out, SPAN);
     trace_global.SetGlobalBuffer(trace, SPAN);
-    packed_global.SetGlobalBuffer(packed, 2 * SPAN);
+    // Where the second half goes. The routed kernel's own writes land at
+    // offset zero and vanish at 12288; this is the remaining variable.
+    packed_global.SetGlobalBuffer(packed, LOW_AT + SPAN);
 
     DataCopy(narrow, source_global, SPAN);
     PipeBarrier<PIPE_ALL>();
@@ -104,7 +131,7 @@ extern "C" __global__ __aicore__ void split_probe(__gm__ int8_t* source,
     PipeBarrier<PIPE_V>();
     Cast(code, half_value, RoundMode::CAST_RINT, SPAN);
     PipeBarrier<PIPE_ALL>();
-    DataCopy(packed_global[SPAN], code, SPAN);
+    DataCopy(packed_global[LOW_AT], code, SPAN);
 }
 
 void split_probe_launch(void* stream, void* source, void* high_out,

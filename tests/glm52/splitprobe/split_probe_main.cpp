@@ -9,7 +9,14 @@
 
 namespace {
 
-constexpr int64_t SPAN = 256;
+#ifndef SPAN_K
+#define SPAN_K 256
+#endif
+constexpr int64_t SPAN = SPAN_K;
+#ifndef LOW_AT
+#define LOW_AT 256
+#endif
+constexpr int64_t LOW_OFFSET = LOW_AT;
 
 void Check(aclError status, const char* what)
 {
@@ -38,11 +45,13 @@ int main(int argc, char** argv)
     Check(aclrtMalloc(&high_out, SPAN * 4, ACL_MEM_MALLOC_HUGE_FIRST), "high");
     Check(aclrtMalloc(&low_out, SPAN * 4, ACL_MEM_MALLOC_HUGE_FIRST), "low");
     Check(aclrtMalloc(&trace, SPAN * 4, ACL_MEM_MALLOC_HUGE_FIRST), "trace");
-    Check(aclrtMalloc(&packed, SPAN, ACL_MEM_MALLOC_HUGE_FIRST), "packed");
+    Check(aclrtMalloc(&packed, (LOW_OFFSET + SPAN) / 2,
+                      ACL_MEM_MALLOC_HUGE_FIRST), "packed");
 
     std::vector<int8_t> source_host(SPAN);
     for (int64_t index = 0; index < SPAN; ++index) {
-        source_host[index] = static_cast<int8_t>(index - 128);
+        source_host[index] = static_cast<int8_t>((index * 37 + 11) % 256
+                                                 - 128);
     }
     Check(aclrtMemcpy(source, SPAN, source_host.data(), SPAN,
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload");
@@ -60,9 +69,10 @@ int main(int argc, char** argv)
     Check(aclrtMemcpy(floored.data(), SPAN * 4, trace, SPAN * 4,
                       ACL_MEMCPY_DEVICE_TO_HOST), "down trace");
 
-    std::vector<uint8_t> packed_host(SPAN);
-    Check(aclrtMemcpy(packed_host.data(), SPAN, packed, SPAN,
-                      ACL_MEMCPY_DEVICE_TO_HOST), "down packed");
+    std::vector<uint8_t> packed_host((LOW_OFFSET + SPAN) / 2);
+    Check(aclrtMemcpy(packed_host.data(), packed_host.size(), packed,
+                      packed_host.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+          "down packed");
     {
         // Which nibble of a byte holds the earlier element?
         const auto read = [&](int64_t index, bool low_first) {
@@ -77,16 +87,15 @@ int main(int argc, char** argv)
         int64_t as_low_first = 0;
         int64_t as_high_first = 0;
         for (int64_t index = 0; index < SPAN; ++index) {
-            as_low_first += (read(SPAN + index, true) == low[index]);
-            as_high_first += (read(SPAN + index, false) == low[index]);
+            as_low_first += (read(LOW_OFFSET + index, true) == low[index]);
+            as_high_first += (read(LOW_OFFSET + index, false) == low[index]);
         }
-        std::printf("packed low matches the INT32 low in %lld of %lld slots "
-                    "reading the earlier element from the low nibble, %lld "
-                    "from the high nibble\n", (long long)as_low_first,
+        std::printf("packed low matches in %lld of %lld "
+                    "(other convention %lld)\n", (long long)as_low_first,
                     (long long)SPAN, (long long)as_high_first);
         std::printf("  first 8 bytes:");
         for (int64_t at = 0; at < 8; ++at) {
-            std::printf(" %02x", packed_host[SPAN / 2 + at]);
+            std::printf(" %02x", packed_host[LOW_OFFSET / 2 + at]);
         }
         std::printf("\n  first 8 INT32 lows:");
         for (int64_t at = 0; at < 8; ++at) {

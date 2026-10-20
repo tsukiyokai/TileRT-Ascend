@@ -201,6 +201,7 @@ int main(int argc, char** argv)
     void* out = Hold(experts * ROWS * HIDDEN * sizeof(uint16_t), "out");
     void* gu_tiling = Hold(TILING_BYTES, "gu tiling");
     void* down_tiling = Hold(TILING_BYTES, "down tiling");
+    void* witness = Hold(2048, "witness");
 
     const auto upload = [&](void* where, const void* what, size_t bytes,
                             const char* name) {
@@ -242,7 +243,7 @@ int main(int argc, char** argv)
                        (float*)gu_bias, (float*)gu_scale, down,
                        (float*)down_bias, (float*)down_scale, (float*)token,
                        partial, middle, (float*)middle_scale, wide, out,
-                       gu_tiling, down_tiling, experts);
+                       gu_tiling, down_tiling, witness, experts);
     Check(aclrtSynchronizeStream(stream), "once");
 
     std::vector<uint16_t> out_host(experts * ROWS * HIDDEN);
@@ -322,6 +323,17 @@ int main(int argc, char** argv)
                         "\n  low halves addressed at nibble %lld, found at "
                         "%lld", (long long)high_at,
                         (long long)(ROWS * HIDDEN), (long long)found_at);
+        }
+        std::vector<uint8_t> witness_host(1024);
+        Check(aclrtMemcpy(witness_host.data(), witness_host.size(), witness,
+                          witness_host.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+              "down witness");
+        std::printf("\n  low halves through a dedicated buffer at zero:");
+        for (int64_t at = 0; at < 8; ++at) {
+            const uint8_t byte = witness_host[at / 2];
+            const uint8_t four = (at % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+            std::printf(" %4d", (int)((four >= 8) ? (int)four - 16
+                                                  : (int)four));
         }
         std::printf("\n  product, first 4 columns: want");
         for (int64_t column = 0; column < 4; ++column) {
@@ -412,7 +424,7 @@ int main(int argc, char** argv)
                                down, (float*)down_bias, (float*)down_scale,
                                (float*)token, partial, middle,
                                (float*)middle_scale, wide, out, gu_tiling,
-                               down_tiling, experts);
+                               down_tiling, witness, experts);
         }
         Check(aclrtSynchronizeStream(stream), "timing");
         clock_gettime(CLOCK_MONOTONIC, &end);
