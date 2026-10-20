@@ -51,6 +51,11 @@ def operations(device):
         "foreach_add_32_rows": lambda: torch._foreach_add([widest], [widest]),
         # Two kernels: the FP32 bracket the engine wraps each TP reduction in.
         "cast_round_trip_8_rows": lambda: wide.float().bfloat16(),
+        # The rest of the residual combine, scale then add, in two spellings.
+        # `alpha` keeps the product in the accumulator, so the one-kernel form
+        # is more accurate rather than identical.
+        "scale_then_add_8_rows": lambda: (wide * 1.5) + wide,
+        "fused_axpy_8_rows": lambda: torch.add(wide, wide, alpha=1.5),
     }
 
 
@@ -113,7 +118,8 @@ def arguments():
 def main():
     args = arguments()
     report = {
-        "status": "error", "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "error",
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv], "hostname": platform.node(),
         "device": args.device, "calls": args.calls, "warmup": args.warmup,
         "batches": args.batches, "hidden": HIDDEN,

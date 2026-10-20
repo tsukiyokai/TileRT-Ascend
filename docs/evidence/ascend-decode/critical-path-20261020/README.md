@@ -111,6 +111,26 @@ carry host issue — `empty_like` alone costs 4.680 µs — and its 28.97 µs
 difference is an upper bound. The capture's device-side difference, 19.46 µs,
 is the one to price: 1.46 ms a round over 75 layers.
 
+The combine's other half splits the same way. A second run on the same die
+([record](combine-floor-die1-axpy.json)) is slower throughout — `add_8_rows`
+11.779 against the first run's 9.520, the die having grown busier — which is
+why only pairs inside one run count. In that run's units: `Muls` then add,
+spelled `(x * s) + y`, costs 27.505 µs, while the single `torch.add(y, x,
+alpha=s)` costs 14.453 against a plain add's 11.779. So one kernel does the
+whole scale-and-add for about what an add costs.
+
+That gives two steps rather than one, and only the first is free of numerics:
+
+| step | per layer, device side | a round | exact? |
+|---|---|---|---|
+| now: `Muls` 8.46 + `ForeachAddList` 21.403 | 29.86 µs | — | — |
+| plain add, keeping `Muls` | 10.36 µs | 1.46 ms | bit-exact |
+| one `add(..., alpha=scale)` | about 3.5 µs | 1.98 ms | more accurate |
+
+`alpha` keeps the product in the accumulator instead of rounding it to BF16
+first, so the second step changes values and needs the frozen teacher. Take
+the bit-exact step first; the second is worth about 0.5 ms a round beyond it.
+
 This is the megakernel's target stated in numbers, and it is not the boundary
 the closed brick tested. That brick fused publication with its consumer and
 measured 162.141 against 162.781 µs — a communication boundary, with the
