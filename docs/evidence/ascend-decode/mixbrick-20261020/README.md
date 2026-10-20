@@ -204,13 +204,34 @@ spans every slice. [raw](dynamic.txt)
 Correct: 0 of 49152 at one, two and four blocks, 0 of 196608 at 32 rows, and
 6 of 6 clean runs. Eight blocks fails entirely and is not yet understood.
 
-So the chain is still ahead of the vendor's four kernels — 29.343 against
+So the chain is still ahead of the vendor's four kernels — 29.180 against
 33.952, 1.16x — but the 2.45x the static scale showed was bought by skipping
-the reduction. Correctness costs 15.5 µs here, and that figure is the next
-thing to attribute rather than to optimise blind: the candidates are the two
-`SyncAll<false>()` barriers and the extra global round trip of the FP32
-activation, and removing the per-row scalar read of the reduction's result
-changed nothing, which rules out the one thing that looked obvious.
+the reduction.
+
+The 15 µs is now attributed, and it is not where it looked. A stage bit that
+runs the two barriers with nothing between or after them prices them apart
+from the work:
+
+| at four blocks, 8 rows | µs |
+|---|---|
+| gate and up projection, dequantisation, SwiGLU, partial maxima | 14.125 |
+| plus the two `SyncAll<false>()` barriers, nothing else | 16.494 |
+| plus the reduction, quantisation, down projection and its dequantisation | 29.180 |
+
+**The two grid barriers cost 2.37 µs, 1.18 each.** The down projection and its
+epilogue cost 1.556 in the static-scale measurement. So the quantisation pass
+alone is about 11 µs, and the reason is its shape, not its arithmetic: per
+block it walks eight rows, and each row does a 32-element global copy, a
+scalar multiply, two casts and a 32-element copy back. Forty operations on
+32 elements each, where one vector repeat is 64 floats — all of it fixed
+overhead.
+
+The fix is to batch the rows: a strided `DataCopy` brings the whole slice in
+at once, the casts run over the whole buffer, and only the per-row scalar
+multiply stays per row. Thirteen operations instead of forty. Two earlier
+guesses were wrong and are recorded as such — the per-row scalar read of the
+reduction's result, and a 32 KiB copy of the whole maxima workspace, each
+changed the total by under 0.3 µs.
 
 Two findings from building it. A reduction's destination is written a whole
 32-byte block at a time, so one float a row stamps over the next seven rows'

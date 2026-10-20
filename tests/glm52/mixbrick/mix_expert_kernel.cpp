@@ -448,8 +448,9 @@ __aicore__ inline void Quantise(TPipe& pipe, __gm__ float* hidden,
     middle_global.SetGlobalBuffer(middle, rows * HALF);
     scale_global.SetGlobalBuffer(scale_out, MAX_ROWS);
 
-    DataCopy(partial, maxima_global,
-             MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN);
+    // Only the blocks that ran. Copying the whole fixed-size workspace was
+    // 32 KiB a core and cost most of the pass.
+    DataCopy(partial, maxima_global, blocks * MAX_ROWS * REDUCE_ALIGN);
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::UB>();
 
@@ -607,14 +608,22 @@ __aicore__ void mix_expert_fused(
         // columns this split spreads across blocks. So two grid barriers,
         // both at top level: every core must arrive even where its own stage
         // work is skipped.
+        // Bit 8 runs the two barriers and nothing between or after them,
+        // which is the only way to price them apart from the work.
+        const bool barriers_only = (stages & 256) != 0;
         Publish();
         SyncAll<false>();
         if ASCEND_IS_AIV {
-            Quantise(pipe, hidden, maxima, middle, middle_scale, rows,
-                     (GetBlockIdx() / 2) * channels, channels, blocks);
+            if (!barriers_only) {
+                Quantise(pipe, hidden, maxima, middle, middle_scale, rows,
+                         (GetBlockIdx() / 2) * channels, channels, blocks);
+            }
         }
         Publish();
         SyncAll<false>();
+        if (barriers_only) {
+            return;
+        }
         const int64_t columns = HIDDEN / blocks;
         if ASCEND_IS_AIC {
             ProjectDown(pipe, middle, down, wide, down_tiling, rows,
