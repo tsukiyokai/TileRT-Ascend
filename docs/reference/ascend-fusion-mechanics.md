@@ -20044,3 +20044,234 @@ row-scale (`fused-moe-expert.md` §B7.2, equation 6) or to the extra `-8` matmul
 **not** fully resident in L1 (`singleK > baseK * stepK`), multi-core execution, and A or B in GM — and the
 summary puts the useful threshold at K **> 4096**. GLM-5.2's per-expert K is in that range, so the gate is the
 MDL template and L1 residency rather than the shape.
+
+## 52. ★ IBShare — sharing one L1-resident B across the AIVs that use the same weight, and the only int4-compatible template that does it
+
+Sources: `docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_ibshare_b.md` and
+`matmul_ibshare_ab.md` in the shipped devkit. Read 2026-10-20. This matters because at decode every core uses
+the *same* weight, which is IBShare's precondition verbatim, and because `IBShare` is one of only three
+Matmul templates that accept `int4b_t` at all (§42.7: 「int4数据类型输入的Matmul对象仅支持Norm、MDL、IBShare模板」).
+
+### 52.1 B-only IBShare: MTE2 −15.46%, and the exact residency condition
+
+案例介绍, verbatim:
+
+> - 开启IBShare的适用场景
+>   **MIX场景（包含矩阵计算和矢量计算）下，多个AIV的A矩阵或B矩阵GM地址相同，且多个AIV复用的A矩阵或B矩阵在L1 Buffer上全载。**
+> - 开启IBShare的约束条件
+>   - A矩阵和B矩阵同时开启IBShare的场景，**同一算子中其它Matmul对象的A矩阵和B矩阵也必须同时开启IBShare**。
+>   - A矩阵和B矩阵同时开启IBShare的场景，获取矩阵计算结果时，**只支持调用IterateAll接口，且只支持输出到Global Memory**。
+
+Spec and tiling, verbatim:
+
+> - 原始shape：M=64, N= 256, K=384。
+> - 单核shape：singleCoreM=32，singleCoreN=256，singleCoreK=384。**A矩阵拆成两半，一半在AIV0上处理，一半在AIV1上处理；AIV0和AIV1使用的B矩阵数据相同。**
+> - 基本块shape：baseM=32，baseN=256，baseK=64。
+> - L1缓存相关Tiling参数：stepM=1，stepN=1，stepKa=6，stepKb=6。
+
+The diagnosis, verbatim — and it contains the residency test:
+
+> 优化前的流水图如下，不开启IBShare模板，默认使用的Norm模板。黑框标识AIV0发起的MTE2搬运流水：**MTE2总共搬运了12次，其中A矩阵搬运了6次（stepM*stepKa=6），B矩阵搬运了6次（stepN*stepKb=6）**。红框标识的AIV1发起的MTE2搬运流水，跟AIV0基本一致。在该案例中，因为AIV1使用的B矩阵跟AIV0使用的B矩阵数据相同，且 **singleCoreN=baseN*stepN，singleCoreK=baseK*stepKb，即B矩阵可以在L1全载**。考虑在AIV0搬入B矩阵到L1 Buffer后，将B矩阵数据缓存在L1 Buffer上等待AIV1进行复用，进而节省B矩阵的MTE2重复搬运开销。
+>
+> 优化前的Profiling数据如下，C列的aic_time是 **10.29us**，K列的aic_mte2_time是 **5.56us**。
+
+The mechanism stated twice, verbatim:
+
+> 下图是不开启IBShare模板（默认使用Norm模板）的Matmul计算流水示意图。MTE2分多次从Global Memory搬运基本块到L1 Buffer（A1或B1），**即使前后两次搬运的B矩阵基本块数据是相同的数据，也会重复搬运**。
+>
+> 下图是开启IBShare模板的Matmul计算流水示意图。MTE2分多次从Global Memory搬运基本块到L1 Buffer（A1或B1），**若前后两次搬运的B矩阵基本块数据相同，不会重复搬运，第一次搬运到B1内的数据会被复用**。
+
+The enabling code, verbatim (template arguments elided by the HTML strip, but the comments survive):
+
+```cpp
+#define ASCENDC_CUBE_ONLY
+#include "lib/matmul_intf.h"
+using A_TYPE = AscendC::MatmulType< ... >;
+using B_TYPE = AscendC::MatmulType< ... >; // 设置B矩阵的IBSHARE参数为true
+using C_TYPE = AscendC::MatmulType< ... >;
+using BIAS_TYPE =  AscendC::MatmulType< ... >;
+AscendC::Matmul< ... > matmulObj; // 使用默认的IBShare模板参数CFG_IBSHARE_NORM定义Matmul对象
+```
+
+The result, verbatim:
+
+> - 优化后的流水图如下，黑框标识的AIV0发起的MTE2搬运流水，与优化前一致。红框标识的AIV1发起的MTE2搬运流水，**相较于优化前的A矩阵和B矩阵一共12次MTE2数据搬运，减少到了仅6次A矩阵的MTE2数据搬运，省去了B矩阵的6次MTE2数据搬运开销**。
+> - 优化后的Profiling数据如下，C列的aic_time是 **9.93us**，较优化前的10.29us提升了 **3.55%**。K列的aic_mte2_time是 **4.71us**，较优化前的5.56us提升了 **15.46%**。
+
+> 总结：MIX场景（包含矩阵计算和矢量计算）下，若多个AIV的A矩阵或B矩阵GM地址相同，且多个AIV复用的A矩阵/B矩阵在L1 Buffer上全载。可以考虑开启IBShare模板，通过共享L1 Buffer上相同的A矩阵或B矩阵数据，减少重复的MTE2数据搬运开销，提升算子性能。
+
+**`aic_time` 10.29 → 9.93 us (−3.55%), `aic_mte2_time` 5.56 → 4.71 us (−15.46%)**, by halving the MTE2 moves
+from 12 to 6 on the second AIV.
+
+### 52.2 A-and-B IBShare with a cube-view core split: 27.11 → 22.44 us, and it attacks Scalar not MTE2
+
+`matmul_ibshare_ab.md`, verbatim:
+
+> 本案例呈现了在**融合算子场景**中，使用Matmul高阶API进行矩阵乘法计算时，A矩阵和B矩阵同时启用IBShare对性能的提升效果。该案例的关键优化措施包括：
+> - 分核逻辑：**以Cube核视角分核**，Matmul计算结果输出到GM，提供给Vector核进行后续计算。
+> - 开启IBShare：A矩阵和B矩阵同时开启IBShare。
+
+> 通过分析以上Profiling数据可以看出，算子执行多次的平均耗时为 **27.11us**，**aic_scalar_time的平均耗时为26.27us，当前性能瓶颈点为Cube的Scalar流水**。
+
+> 优化后执行多次的平均耗时：**22.44us**，较优化前有较大提升。
+
+> 总结：融合算子场景下，Matmul A矩阵和B矩阵同时开启IBShare，**以Cube核视角分核，可以有效减少Cube侧的Scalar开销**，提升性能。
+
+**27.11 → 22.44 us, −17.2%**, with `aic_scalar_time` 26.27 of 27.11 us beforehand — i.e. 97% Scalar-bound
+before, and the fix is the combination of a cube-view core split and AB IBShare. The `Init` it ships is the
+ordinary one, with the element-counted `SetGlobalBuffer` and the tensor-subscript offsets of §42.6:
+
+```cpp
+    aGlobal.SetGlobalBuffer(reinterpret_cast< ... >(a), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast< ... >(b), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast< ... >(c), tiling.M * tiling.N);
+    int32_t offsetA, offsetB, offsetC;
+    CalcOffset(AscendC::GetBlockIdx(), tiling, offsetA, offsetB, offsetC); // calculate offset
+    aGlobal = aGlobal[offsetA];
+    bGlobal = bGlobal[offsetB];
+    cGlobal = cGlobal[offsetC];
+```
+
+## Relevance
+
+IBShare's stated precondition is our decode situation written out: 「多个AIV的A矩阵或B矩阵GM地址相同」 — several
+AIVs reading the same weight from the same GM address. And it is one of only three templates that accept
+`int4b_t` at all (§42.7), so unlike most of the Matmul tuning surface it is not closed to us by the W4 weight
+type. What it buys is the removal of *duplicate* MTE2 traffic for the shared operand: 12 moves become 6 in the
+B-only case, `aic_mte2_time` −15.46%. Against families spending two to five times their byte-movement time,
+removing the duplicate fetch of a weight that every core wants is the right shape of fix, and it composes with
+§51.2's staggering (which reorders the fetches that remain) rather than competing with it.
+
+The gate is residency, and it is arithmetic we can check without a run: the shared operand must be **fully
+loaded in L1**, tested as `singleCoreN = baseN * stepN` and `singleCoreK = baseK * stepKb`. A whole GLM-5.2
+expert weight will not fit L1, so this constrains `singleCoreN` and `singleCoreK` to a slice that does — which
+is a tiling choice, not an impossibility. Two constraints to price in if we enable it on both operands: every
+other `Matmul` object in the same operator must then also have both on
+(「同一算子中其它Matmul对象的A矩阵和B矩阵也必须同时开启IBShare」), and the result can only be taken with
+`IterateAll` to Global Memory — which closes `Iterate()`-level CV handoff (§B8.4's per-`Iterate` flag) and
+L0C-resident accumulation for that object. So B-only IBShare is the composable choice and AB IBShare is the
+all-or-nothing one.
+
+52.2 is also the third measurement in this file pointing at Scalar rather than compute or movement as the real
+cost at small shapes: 26.27 us of 27.11 us was `aic_scalar_time` there, 15.02 of 17.85 was Scalar in the
+pure-Cube case (§B8.6 in `fused-moe-expert.md`), and the measured 13.58 us MIX_AIC launch floor is itself a
+Scalar-side cost. Three independent cases say that at our shapes the Cube's Scalar pipeline, not its Cube
+pipeline, is what to profile first — `aic_scalar_time` against `aic_time` in column G against column C of the
+msOpProf output is the one ratio to look at.
+
+## 53. ★ Three more measured Matmul cases: constant tiling (−25.9%, Scalar −46.5%), the 256-byte inner-axis rule behind an AIV ND2NZ (−39.0%), and NBuffer33
+
+Sources, in the shipped devkit, read 2026-10-20:
+`docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_tiling_constant.md`,
+`aiv_nd2nz_conversion.md`, `matmul_nbuffer33.md`.
+
+### 53.1 ★★ Tiling constantization — the fourth Scalar-bound case in this file, and the largest
+
+案例介绍, verbatim:
+
+> 本案例呈现了在使用Matmul高阶API进行矩阵乘法计算时，开启Matmul Tiling全量常量化对算子性能的提升效果。**Matmul API在初始化和迭代过程中有大量Scalar计算，Matmul初始化时的Scalar计算影响指令头开销，Matmul迭代间的Scalar计算可能阻塞MTE2流水。** 在调用Matmul API实现矩阵乘法时，使用 **MatmulApiStaticTiling** 参数替代TCubeTiling变量参数，**将Scalar计算提前到编译期进行**，以减少运行时的Scalar计算开销，实现算子性能的提升。
+>
+> - Matmul Tiling常量化的适用场景：
+>     - Matmul初始化时的Scalar计算较多，影响指令头开销。
+>     - Matmul迭代之间的Scalar计算较多，阻塞MTE2流水。
+> - Matmul Tiling常量化需要在编译期确定部分Tiling参数，根据确定参数的不同，分为全量常量化和部分常量化两种场景，使用Matmul Tiling常量化需要满足两种场景中任一场景的条件：
+>     - **全量常量化：能够确定常量singleCore Shape（singleCoreM/singleCoreN/singleCoreK）和常量base Shape（basicM/basicN/basicK，也称baseM/baseN/baseK）。**
+>     - **部分常量化：能够确定常量base Shape（basicM/basicN/basicK，也称baseM/baseN/baseK）。**
+>
+>     其中，**全量常量化场景比部分常量化场景可以减少更多的Scalar计算开销。**
+
+Spec: `a` (128, 64) float16 ND, `b` (64, 30720) float16 ND, M=128 N=30720 K=64, 24 AIC cores, pure-Cube mode,
+singleCoreM=128 singleCoreN=1280 singleCoreK=64, baseM=128 baseN=256 baseK=64, stepM=1 stepN=1 stepKa=4
+stepKb=4 depthA1=8 depthB1=8 — i.e. the same case as §B8.6's pure-Cube one, tuned further.
+
+The measurement, verbatim:
+
+> - 优化前的流水图如下，默认不开启Tiling常量化，**Tiling参数需要从Host侧拷贝到核函数（Kernel）侧，导致Matmul初始化时的Scalar计算较多，第一个MTE2指令开始于3.536us左右**，MTE2前的指令头开销在算子整个流水中占比较大，因此需要优化Scalar计算。
+> - 优化前的Profiling数据如下，从C列的aic_time数据来看，多个核中最大算子执行耗时为 **10.62us**，从G列的aic_scalar_time数据来看，Scalar平均耗时 **6.32us**。
+> - 优化后的流水图如下，通过开启Tiling全量常量化，无需将Tiling参数从Host侧拷贝到核函数（Kernel）侧，在编译期完成Tiling常量化，减少了Matmul初始化时的Scalar计算。**从0us起到第一个MTE2指令发起，这之间的时间为Matmul初始化时间，Matmul初始化时间从优化前的3.536us减少到2.185us**，性能有所提升。
+> - 优化后的Profiling数据如下，从C列的aic_time数据来看，多个核中最大算子执行耗时为 **7.87us**，相较于优化前的10.62us提升了 **25.9%**。从G列的aic_scalar_time数据来看，Scalar平均耗时 **3.38us**，相较于优化前的6.32us提升了 **46.5%**。
+
+**`aic_time` 10.62 → 7.87 us (−25.9%), `aic_scalar_time` 6.32 → 3.38 us (−46.5%), Matmul init 3.536 → 2.185 us.**
+
+### 53.2 ★★ The 256-byte inner-axis rule — and doing ND2NZ on the AIV instead, −39.0%
+
+案例介绍, verbatim. This is a *data-layout* rule we did not have:
+
+> 本案例展示了在矩阵乘算子场景中，使用Matmul高阶API进行计算，**对内轴（内轴即矩阵的行方向）非256字节对齐的输入矩阵**，在AIV核上进行ND2NZ格式转换对算子性能提升的效果。为提升Cube单元的计算效率，ND格式的输入矩阵在执行Cube计算前会先转换为NZ格式… Matmul API内部使用随路ND2NZ指令同时进行格式转换以及数据搬运。**但在数据非256字节对齐时，随路ND2NZ指令存在带宽利用率低的问题。** 因此输入矩阵的内轴非256字节对齐时，在进行Matmul计算前，利用AIV核上Vector计算单元完成ND格式到NZ格式的转换，可以避免随路非对齐数据搬运存在的效率低的问题，从而提升算子性能。
+>
+> - AIV核上的ND2NZ格式转换的适用场景
+>   **输入矩阵内轴非256字节对齐，且数据量较大影响随路格式转换的效率。**
+
+Spec: `a` (1024, 1024) float16, M=1024, **N=4095**, K=1024 — N deliberately one short of alignment.
+singleCoreM=128 singleCoreN=1408 singleCoreK=1024, baseM=128 baseN=256 baseK=64, stepM=1 stepN=1 stepKa=4
+stepKb=4.
+
+The measurement, verbatim:
+
+> - 优化前的Cube流水图如下，由于使用了随路ND2NZ指令，在MTE2数据搬运过程中进行数据格式的转换，导致MTE2整体占比较高。
+> - 优化前的Profiling数据如下，可以看到只使用Cube单元执行计算，**aic_time最大耗时149.04us**，其中aic_mte2_ratio占比很高。
+> - 优化后的Vector流水图如下所示，利用Vector计算单元的能力，完成B矩阵的数据格式转换。
+> - 优化后的Cube流水图如下所示，不使用随路ND2NZ指令对B矩阵进行格式转换后，MTE2的占比明显下降。
+> - 优化后的Profiling数据如下，可以看到同时使用Cube单元和Vector单元，**aic_time最大耗时90.95us**，其中aic_mte2_ratio占比明显降低。
+
+and the summary, with its warning, verbatim:
+
+> 对于矩阵乘计算中矩阵内轴非256字节对齐的场景，随路ND2NZ指令的带宽利用率低，影响算子性能，通过在AIV核上进行ND2NZ的数据重排，提升算子整体性能。**值得注意的是，带宽利用率与数据量有关，如果矩阵数据总量太小，即使是在AIV核上进行的ND2NZ转换也无法明显提升有效带宽，反而会因为引入了多核同步，导致算子端到端的性能劣化。**
+
+**`aic_time` max 149.04 → 90.95 us, −39.0%** — the largest single-knob delta in the whole guide.
+
+### 53.3 NBuffer33 — balancing MTE2 against FixPipe, with six constraints
+
+案例介绍, verbatim:
+
+> NBuffer33模板的实现为**单核计算的A矩阵切分为3x3个基本块，该3x3个A矩阵的基本块全载和保持在L1 Buffer中，每次与3x1个B矩阵的基本块计算矩阵乘，同时DoubleBuffer并行搬入下次计算所需的3x1个B矩阵基本块**，直到singleCoreN方向的矩阵乘计算完成。针对MTE2 Bound场景，通过NBuffer33算法的切分数据方式，**错开搬运流水，减少单次搬运的数据量，平衡MTE2和FixPipe的数据流量，让两者带宽均匀分布**。
+>
+> - 开启NBuffer33模板的适用场景：MTE2 Bound的场景，Tiling参数满足约束条件时，可以开启NBuffer33模板。
+> - 开启NBuffer33模板的约束条件
+>     - **仅支持MatmulConfig为MDL模板。**
+>     - **A矩阵、B矩阵的内存逻辑位置只支持TPosition::GM。**
+>     - **仅支持纯Cube模式（只有矩阵计算），暂不支持MIX模式（包含矩阵计算和矢量计算）。**
+>     - **仅支持通过IterateAll接口获取Matmul的计算结果C矩阵。**
+>     - **stepM、stepKa、stepKb小于等于3，且满足：stepKa=stepKb=Ceil(singleCoreK/baseK)。**
+>     - **A矩阵全载的基本块大小与B矩阵载入的基本块大小之和不超过L1 Buffer的大小。**
+
+Spec: M=256 N=512 K=192, singleCoreM=256 singleCoreN=256 singleCoreK=192, baseM=128 baseN=256 baseK=64,
+stepM=2 stepN=1 stepKa=3 stepKb=3. Result, verbatim:
+
+> - 优化前的流水图如下，MatmulPolicy的默认模板下A、B矩阵全载，A、B矩阵都只搬运一次。此时MTE2执行时间较长，且流水整体呈串行。
+> - 优化前的Profiling数据如下，**aic_time平均耗时34.01us**。
+> - 优化后的流水图如下，Tiling参数不变，但由于stepM为2，NBuffer33模式会将左矩阵数据的搬运拆分为两次。可以看到，**第一次MTE2结束后的计算过程（包括MTE1、MMAD和FIXPIPE）可以和第二次MTE2并行**。分块搬运数据可以减少一次搬运数据导致的部分头开销，优化加载数据的性能。
+> - 优化后的Profiling数据如下，**aic_time平均耗时32.66us**，较优化前的34.01us有所提升。
+
+**34.01 → 32.66 us, −4.0%.**
+
+## Relevance
+
+53.2 is the finding to check first because it is a property of our *weight shapes*, not of our code. The
+on-the-fly ND2NZ instruction that `Matmul` uses by default has poor bandwidth utilization whenever the input's
+**inner (row-direction) axis is not 256-byte aligned**, and the vendor's fix — doing the ND→NZ rearrangement on
+the AIV instead — is worth **−39.0%** on their case, the largest single-knob delta in the guide. For
+`int4b_t`, 256 bytes is **512 elements**. GLM-5.2's `hidden = 5120` is 2560 bytes, a clean 10 × 256; but
+`moe_intermediate = 1792` is **896 bytes = 3.5 × 256, which is not aligned**. So any matmul whose inner axis
+is the 1792 one — the down-projection's K — sits in exactly the bad regime this case describes, and would
+present as a high `aic_mte2_ratio` with no obvious cause. Two caveats before acting: the weights in the
+GroupedMatmul tuning case (§B8.1 表1) are already **NZ** on disk, which sidesteps the conversion entirely and
+is the cheaper answer if we control the offline layout; and the document's own warning is that below some data
+volume the AIV route loses — 「如果矩阵数据总量太小…反而会因为引入了多核同步，导致算子端到端的性能劣化」.
+
+53.1 is the fourth Scalar-bound case in this file and the largest, and it is the operator-level number behind
+the 2.845 → 0.038 us TilingData figure we already had: **`aic_time` −25.9%, `aic_scalar_time` −46.5%, Matmul
+init 3.536 → 2.185 us**, purely from passing `MatmulApiStaticTiling` instead of a runtime `TCubeTiling`. Two
+gates, and batch=1 specialization satisfies the stronger one: 全量常量化 needs constant `singleCoreM/N/K` **and**
+constant `baseM/N/K`; 部分常量化 needs only constant `base*`. The sentence to note is that the Scalar cost
+appears in two places, not one — 「Matmul初始化时的Scalar计算影响指令头开销，Matmul迭代间的Scalar计算可能阻塞
+MTE2流水」 — so constantization is both a head-overhead fix and an MTE2-stall fix.
+
+53.3 is the smallest of the three (−4.0%) and the most constrained, but its mechanism is the one worth
+remembering: NBuffer33 exists to **balance MTE2 against FixPipe bandwidth** by splitting one large A load into
+staggered pieces so that MTE1/MMAD/FIXPIPE on piece one overlaps MTE2 on piece two. Its six constraints are
+restrictive and two of them conflict with other levers we want: **pure-Cube only, no MIX** (so it cannot
+coexist with an in-kernel vector stage), and **`IterateAll` only** (so no per-`Iterate` CV handoff, the same
+exclusion IBShare-AB carries in §52.1). Its tiling gate is exact and checkable:
+`stepM, stepKa, stepKb <= 3` with `stepKa = stepKb = Ceil(singleCoreK / baseK)`, and A's fully-loaded blocks
+plus B's loaded blocks must fit L1.

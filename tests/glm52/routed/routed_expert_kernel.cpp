@@ -84,16 +84,13 @@ __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* tiling)
     }
 }
 
+using Projection = Matmul<AQuant, BQuant, CProduct, BiasNone>;
+
 /** One expert's gate-and-up projection, at full width. */
-__aicore__ inline void ProjectGateUp(TPipe& pipe, __gm__ int8_t* rows,
+__aicore__ inline void ProjectGateUp(Projection& mm, __gm__ int8_t* rows,
                                      __gm__ int8_t* weight,
-                                     __gm__ int32_t* product,
-                                     __gm__ uint8_t* tiling)
+                                     __gm__ int32_t* product)
 {
-    TCubeTiling cube;
-    LoadTiling(cube, tiling);
-    Matmul<AQuant, BQuant, CProduct, BiasNone> mm;
-    mm.Init(&cube, &pipe);
     GlobalTensor<int8_t> a;
     GlobalTensor<int8_t> b;
     GlobalTensor<int32_t> c;
@@ -104,19 +101,13 @@ __aicore__ inline void ProjectGateUp(TPipe& pipe, __gm__ int8_t* rows,
     mm.SetTensorA(a);
     mm.SetTensorB(b, true);
     mm.IterateAll(c);
-    mm.End();
 }
 
 /** One expert's down projection, at full width. */
-__aicore__ inline void ProjectDown(TPipe& pipe, __gm__ int8_t* codes,
+__aicore__ inline void ProjectDown(Projection& mm, __gm__ int8_t* codes,
                                    __gm__ int8_t* weight,
-                                   __gm__ int32_t* product,
-                                   __gm__ uint8_t* tiling)
+                                   __gm__ int32_t* product)
 {
-    TCubeTiling cube;
-    LoadTiling(cube, tiling);
-    Matmul<AQuant, BQuant, CProduct, BiasNone> mm;
-    mm.Init(&cube, &pipe);
     GlobalTensor<int8_t> a;
     GlobalTensor<int8_t> b;
     GlobalTensor<int32_t> c;
@@ -127,7 +118,6 @@ __aicore__ inline void ProjectDown(TPipe& pipe, __gm__ int8_t* codes,
     mm.SetTensorA(a);
     mm.SetTensorB(b, true);
     mm.IterateAll(c);
-    mm.End();
 }
 
 /** The vector state one expert's activation and quantisation needs. */
@@ -348,26 +338,34 @@ __aicore__ void routed_expert_fused(
     TPipe pipe;
 
     if ASCEND_IS_AIC {
+        TCubeTiling gate_up_shape;
+        TCubeTiling down_shape;
+        LoadTiling(gate_up_shape, gu_tiling);
+        LoadTiling(down_shape, down_tiling);
+        Projection gate_up_mm;
+        Projection down_mm;
+        gate_up_mm.Init(&gate_up_shape, &pipe);
+        down_mm.Init(&down_shape, &pipe);
         const int64_t first = GetBlockIdx() * per_block;
         for (int64_t step = 0; step < per_block; ++step) {
             const int64_t expert = first + step;
             if (expert >= experts) {
                 break;
             }
-            ProjectGateUp(pipe, rows + expert * ROWS * HIDDEN,
+            ProjectGateUp(gate_up_mm, rows + expert * ROWS * HIDDEN,
                           gate_up + expert * GATE_UP * HIDDEN,
-                          partial + expert * ROWS * GATE_UP,
-                          gu_tiling);
+                          partial + expert * ROWS * GATE_UP);
             Publish();
             CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
             CrossCoreWaitFlag<0x03, PIPE_MTE2>(MIDDLE_READY);
-            ProjectDown(pipe, middle + expert * ROWS * HALF,
+            ProjectDown(down_mm, middle + expert * ROWS * HALF,
                         down + expert * HIDDEN * HALF,
-                        wide + expert * ROWS * HIDDEN,
-                        down_tiling);
+                        wide + expert * ROWS * HIDDEN);
             Publish();
             CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
         }
+        gate_up_mm.End();
+        down_mm.End();
     }
     if ASCEND_IS_AIV {
         const int64_t first = (GetBlockIdx() / 2) * per_block;

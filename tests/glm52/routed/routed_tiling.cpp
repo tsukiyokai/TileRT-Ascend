@@ -26,6 +26,13 @@ extern "C" int routed_build_tiling(int rows, int columns, int inner,
     tiling.SetShape(rows, columns, inner);
     tiling.SetOrgShape(rows, width, inner);
     tiling.SetBias(false);
+    // Fixed tiles, because the cost is scalar and the scalar work is per
+    // iteration inside `IterateAll`: fewer, larger tiles mean fewer address
+    // computations. 128 by 512 of INT8 fills L0B exactly at 64 KB, which is
+    // the corner -- measured against the library's own choice, 41.677 µs a
+    // layer rather than 49.692, with 128 by 256 at 42.095, 256 by 128 at
+    // 49.874 and 64 by 512 at 56.410.
+    tiling.SetFixSplit(16, 128, 512);
     tiling.SetBufferSpace(-1, -1, -1);
 
     AscendC::tiling::TCubeTiling cube;

@@ -89,6 +89,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [The routed kernel is scalar bound](evidence/ascend-decode/routed-kernel-20261020/README.md) | `msprof --aic-metrics=PipeUtilization`,16 experts／16 blocks. | scalar 27.860µs／0.625, MTE2 32.826／0.733, MAC 4.845／**0.109**, vector 0.622／0.013. The cube spends62.5% of its time in scalar and11% multiplying; the vendor's MTE2-bound cases read0.93–0.99 where this reads0.733. "66% of bandwidth" was the wrong account — it explains the null L2 hint, INT4's21% instead of ~45%, and the flat block-count curve. Next lever: hoist `Matmul` out of the expert loop, or drive L1／L0 by hand. |
 
+| 10-20 | [Fixed cube tiles](evidence/ascend-decode/routed-kernel-20261020/README.md) | `SetFixSplit` swept against the library's own choice, from the scalar diagnosis: fewer, larger tiles mean fewer per-iteration address computations. | 128×512 (which fills L0B exactly) gives41.677µs against49.692 auto,42.095 at128×256, 49.874 at256×128,56.410 at64×512 — all0 of196608. Full table38.761／40.000／41.990／74.555 at4／8／16／44 experts, so **3.93x the vendor** at the per-rank shape (was3.3x) =1.32ms TPOT. Hoisting `Matmul` out of the loop gave nothing, so the cost is inside the iteration. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.

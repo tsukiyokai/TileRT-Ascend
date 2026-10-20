@@ -161,3 +161,42 @@ So the next lever on this kernel is not bandwidth and not cores. It is either
 hoisting the `Matmul` object out of the expert loop, or driving L1 and L0 by
 hand -- `DataCopy`, `LoadData`, `Mmad`, `Fixpipe` -- which this project has
 already proven end to end on the INT4 probe.
+
+## Fixing the tile sizes: 16% from the scalar diagnosis
+
+If the cost is scalar and the scalar work is per iteration inside
+`IterateAll`, then fewer and larger tiles mean fewer address computations.
+`SetFixSplit(baseM, baseN, baseK)` is the lever. Swept at sixteen experts on
+sixteen blocks, correctness unchanged at 0 of 196608 throughout:
+
+| baseN | baseK | wall, µs |
+|---|---|---|
+| the library's own choice | | 49.692 |
+| 256 | 128 | 49.874 |
+| 128 | 256 | 42.095 |
+| **128** | **512** | **41.677** |
+| 64 | 512 | 56.410 |
+
+128 by 512 of INT8 fills L0B exactly at 64 KB, so it is the corner rather
+than a sweet spot, and the shape of the curve says what the profile said:
+widening N without deepening K does nothing (256 by 128 is the library's own
+figure), and deepening K while narrowing N is worse than either.
+
+Two things that did not work, for the record. Hoisting the `Matmul` objects
+out of the expert loop -- two constructions a launch instead of thirty-two --
+gave 49.169, 49.587 and 49.574 µs against the baseline's 49.276 to 49.815, so
+the scalar cost is not in `Init` and `End`. And the L2 hint above gave nothing.
+The cost is inside the iteration, which is why the tile size is what moved it.
+
+With the tiling fixed:
+
+| experts | blocks | wall, µs | before | vendor |
+|---|---|---|---|---|
+| 4 | 4 | 38.761 | 47.108 | |
+| 8 | 8 | 40.000 | 47.755 | |
+| **16** | **16** | **41.990** | 49.276 | 165.2 |
+| 44 | 22 | 74.555 | 91.953 | |
+
+So 3.93 times the vendor at the per-rank shape, where it was 3.3. Over a
+round: 3.15 ms against 12.39, saving 9.24 ms, which at acceptance 7 is 1.32 ms
+of TPOT.

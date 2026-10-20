@@ -3204,3 +3204,751 @@ persistent kernel reading a precomputed work list rather than a per-op tiling st
 `FA_*_END_INDEX`, `FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX`, `FD_WORKSPACE_NUM_INDEX`,
 `FD_M_START_INDEX`, `FD_M_NUM_INDEX`) is a ready-made schema to copy, and `SplitFD`'s
 `averageLoad = ceil(totalFDLoad / aivCoreNum)` greedy assignment is a ready-made balancer.
+
+---
+
+## 12. The audit: flash-decode is live in every DENSE decode attention op and dead in every SPARSE one, and the balanced splitter is a shared library SFA does not link
+
+Same clone and commit (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20).
+
+### 12.1 The grep
+
+```
+$ cd ops-transformer
+$ for f in <each attention op dir mentioning splitKVFlag_>; do \
+      echo "$(grep -rn 'splitKVFlag_ *= *true' $f | wc -l)  $f"; done
+2  attention/fused_infer_attention_score/op_host
+4  attention/incre_flash_attention
+0  attention/kv_quant_sparse_flash_attention
+0  attention/nsa_selected_attention_infer
+0  attention/sparse_flash_attention
+```
+
+Every operator that declares the flag also declares `kvSplitPart_`, a `splitKVParams` tiling
+struct, `accumOut` / `logSumExp` workspace, and an `if constexpr (FLASH_DECODE)` kernel branch.
+In the three sparse ops none of that is ever reached.
+
+`attention/nsa_selected_attention_infer/op_host/nsa_selected_attention_infer_tiling.cpp` even
+hard-codes the admission in its log line:
+
+```cpp
+// for flash decode
+void NsaSelectTiling::FillTilingSplitKV() const
+{
+    tilingData_->splitKVParams.set_s2(kvSplitPart_);
+    int64_t sInnerLoopSize_ = (maxActualseq_ + (kvSplitPart_ - 1)) / kvSplitPart_;
+    sInnerLoopSize_ = Align(sInnerLoopSize_, blockSize_);
+    OP_LOGD(context_->opName, "PA FlashDecode is not enabled, sInnerLoopSize is %ld, blockSize is %ld", sInnerLoopSize_,
+            blockSize_);
+    tilingData_->splitKVParams.set_sInnerLoopSize(sInnerLoopSize_);
+    if (!splitKVFlag_) {
+        tilingData_->splitKVParams.set_s2(0);
+    }
+}
+```
+
+`PA FlashDecode is not enabled` is emitted unconditionally, as a `OP_LOGD` and not as a warning.
+
+### 12.2 `SparseFlashAttention` was forked from the FIA MLA tiling and the splitter was dropped
+
+`attention/fused_infer_attention_score/op_host/arch22/fia_tiling_nonquant_mla.cpp`:
+
+```cpp
+void FiaTilingNonQuantMla::CalcInnerSize(uint32_t seqSize)
+{
+    sInnerSize_ = 512U;
+    // FlashDecode时，如果S2的计算量>=256(确保切分后不小于128)但又不足以分2次计算时，则修改sInnerSize_，均分为2份进行计算，确保Nbuffer=2
+    if (splitKVFlag_ && fiaInfo_->inputLayout != TilingKeyLayout::TND) {
+        if (seqSize == 256U) {
+            sInnerSize_ = 128U;
+        } else if (seqSize > 256U && seqSize <= sInnerSize_) {
+            sInnerSize_ = (sInnerSize_ + 1U) / 2U;
+```
+
+Compare `attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp` (quoted in
+full in section 8.1): identical function name, identical `sInnerSize_ = 512`, identical comment
+text character-for-character, identical `splitKVFlag_ && ... != TND` guard, identical 256/128
+constants. The two are the same code. The difference is everything around it.
+
+FIA's `Split()`:
+
+```cpp
+void FiaTilingNonQuantMla::Split()
+{
+    CalcInnerSize(static_cast<uint32_t>(fiaInfo_->s2Size));
+
+    // 构造分核输入参数
+    BaseInfo baseInfo{};
+    SplitParam splitParam{};
+    CreateSplitInput(baseInfo, splitParam);
+
+    // 构造分核输出参数
+    SplitResult res{aicNum_, cvRatio_};
+    SplitCore(aicNum_, baseInfo, splitParam, res);
+    if (res.numOfFdHead > aicNum_ || res.usedCoreNum > aicNum_ || res.maxS2SplitNum > aicNum_ + 1U) {
+        OP_LOGE(fiaInfo_->opName, "used_core_num: %u, num_of_fd_head: %u, max_s2_split_num: %u, aic_num: %u",
+                res.usedCoreNum, res.numOfFdHead, res.maxS2SplitNum, aicNum_);
+    }
+    SetSplitOutput(res);
+    tilingData_.innerSplitParams.set_mBaseSize(mBaseSize_);
+    tilingData_.innerSplitParams.set_s2BaseSize(sInnerSize_);
+    tilingData_.fdParams.set_numOfFdHead(res.numOfFdHead);
+    tilingData_.fdParams.set_gS1BaseSizeOfFd(mFdBaseSize_);
+    usedCoreNum_ = res.usedCoreNum;
+
+    // kvSplitPart_,用于lse out workspace计算
+    if (IsFlashDecode()) {
+        splitKVFlag_ = true;
+        kvSplit_++;
+        kvSplitPart_ = res.maxS2SplitNum;
+        tilingData_.fdParams.set_usedVecNumOfFd(res.usedVecNumOfFd);
+    }
+    CalcMmResSize();
+}
+```
+
+```cpp
+bool FiaTilingNonQuantMla::IsFlashDecode()
+{
+    uint32_t tndFDCoreArrLen = tilingData_.fdParams.get_numOfFdHead();
+    return tndFDCoreArrLen > 0U;
+}
+```
+
+SFA's `Split()`, for comparison (section 8.2), is three assignments and `usedCoreNum_ = aicNum_`.
+
+### 12.3 `attention/common/op_host/split_core.{h,cpp}` — a reusable balanced splitter with flash-decode, 797 + 279 lines
+
+```cpp
+void SplitCore(uint32_t coreNum, const BaseInfo& baseInfo, const SplitParam& param, SplitResult& result)
+{
+    // 打印baseInfo,param信息
+    LogSplitCoreInput(baseInfo, param);
+    SplitContext splitContext(baseInfo, param);
+
+    // 1、划分基本块，统计信息
+    CalcSplitInfo(splitContext);
+    // 全空case
+    if (splitContext.splitInfo.isKvSeqAllZero) {
+        result.usedCoreNum = 1U;
+        result.bN2End[0] = baseInfo.bSize * baseInfo.n2Size;
+        result.gS1End[0] = 0U;
+        result.s2End[0] = 0U;
+        return;
+    }
+
+    CalcCostInfo(splitContext);
+
+    // 2、获取每个核的分配方案
+    uint32_t maxCore = std::min(coreNum, splitContext.costInfo.totalBlockNum);
+    uint32_t minCore =
+        static_cast<uint32_t>(std::sqrt(static_cast<float>(splitContext.costInfo.totalBlockNum) + 0.25f) + 0.5f);
+    minCore = std::min(minCore, maxCore);
+
+    result.usedCoreNum = 1U;
+    result.maxCost = INT64_MAX;
+
+    SplitResult tmpResult{coreNum, result.vecCubeRatio};
+    for (uint32_t i = minCore; i <= maxCore; ++i) {
+        OP_LOGD("SplitRes", "CoreNum: %u", i);
+        CalcSplitPlan(i, result.maxCost, splitContext, tmpResult);
+        if (tmpResult.maxCost < result.maxCost) {
+            CopyTmpResult(tmpResult, result);
+        }
+        ClearTmpResult(tmpResult);
+    }
+
+    // 3、存在FD任务，对FD进行负载均衡分配
+    if (result.numOfFdHead > 0U) {
+        SplitFD(result);
+    }
+    result.usedCoreNum = std::max(result.usedCoreNum, 1U); // 至少使用1个core
+
+    // 打印分核结果信息
+    LogSplitCoreResult(result);
+}
+```
+
+It is a *search*: it tries every core count from `minCore` to `maxCore` and keeps the plan with
+the lowest `maxCost`. Note `maxCore = min(coreNum, totalBlockNum)` — and `totalBlockNum` here is
+computed over `(batch, n2, s1G, s2)` blocks including S2, so unlike SFA's `totalBaseNum` it is
+not capped at 1 for a one-token decode.
+
+The cost model being minimized:
+
+```cpp
+int64_t CalcCost(uint32_t basicM, uint32_t basicS2)
+{
+    uint32_t alignCoefM = 16U;
+    uint32_t alignCoefS2 = 64U;
+    uint32_t alignBasicM = (basicM + alignCoefM - 1U) >> 4U; // 按alignCoefM对齐，向上取整，4：移位操作实现除16
+    uint32_t alignBasicS2 = (basicS2 + alignCoefS2 - 1U) >> 6U; // 按alignCoefS2对齐，向上取整，6：移位操作实现除64
+    return static_cast<int64_t>(6U * alignBasicM + 10U * alignBasicS2); // 6：M轴系数，10：S2轴系数
+}
+```
+
+An explicit published cost model for A3 attention: cost = `6 * ceil(M/16) + 10 * ceil(S2/64)`.
+The M axis is quantized at 16 and weighted 6; the S2 axis is quantized at 64 and weighted 10.
+A one-token-query decode has `M = gSize`, so `ceil(M/16) = 1` and the M term contributes a
+constant 6 regardless of head count up to 16 — i.e. the model says heads 1..16 are free, and all
+cost is in S2.
+
+The FD reduction balancer:
+
+```cpp
+void SplitFD(SplitResult& result)
+{
+    uint32_t totalFDLoad = 0;
+    uint32_t totalFDHeadSplit = 0;
+    // 计算FD的总数据量
+    for (uint32_t i = 0; i < result.numOfFdHead; i++) {
+        totalFDLoad += result.fdRes.s2SplitNumOfFdHead[i] * result.fdRes.gS1SplitNumOfFdHead[i];
+        totalFDHeadSplit += result.fdRes.gS1SplitNumOfFdHead[i];
+    }
+
+    // 基于FA开核数量，计算每个Vector需要计算的FD数据量
+    // FD均衡的最小单位为一个归约任务的一个split，所以最多占用totalFDHeadSplit个vector
+    uint32_t maxVectorNum = std::min(totalFDHeadSplit, result.usedCoreNum * result.vecCubeRatio);
+```
+
+and the condition under which a cross-core reduction is recorded at all:
+
+```cpp
+bool IsNeedRecordFDInfo(const AssignContext& assignContext, const SplitResult& splitRes)
+{
+    // 切分点大概率不会刚好在行尾，因此滞后处理归约信息的统计，到下一个切分点再判断是否需要归约
+    // 核0无需处理
+    if (assignContext.curCoreIdx == 0U) {
+        return false;
+    }
+    // 无跨核行，无需处理
+    if (assignContext.curKvSplitPart <= 1U) {
+        return false;
+    }
+```
+
+The full public API of the splitter, from `split_core.h`:
+
+```cpp
+// cache calculation
+void CalcBatchCache(uint32_t bIdx, const SplitContext& splitContext, BatchCache& batchCache);
+void CalcS1GCache(uint32_t s1GIdx, const SplitContext& splitContext, const BatchCache& batchCache, S1GCache& s1GCache);
+void CopyTmpResult(SplitResult& tmpRes, SplitResult& splitRes);
+void ClearTmpResult(SplitResult& tmpResult);
+
+// preprocess
+void CalcSplitInfo(SplitContext& splitContext);
+void CalcBatchCost(uint32_t bIdx, const SplitContext& splitContext, CostInfo& costInfo);
+void CalcCostInfo(SplitContext& splitContext);
+
+// assign
+void UpdateCursor(const SplitContext& splitContext, AssignContext& assignContext);
+void AssignByBatch(const SplitContext& splitContext, AssignContext& assignContext);
+void AssignByRow(const SplitContext& splitContext, AssignContext& assignContext);
+void AssignByBlock(AssignContext& assignContext);
+void ForceAssign(const SplitContext& splitContext, AssignContext& assignContext);
+
+// FD
+bool IsNeedRecordFDInfo(const AssignContext& assignContext, const SplitResult& splitRes);
+void RecordFDInfo(const SplitContext& splitContext, const AssignContext& assignContext, SplitResult& result);
+
+// main
+void SplitFD(SplitResult& result);
+void CalcSplitPlan(uint32_t coreNum, int64_t costLimit, const SplitContext& splitContext, SplitResult& result);
+void SplitCore(uint32_t coreNum, const BaseInfo& baseInfo, const SplitParam& param, SplitResult& result);
+void LogSplitCoreInput(const BaseInfo& baseInfo, const SplitParam& param);
+void LogSplitCoreResult(const SplitResult& result);
+void LogAssignContext(const char* phase, const AssignContext& assignContext);
+```
+
+`AssignByBatch` / `AssignByRow` / `AssignByBlock` / `ForceAssign` is a four-level fallback: split
+by batch first, then by `(s1, G)` row, then by block (which is where S2 gets cut), then force.
+
+### 12.4 Who links it
+
+```
+$ grep -rln 'split_core.h\|split_core_v2.h' --include=*.cpp --include=*.h attention/
+common/op_host/split_core.cpp
+common/op_host/split_core.h
+common/op_host/split_core_v2.cpp
+common/op_host/split_core_v2.h
+fused_infer_attention_score/op_host/arch22/fia_tiling_nonquant.cpp
+fused_infer_attention_score/op_host/arch22/fia_tiling_nonquant.h
+fused_infer_attention_score/op_host/arch22/fia_tiling_nonquant_mla_arch22.h
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_gqa.cpp
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_gqa.h
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_mla.cpp
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_mla.h
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_mx.cpp
+fused_infer_attention_score/op_host/arch35/fia_tiling_fullquant_mx.h
+fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_gqa.cpp
+fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_gqa.h
+fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp
+fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla_arch35.h
+```
+
+Exactly one operator family. And `sparse_flash_attention`'s complete include list:
+
+```cpp
+#include <map>
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <graph/utils/type_utils.h>
+#include "err/ops_err.h"
+#include "register/op_def_registry.h"
+#include "../op_kernel/sparse_flash_attention_template_tiling_key.h"
+#include "sparse_flash_attention_tiling.h"
+```
+
+No `split_core.h`.
+
+(`SparseFlashMlaMetadata`, section 11, does not include it either — it reimplements the same
+algorithm, with the same function names `CalcSplitInfo` / `CalcCostInfo` / `CalcSplitPlan` /
+`SplitFD` / `AssignBlocksToCore`, inside the AI CPU kernel. So there are two independent
+implementations of this splitter in the repo and `SparseFlashAttention` uses neither.)
+
+## Relevance
+
+This closes the question. The 5.0x roofline miss on our 6.973 ms `SparseFlashAttention` is not a
+hardware property of A3, not an intrinsic cost of scattered KV gather, and not a small-batch law.
+It is one operator that was forked from `FusedInferAttentionScore`'s MLA tiling and shipped
+without the `SplitCore` call. Everything else — the `splitKVParams` struct, the `accumOut` and
+`logSumExp` workspace, the `if constexpr (FLASH_DECODE)` kernel branch, the `softmax_max` /
+`softmax_sum` outputs — is still there, wired to constants.
+
+The published cost model `6 * ceil(M/16) + 10 * ceil(S2/64)` is the most useful single artifact
+for our own megakernel scheduler, because it is Huawei's own weighting of the two axes on this
+chip and it says the S2 axis dominates by 10:6 per quantum, with the M axis flat up to 16 rows.
+For a batch=1 TP16 decode with `gSize` in {4, 8} that is: all the cost is in S2, M is free, and
+any scheduler that does not cut S2 is leaving the only axis that matters uncut.
+
+Three things this makes concretely actionable against our numbers:
+
+1. **Our 5.6 ms target is reachable but not by closing to the byte roofline.** Section 9 showed
+   the op's own floor is ~3x the byte roofline because of the `kvMergeGm_` round trip. Section 12
+   shows the parallelism is 1 core. The product of those two is the gap; the fix for the first is
+   a kernel that keeps gathered KV in UB/L1, and the fix for the second is an S2 split with an
+   lse combine. A megakernel does both at once, and neither in isolation gets most of the win.
+2. **`FusedInferAttentionScore` is a measurable baseline we can run today.** It is on A3
+   (`arch22`), it has an MLA non-quant path (`fia_tiling_nonquant_mla.cpp`), and it calls
+   `SplitCore`. Running our batch=1 seq-8K decode through FIA *without* sparsity and comparing to
+   `SparseFlashAttention` *with* sparsity would separate "sparse gather is expensive" from "sparse
+   op has no decode tiling". Our measurement cannot currently tell those apart. If dense FIA on
+   8192 tokens beats sparse SFA on top-k tokens, the sparsity is costing us rather than saving us
+   — and that would be the most important thing to know.
+3. **The `OP_LOGD("SplitRes", "CoreNum: %u", i)` and `LogSplitCoreResult` lines give FIA's chosen
+   plan for free in plog**, so the core count FIA *would* pick for our shape is observable without
+   any instrumentation.
+
+---
+
+## 13. GLM-5.2's attention, verbatim from the config and the tech report: 64 heads, 576-dim latent, `index_topk = 2048`, 78 layers
+
+### 13.1 `zai-org/GLM-5.2` config.json
+
+https://huggingface.co/zai-org/GLM-5.2/raw/main/config.json
+zai-org (Z.ai / Zhipu). Repo `createdAt 2026-06-16T07:39:20.000Z`, `lastModified 2026-09-01T11:36:01.000Z`.
+Fetched 2026-10-20, HTTP 200, 3732 bytes.
+
+```json
+{
+  "architectures": [
+    "GlmMoeDsaForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "dtype": "bfloat16",
+  "ep_size": 1,
+  "first_k_dense_replace": 3,
+  "head_dim": 192,
+  "hidden_act": "silu",
+  "hidden_size": 6144,
+  "index_head_dim": 128,
+  "index_n_heads": 32,
+  "index_share_for_mtp_iteration": true,
+  "index_skip_topk_offset": 3,
+  "index_topk": 2048,
+  "index_topk_freq": 4,
+  "index_topk_pattern": null,
+  "indexer_rope_interleave": true,
+  "indexer_types": [ ... 78 entries: 21 "full", 57 "shared" ... ],
+  "initializer_range": 0.02,
+  "intermediate_size": 12288,
+  "kv_lora_rank": 512,
+  "max_position_embeddings": 1048576,
+  "mlp_layer_types": [ ... 78 entries: 3 "dense", 75 "sparse" ... ],
+  "model_type": "glm_moe_dsa",
+  "moe_intermediate_size": 2048,
+  "moe_layer_freq": 1,
+  "moe_router_dtype": "float32",
+  "n_group": 1,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "num_attention_heads": 64,
+  "num_experts_per_tok": 8,
+  "num_hidden_layers": 78,
+  "num_key_value_heads": 64,
+  "num_nextn_predict_layers": 1,
+  "pretraining_tp": 1,
+  "q_lora_rank": 2048,
+  "qk_head_dim": 256,
+  "qk_nope_head_dim": 192,
+  "qk_rope_head_dim": 64,
+  "rms_norm_eps": 1e-05,
+  "rope_interleave": true,
+  "rope_parameters": {
+    "rope_theta": 8000000,
+    "rope_type": "default"
+  },
+  "routed_scaling_factor": 2.5,
+  "scoring_func": "sigmoid",
+  "tie_word_embeddings": false,
+  "topk_group": 1,
+  "topk_method": "noaux_tc",
+  "transformers_version": "5.12.0",
+  "use_cache": true,
+  "v_head_dim": 256,
+  "vocab_size": 154880
+}
+```
+
+`indexer_types` decoded: `full` at layer indices
+**[0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74]** = **21 full,
+57 shared**, matching the derivation in `configuration_glm_moe_dsa.py`:
+
+```python
+                freq = max(kwargs.get("index_topk_freq", 1), 1)
+                offset = kwargs.get("index_skip_topk_offset", 2)
+                self.indexer_types = [
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared" for i in range(self.num_hidden_layers)
+                ]
+```
+
+(https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/glm_moe_dsa/configuration_glm_moe_dsa.py)
+
+`zai-org/GLM-5` (https://huggingface.co/zai-org/GLM-5/raw/main/config.json, 1384 bytes) is the
+same architecture *without* `index_topk_freq` / `indexer_types` — every layer runs its own
+indexer. `index_topk` is 2048 in both. `zai-org/GLM-5.3`
+(https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json, 29464 bytes) is architecturally
+identical to 5.2, confirmed by the Transformers doc
+(https://raw.githubusercontent.com/huggingface/transformers/main/docs/source/en/model_doc/glm_moe_dsa.md):
+
+> ### GLM-5.3
+> GLM-5.3 uses the same base model as GLM-5.2 — every gain comes from post-training.
+
+> ### GLM-5
+> GLM-5 ([GlmMoeDsa](https://huggingface.co/papers/2602.15763)) is a 744B-parameter mixture-of-experts model with 40B active parameters per token, using DeepSeek Sparse Attention (DSA) for efficient 200K-token context handling. It was trained entirely on Huawei Ascend chips and matches frontier-level performance on reasoning and long-context benchmarks.
+
+GLM-4.5 and GLM-4.6 are **not** a valid analogue: `"architectures": ["Glm4MoeForCausalLM"]`,
+`"num_attention_heads": 96`, `"num_key_value_heads": 8`, `"head_dim": 128`, no `kv_lora_rank`, no
+`index_*` field at all — plain GQA-8, dense attention
+(https://huggingface.co/zai-org/GLM-4.6/raw/main/config.json, 1007 bytes).
+
+### 13.2 The GLM-5 tech report on the attention design — and on Ascend specifically
+
+https://arxiv.org/abs/2602.15763 / https://arxiv.org/html/2602.15763v2
+GLM-5-Team (Aohan Zeng, Xin Lv, Zhenyu Hou, ..., Jie Tang), "GLM-5: from Vibe Coding to Agentic
+Engineering". Submitted 17 Feb 2026 (v1), last revised 24 Feb 2026 (v2).
+
+> Multi-latent Attention.
+>
+> By employing reduced key-value vectors, Multi-latent attention (MLA) [24] matches the effectiveness of Grouped-Query Attention (GQA) but offers superior GPU memory savings and faster processing for long-context sequences.
+>
+> However, in our experiments with Muon optimizer, we find that MLA with a 576-dimension latent KV-cache cannot match the performance of GQA with 8 query groups (denoted as GQA-8, 2048-dimension KV-cache). To overcome the performance gap, we propose an adaptation to the recipe of Muon optimizer in GLM-4.5.
+> In the original recipe, we apply matrix orthogonalization to the up-projection matrices $W^{UQ},W^{UK},W^{UV}$ for multi-head queries, keys, and values. Instead, we split these matrices into smaller matrices for different heads and apply matrix orthogonalization to these independent matrices. The method, denoted as Muon Split, enables projection weights for different attention heads to update at different scales. As shown in Table 1, the method effectively improves the performance of MLA to match that of GQA-8. In practice, we also find that with Muon Split, the scale of attention logits of GLM-5 remains stable during pre-training without any clipping strategy.
+>
+> Another disadvantage of MLA is its high computational cost during decoding. In decoding, MLA performs a 576-dimensional dot product, higher than the 128-dimensional computation of GQA. While the number of attention heads in DeepSeek-V3 is selected according to the roofline of H800 [60], it is inappropriate for other hardware. Given the Multi-head Attention (MHA) style of MLA during training and prefilling, we increase the head dimension from 192 to 256 and decrease the number of attention heads by 1/3. This keeps the training computation and the number of parameters constant while decreasing the decoding computation. The variant, denoted as MLA-256 in Table 1, matches the performance of MLA under Muon Split.
+
+The architecture table (GLM-4.5 | GLM-5):
+
+> \# Total Parameters | 355B | 744B
+> \# Activated Parameters | 32B | 40B
+> \# Dense Layers | 3 | 3
+> \# MoE Layers | 89 | 75
+> \# MTP Layers | 1 | 1
+> Hidden Dim | 5120 | 6144
+> Dense Intermediate Dim | 12288 | 12288
+> MoE Intermediate Dim | 1536 | 2048
+> QK Head Dim | 128 | 192
+> V Head Dim | 128 | 256
+> Q LoRA Dim | – | 2048
+> KV LoRA Dim | – | 512
+> \# Attention Heads | 96 | 64
+> \# Key-Value Heads | 8 | –
+> \# Indexer Attn Heads | – | 32
+> \# Indexer Head Dim | – | 128
+> \# Experts (total) | 160 | 256
+> \# Routed Experts | 8 | 8
+> \# Shared Experts | 1 | 1
+> Vocabulary Size | 151552 | 154880
+
+On top-k, from the RL section:
+
+> We conduct a very large-scale RL training on a model based on the DSA architecture. Compared with MLA, DSA introduces an additional indexer that retrieves the top-k most relevant key-value entries and computes attention sparsely over the retrieved subset.
+> The retrieved top-k results are critical for RL stability. [...]
+> However, directly adapting this strategy to indexer replay, i.e., storing the indexer's top-k indices at every token position is clearly impractical, since the $k=2048$ used by the indexer is much larger than the $k$ typically used in MoE, and storing all these indices would incur enormous storage costs as well as significant communication overhead between the training engine and the inference engine.
+
+And Section 5, "Adapting GLM-5 to Chinese Chip Infrastructure" — this names our exact kernel set
+and our exact machine:
+
+> Mixed-Precision W4A8 quantization.
+>
+> To fit the 750B parameter GLM-5 model onto a single Atlas 800T A3 machine, we implemented a sophisticated W4A8 mixed-precision quantization strategy. Utilizing the msModelSlim tool, we applied specific precisions to different model components: standard Attention and MLP blocks use W8A8 (INT8), while the MoE experts are compressed to W4A8 (INT4) to drastically reduce memory footprint without significant accuracy loss. Advanced algorithms like QuaRot [2] for outlier suppression and Flex_AWQ_SSZ for scaling calibration were employed to maintain stability in low-bit deployment.
+>
+> High-Performance fusion kernels.
+>
+> To overcome the computational bottlenecks of sparse attention on Ascend NPUs, we developed a suite of customized fusion kernels: Lightning Indexer, Sparse Flash Attention, and MLAPO (Multi-head Latent Attention Pre-processing Optimization).
+> Lightning Indexer integrates score calculation, ReLU, and TopK operations into a single kernel, allowing the NPU to overlap computation with memory access.
+> For the Sparse Flash Attention kernel, we specifically optimized for GLM-5's sparse patterns. This kernel handles the selection of TopK tokens from the KV cache and sparse attention computation in parallel.
+> Last, MLAPO fuses 13 small pre-processing operators into one "super operator", utilizing parallel processing between Vector and Cube units to boost end-to-end efficiency.
+> [...]
+> Through these hardware-level co-optimizations, GLM-5 on a single Chinese node achieves performance comparable to dual-GPU international clusters, while reducing deployment costs in long-sequence scenarios by 50%.
+
+And the DSA adoption statement:
+
+> 2.1.1 Continued Pre-Training with DeepSeek Sparse Attention (DSA)
+>
+> We use DSA in our training.
+> The core philosophy of DSA [9] is to replace the traditional dense $O(L^{2})$ attention—which becomes prohibitively expensive at $128\text{K}$ contexts—with a dynamic, fine-grained selection mechanism. Unlike fixed patterns (like sliding windows), DSA "looks" at the content to decide which tokens are important.
+> [...]
+> DSA reduces the attention computation by roughly 1.5-2× for long sequences, which is very important for the reasoning-heavy agents we are building, being able to handle 128K contexts at half the GPU cost.
+
+### 13.3 The reference indexer, and the exact top-k clamp
+
+https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+HuggingFace Transformers, main branch, fetched 2026-10-20 (37299 bytes). Doc states: "*This
+model was published in HF papers on 2026-02-17 and contributed to Hugging Face Transformers on
+2026-02-09.*"
+
+```python
+        batch_size, seq_len, _ = hidden_states.shape
+        cos, sin = position_embeddings
+        q = self.wq_b(q_resid)  # [B, S, H*D]
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
+        q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
+
+        k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)  # [B, S, 1, D]
+        k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
+
+        # GLM-MoE-DSA uses interleaved RoPE in the indexer
+        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+        q = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
+        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)  # [B, S, D]
+
+        if past_key_values is not None:
+            k = past_key_values.update_indexer(k, self.layer_idx)
+
+        scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * self.softmax_scale
+        scores = F.relu(scores)
+
+        # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, T] → [B, S, T]
+        weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
+        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+
+        # Causality needs to be taken into account when computing scores so padding tokens don't affect computation
+        if attention_mask.dtype == torch.bool:
+            index_scores = index_scores.masked_fill(~attention_mask, float("-inf"))
+        else:
+            index_scores = index_scores + attention_mask
+
+        topk = min(self.index_topk, index_scores.shape[-1])
+        return index_scores.topk(topk, dim=-1).indices.to(torch.int32)  # [B, S, topk]
+```
+
+and the per-layer dispatch:
+
+```python
+        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+```
+```python
+        # DSA: select this layer's top-k tokens, or reuse the previous full layer's on `"shared"` layers.
+```
+
+The vLLM-Ascend production clamp is the same, and states the decode value directly —
+https://github.com/vllm-project/vllm-ascend `vllm_ascend/attention/indexer.py` (1111 lines):
+
+```python
+    @property
+    def topk_output_width(self) -> int:
+        return self.topk_tokens
+
+    def get_topk_lengths(self, positions: torch.Tensor) -> torch.Tensor:
+        return (positions + 1).clamp(min=0, max=self.topk_tokens)
+```
+```python
+    @staticmethod
+    def get_name() -> str:
+        return "ASCEND_SFA_INDEXER"
+```
+```python
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
+        return [128]
+```
+```python
+        self.n_head: int = vllm_indexer.n_head  # 64
+        self.head_dim: int = vllm_indexer.head_dim  # 128
+        self.topk_tokens: int = vllm_indexer.topk_tokens  # 2048
+        self.q_lora_rank: int = vllm_indexer.q_lora_rank  # 1536
+```
+```python
+        reads the freshly written cache. ``compute_topk=False`` (SFA layers
+```
+
+### 13.4 DeepSeek-V3.2's DSA — the published formula and the 2048
+
+`index_topk = 2048` independently in two DeepSeek files:
+
+https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/raw/main/config.json
+deepseek-ai, `lastModified 2025-11-18T02:39:54.000Z`, fetched 2026-10-20, 1552 bytes:
+
+```json
+  "index_head_dim": 128,
+  "index_n_heads": 64,
+  "index_topk": 2048,
+  "kv_lora_rank": 512,
+  "num_attention_heads": 128,
+  "num_hidden_layers": 61,
+  "num_key_value_heads": 128,
+  "q_lora_rank": 1536,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+```
+
+https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/raw/main/inference/config_671B_v3.2.json
+
+```json
+    "index_n_heads": 64,
+    "index_head_dim": 128,
+    "index_topk": 2048
+```
+
+https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V3.2-Exp/main/DeepSeek_V3_2.pdf
+(526189 bytes, 6 pages). DeepSeek-AI, "DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with
+DeepSeek Sparse Attention":
+
+> Prototype of DSA. The prototype of DSA primarily consists of two components: a lightning indexer and a fine-grained token selection mechanism.
+>
+> The lightning indexer computes the index score 𝐼𝑡,𝑠 between the query token h 𝑡∈R 𝑑 and a preceding tokenh 𝑠∈R 𝑑, determining which tokens to be selected by the query token:
+>
+> 𝐼𝑡,𝑠 = ∑︁_{𝑗=1}^{𝐻𝐼} 𝑤𝐼_{𝑡,𝑗}·ReLU( q𝐼_{𝑡,𝑗}·k 𝐼_𝑠 ),  (1)
+>
+> where 𝐻𝐼 denotes the number of indexer heads; q 𝐼_{𝑡,𝑗} ∈R 𝑑𝐼 and 𝑤𝐼_{𝑡,𝑗} ∈R are derived from the query token h 𝑡; and k 𝐼_𝑠∈R 𝑑𝐼 is derived from the preceding token h 𝑠. We choose ReLU as the activation function for throughput consideration. Given that the lightning indexer has a small number of heads and can be implemented in FP8, its computational efficiency is remarkable.
+>
+> Given the index scores {𝐼𝑡,𝑠} for each query token h 𝑡, our fine-grained token selection mechanism retrieves only the key-value entries {c𝑠} corresponding to the top-k index scores. Then, the attention output u 𝑡 is computed by applying the attention mechanism between the query token h 𝑡 and the sparsely selected key-value entries {c 𝑠}:
+>
+> u𝑡 =Attn( h𝑡, { c𝑠 | 𝐼𝑡,𝑠∈Top-k(𝐼𝑡,:) } ).  (2)
+
+> Instantiate DSA Under MLA. For the consideration of continued training from DeepSeek-V3.1-Terminus, we instantiate DSA based on MLA (DeepSeek-AI, 2024) for DeepSeek-V3.2-Exp. At the kernel level, each key-value entry must be shared across multiple queries for computational efficiency (Yuan et al., 2025). Therefore, we implement DSA based on the MQA (Shazeer, 2019) mode of MLA, where each latent vector (the key-value entry of MLA) will be shared across all query heads of the query token.
+
+> In this sparse training stage, we use a learning rate of 7.3× 10−6, and select 2048 key-value tokens for each query token. We train both the main model and the indexer for 15000 steps, with each step consisting of 480 sequences of 128K tokens, resulting in a total of 943.7B tokens.
+
+> Inference Costs. DSA reduces the core attention complexity of the main model from O(𝐿2) to O(𝐿𝑘), where 𝑘 (≪𝐿) is the number of selected tokens. Although the lightning indexer still has a complexity of O(𝐿2), it requires much less computation compared with MLA in DeepSeek-V3.1-Terminus. Combined with our optimized implementation, DSA achieves a significant end-to-end speedup in long-context scenarios. Figure 3 presents how token costs of DeepSeek-V3.1-Terminus and DeepSeek-V3.2-Exp vary with the token position in the sequence. These costs are estimated from benchmarking the actual service deployed on H800 GPUs, at a rental price of 2 USD per GPU hour. Note that for short-sequence prefilling, we specially implement a masked MHA mode to simulate DSA, which can achieve higher efficiency under short-context conditions.
+
+The authors' reference implementation
+(https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/raw/main/inference/model.py, 38639 bytes):
+
+```python
+        weights = self.weights_proj(x.float()) * self.n_heads ** -0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous())
+        if mask is not None:
+            index_score += mask
+        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+```
+
+with the separate indexer K cache:
+
+```python
+        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn), persistent=False)
+        self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
+```
+
+### 13.5 The 656-byte C8 KV row — the byte constant our roofline turns on
+
+https://raw.githubusercontent.com/vllm-project/vllm-project.github.io/main/_posts/2025-09-29-deepseek-v3-2.md
+vLLM Team, 2025-09-29, "DeepSeek-V3.2-Exp in vLLM: Fine-Grained Sparse Attention in Action".
+(The rendered page https://vllm.ai/blog/2025-09-29-deepseek-v3-2 returns HTTP 302 into a
+corporate proxy block page from this network; the git source serves the text.)
+
+> Another interesting point is the handling of the FP8 KV cache, which this model supports. For MLA, each token's KV cache is 656 bytes, structured as:
+>
+> * First 512 bytes: The "quantized NoPE" part, containing 512 `float8_e4m3` values.
+> * Next 16 bytes: Scale factors, containing 4 `float32` values. The first `float32` is the scale for the first 128 `float8_e4m3` values, the second for the next 128, and so on.
+> * Last 128 bytes: The "RoPE" part, containing 64 `bfloat16` values. This part is not quantized for accuracy.
+
+> For each new query token, it now passes through the indexer to compute the top 2048 tokens to attend to. A query for a token is a tensor of shape `(h, d)`, with `h` being the number of query heads, and `d` being the head dimension. The context of size `n` is a 2D tensor of shape `(n, d)`. The computed logits (relevance scores between the query and the context) are a tensor of shape `(n, h)`. Weighting the logits by the head weights of shape `(h,)`, we get a tensor of shape `(n,)`. We need to produce a `(2048,)` integer tensor of the indices of the top-2048 tokens, with `-1` filled for the rest if there are fewer than 2048 tokens.
+
+> However, for the indexer key cache, it is stored on a per-block basis. This is one of the reasons we only support block size 64 for this model; the other being that FlashMLA is tailored to it as well. The first `block_size * head_dim` entries contain the value, the rest contain the scaling factor:
+>
+> ```
+> x_fp8[ :, : block_size * head_dim] = x_scaled.view(num_blocks, block_size * head_dim).view(dtype=torch.uint8)
+> x_fp8[ :, block_size * head_dim :] = scales.view(num_blocks, block_size).view(dtype=torch.uint8)
+> ```
+>
+> In the indexer, the cache for one token is not stored contiguously.
+
+The Ascend kernel README states the same 656 and gives the formula —
+https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/kv_quant_sparse_flash_attention_vllm/README.md:
+
+> k_nope、query相同数据类型的k_rope和float32的量化参数按D维度拼接得到。[…] layout_kv为"PA_BSND"时shape为[block_num, block_size, KV_N, KV_D]，其中block_num为PageAttention时block总数，block_size为一个block的token数，block_size取值为16的整数倍，最大支持到1024。KV_N仅支持1；KV_D = 512 + rope_head_dim*2 + 4*4，表示每行拼接数据的字节数。A2/A3 INT8 C8支持528（rope_head_dim=0）或656（rope_head_dim=64）；[…] 4个FLOAT32 scale组成的区域起始偏移分别为512或640字节，偏移从0开始。
+
+> 代表sparse阶段的block大小。sparse_block_size为1时，为Token-wise稀疏化场景；sparse_block_size大于1且小于等于128时，为Block-wise稀疏化场景，块内token共享相同的稀疏化决策。
+
+> - API功能：`kv_quant_sparse_flash_attention_vllm`在`sparse_flash_attention`的基础上支持了[Per-Token-Head-Tile-128量化]输入。随着大模型上下文长度的增加，Sparse Attention的重要性与日俱增，这一技术通过"只计算关键部分"大幅减少计算量，然而会引入大量的离散访存，造成数据搬运时间增加，进而影响整体性能。
+
+## Relevance
+
+Everything now locks onto the kernel findings of sections 8-12, and it produces one number that
+contradicts our measurement.
+
+**The shape, resolved.** GLM-5.2: 64 Q heads, 78 layers, `kv_lora_rank 512` + `qk_rope_head_dim
+64` = the 576-dim latent that `SparseFlashAttention`'s `约束说明` requires (`Q_D ... 为512`,
+`Dr ... 为64`). At TP16 that is **`Q_N = 64 / 16 = 4` heads per rank** — a legal value in the op's
+`Q_N支持1/2/4/8/16/32/64/128` list, and far below the `gSize > 64` threshold that would turn on
+`IS_SPLIT_G` (section 8.1). So `IS_SPLIT_G = 0` is confirmed for our configuration, not inferred.
+And in the published cost model `6 * ceil(M/16) + 10 * ceil(S2/64)` (section 12.3),
+`ceil(4/16) = 1` — the M term is a flat 6 and *all* of the modelled cost is S2, the one axis the
+op refuses to split.
+
+**The byte count, resolved.** Top-k is 2048, clamped only by position:
+`(positions + 1).clamp(max=2048)`, so at seq 8192 a decode step reads exactly **2048 of 8192 KV
+tokens = 25.0%**, every layer. C8 row = 656 B. Per layer per query token:
+`2048 x 656 = 1,343,488 B = 1.28 MiB`. Over 78 layers: **104.8 MB per decode step**.
+
+**The contradiction.** `KV_N仅支持1` — the MLA latent is MQA, one KV head, shared across all
+query heads of the token. It is therefore **not shardable by tensor parallelism**. At TP16 with
+`--data-parallel-size 1`, all 16 ranks read the *same* 104.8 MB. Our stated roofline for
+`SparseFlashAttention` is 1.382 ms of bytes "at batch=1 seq 8K TP16". 104.8 MB / 1.382 ms implies
+a bandwidth of **75.8 GB/s**. If our roofline uses A3 per-die HBM bandwidth — order 1.2-1.6 TB/s
+— then 1.382 ms corresponds to 1.7-2.2 GB of bytes, i.e. **16-21x more than the 104.8 MB that
+`index_topk = 2048` actually requires**. That factor is suspiciously close to TP16. Two
+possibilities, and they point in opposite directions:
+
+- If our roofline was computed from the **full 8192-token** KV rather than the 2048 selected
+  (8192 x 656 x 78 = 419 MB, 4x more) and/or multiplied by a TP factor, then the roofline is
+  *overstated* and the true gap is much larger than 5.0x — consistent with sections 8-12
+  predicting a 1-core, 3-HBM-transit execution.
+- If our roofline already counts only the selected 2048 tokens once, then the implied bandwidth
+  is 75.8 GB/s, which is roughly what **one** AI core can pull — and then our measurement is
+  independently confirming section 8.3's conclusion that `usedCoreNum = 1`.
+
+Either way the resolution is the same single check, and it is worth doing before any kernel work:
+recompute the `SparseFlashAttention` roofline as `2048 x 656 x (SFA calls per round)` against
+aggregate per-die HBM bandwidth, with **no** division by TP. If that lands near 65-90 us rather
+than 1.382 ms, then the real gap is ~80-100x, not 5.0x, and the 5.6 ms we hoped to recover is a
+severe underestimate of what is on the table.
+
+**Two facts that bound the opportunity.** First, index sharing does *not* reduce SFA work: 57 of
+78 layers skip the indexer but all 78 still attend over 2048 tokens. Our SFA budget is 78 x 2048,
+not 21 x 2048. Second, GLM's own team names `Sparse Flash Attention` as a kernel they wrote for
+Ascend and describes it as handling "the selection of TopK tokens from the KV cache and sparse
+attention computation **in parallel**" — the gather/compute overlap that section 9.5's
+`SetFlag`/`WaitFlag` pair on `MTE2_MTE3` demonstrably does *not* achieve in the public `arch22`
+code. Either the shipped `ops-transformer` kernel is not the one they measured, or the overlap
+they claim is the one we are not getting.
