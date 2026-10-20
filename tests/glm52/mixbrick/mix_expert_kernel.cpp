@@ -68,32 +68,23 @@ namespace {
  * correct every time when downloaded, and the count of wrong rows differed on
  * every run.
  */
-/** Producer side: wait for this core's writes to retire.
+/** Publish this core's global writes to the others.
  *
- * `PipeBarrier` blocks a pipe's *issue* order, which is why three of them
- * changed nothing here. This blocks until the memory accesses retire, and it
- * is what makes the cube's write-back visible: the fixpipe's store can still
- * be in a write buffer when the flag goes up, and a consumer that invalidates
- * its own cache then reads the old value anyway.
+ * On NPU architecture 2201 the L2 cache is shared across cores, the DCache is
+ * per-core but used only by the Scalar unit, and the ICache is read-only. A
+ * cube-to-vector handoff goes L0C, Fixpipe, GM, MTE2, UB -- entirely through
+ * the shared L2 -- so it has no coherence problem and needs no cache
+ * maintenance. Earlier attempts here flushed the DCache, which is the wrong
+ * cache for this path.
  *
- * No clean on this side. A clean of the entire data cache writes back
- * whatever stale lines this core happens to hold, which across eight cores
- * sharing one buffer means each can clobber another's fresh values -- a
- * published A/B measured more mismatches with the producer's clean on than
- * off.
+ * What it does need is completion ordering, and `PipeBarrier` is not that:
+ * it blocks a pipe's issue order, while this blocks until the write is
+ * visible to other cores. `MemDsbT::ALL` would not do -- it covers GM and UB
+ * but explicitly not L0C or L1 -- and `DDR` is the one that covers the
+ * Fixpipe write this hands over.
  */
-__aicore__ inline void Drain()
+__aicore__ inline void Publish()
 {
-    DataSyncBarrier<MemDsbT::DDR>();
-}
-
-/** Consumer side: drop this core's view before reading what another wrote. */
-__aicore__ inline void Acquire(__gm__ int32_t* buffer)
-{
-    GlobalTensor<int32_t> whole;
-    whole.SetGlobalBuffer(buffer);
-    DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
-                             DcciDst::CACHELINE_OUT>(whole);
     DataSyncBarrier<MemDsbT::DDR>();
 }
 
@@ -298,14 +289,22 @@ __aicore__ void mix_expert_fused(
     if ASCEND_IS_AIC {
         TPipe cube_pipe;
         if (stages & 1) {
-            Project(cube_pipe, x, gate_up, partial, tiling, rows, channel,
-                    channels);
-            Project(cube_pipe, x, gate_up, partial, tiling, rows,
-                    HALF + channel, channels);
+            // Bit 5 projects the whole axis in one call instead of two. Two
+            // `Matmul` objects sharing one `TPipe` is the one variable the
+            // regression arrived with, and the original single-call kernel
+            // was repeatably correct.
+            if (stages & 32) {
+                Project(cube_pipe, x, gate_up, partial, tiling, rows, 0,
+                        GATE_UP);
+            } else {
+                Project(cube_pipe, x, gate_up, partial, tiling, rows, channel,
+                        channels);
+                Project(cube_pipe, x, gate_up, partial, tiling, rows,
+                        HALF + channel, channels);
+            }
             // Drain the fixpipe, then publish out of the data cache, then
             // raise the flag. All three, in that order.
-            Drain();
-            PipeBarrier<PIPE_FIX>();
+            Publish();
         }
         if (stages & 2) {
             // Mode 2 is the only one that crosses from cube to vector. Mode 0
@@ -335,7 +334,6 @@ __aicore__ void mix_expert_fused(
             // writes it: the set's template arguments and the wait's must
             // agree or they are different flags.
             CrossCoreWaitFlag<0x02>(GATE_READY);
-            Acquire(partial);
         }
         if (stages & 16) {
             CrossCoreSetFlag<0x02, PIPE_MTE3>(VECTOR_ALIVE);

@@ -3514,6 +3514,9253 @@ This is a production, merged, barrier-free one-shot push allreduce with a batch=
 
 ---
 
+---
+
+# Part 7 — The in-kernel collective on A3: `aclshmem`, epoch tagging, and what orders a remote write
+
+Collected 2026-10-20 for question 2.3, "how an in-kernel collective is made safe without a host
+barrier". Everything below is verbatim. Provenance note from the collector, verbatim:
+
+> Primary corpus for TOPIC A is the CANN `shmem` library. The canonical upstream is
+> `https://gitcode.com/cann/shmem` (gitcode HTML is JS-rendered and raw paths 404 for
+> anonymous access); a byte-identical GitHub mirror that *is* raw-fetchable is
+> `immengzi/shmem` (HEAD = `5408559b89`, xmengh, 2026-03-04). All `immengzi/shmem` URLs
+> below are that mirror of the Huawei-copyright source; the copyright headers in the quoted
+> blocks confirm provenance (`Copyright (c) 2025 Huawei Technologies Co., Ltd.`,
+> `CANN Open Software License Agreement Version 2.0`).
+
+## Relevance
+This is the material for fusing the TP all-reduce into the layer kernel, against our measured TP
+reduce of 5.35 ms, 100% serial, inside an 11.6198 ms TPOT.
+- The ordering question has a one-line answer: `aclshmem_quiet` is `PipeBarrier<PIPE_ALL>()` plus
+  `dcci_entire_cache()`, `aclshmem_fence` is implemented identically, and
+  `aclshmem_putmem_signal` is literally `put_nbi` → `quiet` → `signal_op`. So **`quiet` is the
+  thing that orders a remote write against the consumer's read**, and it is a full-pipe barrier
+  plus a whole-DCache flush — i.e. not free, and 78 layers × 2 all-reduces would pay it 156 times.
+  See also `ascend-fusion-mechanics.md` §35: on 2201 the DCache is the only incoherent cache and
+  only the Scalar unit uses it, which is why LCCL's choice to move flags by MTE instead of scalar
+  stores lets it skip `dcci` entirely.
+- Epoch tagging is the upstream norm, not an invention of TileRT's ROCm build. The `shmem` barrier
+  design note states it directly: 「instead of simply write a flag, each rank writes a 64-bit
+  number ... indicating how many times this team has performed barrier」, with 「no cache
+  consistency ensurance」 named as the reason flag slots must be cacheline-isolated. LCCL puts a
+  32-bit magic in the **high** half of an int64 and rejects stale values with
+  `(v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue` — exactly the "16-bit epoch tag
+  in the high half of each transferred word" shape our ROCm build uses, at 32 bits.
+- Three ways the epoch is generated with **no host barrier**, all published: a host-side
+  per-communicator counter passed as a kernel scalar (LCCL `int64_t magic_ = 1`, post-incremented
+  per call); a device-side atomic-add into a symmetric slot followed by `SyncAll<true>()` (LCCL
+  `SET_MAGIC`); and a per-block self-incrementing read-modify-write of the block's own magic slot,
+  which needs no atomic because exactly one core owns each slot (sgl-kernel-npu
+  `NotifyDispatch::GetMagicValue()`). The third is the right shape for a batch=1 megakernel.
+- `magic % PING_PONG_SIZE` selecting which half of the symmetric window a generation writes into is
+  the standard companion trick — it removes the need to ever zero the flag region, which is what
+  would otherwise force a barrier.
+- **The decisive A3 constraint:** of the device-side AMOs, only `atomic_add` is available on
+  A2/A3; `atomic_set`, `atomic_swap`, `atomic_compare_swap`, `atomic_inc`, `atomic_fetch_inc`,
+  `atomic_fetch_add` and the bitwise AMOs are all 950-only. So there is no device-side atomic SET
+  or CAS to bump an epoch with on our hardware — the epoch must come from a scalar argument, a
+  single-owner slot, or an atomic *add*.
+- `aclshmemx_signal_op` carries 「WARNING: Atomicity NOT Guaranteed.」 in the mirror, reworded in
+  current gitcode master to 「On Ascend950, RDMA is used as the communication engine, supporting
+  signal_set with guaranteed atomicity」 — i.e. the guarantee is explicitly 950-only, which is
+  another reason A3 should use the add/epoch form rather than a set.
+- A one-sided `put` on A3 is address translation plus an ordinary `DataCopyPad`, and
+  `EpilogueAllReduce` shows the TP all-reduce fused into a GEMM epilogue with three in-kernel
+  barriers and an atomic-add reduce-scatter by remote *pull* — the closest published analogue of
+  what we want the layer kernel to do.
+- Two landmines to design around now: `shmem_device_cc.h` states 「Barrier APIs conflict with
+  SyncAll. Avoid mixing them together」, and both depend on `shmemx_set_ffts_config` being called
+  at kernel entry.
+
+# TOPIC A — making an in-kernel collective safe without a host barrier
+
+## A1. `aclshmem_quiet` / `aclshmem_fence` — the declared memory-ordering contract
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_mo.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+/**
+ * @brief The aclshmem_quiet routine ensures completion of all operations on symmetric data objects issued by the
+ *        calling PE.
+ *        On systems with only scale-up network (HCCS), updates are globally visible, whereas on systems with
+ *        both scale-up network HCCS and scale-out network (RDMA), ACLSHMEM only guarantees that updates to the
+ *        memory of a given PE are visible to that PE.
+ *        Quiet operations issued on the CPU and the NPU only complete communication operations that were
+ *        issued from the CPU and the NPU, respectively. To ensure completion of GPU-side operations from
+ *        the CPU, using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_quiet(void);
+#define shmem_quiet aclshmem_quiet
+
+/**
+ * @brief In OpenACLSHMEM specification, aclshmem_fence assures ordering of delivery of Put, AMOs, and memory store routines
+ *        to symmetric data objects, but does not guarantee the completion of these operations.
+ *        However, due to hardware capabilities, we implemented aclshmem_fence same as aclshmem_quiet, ensuring both ordering
+ *        and completion.
+ *        Fence operations issued on the CPU and the NPU only order communication operations that were issued from the
+ *        CPU and the NPU, respectively. To ensure completion of GPU-side operations from the CPU,
+ *        using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_fence(void);
+#define shmem_fence aclshmem_fence
+```
+
+## A2. What `quiet` actually compiles to — two instructions, nothing else
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmem_device_mo.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_quiet()
+{
+    // clear instruction pipes
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    // flush data cache to GM
+    dcci_entire_cache();
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+ACLSHMEM_DEVICE void aclshmem_quiet()
+{
+    aclshmemi_quiet();
+}
+
+ACLSHMEM_DEVICE void aclshmem_fence()
+{
+    aclshmemi_quiet();
+}
+```
+
+## A3. `dcci` wrappers — the exact AscendC intrinsic, and the compiler-barrier requirement
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmemi_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 334-380)
+
+```cpp
+ACLSHMEM_DEVICE void dcci_cacheline(__gm__ uint8_t * addr)
+{
+    using namespace AscendC;
+    GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(addr);
+
+    // Important: add hint to avoid dcci being optimized by compiler
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(global);
+    __asm__ __volatile__("");
+}
+
+ACLSHMEM_DEVICE void dcci_cachelines(__gm__ uint8_t* addr, uint64_t length)
+{
+    __gm__ uint8_t* start = (__gm__ uint8_t*)((uint64_t)addr / ACLSHMEM_DATA_CACHE_LINE_SIZE
+        * ACLSHMEM_DATA_CACHE_LINE_SIZE);
+    __gm__ uint8_t* end = (__gm__ uint8_t*)(((uint64_t)addr + length) / ACLSHMEM_DATA_CACHE_LINE_SIZE
+        * ACLSHMEM_DATA_CACHE_LINE_SIZE);
+    AscendC::GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(start);
+    for (uint64_t i = 0; i <= end - start; i+= ACLSHMEM_DATA_CACHE_LINE_SIZE) {
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<uint8_t,
+            AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global[i]);
+        __asm__ __volatile__("");
+    }
+}
+
+ACLSHMEM_DEVICE void dcci_entire_cache()
+{
+    using namespace AscendC;
+    GlobalTensor<uint8_t> global;
+    
+    // Important: add hint to avoid dcci being optimized by compiler
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(global);
+    __asm__ __volatile__("");
+}
+```
+
+Same file, line 35 — the cacheline constant:
+
+```cpp
+constexpr uint64_t ACLSHMEM_DATA_CACHE_LINE_SIZE = 64;
+```
+
+## A4. `dcci` before `GetValue` on a remote-written GM flag — the official poll loop
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmem_device_p2p_sync.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 18-110)
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_signal_wait_until_eq(__gm__ volatile T *sig_addr, T cmp_val)
+{
+    do {
+        dcci_cacheline((__gm__ uint8_t *)sig_addr);
+    } while (*sig_addr != cmp_val);
+}
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_signal_wait_until_ne(__gm__ volatile T *sig_addr, T cmp_val)
+{
+    do {
+        dcci_cacheline((__gm__ uint8_t *)sig_addr);
+    } while (*sig_addr == cmp_val);
+}
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_signal_wait_until_gt(__gm__ volatile T *sig_addr, T cmp_val)
+{
+    do {
+        dcci_cacheline((__gm__ uint8_t *)sig_addr);
+    } while (*sig_addr <= cmp_val);
+}
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_signal_wait_until_ge(__gm__ volatile T *sig_addr, T cmp_val)
+{
+    do {
+        dcci_cacheline((__gm__ uint8_t *)sig_addr);
+    } while (*sig_addr < cmp_val);
+}
+
+ACLSHMEM_DEVICE int32_t aclshmemi_signal_fetch(__gm__ int32_t *sig_addr)
+{
+    dcci_cacheline((__gm__ uint8_t *)sig_addr);
+    return *sig_addr;
+}
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_wait_until(__gm__ volatile T *ivar, int cmp, T cmp_value)
+{
+    switch (cmp) {
+        case ACLSHMEM_CMP_EQ:
+            return aclshmemi_signal_wait_until_eq<T>(ivar, cmp_value);
+        case ACLSHMEM_CMP_NE:
+            return aclshmemi_signal_wait_until_ne<T>(ivar, cmp_value);
+        case ACLSHMEM_CMP_GT:
+            return aclshmemi_signal_wait_until_gt<T>(ivar, cmp_value);
+        case ACLSHMEM_CMP_GE:
+            return aclshmemi_signal_wait_until_ge<T>(ivar, cmp_value);
+        case ACLSHMEM_CMP_LT:
+            return aclshmemi_signal_wait_until_lt<T>(ivar, cmp_value);
+        case ACLSHMEM_CMP_LE:
+            return aclshmemi_signal_wait_until_le<T>(ivar, cmp_value);
+    }
+}
+```
+
+Note the two load-bearing details: `__gm__ volatile T *` on the pointer, and `dcci_cacheline`
+*inside* the loop body (do/while, so it runs before the first compare too).
+
+## A5. `aclshmemx_signal_op` and `aclshmem_signal_wait_until` — declared API, with the atomicity warning
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_p2p_sync.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 23-51)
+
+```c
+/**
+ * @brief The aclshmemx_signal_op operation updates sig_addr with signal using operation sig_op on the specified PE.
+ *        This operation can be used together with aclshmem_signal_wait_until for efficient
+ *        point-to-point synchronization.
+ * WARNING: Atomicity NOT Guaranteed.
+ *
+ * @param sig_addr              [in] Symmetric address of the signal word to be updated.
+ * @param signal                [in] The value used to update sig_addr.
+ * @param sig_op                [in] Operation used to update sig_addr with signal. Supported operations:
+ *                                   ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                    [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmemx_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe);
+#define shmemx_signal_op aclshmemx_signal_op
+
+/**
+ * @brief This routine can be used to implement point-to-point synchronization between PEs or between threads within
+ *        the same PE. A call to this routine blocks until the value of sig_addr at the calling PE satisfies the wait
+ *        condition specified by the comparison operator, cmp, and comparison value, cmp_val.
+ *
+ * @param sig_addr              [in] Local address of the source signal variable.
+ * @param cmp                   [in] The comparison operator that compares sig_addr with cmp_val. Supported operators:
+ *                                   ACLSHMEM_CMP_EQ/ACLSHMEM_CMP_NE/ACLSHMEM_CMP_GT/
+ *                                   ACLSHMEM_CMP_GE/ACLSHMEM_CMP_LT/ACLSHMEM_CMP_LE.
+ * @param cmp_val               [in] The value against which the object pointed to by sig_addr will be compared.
+ * @return Return the contents of the signal data object, sig_addr, at the calling PE that satisfies the wait condition.
+ */
+ACLSHMEM_DEVICE int32_t aclshmem_signal_wait_until(__gm__ int32_t *sig_addr, int cmp, int32_t cmp_val);
+#define shmem_signal_wait_until aclshmem_signal_wait_until
+```
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/host_device/shmem_common_types.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 108-123)
+
+```c
+enum aclshmem_signal_op_type_t {
+    ACLSHMEM_SIGNAL_SET,
+    ACLSHMEM_SIGNAL_ADD
+};
+
+/**
+ * @brief Signal comparison operations, used by the signalee in peer-to-peer synchronization
+ */
+enum aclshmem_cmp_op_type_t {
+    ACLSHMEM_CMP_EQ = 0,
+    ACLSHMEM_CMP_NE,
+    ACLSHMEM_CMP_GT,
+    ACLSHMEM_CMP_GE,
+    ACLSHMEM_CMP_LT,
+    ACLSHMEM_CMP_LE
+};
+```
+
+## A6. `signal_op` implementation — `AMO_SET` is a plain store + dcci; `AMO_ADD` is `SetAtomicAdd` via UB→GM
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmem_device_so.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 255-342)
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_signal_set(__gm__ int32_t *addr, int32_t val)
+{
+    aclshmemi_store(addr, val);
+
+    // flush data cache to GM after signal to ensure it is visiable to other ranks
+    dcci_cacheline((__gm__ uint8_t *)addr);
+}
+
+ACLSHMEM_DEVICE void aclshmemi_signal_set(__gm__ int32_t *addr, int pe, int32_t val)
+{
+    aclshmemi_signal_set((__gm__ int32_t *)aclshmem_ptr(addr, pe), val);
+}
+
+ACLSHMEM_DEVICE void aclshmemi_highlevel_signal_set(__gm__ int32_t *dst, __gm__ int32_t *src, int pe)
+{
+    AscendC::LocalTensor<uint32_t> ub_tensor_32;
+    ub_tensor_32.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+    ub_tensor_32.address_.bufferAddr = reinterpret_cast<uint64_t>(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR);
+    ub_tensor_32.address_.dataLen = UB_ALIGN_SIZE;
+    AscendC::LocalTensor<uint64_t> ub_tensor_64;
+    ub_tensor_64.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+    ub_tensor_64.address_.bufferAddr = reinterpret_cast<uint64_t>(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR
+                                                                        + UB_ALIGN_SIZE);
+    ub_tensor_64.address_.dataLen = UB_ALIGN_SIZE;
+    aclshmemi_roce_write((__gm__ uint8_t*)aclshmem_roce_ptr(dst, pe), (__gm__ uint8_t*)src, pe, 0, sizeof(int32_t),
+        ub_tensor_64, ub_tensor_32, 0);
+    aclshmemi_roce_quiet(pe, 0, ub_tensor_64, ub_tensor_32, 0);
+}
+
+ACLSHMEM_DEVICE void aclshmemi_signal_add(__gm__ int32_t *addr, int pe, int32_t val)
+{
+    if (AscendC::GetBlockIdx() == 0){
+        auto ptr = aclshmem_ptr(addr, pe);
+        if (ptr == nullptr) return;
+        AscendC::SetAtomicNone();
+        __gm__ int32_t* remote_ptr = reinterpret_cast<__gm__ int32_t*>(ptr);
+
+        __ubuf__ int32_t* buf =(__ubuf__ int32_t*)(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR);
+        *buf = val;
+
+        AscendC::SetAtomicAdd<int32_t>();
+        aclshmemi_copy_ub2gm(remote_ptr, buf, sizeof(int32_t));
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+
+        AscendC::SetAtomicNone();
+    }
+}
+
+ACLSHMEM_DEVICE int32_t aclshmemi_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val)
+{
+    do {
+        dcci_cacheline((__gm__ uint8_t *)sig_addr);
+
+        if (*sig_addr == cmp_val) {
+            return *sig_addr;
+        }
+
+        // in case when peer pe enters next barrier
+        if (*sig_addr == cmp_val + 1) {
+            return *sig_addr;
+        }
+    } while (true);
+
+    // never reach
+    return -1;
+}
+
+ACLSHMEM_DEVICE void aclshmemi_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+{
+    switch (sig_op) {
+        case ACLSHMEM_SIGNAL_SET:
+            aclshmemi_signal_set(sig_addr, pe, signal);
+            break;
+        case ACLSHMEM_SIGNAL_ADD:
+            aclshmemi_signal_add(sig_addr, pe, signal);
+            break;
+    }
+}
+
+ACLSHMEM_DEVICE void aclshmemx_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+{
+    aclshmemi_signal_op(sig_addr, signal, sig_op, pe);
+}
+```
+
+`aclshmemi_store` / `aclshmemi_load` are plain dereferences — no barrier of their own:
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/shmemi_device_common.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```cpp
+template<typename T>
+ACLSHMEM_DEVICE void aclshmemi_store(__gm__ T *addr, T val)
+{
+    *((__gm__ T *)addr) = val;
+}
+
+template<typename T>
+ACLSHMEM_DEVICE T aclshmemi_load(__gm__ T *cache)
+{
+    return *((__gm__ T *)cache);
+}
+```
+
+## A7. The upstream message-passing litmus test — exactly "what orders a remote write against the local read"
+
+https://raw.githubusercontent.com/immengzi/shmem/master/tests/unittest/device/sync/order/order_kernel.cpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```cpp
+#include "kernel_operator.h"
+#include "shmem.h"
+#include "gm2gm/shmemi_device_cc.h"
+
+extern "C" ACLSHMEM_GLOBAL void quiet_order(uint64_t config, GM_ADDR addr, int rank_id, int rank_size) {
+    util_set_ffts_config(config);
+    __gm__ uint64_t *base = reinterpret_cast<__gm__ uint64_t*>(addr);
+    if (rank_id == 0) {
+        aclshmemi_store<uint64_t>(base, 0xAA);
+        aclshmem_quiet();
+        aclshmemi_store<uint64_t>(base + 32, 0xBB);
+        dcci_cacheline((__gm__ uint8_t *)(base + 32));
+    }
+
+    if (rank_id == 1) {
+        uint64_t seen_b;
+        __gm__ uint64_t *remote = (__gm__ uint64_t *)aclshmem_ptr(base, 0);
+        do {
+            dcci_cacheline((__gm__ uint8_t *)(remote + 32));
+            seen_b = aclshmemi_load<uint64_t>(remote + 32);
+        } while (seen_b != 0xBB);
+        dcci_cacheline((__gm__ uint8_t *)(remote));
+        uint64_t seen_a = aclshmemi_load<uint64_t>(remote);
+
+        aclshmemi_store<uint64_t>(base + 33, seen_b);
+        aclshmemi_store<uint64_t>(base + 34, seen_a);
+    }
+}
+
+extern "C" ACLSHMEM_GLOBAL void fence_order(uint64_t config, GM_ADDR addr, int rank_id, int rank_size) {
+    util_set_ffts_config(config);
+    __gm__ uint64_t *base = reinterpret_cast<__gm__ uint64_t*>(addr);
+    if (rank_id == 0) {
+        uint64_t a_val = 42, b_val = 84;
+        aclshmemi_store<uint64_t>(base, a_val);
+        aclshmem_fence();
+        aclshmemi_store<uint64_t>(base + 16, b_val);
+        dcci_cacheline((__gm__ uint8_t *)(base + 16));
+    }
+
+    if (rank_id == 1) {
+        uint64_t seen_b;
+        __gm__ uint64_t *remote = (__gm__ uint64_t *)aclshmem_ptr(base, 0);
+        do {
+            dcci_cacheline((__gm__ uint8_t *)(remote + 16));
+            seen_b = aclshmemi_load<uint64_t>(remote + 16);
+        } while (seen_b != 84);
+        dcci_cacheline((__gm__ uint8_t *)remote);
+        uint64_t seen_a = aclshmemi_load<uint64_t>(remote);
+
+        aclshmemi_store<uint64_t>(base + 17, seen_b);
+        aclshmemi_store<uint64_t>(base + 18, seen_a);
+    }
+}
+
+void quiet_order_do(void* stream, uint64_t config, uint8_t *addr, int32_t rank_id, int32_t n_ranks)
+{
+    quiet_order<<<1, nullptr, stream>>>(config, addr, rank_id, n_ranks);
+}
+
+void fence_order_do(void* stream, uint64_t config, uint8_t *addr, int32_t rank_id, int32_t n_ranks)
+{
+    fence_order<<<1, nullptr, stream>>>(config, addr, rank_id, n_ranks);
+}
+```
+
+Note the asymmetry it encodes: the writer needs `quiet`/`fence` between data and flag *plus*
+an explicit `dcci_cacheline` on the flag; the reader needs `dcci_cacheline` on the flag inside
+the poll loop *and a second `dcci_cacheline` on the data* after the flag is observed. There is
+no implied data invalidate riding on the flag observation.
+
+## A8. Epoch / generation tagging — the upstream rationale, verbatim
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmemi_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 11-17 and 101-180)
+
+File-header contract:
+
+```
+/*
+This file provides device-side collective synchronization implementations, ensuring that:
+1. ALL VEC CORES of all ranks of a team reach a sychonization point before doing subsequent operations.
+2. All operations of ALL VEC CORES of all ranks of the team before the synchronization point are visible
+   to ALL VEC CORES of all ranks of the team after the synchronization point.
+
+*/
+```
+
+The dissemination-barrier design note — this is the explicit statement that a monotone counter
+replaces a flag, and the explicit statement that there is no cache coherence to lean on:
+
+```
+/* Level 2: barrier between devices (within a host)
+
+Dissemination Barrier
+
+1. Algorithm process
+
+The algorithm process could be separated into multiple rounds.
+In each round, every participating rank signals its succeeding rank and waits its preceding rank's signal.
+The distance of a rank and its successor increases exponentially with the round.
+
+An 8-rank example is shown below:
+
+           round 1            round 2            round 3
+  rank 0  --------→  rank 1  --------→  rank 3  --------→  rank 7
+  rank 1  --------→  rank 2  --------→  rank 4  --------→  rank 0
+  rank 2  --------→  rank 3  --------→  rank 5  --------→  rank 1
+  rank 3  --------→  rank 4  --------→  rank 6  --------→  rank 2
+  rank 4  --------→  rank 5  --------→  rank 7  --------→  rank 3
+  rank 5  --------→  rank 6  --------→  rank 0  --------→  rank 4
+  rank 6  --------→  rank 7  --------→  rank 1  --------→  rank 5
+  rank 7  --------→  rank 0  --------→  rank 2  --------→  rank 6
+
+Refer to https://www.inf.ed.ac.uk/teaching/courses/ppls/BarrierPaper.pdf for more details.
+
+2. Implementation details
+
+Current implementation maintains an array of MAX_RANK_SIZE for each rank, with element of pos i indicating whether the
+rank has received signal of rank i.
+In each round, every rank writes remote array and check local array to decide whether this round has finished.
+Once all rounds finished, barrier ends.
+
+Theoretically, each element is writen by only 1 rank and read by self, involving only p2p synchronization.
+However, separate elements may exist on the same cacheline, so that concurrent write
+acctually happens and may cause wrong result.
+
+For example:
+a. rank n is waiting for rank n-1's signal (in round 1).
+             ↑   n
+--------------------------------------------
+      ...  | 0 | 0 | ...
+--------------------------------------------
+
+b. rank n-1 reads rank n's array, and write the element at position n-1 (in round 1).
+             ↓   n
+--------------------------------------------
+      ...  | 1 | 0 | ...
+--------------------------------------------
+
+c. rank n-2 reads staled rank n's array (no cache consistency ensurance), and write
+   the element at position n-2 (in round 2).
+         ↓       n
+--------------------------------------------
+   ... | 1 | 0 | 0 | ...
+--------------------------------------------
+
+d. rank n-2 overwrites rank n-1，so rank n may miss rank n-1's signal and wait forever.
+             ↑   n
+--------------------------------------------
+   ... | 1 | 0 | 0 | ...
+--------------------------------------------
+
+To avoid this issue, separate elements must exist on different cachelines. See aclshmemi_sync_bit for detailed definition.
+
+Additionly, instead of simply write a flag, each rank writes a 64-bit number into the array,
+indicating how many times this team has performed barrier.
+
+The temporal and spatial complexity of this implementation are O(logN) and O(N), respectively.
+
+3. Futher development
+  a. Hierarchical synchronization.
+    Sync within the host first, then sync between host. May achieve better
+    performance by utilizing low-latency in-host network better.
+
+  b. Group dissemination.
+    Group the ranks so that each rank could issue multiple signals and waits concurrently,
+    instead of 1 signal and 1 wait as above.
+
+  c. Optimize spatial complexity to O(logN).
+*/
+```
+
+The cacheline-padded flag type and the persistent epoch counters it refers to:
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/host_device/shmem_common_types.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 257-258, 387-395)
+
+```c
+/// \brief ACLSHMEM synchronization bit array type, cache line-aligned storage structure for synchronization flags
+typedef int32_t aclshmemi_sync_bit[ACLSHMEMI_SYNCBIT_SIZE / sizeof(int32_t)];
+```
+
+```c
+    // Using aclshmemi_sync_bit instead of basic types to aclshmemi_store flag,
+    // avoiding concurrent write due to cacheline sharing.
+    // Refer to shmemi_barrier.h for more details.
+    // These members are 'shmemi_sync_bit *' types actually, but are defined as 'uint64_t' due to compiler restriction.
+    uint64_t sync_pool;          ///< NPU-level sync pool pointer (actual type is aclshmemi_sync_bit*, defined as uint64_t due to compiler restrictions)
+    uint64_t sync_counter;       ///< NPU-level sync counter pointer (actual type is aclshmemi_sync_bit*, defined as uint64_t due to compiler restrictions)
+    uint64_t core_sync_pool;     ///< Core-level sync pool pointer (actual type is aclshmemi_sync_bit*, defined as uint64_t due to compiler restrictions)
+    uint64_t core_sync_counter;  ///< Core-level sync counter pointer (actual type is aclshmemi_sync_bit*, defined as uint64_t due to compiler restrictions)
+```
+
+## A9. Epoch tagging in the barrier code itself — `count = load(counter) + 1`, no zeroing, ever
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmemi_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 46-83, 285-332)
+
+The intra-device (cross-AI-core) soft barrier, and the `SyncAll` fallback switch:
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_barrier_core_soft()
+{
+    if ASCEND_IS_AIC {
+        return;
+    }
+
+    int32_t cur_block_idx = AscendC::GetBlockIdx();
+    int32_t block_dim = AscendC::GetBlockNum() * AscendC::GetTaskRation();
+    auto sync_pool = aclshmemi_get_core_sync_pool();
+    auto sync_counter = aclshmemi_get_core_sync_counter();
+    int32_t count = aclshmemi_load((__gm__ int32_t *)(sync_counter)) + 1;
+
+    int32_t shift = 1;
+    int32_t offset = 0;
+    while (shift < block_dim) {
+        int32_t next = (cur_block_idx + shift) % block_dim;
+
+        aclshmemi_signal_set((__gm__ int32_t *)(sync_pool + next * ACLSHMEM_LOG_MAX_AIV_PER_NPU + offset), count);
+        aclshmemi_signal_wait_until_eq_for_barrier((__gm__ int32_t *)(sync_pool +
+            cur_block_idx * ACLSHMEM_LOG_MAX_AIV_PER_NPU + offset), count);
+
+        shift *= SHIFT_MULTIPLIER;
+        offset++;
+    }
+
+    aclshmemi_store((__gm__ int32_t *)(sync_counter), count);
+}
+
+/* Level 1: barrier between vec cores (within a device) */
+template<bool IS_AIV_ONLY>
+ACLSHMEM_DEVICE void aclshmemi_barrier_core()
+{
+#ifdef __CCE_AICORE_ENABLE_MIX__
+    AscendC::SyncAll<IS_AIV_ONLY>();
+#else
+    aclshmemi_barrier_core_soft();
+#endif
+}
+```
+
+The cross-device barrier actually used (`aclshmem_barrier_all` → `aclshmemi_barrier` → `v3`),
+a centralised *pull*-mode barrier — note it writes its own slot locally and polls the *remote*
+slot of every peer, so only one remote write per rank per barrier:
+
+```cpp
+/** Centralized Barrier (pull mode).
+ *
+ *  The temporal and spatial complexity of this implementation are O(N/K) and O(1), respectively.
+ *  Performs better than Group Dissemination Barrier at small scale (eg. 8 ranks).
+ */
+template<bool IS_AIV_ONLY = true>
+ACLSHMEM_DEVICE void aclshmemi_barrier_npu_v3(aclshmem_team_t team_idx)
+{
+    aclshmemx_team_t *team = aclshmemi_get_state()->team_pools[team_idx];
+    int32_t vec_id = AscendC::GetBlockIdx();
+    int32_t vec_size = AscendC::GetBlockNum() * AscendC::GetTaskRation();
+
+    int32_t my_pe = aclshmemi_get_state()->team_pools[ACLSHMEM_TEAM_WORLD]->mype;
+    int32_t start = team->start;
+    int32_t stride = team->stride;
+    int32_t size = team->size;
+    auto sync_pool = aclshmemi_get_team_sync_pool(team->team_idx);
+    auto sync_counter = aclshmemi_get_team_sync_counter(team->team_idx);
+
+    int32_t k = ACLSHMEM_BARRIER_TG_DISSEM_KVAL;
+    k = k < size ? k : size;
+    k = k < vec_size ? k : vec_size;
+    int32_t my_pe_in_team = (my_pe - start) / stride;
+    int32_t count = aclshmemi_load((__gm__ int32_t *)sync_counter) + 1;
+
+    aclshmemi_barrier_core<IS_AIV_ONLY>();
+
+    if ASCEND_IS_AIV {
+        for (int32_t i = vec_id; i < size; i += k) {
+            if (i == my_pe_in_team) {
+                // write local
+                aclshmemi_signal_set((__gm__ int32_t *)sync_pool, count);
+            } else {
+                // read remote
+                int32_t remote_pe = start + i * stride;
+                aclshmemi_signal_wait_until_eq_for_barrier((__gm__ int32_t *)aclshmem_ptr(sync_pool, remote_pe), count);
+            }
+        }
+        aclshmemi_store((__gm__ int32_t *)sync_counter, count);
+    }
+    aclshmemi_barrier_core<IS_AIV_ONLY>();
+}
+
+template<bool IS_AIV_ONLY = true>
+ACLSHMEM_DEVICE void aclshmemi_barrier(aclshmem_team_t team)
+{
+    if (team == -1) {
+        return; // not in team
+    }
+    aclshmemi_barrier_npu_v3<IS_AIV_ONLY>(team);
+}
+```
+
+The `cmp_val || cmp_val + 1` acceptance in `aclshmemi_signal_wait_until_eq_for_barrier`
+(quoted in A6, `// in case when peer pe enters next barrier`) is the epoch-skew tolerance that
+lets a peer run one generation ahead without deadlocking the waiter.
+
+## A10. Epoch tagging in a real one-sided collective kernel — the `magic` parameter
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/allgather/allgather_kernel.cpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+Kernel entry carries an `int magic` from host; the big-data path scales it by 1024 per
+iteration so the high bits are the generation and the low 10 bits are the chunk counter:
+
+```cpp
+// all_gather
+template <typename T>
+ACLSHMEM_DEVICE void all_gather_big_data(uint64_t fftsAddr, __gm__ T *input, __gm__ T *output, __gm__ T *gva, int elements,
+                                      int magic)
+{
+    util_set_ffts_config(fftsAddr);
+
+    const int64_t max_gva_num = GVA_BUFF_MAX_SIZE / sizeof(T);
+    int times = (elements + max_gva_num - 1) / max_gva_num;
+    int total_num = elements;
+
+    __ubuf__ int64_t *ctrl_ub = (__ubuf__ int64_t *)(0);
+    for (int i = 0; i < times; i++) {
+        *ctrl_ub = 0;
+        AscendC::PipeBarrier<PIPE_ALL>();
+        int32_t len = total_num > max_gva_num ? max_gva_num : total_num;
+        aclshmemx_barrier_all_vec();
+        all_gather_origin(input + i * max_gva_num, output + i * max_gva_num, gva, max_gva_num, elements, len,
+                          (magic + i) * 1024);
+        total_num -= max_gva_num;
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+}
+```
+
+Producer side — `put_nbi`, then an MTE3→S hard-event pair, then the epoch-tagged flag
+`flag = times + magic`:
+
+```cpp
+        int64_t times = 0;
+        int64_t flag = 0;
+        while (copy_total_size >= copy_ub_size) {
+            SHMEMI_PROF_START(0);
+            aclshmemx_mte_put_nbi(gva_data_gm + aivIndex * len_per_core + times * copy_ub_num,
+                                  input_gm + aivIndex * len_per_core + times * copy_ub_num, tmp_buff, copy_ub_size,
+                                  copy_ub_num, my_rank, EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+            times += 1;
+            flag = times + magic;
+            aclshmemx_signal_op(gva_sync_gm + flag_offset, flag, ACLSHMEM_SIGNAL_SET, my_rank);
+            SHMEMI_PROF_END(0);
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
+
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+
+            copy_total_size -= copy_ub_size;
+        }
+```
+
+Consumer side — this is the generation test. `*flags_ub2 >> 10` vs `magic >> 10` rejects a word
+left over from a previous launch; `ready_num = *flags_ub2 - magic` recovers how many chunks of
+*this* generation have landed. No flag buffer is ever cleared:
+
+```cpp
+            aclshmem_int32_get_nbi(flags_ub2[group_idx], gva_sync_gm + group_idx * SYNC_FLAG_INTERVAL, 1, x);
+            AscendC::PipeBarrier<PIPE_ALL>();
+
+            if ((*flags_ub2[group_idx] >> 10) != (magic >> 10)) {
+                continue;
+            }
+
+            int64_t ready_num = *flags_ub2[group_idx] - magic;
+            if (ready_num <= 0 || *flags_ub1[group_idx] >= ready_num) {
+                continue;
+            }
+```
+
+Small-data (<2 MiB) path — the exact "no host barrier" prologue/epilogue, with `quiet` then an
+*intra-device* soft barrier, then signal, then remote-slot wait:
+
+```cpp
+    aclshmemx_mte_put_nbi(gva_data_gm + gva_offset, input_gm + input_offset, tmp_buff, ub_size, num_per_core, my_rank,
+                          EVENT_ID0);
+
+    const int64_t core_per_rank = aivNum / pe_size;
+    const int64_t core_rank_idx = aivIndex % core_per_rank;
+    const int64_t x = aivIndex / core_per_rank;
+
+    // Sync Ensure Corresponding Tasks Done.
+    aclshmem_quiet();
+    aclshmemi_barrier_core_soft();
+
+    aclshmemx_signal_op(gva_sync_gm + flag_offset, magic, ACLSHMEM_SIGNAL_SET, my_rank);
+    aclshmem_signal_wait_until((__gm__ int32_t *)aclshmem_ptr(gva_sync_gm, x) + flag_offset, ACLSHMEM_CMP_EQ, magic);
+
+    // [AllGather Step 2] symmetric mem -> local output.
+    num_per_core = elements / core_per_rank;
+    output_offset = x * elements + core_rank_idx * num_per_core;
+    gva_offset = core_rank_idx * num_per_core;
+    if (core_rank_idx == core_per_rank - 1) {
+        num_per_core = elements - num_per_core * core_rank_idx;
+    }
+    aclshmemx_mte_get_nbi(output_gm + output_offset, gva_data_gm + gva_offset, tmp_buff, ub_size, num_per_core, x,
+                          EVENT_ID0);
+```
+
+Flag-slot stride constant (16 × int32 = 64 B = one cacheline), i.e. one cacheline per AIV:
+
+```cpp
+constexpr int64_t SYNC_FLAG_INTERVAL = 16;
+constexpr int64_t UB_DMA_MAX_SIZE = 190 * 1024;
+constexpr int64_t GVA_BUFF_MAX_SIZE = 100 * 1024 * 1024;
+```
+
+## A11. `aclshmemx_mte_put_nbi` / `aclshmemx_mte_get_nbi` / `aclshmem_ptr` — all declared overloads
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/engine/shmem_device_mte.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+/**
+ * @brief Translate an local symmetric address to remote symmetric address on the specified PE.
+ *
+ * @param ptr               [in] Symmetric address on local PE.
+ * @param pe                [in] The number of the remote PE.
+ * @return A remote symmetric address on the specified PE that can be accessed using memory loads and stores.
+ */
+ACLSHMEM_DEVICE __gm__ void *aclshmem_ptr(__gm__ void *ptr, int pe);
+#define shmem_ptr aclshmem_ptr
+```
+
+```c
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(__gm__ T *dst, __gm__ T *src, __ubuf__ T *buf, uint32_t ub_size,
+                                           uint32_t elem_size, int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Provide a high-performance way to copy non-contiguous data
+ *        on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param copy_params       [in] Params to describe how non-contiguous data is organized in src and dst.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(__gm__ T *dst, __gm__ T *src, __ubuf__ T *buf, uint32_t ub_size,
+                                           const non_contiguous_copy_param &copy_params, int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] GlobalTensor on Symmetric memory of the destination data.
+ * @param src               [in] GlobalTensor on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src,
+                                           AscendC::LocalTensor<T> buf, uint32_t elem_size, int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Provide a high-performance way to copy non-contiguous data
+ *        on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] GlobalTensor on Symmetric memory of the destination data.
+ * @param src               [in] GlobalTensor on local device of the source data.
+ * @param buf               [in] LocalTensor on local UB.
+ * @param copy_params       [in] Params to describe how non-contiguous data is organized in src and dst.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src,
+                                           AscendC::LocalTensor<T> buf, const non_contiguous_copy_param &copy_params,
+                                           int pe, uint32_t sync_id);
+#define shmem_mte_put_mem_nbi aclshmemx_mte_put_nbi
+```
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/ub2gm/engine/shmem_device_mte.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 — the UB→GM (no staging
+buffer) variants, which are the right ones for a fused megakernel since the data is already in UB:
+
+```c
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local UB to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local UB of the source data.
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(__gm__ T *dst, __ubuf__ T *src, uint32_t elem_size, int pe,
+                                           uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local UB to symmetric address on the specified PE.
+ *
+ * @param dst               [in] GlobalTensor on Symmetric memory of the destination data.
+ * @param src               [in] LocalTensor on local UB of the source data.
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(AscendC::GlobalTensor<T> dst, AscendC::LocalTensor<T> src,
+                                           uint32_t elem_size, int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Provide a high-performance way to copy non-contiguous data
+ *        on local UB to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local UB of the source data.
+ * @param copy_params       [in] Params to describe how non-contiguous data is organized in src and dst.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(__gm__ T *dst, __ubuf__ T *src, const non_contiguous_copy_param &copy_params,
+                                           int pe, uint32_t sync_id);
+```
+
+Supporting constants / the non-contiguous descriptor:
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/shmem_def.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+constexpr uint64_t ACLSHMEM_INTERNAL_UB_BUF_START_ADDR = 188 * 1024;
+constexpr uint32_t UB_ALIGN_SIZE = 32;
+constexpr uint32_t ACLSHMEM_NUM_CQE_PER_POLL_CQ = 100;
+
+/**
+ * @struct non_contiguous_copy_param
+ * @brief Non-Contiguous Datacopy Param.
+ *
+ * - uint32_t repeat: Data move times
+ * - uint32_t length: Data move unit length
+ * - uint32_t src_ld: Src data leading dimension. Interval between the head of the repeat and the
+ *   head of the following repeat.
+ * - uint32_t dst_ld: Dst data leading dimension.
+*/
+struct non_contiguous_copy_param {
+    uint32_t repeat;
+    uint32_t length;
+    uint32_t src_ld;
+    uint32_t dst_ld;
+};
+```
+
+## A12. `aclshmem_barrier_all` — host and device declarations
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+The file opens with a restrictions block that is directly load-bearing for a fused megakernel —
+note item 2, which forbids mixing these barriers with `AscendC::SyncAll` (Topic B):
+
+```c
+/*
+    WARNING：Restrictions of Barrier APIs.
+
+    1. Barrier APIs can be used only in MIX kernels. The compiler will optimize the kernel to VEC or CUBE if
+       it lacks effective cube instructions (eg. Mmad) or vector instructions (eg: DataCopy).
+    Need compiler updates to remove this feature, or insert Mmad/DataCopy calls manully.
+
+    2. Barrier APIs conflict with SyncAll. Avoid mixing them together.
+
+    3. We provide 2 kinds of barrier:
+        a. aclshmem_barrier_xxx
+            Barrier of all cores. On systems with only HCCS: All operations of all pes of a team on excuting
+            stream before the barrier are visiable to all pes of the team after the barrier.
+        b. aclshmemx_barrier_xxx_vec
+            Barrier of all VEC cores. On systems with only HCCS: All operations of ALL VEC CORES of all pes of a
+            team on excuting stream before the barrier are visiable to ALL VEC CORES of all pes of the team after
+            the barrier.
+
+    4. The scalar unit of cube core is not affected by aclshmem_barrier_xxx. Make sure don't use that.
+*/
+```
+
+```c
+/**
+ * @fn ACLSHMEM_DEVICE void util_set_ffts_config(uint64_t config)
+ * @brief Set runtime ffts address. Call this at MIX Kernel entry point (if the kernel contains barrier calls).
+ *
+ * @param config              [config] ffts config, acquired by util_get_ffts_config()
+ */
+ACLSHMEM_DEVICE void util_set_ffts_config(uint64_t config);
+#define shmemx_set_ffts_config util_set_ffts_config
+
+/**
+ * @brief aclshmem_barrier is a collective synchronization routine over a team. Control returns from aclshmem_barrier
+ *        after all PEs in the team have called aclshmem_barrier.
+ *        aclshmem_barrier ensures that all previously issued stores and remote memory updates, including AMOs and
+ *        RMA operations, done by any of the PEs in the active set are complete before returning. On systems with
+ *        only scale-up network (HCCS), updates are globally visible, whereas on systems with both scale-up network
+ *        HCCS and scale-out network (RDMA), ACLSHMEM only guarantees that updates to the memory of a given PE are
+ *        visible to that PE.
+ *        Barrier operations issued on the CPU and the NPU only complete communication operations that were issued
+ *        from the CPU and the NPU, respectively. To ensure completion of GPU-side operations from the CPU, using
+ *        aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ * @param team              [in] team to do barrier
+ */
+ACLSHMEM_DEVICE void aclshmem_barrier(aclshmem_team_t team);
+#define shmem_barrier aclshmem_barrier
+
+/**
+ * @brief aclshmem_barrier of all PEs.
+ */
+ACLSHMEM_DEVICE void aclshmem_barrier_all(void);
+#define shmem_barrier_all aclshmem_barrier_all
+
+/**
+ * @brief Similar to aclshmem_barrier except that only vector cores participate. Useful in communication-over-compute
+ *        operators. Cube core may call the api but takes no effect.
+ *
+ * @param team              [in] team to do barrier
+ */
+[[deprecated("aclshmemx_barrier_all_vec is deprecated, please use aclshmem_barrier instead.")]]
+ACLSHMEM_DEVICE void aclshmemx_barrier_vec(aclshmem_team_t team);
+#define shmemx_barrier_vec aclshmemx_barrier_vec
+
+/**
+ * @brief aclshmemx_barrier_vec of all PEs.
+ *
+ */
+[[deprecated("aclshmemx_barrier_all_vec is deprecated, please use aclshmem_barrier_all instead.")]]
+ACLSHMEM_DEVICE void aclshmemx_barrier_all_vec(void);
+#define shmemx_barrier_all_vec aclshmemx_barrier_all_vec
+
+/**
+ * @brief Similar to aclshmem_barrier. In constract with the aclshmem_barrier routine, aclshmem_sync only ensures
+ *        completion and visibility of previously issued memory stores and does not ensure completion of remote memory
+ *        updates issued via ACLSHMEM rountines.
+ *
+ * @param team           [in] team to do barrier
+ */
+ACLSHMEM_DEVICE void aclshmem_sync(aclshmem_team_t team);
+
+/**
+ * @brief aclshmem_sync_all of all PEs.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_sync_all(void);
+```
+
+## A13. Symmetric heap allocation — `aclshmem_malloc` and the `aclshmemx_*` mem_type variants
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/host/mem/shmem_host_heap.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+/**
+ * @brief allocate <i>size</i> bytes and returns a pointer to the allocated memory. The memory is not initialized.
+ *        If <i>size</i> is 0, then <b>aclshmem_malloc()</b> returns NULL.
+ *
+ * @param size             [in] bytes to be allocated
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void *aclshmem_malloc(size_t size);
+#define shmem_malloc aclshmem_malloc
+
+
+/**
+ * @brief allocate memory for an array of <i>nmemb</i> elements of <i>size</i> bytes each and returns a pointer to the
+ *        allocated memory. The memory is set to zero. If <i>nmemb</i> or <i>size</i> is 0, then <b>aclshmem_calloc()</b>
+ *        returns either NULL.
+ *
+ * @param nmemb            [in] elements count
+ * @param size             [in] each element size in bytes
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void *aclshmem_calloc(size_t nmemb, size_t size);
+#define shmem_calloc aclshmem_calloc
+
+
+/**
+ * @brief allocate <i>size</i> bytes and returns a pointer to the allocated memory. The memory address will be a
+ *        multiple of <i>alignment</i>, which must be a power of two.
+ *
+ * @param alignment        [in] memory address alignment
+ * @param size             [in] bytes allocated
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void *aclshmem_align(size_t alignment, size_t size);
+#define shmem_align aclshmem_align
+
+/**
+ * @brief Allocates a block of ACLSHMEM symmetric memory, the data in this memory is uninitialized
+ *
+ * @param size          [in] Memory allocation size (in bytes)
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the symmetric memory
+ *
+ */
+ACLSHMEM_HOST_API void *aclshmemx_malloc(size_t size, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Allocates a block of SHMEM symmetric memory and initializes all content to zero
+ *
+ * @param count         [in] Number of elements
+ * @param size          [in] Number of bytes occupied by each element
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the symmetric memory
+ */
+ACLSHMEM_HOST_API void *aclshmemx_calloc(size_t count, size_t size, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+```
+
+## A14. Signal/wait family beyond the single word — all internal entry points
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmemi_device_p2p_sync.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_signal_set(__gm__ int32_t *addr, int32_t val);
+
+ACLSHMEM_DEVICE void aclshmemi_signal_set(__gm__ int32_t *addr, int pe, int32_t val);
+
+ACLSHMEM_DEVICE void aclshmemi_highlevel_signal_set(__gm__ int32_t *dst, __gm__ int32_t *src, int pe);
+
+ACLSHMEM_DEVICE void aclshmemi_signal_add(__gm__ int32_t *addr, int pe, int32_t val);
+
+ACLSHMEM_DEVICE int32_t aclshmemi_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val);
+
+// Atomicity of ACLSHMEM_SIGNAL_SET not guaranteed
+ACLSHMEM_DEVICE void aclshmemi_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe);
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_signal_wait_until_eq(__gm__ volatile T *sig_addr, T cmp_val);
+
+template <typename T>
+ACLSHMEM_DEVICE int aclshmemi_test(__gm__ volatile T *ivar, int cmp, T cmp_value);
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemi_wait_until_all(__gm__ volatile T *ivars, size_t nelems, __gm__ const int *status,
+    int cmp, T cmp_value);
+
+template <typename T>
+ACLSHMEM_DEVICE size_t aclshmemi_wait_until_any(__gm__ volatile T *ivars, size_t nelems, __gm__ const int *status,
+    int cmp, T cmp_value);
+
+template <typename T>
+ACLSHMEM_DEVICE size_t aclshmemi_wait_until_some(__gm__ volatile T *ivars, size_t nelems, __gm__ size_t *indices,
+    __gm__ const int *status, int cmp, T cmp_value);
+
+template <typename T>
+ACLSHMEM_DEVICE int aclshmemi_test_all(__gm__ T *sig_addr, size_t nelems, __gm__ const int *status, int cmp,
+    T cmp_value, int stride = ACLSHMEMI_SYNCBIT_SIZE / sizeof(T));
+```
+
+## A15. Device-side atomic-add on symmetric memory (`aclshmem_<type>_atomic_add`)
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_amo.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+/**
+ * @brief Standard Atomic Add Types and Names
+ *
+ * |NAME       | TYPE      |
+ * |-----------|-----------|
+ * |int8       | int8      |
+ * |int16      | int16     |
+ * |int32      | int32     |
+ * |half       | half      |
+ * |bfloat16   | bfloat16  |
+ * |float      | float     |
+ */
+#define ACLSHMEM_TYPE_FUNC_ATOMIC_ADD(FUNC)  \
+    FUNC(int8, int8_t);           \
+    FUNC(int16, int16_t);        \
+    FUNC(int32, int32_t);        \
+    FUNC(half, half);            \
+    FUNC(bfloat16, bfloat16_t); \
+    FUNC(float, float)
+
+/**
+ * @brief  Automatically generates aclshmem atomic add functions for different data types (e.g., int8, int16, int32, float, half, bfloat16).
+ *        The macro parameters: NAME is the function name suffix, TYPE is the operation data type.
+ * 
+ * \remark ACLSHMEM_DEVICE void aclshmem_NAME_atomic_add(\_\_gm\_\_ TYPE *dst, TYPE value, int32_t pe)
+ *
+ * @par Function Description
+ * Asynchronous interface. Perform contiguous data atomic add operation on
+ * symmetric memory from the specified PE to address on the local PE.
+ *
+ * @par Parameters
+ * - **dst**    - [in] Pointer on local device of the destination data.
+ * - **value**  - [in] Value atomic add to destination.
+ * - **pe**     - [in] PE number of the remote PE.
+ */
+#define ACLSHMEM_ATOMIC_ADD_TYPENAME(NAME, TYPE)                                                      \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_atomic_add(__gm__ TYPE *dst, TYPE value, int32_t pe)
+
+/** \cond */
+ACLSHMEM_TYPE_FUNC_ATOMIC_ADD(ACLSHMEM_ATOMIC_ADD_TYPENAME);
+/** \endcond */
+#define shmem_int8_atomic_add aclshmem_int8_atomic_add
+#define shmem_int16_atomic_add aclshmem_int16_atomic_add
+#define shmem_int32_atomic_add aclshmem_int32_atomic_add
+#define shmem_half_atomic_add aclshmem_half_atomic_add
+#define shmem_bfloat16_atomic_add aclshmem_bfloat16_atomic_add
+#define shmem_float_atomic_add aclshmem_float_atomic_add
+```
+
+## A16. Symmetric-heap address arithmetic and the `ffts` precondition (Chinese, verbatim)
+
+https://raw.githubusercontent.com/immengzi/shmem/master/docs/principles.md
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+Why `aclshmem_ptr(p, pe)` is pure address arithmetic — and the symmetry precondition that
+makes a hand-rolled `tp_push` legal:
+
+```
+该部分会分配出两块内存：
+* 用户申请的共享内存空间，每个rank申请的内存大小和初始化传入attributes的local_mem_size大小一致，后续可以通过`aclshmem_malloc`、`aclshmem_free`等共享内存接口管理。
+* 用于在device保存shmem的state、team等元数据空间，当state和team等信息发生变化，进程将自动同步到元数据空间，元数据空间32M，不对外提供访问接口
+```
+
+```
+* `aclshmem_malloc`内部采用first fit找到第一个满足要求的chunk，从该chunk中分离出对应大小的chunk，剩余空间（如果有）则作为新的空闲chunk。
+* `aclshmem_free`释放后补充空闲chunk 。若新添加chunk与其他空闲chunk连续，则合并。
+```
+
+```
+<p style="text-indent: 2em;"><strong>aclshmem_malloc和aclshmem_free接口使用时需要在所有进程同步调用，且需要分配或释放相同大小的内存。</strong>SHMEM内部默认aclshmem_malloc分配的内存在虚拟地址空间对称，即<strong>当前rank malloc的地址+heap_size=下一个rank malloc的地址</strong>。如果进程间分配内存不同会导致后续分配的内存首地址不对称，无法通过地址偏移访问到正确的数据。</p>
+```
+
+Where the epoch counters live, and the explicit split between inter-card and inter-core pools:
+
+```
+<p style="text-indent: 2em;">在device上分配并初始化后续team级别同步需要的资源sync_pool、sync_counter、core_sync_pool、core_sync_counter。前俩个成员用于team内所有的卡间同步、后两个成员用于卡内核间同步。</p>
+
+
+**team_pool、sync_pool、sync_counter、core_sync_pool、core_sync_counter这些信息都会在state里储存。**
+```
+
+The `ffts` config — this is the hard dependency that couples shmem barriers to AscendC
+`SyncAll` / `CrossCoreSetFlag` / `CrossCoreWaitFlag` (directly relevant to TOPIC B):
+
+```
+<p style="text-indent: 2em;">该部分仅获取一个ffts地址，后续可通过<code>shmemx_get_ffts_config</code>获得，在算子内通过<code>shmemx_set_ffts_config</code>设置，用于runtime同步，AscendC层面会影响的<code>SyncAll</code>、<code>CrossCoreSetFlag</code>和<code>CrossCoreWaitFlag</code>接口，shmem层面会影响到barrier相关接口。（</ode>shmemx_set_ffts_config</code>开销较小，建议算子内都调用一次该接口）。</p>
+```
+
+Host-side bootstrap barrier is TCP/socket based and is explicitly *not* `aclshmem_barrier`:
+
+```
+<p style="text-indent: 2em;">多进程间的建链是基于TCP socket实现的。所有进程会先基于uid内部的ip::port信息和rank0建立连接，连接时会根据uid内magic信息是否一致判断是否为同一通信域，不同则断开连接。连接成功后所有rank与rank0通信，基于此实现host侧的allgather和barrier等能力。（<strong>该部分能力并非aclshmem_barrier相关能力，而是类似于MPI_Barrier</strong>）</p>
+```
+
+## A17. Flag-free collectives in the official DeepSeek-V4 recipe — signal-with-ADD + WaitUntil, and the float "sum of flags" idiom
+
+https://raw.githubusercontent.com/hicann/cann-recipes-infer/master/docs/models/deepseek_v4/deepseek_v4_shmem_guide.md
+hicann / CANN recipes-infer, `master` (fetched 2026-10-20)
+
+pyPTO-SHMEM API surface, including the non-standard clear-signal helpers that exist precisely
+because a non-epoch-tagged flag must be zeroed between generations:
+
+```
+#### pyPTO-shmem API介绍
+
+PyPTO中实现了 OPENSHMEM 部分通信语义，并且封装为API，供用户调用：
+
+* **shmem_put**：将本地数据（local tensor）发送到对称内存（shmem tensor）中指定位置
+* **shmem_get**：从对称内存（shmem tensor）中指定位置获取数据存放到本地（local tensor）
+* **shmem_signal**：给其他卡发送信号
+* **shmem_wait**：等待本卡信号，指定signal等于指定值
+* **shmem_barrier_all**：通信域内卡间同步，当所有卡都到达此同步点才会解除继续执行
+
+此外也实现了部分非标准 OPENSHMEM 语义：
+
+* **create_shmem_tensor**：在指定通信域内创建表示对称内存的Tensor
+* **shmem_clear_data**：将shmem tensor的数据清零
+* **shmem_signal_data**：将shmem signal清零
+* **my_symbolic_pe**：本卡符号化的rank id
+```
+
+The dispatch graph — `ShmemPut` of data, then `ShmemSignal(..., AtomicType::ADD)`, then
+`WaitUntil` on the local signal tile. This is `putmem_signal` + `signal_wait_until` with
+`AMO_ADD`, i.e. the count-based (not value-based) completion test:
+
+```
+LOOP("send_signal", FunctionType::DYNAMIC_LOOP, expertId, LoopRange(moeExpertNum)) {
+    TileShape::Current().SetVecTile({1, 1});
+    SymbolicScalar remoteRankId = expertId / expertNumPerRankScalar;
+    SymbolicScalar remoteExpertOffset = expertId % expertNumPerRankScalar;
+    Tensor shmemCountTile = View(shmemCount, {1, 1, 1, 1}, {remoteRankId, 0, remoteExpertOffset * epWorldSize + thisRank + 1, 0});
+    Tensor totalOffsetTile = View(totalOffset, {1, 1}, {expertId, 0});
+    Tensor shmemPutOut = ShmemPut(shmemSendOut, totalOffsetTile, shmemCountTile);
+    TileShape::Current().SetVecTile({1, signalCol});
+    Tensor shmemSignalTile = View(shmemSignal, {1, 1, 1, 1, signalCol}, {remoteRankId, 0, 0, 0, 0});
+    shmemCountOut = ShmemSignal(shmemPutOut, shmemSignalTile, AtomicType::ADD);
+}
+
+LOOP("receive_token", FunctionType::DYNAMIC_LOOP, i, LoopRange(1)) {
+    (void) i;
+    TileShape::Current().SetVecTile({1, signalCol});
+    Tensor shmemSignalLocalTile = View(shmemSignal, {1, 1, 1, 1, signalCol}, {thisRank, 0, 0, 0, 0});
+    Tensor waitUntilOut = WaitUntil(shmemCountOut, shmemSignalLocalTile, moeExpertNum, true);
+```
+
+The TileLang dispatch kernel — note `T.sync_all()` in the Cube scope and the status loop that
+waits on a *float sum* of status words rather than on individual flags:
+
+```
+        with T.Kernel(ai_core_num, is_npu=True) as (cid, vid):
+            x_ub = T.alloc_ub([H + (32 + 12) // 2], "bfloat16")
+            ...
+            with T.Scope("C"):
+                T.sync_all()
+                ...
+            with T.Scope("V"):
+                send_token_num = cur_send_token_cnt // aiv_num
+                remainder_token_num = cur_send_token_cnt % aiv_num
+                start_send_token_id = send_token_num * true_vid
+                ...
+                # 发数据
+                for cur_send_token_id in range(start_send_token_id, start_send_token_id + send_token_num):
+                    ...
+                    T.shmem_ub_put_nbi_new(x_ub, win_data, ub_size, dest_rank_id, (rank * Bs * local_expert_num + dest_expert_id * Bs + token_repeat_num[0]) * ub_size)
+                # 发状态
+                for cur_expert_id in range(start_expert_id, start_expert_id + aiv_expert_num):
+                    ...
+                    T.shmem_ub_put_nbi_new(win_status_ub_single, win_status, 8, dest_rank_id, local_expert_id * ep_world_size * 8 + rank * 8)
+                # 循环等状态
+                while (sum_of_flag[0] != aiv_expert_fp_num):
+                    ...
+                # 本地win区数据拷贝
+                for i in range(status_num_per_core):
+                    ...
+```
+
+The combine kernel's range-bounded sum-of-flags test — tolerant to partial arrival, which is
+the dual of the epoch tag (`targetMin`/`targetMax` window instead of exact equality):
+
+```
+            with T.Scope("V"):
+                T.tile.fill(statusUb, 1.0)
+                ...
+                # 发数据、发状态
+                for loop in range(sendTokenNum[0]):
+                    ...
+                    T.shmem_ub_put_nbi_new(x_ub, winData, H, toRankId, winGM * H)
+
+                    T.shmem_ub_put_nbi_new(statusUb, winStatus, 8, toRankId, winGM * 8)
+                for curIdx in range(startTokenId[0], startTokenId[0] + tokenNum[0]):
+                    sumOfFlag[0] = -1.0
+                    stateGM = curIdx * K
+                    calCnt = compareTarget
+                    # 等状态
+                    while((sumOfFlag[0] < targetMin) or (sumOfFlag[0] > targetMax)):
+                        ...
+                    # 本地win区数据拷贝
+                    T.copy(winData[tokenIndexOffset, 0], winData_ub_bfloat)
+                    T.copy(winData_ub_bfloat, combineOut[curIdx,0])
+```
+
+Tilelang `sync_all` is documented there as the inter-core barrier primitive:
+
+```
+* **T.alloc_ub**：申请ub上内存空间，使用样例为：T.alloc_ub(shape, dtype)
+* **T.sync_all()**：核间同步
+* **T.shmem_ub_put_nbi*_new***：Tilelang中封装的shmem接口，用于将本卡ub数据传送到Win区，使用样例为：T.shmem_ub_put_nbi_new(x_ub, win, ub_size, dest_rank_id, stride)，其中x_ub为本卡ub数据，win为申请得到的win区，ub_size为ub大小，dest_rank_id为对端卡id，stride为偏移量。
+```
+
+## A18. What a one-sided `put` actually is on A3 — address translation plus an ordinary `DataCopyPad`
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/engine/shmem_device_mte.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 30-45)
+
+`aclshmem_ptr` is pure offset arithmetic against a per-PE mapped heap base. There is no
+doorbell, no descriptor, no completion queue in this path:
+
+```cpp
+ACLSHMEM_DEVICE __gm__ void *aclshmem_ptr(__gm__ void *ptr, int pe)
+{
+    // Get Global State
+    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
+    if (is_host_mem_heap(ptr)) {
+        uint64_t host_heap_offset =
+            reinterpret_cast<uint64_t>(ptr) - reinterpret_cast<uint64_t>(device_state->host_heap_base);
+        uint64_t remote_host_ptr = reinterpret_cast<uint64_t>(device_state->p2p_host_heap_base[pe]) + host_heap_offset;
+        return reinterpret_cast<__gm__ void *>(remote_host_ptr);
+    }
+    // Back to root address
+    uint64_t offset = reinterpret_cast<uint64_t>(ptr) - reinterpret_cast<uint64_t>(device_state->heap_base);
+    // Address translate
+    uint64_t remote_ptr = reinterpret_cast<uint64_t>(device_state->p2p_device_heap_base[pe]) + offset;
+    return reinterpret_cast<__gm__ void *>(remote_ptr);
+}
+```
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/ub2gm/mte/shmem_device_mte.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+The UB→remote-GM put, in full. Note it is a bare `DataCopyPad` on an MTE3 pipe — which is why
+the producer in A10 needs `SetFlag/WaitFlag<HardEvent::MTE3_S>` before writing the flag with a
+scalar store:
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(__gm__ T *dst, __ubuf__ T *src, uint32_t elem_size, int pe, uint32_t sync_id)
+{
+    auto ptr = aclshmem_ptr(dst, pe);
+
+    // Check if Process will out of UB address.
+    uint64_t ub_offset = reinterpret_cast<uint64_t>(src);
+    uint64_t process_num = elem_size;
+    if (ub_offset + process_num * sizeof(T) > ub_limit)
+        return;
+
+    __gm__ T *remote_ptr = reinterpret_cast<__gm__ T *>(ptr);
+
+    aclshmemi_copy_ub2gm(remote_ptr, src, elem_size * sizeof(T));
+}
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(AscendC::GlobalTensor<T> dst, AscendC::LocalTensor<T> src, uint32_t elem_size,
+                                           int pe, uint32_t sync_id)
+{
+    auto ptr = aclshmem_ptr((__gm__ void *)dst.GetPhyAddr(), pe);
+
+    // Check if Process will out of UB address.
+    uint64_t ub_offset = reinterpret_cast<uint64_t>(src.GetPhyAddr());
+    uint64_t process_num = elem_size;
+    if (ub_offset + process_num * sizeof(T) > ub_limit) {
+        return;
+    }
+
+    AscendC::GlobalTensor<T> remote_buff;
+    remote_buff.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(ptr));
+
+    aclshmemi_copy_ub2gm(remote_buff, src, elem_size * sizeof(T));
+}
+```
+
+And the `copy_ub2gm` primitive it lands on — including the `SetL2CacheHint` /
+`CACHE_MODE_DISABLE` lever, which is the one place the library lets you bypass L2 on a remote
+write:
+
+```cpp
+template<typename T>
+ACLSHMEM_DEVICE void aclshmemi_copy_ub2gm(__gm__ T* dstGva, __ubuf__ T* srcUb,
+    uint32_t size, bool toL2Cache)
+{
+    ASCENDC_ASSERT((dstGva != nullptr), "input gva is null");
+
+    AscendC::LocalTensor<T> ubTensor;
+    AscendC::GlobalTensor<T> gmTensor;
+    AscendC::DataCopyExtParams dataCopyParams(1, size, 0, 0, 0);
+    ubTensor.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+    ubTensor.address_.bufferAddr = reinterpret_cast<uint64_t>(srcUb);
+    ubTensor.address_.dataLen = ALIGN_UP(size, UB_ALIGN_SIZE);
+    gmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(dstGva));
+    if (!toL2Cache) {
+        gmTensor.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+    }
+    AscendC::DataCopyPad(gmTensor, ubTensor, dataCopyParams);
+}
+
+template<typename T>
+ACLSHMEM_DEVICE void aclshmemi_copy_gm2ub(__ubuf__ T* dstUb, __gm__ T* srcGva,
+    uint32_t size, bool toL2Cache)
+{
+    ASCENDC_ASSERT((srcGva != nullptr), "input gva is null");
+    AscendC::LocalTensor<T> ubTensor;
+    AscendC::GlobalTensor<T> gmTensor;
+    AscendC::DataCopyExtParams dataCopyParams(1, size, 0, 0, 0);
+    ubTensor.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+    ubTensor.address_.bufferAddr = reinterpret_cast<uint64_t>(dstUb);
+    ubTensor.address_.dataLen = ALIGN_UP(size, UB_ALIGN_SIZE);
+    gmTensor.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(srcGva));
+    if (!toL2Cache) {
+        gmTensor.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+    }
+    AscendC::DataCopyPadExtParams<T> padParams;
+    AscendC::DataCopyPad(ubTensor, gmTensor, dataCopyParams, padParams);
+}
+```
+
+---
+
+# TOPIC A, addendum — the official fused Matmul+AllReduce epilogue (the shape you are building)
+
+## A19. `EpilogueAllReduce` — TP all-reduce fused into the GEMM epilogue, three in-kernel barriers, atomic-add reduce-scatter by remote *pull*
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/matmul_allreduce/epilogue/block/epilogue_allreduce.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 — complete `operator()`
+
+The structure to read off it: a double-buffered symmetric window indexed by
+`flagIdx = calIdx % BufferNum`; `SetAtomicAdd<ElementC>()` armed around a `mte_get_nbi` loop so
+the reduce-scatter is a *remote read that accumulates locally* (not a remote write); one AIV per
+AI core does the comms (`aivIndex == 0`); and three `aclshmemx_barrier_all_vec()` calls —
+before RS, between RS and AG, and after AG.
+
+Class declaration and params:
+
+```cpp
+namespace Catlass::Epilogue::Block {
+template <class... Args>
+class EpilogueAllReduce {};
+
+template <class BlockScheduler_, class CommBlockSwizzle_>
+class EpilogueAllReduce<BlockScheduler_, CommBlockSwizzle_> {
+public:
+    using BlockScheduler = BlockScheduler_;
+    using CommBlockSwizzle = CommBlockSwizzle_;
+
+    // Type aliases
+    using ArchTag = Arch::AtlasA2;
+
+    using ElementC = half;
+    using ElementAttachedSource = half;
+    using ElementAttachedOutput = half;
+
+    using LayoutStore = layout::RowMajor;
+
+    using LayoutWorkspace = LayoutStore;
+
+    using ElementDestination = ElementAttachedOutput;
+
+    using LayoutDestination = LayoutStore;
+
+    using ScheduleTypeOp1 = typename Gemm::Block::ReduceScatterSchedule;
+    using ScheduleTypeOp2 = typename Gemm::Block::AllGatherSchedule;
+
+    // Epilogue params definition
+    struct Params {
+        AscendC::GlobalTensor<ElementDestination> destination;
+        LayoutDestination layoutDestination;
+        int64_t strideDestination;
+        __gm__ ElementAttachedSource *symmetricPtr;
+        BlockScheduler gemmSwizzle;
+        CommBlockSwizzle commSwizzle;
+        MatrixCoord blockShape;
+        MatrixCoord processShape;
+
+        CATLASS_DEVICE
+        Params() = default;
+
+        CATLASS_DEVICE
+        Params(AscendC::GlobalTensor<ElementDestination> destination, const LayoutDestination &layoutDestination,
+               int64_t strideDestination, __gm__ ElementAttachedSource *symmetricPtr, MatrixCoord blockShape,
+               MatrixCoord processShape, BlockScheduler gemmSwizzle, CommBlockSwizzle commSwizzle)
+            : destination(destination),
+              layoutDestination(layoutDestination),
+              strideDestination(strideDestination),
+              symmetricPtr(symmetricPtr),
+              blockShape(blockShape),
+              processShape(processShape),
+              gemmSwizzle(gemmSwizzle),
+              commSwizzle(commSwizzle)
+        {
+        }
+    };
+```
+
+Body:
+
+```cpp
+    CATLASS_DEVICE
+    void operator()(MatrixCoord const &blockShape, MatrixCoord const &commBlockCount,
+                    MatrixCoord const &actualCommBlockCount, uint32_t calIdx, uint32_t rankIdx, uint32_t rankSize,
+                    uint32_t pValue)
+    {
+        uint32_t aicoreIndex = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        uint32_t aicoreNum = AscendC::GetBlockNum();
+        int32_t aivIndex = AscendC::GetSubBlockIdx();
+        auto loopNumPerComm = aicoreNum * pValue;
+
+        auto layoutPeerMemStore =
+            layout::RowMajor(blockShape.row() * loopNumPerComm * BufferNum, blockShape.column(), blockShape.column());
+
+        // re-sliced Block by comm cores
+        uint32_t flagIdx = calIdx % BufferNum;
+        MatrixCoord actualCommBlockShape = blockShape * actualCommBlockCount;
+        MatrixCoord outputBlockOffset = blockShape * MatrixCoord{calIdx * loopNumPerComm, 0};
+
+        MatrixCoord commCoordPeerMem{flagIdx, 0};
+        MatrixCoord blockOffset = commCoordPeerMem * commBlockCount * blockShape;
+
+        params.commSwizzle.template SetProblemSize<ScheduleTypeOp1, true>(actualCommBlockShape);
+        auto realAicoreNum = params.commSwizzle.GetRealCore();
+        auto commCoreLoops = params.commSwizzle.GetCoreLoop();
+
+        AscendC::GlobalTensor<ElementC> peerMem;
+        peerMem.SetGlobalBuffer(params.symmetricPtr);
+
+        // Local matmul is completed, waiting until tasks on all devices are complete.
+        aclshmemx_barrier_all_vec();
+
+        AscendC::SetAtomicAdd<ElementC>();
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        if (aivIndex == 0 && aicoreIndex < realAicoreNum) {  // only use one AIV core
+            for (uint32_t idx = aicoreIndex; idx < commCoreLoops; idx += realAicoreNum) {
+                MatrixCoord idxTile = params.commSwizzle.GetBlockIdx(idx);
+                MatrixCoord actualCommSubBlockShape =
+                    params.commSwizzle.template GetBlockSize<ScheduleTypeOp1>(idxTile);
+                MatrixCoord rankBlockOffset = params.commSwizzle.template GetRankOffset<ScheduleTypeOp1>(idxTile);
+                MatrixCoord subBlockOffset = params.commSwizzle.GetBlockOffset(idxTile);
+                uint32_t mRankIdx = idxTile.column();
+                if (mRankIdx == rankIdx) {
+                    continue;
+                }
+
+                auto offsetIn = blockOffset + rankBlockOffset;
+                auto offsetOut = blockOffset + rankBlockOffset;
+
+                auto residueProcessShape = actualCommSubBlockShape % params.processShape;
+                MatrixCoord processCount = CeilDiv(actualCommSubBlockShape, params.processShape);
+                uint32_t processLoop = processCount.row() * processCount.column();
+
+                // [ReduceScatter] 1. Alloc TmpUB
+                int tmpBufferSize = 32 * 1024 / sizeof(ElementC);  // 32 KB
+                AscendC::LocalTensor<half> tmpBuffer1 = resource.ubBuf.template GetBufferByByte<ElementC>(0);
+                tmpBuffer1.SetSize(tmpBufferSize);
+                int tmpBufferOffset = 96 * 1024;  // half of UB
+                AscendC::LocalTensor<half> tmpBuffer2 =
+                    resource.ubBuf.template GetBufferByByte<ElementC>(tmpBufferOffset);
+                tmpBuffer2.SetSize(tmpBufferSize);
+
+                // [ReduceScatter] 2. Pre Interface Sync
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+                int pingpongId = 0;
+
+                for (uint32_t processIndex = 0; processIndex < processLoop; ++processIndex) {
+                    AscendC::TEventID event_id = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
+                    AscendC::LocalTensor<ElementC> buf = pingpongId == 0 ? tmpBuffer1 : tmpBuffer2;
+
+                    MatrixCoord processCoord{processIndex / processCount.column(),
+                                             processIndex % processCount.column()};
+                    auto actualProcessShape =
+                        GetActualShape(processCount, processCoord, params.processShape, residueProcessShape);
+
+                    auto processOffset = processCoord * params.processShape;
+
+                    auto inputOffset = offsetIn + subBlockOffset + processOffset;
+                    auto outputOffset = offsetOut + subBlockOffset + processOffset;
+
+                    uint32_t copySize = actualProcessShape.row() * actualProcessShape.column();
+
+                    int64_t inputElemOffset = layoutPeerMemStore.GetOffset(inputOffset);
+                    int64_t outputElemOffset = layoutPeerMemStore.GetOffset(outputOffset);
+
+                    // [ReduceScatter] 2. Pre Interface Sync
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
+
+                    // [ReduceScatter] 3. Start aclshmemx_mte_get_nbi
+                    aclshmemx_mte_get_nbi(peerMem[outputElemOffset], peerMem[inputElemOffset], buf, copySize,
+                                          mRankIdx % rankSize, event_id);
+
+                    // [ReduceScatter] 4. Post Interface Sync
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
+                    pingpongId = (pingpongId + 1) % BufferNum;
+                }
+                // [ReduceScatter] 4. Post Interface Sync
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+            }
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);  // To SetAtomic, Scalar wait MTE3
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::SetAtomicNone();
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        // ReduceScatter is completed, waiting until tasks on all devices are complete.
+        aclshmemx_barrier_all_vec();
+
+        if (aivIndex == 0 && aicoreIndex < realAicoreNum) {
+            for (uint32_t idx = aicoreIndex; idx < commCoreLoops; idx += realAicoreNum) {
+                MatrixCoord idxTile = params.commSwizzle.GetBlockIdx(idx);
+                MatrixCoord actualCommSubBlockShape =
+                    params.commSwizzle.template GetBlockSize<ScheduleTypeOp2>(idxTile);
+                MatrixCoord rankBlockOffset = params.commSwizzle.template GetRankOffset<ScheduleTypeOp2>(idxTile);
+                MatrixCoord subBlockOffset = params.commSwizzle.GetBlockOffset(idxTile);
+
+                uint32_t mRankIdx = idxTile.column();
+
+                auto offsetIn = blockOffset + rankBlockOffset;
+                auto offsetOut = outputBlockOffset + rankBlockOffset;
+
+                auto residueProcessShape = actualCommSubBlockShape % params.processShape;
+                MatrixCoord processCount = CeilDiv(actualCommSubBlockShape, params.processShape);
+
+                uint32_t processLoop = processCount.row() * processCount.column();
+
+                // [AllGather] 1. Alloc TmpUB
+                int tmpBufferSize = 32 * 1024 / sizeof(ElementC);  // 32 KB
+                AscendC::LocalTensor<half> tmpBuffer1 = resource.ubBuf.template GetBufferByByte<ElementC>(0);
+                tmpBuffer1.SetSize(tmpBufferSize);
+                int tmpBufferOffset = 96 * 1024;  // half of UB
+                AscendC::LocalTensor<half> tmpBuffer2 =
+                    resource.ubBuf.template GetBufferByByte<ElementC>(tmpBufferOffset);
+                tmpBuffer2.SetSize(tmpBufferSize);
+
+                // [AllGather] 2. Pre Interface Sync
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+                int pingpongId = 0;
+
+                for (uint32_t processIndex = 0; processIndex < processLoop; ++processIndex) {
+                    MatrixCoord processCoord{processIndex / processCount.column(),
+                                             processIndex % processCount.column()};
+                    auto actualProcessShape =
+                        GetActualShape(processCount, processCoord, params.processShape, residueProcessShape);
+
+                    auto processOffset = processCoord * params.processShape;
+
+                    uint32_t residueM = actualProcessShape.row();
+
+                    while (residueM > 0) {
+                        MatrixCoord outputLoopOffset = (offsetOut + processOffset + subBlockOffset) / gemmBlockShape;
+                        MatrixCoord residueOutputOffset = (offsetOut + processOffset + subBlockOffset) % gemmBlockShape;
+
+                        auto loopIdx = outputLoopOffset.row();
+                        GemmCoord outputBlockGemmTileOffset = params.gemmSwizzle.GetBlockCoord(loopIdx);
+                        GemmCoord outputBlockGemmActualSize =
+                            params.gemmSwizzle.GetActualBlockShape(outputBlockGemmTileOffset);
+                        MatrixCoord outputBlockTileOffset{outputBlockGemmTileOffset.m(), outputBlockGemmTileOffset.n()};
+
+                        uint32_t actualMoveM = min(gemmBlockShape.row() - residueOutputOffset.row(), residueM);
+                        if (residueOutputOffset.row() < outputBlockGemmActualSize.m()) {
+                            actualMoveM = min(outputBlockGemmActualSize.m() - residueOutputOffset.row(), residueM);
+
+                            auto inputOffset = offsetIn + subBlockOffset + processOffset;
+                            auto outputOffset = outputBlockTileOffset * gemmBlockShape + residueOutputOffset;
+
+                            auto actualMoveShape = MatrixCoord{actualMoveM, outputBlockGemmActualSize.n()};
+                            layout::RowMajor layoutInput = layoutPeerMemStore.GetTileLayout(actualMoveShape);
+                            layout::RowMajor layoutOutput = params.layoutDestination.GetTileLayout(actualMoveShape);
+                            int64_t inputElemOffset = layoutInput.GetOffset(inputOffset);
+                            int64_t outputElemOffset = layoutOutput.GetOffset(outputOffset);
+
+                            uint32_t copySize = actualMoveShape.row() * actualMoveShape.column();
+
+                            AscendC::TEventID event_id = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
+                            AscendC::LocalTensor<ElementC> buf = pingpongId == 0 ? tmpBuffer1 : tmpBuffer2;
+
+                            // [AllGather] 2. Pre Interface Sync
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
+
+                            non_contiguous_copy_param copyParams;
+                            copyParams.repeat = actualMoveShape.row();
+                            copyParams.length = actualMoveShape.column();
+                            copyParams.src_ld = layoutInput.stride(0);
+                            copyParams.dst_ld = layoutOutput.stride(0);
+
+                            // [AllGather] 3. Start aclshmemx_mte_get_nbi non-contiguous version
+                            aclshmemx_mte_get_nbi(params.destination[outputElemOffset], peerMem[inputElemOffset], buf,
+                                                  copyParams, mRankIdx % rankSize, event_id);
+
+                            // [AllGather] 4. Post Interface Sync
+                            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
+                            pingpongId = (pingpongId + 1) % BufferNum;
+                        }
+                        residueM -= actualMoveM;
+                        processOffset += MatrixCoord{actualMoveM, 0};
+                    }
+                }
+                // [AllGather] 4. Post Interface Sync
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+            }
+        }
+
+        // AllGather is completed, waiting until tasks on all devices are complete.
+        aclshmemx_barrier_all_vec();
+    }
+```
+
+---
+
+## A20. `aclshmem_putmem_signal` — put-with-signal DOES exist on Ascend, and `quiet` is the thing that orders it
+
+This is the direct answer to "what orders a remote write against the local read": the library's
+own put-with-signal is literally `put_nbi` → `quiet`/`fence` → `signal_op`, and nothing else.
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_so.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```c
+/**
+ * @brief Synchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE
+ *       then update sig_addr
+ *
+ * @param dst               [in] Pointer on local device of the destination data.
+ * @param src               [in] Pointer on Symmetric memory of the source data.
+ * @param elem_size         [in] Number of elements in the dest and source arrays.
+ * @param sig_addr          [in] Symmetric address of the signal word to be updated.
+ * @param signal            [in] The value used to update sig_addr.
+ * @param sig_op            [in] Operation used to update sig_addr with signal. Supported operations:
+ *                               ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmem_putmem_signal(__gm__ void *dst, __gm__ void *src, size_t elem_size, __gm__ int32_t *sig_addr,
+                                      int32_t signal, int sig_op, int pe);
+#define shmem_putmem_signal aclshmem_putmem_signal
+```
+
+Typed variants are macro-generated over the full `ACLSHMEM_TYPE_FUNC` list, in both raw-pointer
+and `GlobalTensor` form:
+
+```c
+/**
+ * @brief  Automatically generates aclshmem put signal functions for different data types (e.g., float, int8_t).
+ *        The macro parameters: NAME is the function name suffix, TYPE is the operation data type.
+ *
+ * \remark ACLSHMEM_DEVICE void aclshmem_NAME_put_signal(\_\_gm\_\_ TYPE *dst, \_\_gm\_\_ TYPE *src, size_t elem_size,\
+ * \_\_gm\_\_ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+ *
+ * @par Function Description
+ *      Synchronous interface. Copy a contiguous data on local UB to symmetric address on the specified PE.
+ *
+ * @par Parameters
+ * - **dst**         - [in] Pointer on local device of the destination data.
+ * - **src**         - [in] Pointer on Symmetric memory of the source data.
+ * - **elem_size**   - [in] Number of elements in the dest and source arrays.
+ * - **sig_addr**    - [in] Symmetric address of the signal word to be updated.
+ * - **signal**      - [in] The value used to update sig_addr.
+ * - **sig_op**      - [in] Operation used to update sig_addr with signal. Supported operations:
+ *                          ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * - **pe**          - [in] PE number of the remote PE.
+ */
+#define ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL(NAME, TYPE)                                                              \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_put_signal(__gm__ TYPE *dst, __gm__ TYPE *src, size_t elem_size,       \
+                                                    __gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+/** \cond */
+ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL);
+/** \endcond */
+#define shmem_put_half_mem_signal aclshmem_half_put_signal
+#define shmem_put_float_mem_signal aclshmem_float_put_signal
+#define shmem_put_double_mem_signal aclshmem_doubl_put_signal
+#define shmem_put_int8_mem_signal aclshmem_int8_put_signal
+#define shmem_put_int16_mem_signal aclshmem_int16_put_signal
+#define shmem_put_int32_mem_signal aclshmem_int32_put_signal
+#define shmem_put_int64_mem_signal aclshmem_int64_put_signal
+#define shmem_put_uint8_mem_signal aclshmem_uint8_put_signal
+#define shmem_put_uint16_mem_signal aclshmem_uint16_put_signal
+#define shmem_put_uint32_mem_signal aclshmem_uint32_put_signal
+#define shmem_put_uint64_mem_signal aclshmem_uint64_put_signal
+#define shmem_put_char_mem_signal aclshmem_char_put_signal
+#define shmem_put_bfloat16_mem_signal aclshmem_bfloat16_put_signal
+```
+
+```c
+/**
+ * @brief  Automatically generates aclshmem put signal functions for different data types (e.g., float, int8_t).
+ *        The macro parameters: NAME is the function name suffix, TYPE is the operation data type.
+ *
+ * \remark ACLSHMEM_DEVICE void aclshmem_NAME_put_signal(AscendC::GlobalTensor<TYPE> dst, AscendC::GlobalTensor<TYPE>\
+ * src, size_t elem_size, __gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+ *
+ * @par Function Description
+ *      Synchronous interface. Copy a contiguous data on local UB to symmetric address on the specified PE.
+ *
+ * @par Parameters
+ * - **dst**         - [in] Pointer on local device of the destination data.
+ * - **src**         - [in] Pointer on Symmetric memory of the source data.
+ * - **elem_size**   - [in] Number of elements in the dest and source arrays.
+ * - **sig_addr**    - [in] Symmetric address of the signal word to be updated.
+ * - **signal**      - [in] The value used to update sig_addr.
+ * - **sig_op**      - [in] Operation used to update sig_addr with signal. Supported operations:
+ *                          ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * - **pe**          - [in] PE number of the remote PE.
+ */
+#define ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL_TENSOR(NAME, TYPE)                                                                 \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_put_signal(AscendC::GlobalTensor<TYPE> dst, AscendC::GlobalTensor<TYPE> src,     \
+                                                    size_t elem_size, __gm__ int32_t *sig_addr, int32_t signal,             \
+                                                    int sig_op, int pe)
+
+/** \cond */
+ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL_TENSOR);
+```
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmem_device_so.hpp
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+The blocking form uses `aclshmem_quiet()`:
+
+```cpp
+ACLSHMEM_DEVICE void aclshmem_putmem_signal(__gm__ void *dst, __gm__ void *src, size_t elem_size, __gm__ int32_t *sig_addr,
+                                      int32_t signal, int sig_op, int pe)
+{
+    /* ROCE */
+    /* RDMA */
+    /* MTE  */
+    /* Global State Set */
+    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
+    /* CopyUB Config Set */
+    uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
+    uint32_t copy_ub_size = device_state->mte_config.ub_size;
+    AscendC::TEventID copy_event_id = (AscendC::TEventID)device_state->mte_config.sync_id;
+    aclshmemx_mte_put_nbi(reinterpret_cast<__gm__ char *>(dst), reinterpret_cast<__gm__ char *>(src),
+                          reinterpret_cast<__ubuf__ char *>(copy_ub), copy_ub_size, elem_size, pe, copy_event_id);
+    aclshmem_quiet();
+    aclshmemi_signal_op(sig_addr, signal, sig_op, pe);
+}
+
+#define ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL(NAME, TYPE)                                                                 \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_put_signal(__gm__ TYPE *dst, __gm__ TYPE *src, size_t elem_size,          \
+                                                    __gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)    \
+    { /* ROCE */ /* RDMA */ /* MTE  */ /* Global State Set */                                                        \
+        __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();                                   \
+        AscendC::TEventID copy_event_id = (AscendC::TEventID)device_state->mte_config.sync_id;                      \
+        uint64_t copy_ub = device_state->mte_config.aclshmem_ub;                                                     \
+        uint32_t copy_ub_size = device_state->mte_config.ub_size;                                                    \
+        aclshmemx_mte_put_nbi(dst, src, reinterpret_cast<__ubuf__ TYPE *>(copy_ub), copy_ub_size, elem_size, pe,     \
+                              copy_event_id);                                                                        \
+        __gm__ int32_t *sig_addr_int32 = reinterpret_cast<__gm__ int32_t *>(sig_addr);                               \
+        aclshmem_quiet();                                                                                            \
+        aclshmemi_signal_op(sig_addr, signal, sig_op, pe);                                                           \
+    }
+```
+
+The non-blocking form differs in exactly one line — `aclshmem_fence()` instead of
+`aclshmem_quiet()`. Since (per A1/A2) `fence` is *implemented identically to* `quiet` on this
+hardware, the two are currently the same instruction sequence:
+
+```cpp
+
+ACLSHMEM_DEVICE void aclshmem_putmem_signal_nbi(__gm__ void *dst, __gm__ void *src, size_t elem_size,
+                                          __gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+{
+    /* ROCE */
+    /* RDMA */
+    /* MTE  */
+    /* Global State Set */
+    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
+    /* CopyUB Config Set */
+    uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
+    uint32_t copy_ub_size = device_state->mte_config.ub_size;
+    AscendC::TEventID copy_event_id = (AscendC::TEventID)device_state->mte_config.sync_id;
+    aclshmemx_mte_put_nbi(reinterpret_cast<__gm__ char *>(dst), reinterpret_cast<__gm__ char *>(src),
+                          reinterpret_cast<__ubuf__ char *>(copy_ub), copy_ub_size, elem_size, pe, copy_event_id);
+    aclshmem_fence();
+    aclshmemi_signal_op(sig_addr, signal, sig_op, pe);
+```
+
+Note also where the staging UB comes from: `device_state->mte_config.aclshmem_ub` /
+`.ub_size` / `.sync_id` — a library-reserved UB window (`ACLSHMEM_INTERNAL_UB_BUF_START_ADDR =
+188 * 1024`, see A11), not caller-supplied. A hand-written megakernel that wants its own UB
+budget must use the `ub2gm` `aclshmemx_mte_put_nbi` overloads (A11) and open-code the
+`quiet` + `signal_op` pair itself.
+
+## A21. LCCL's epoch mechanism, verified first-hand — magic in the high 32 bits, and flags moved by MTE instead of scalar stores
+
+LCCL (`src/kernels/lcal/` inside Huawei's `ascend-transformer-boost`) is the production
+low-latency collective library. Its whole cross-rank synchronisation for a one-shot all-reduce is
+three calls. I re-fetched these files rather than relying on the delegated sweep because the
+flag transport mechanism here differs from `aclshmem`'s in a way that matters.
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/allreduce_one_shot.h
+Huawei Technologies Co., Ltd., `Copyright (c) 2024`, CANN Open Software License Agreement Version 1.0 (GitHub mirror of ATB; fetched 2026-10-20)
+
+```cpp
+
+    FORCE_INLINE_AICORE void Process()
+    {
+        DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+        if (blockIdx >= blockNum) {
+            DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+            return;
+        }
+        CpInputToBuffAndOutput();
+        sync.SetInnerFlag(magic, 1);
+
+        sync.WaitRankInnerFlag(magic, 1, rank);
+        sync.WaitRankInnerFlag(magic, 1, rankIDOfBlock);
+        if (rankIDOfBlock != rank) {
+            if constexpr (!std::is_same_v<T, U>) {
+                if (!isEnableScale) {
+                    Collectives::CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp);
+                } else if (!isVectorScale) {
+                    CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp, firstScale, offset);
+                } else {
+                    CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp, scaleGt, scaleNum, offset);
+                }
+            } else {
+                Collectives::CpGM2GM<T, U>(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp);
+            }
+```
+
+The data-staging half, for context — every block copies its slice both into the local IPC
+window and straight to the output, then the reduce pass accumulates peers on top:
+
+```cpp
+        DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+    }
+
+    FORCE_INLINE_AICORE void CpInputToBuffAndOutput()
+    {
+        Collectives::CpGM2GM<U>(dstIPCGlobal, srcInputGlobal, blockDataNum, COPYONLY);
+        if constexpr (!std::is_same_v<T, U>) {
+            if (!isEnableScale) {
+                Collectives::CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY);
+            } else if (!isVectorScale) {
+                CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY, firstScale, offset);
+            } else {
+                CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY, scaleGt, scaleNum, offset);
+            }
+        } else {
+```
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/sync_collectives.h
+Huawei Technologies Co., Ltd., `Copyright (c) 2024` (same mirror; fetched 2026-10-20)
+
+Layout: an int64 flag per block, 4 int64 apart (32 B stride), with the inner region at the base
+of the peer's shared window and the outer region offset by `segmentCount`:
+
+```cpp
+
+constexpr int64_t FLAG_UNIT_INT_NUM = 4;
+constexpr int64_t SYNC_UNIT_SIZE = FLAG_UNIT_INT_NUM * sizeof(int64_t);
+constexpr int64_t MAGIC_OFFSET = 32;
+constexpr int64_t MAGIC_MASK = ~((1LL << MAGIC_OFFSET) - 1);
+#ifdef ENABLE_LCCL_MIX
+constexpr int32_t LCAL_BLOCK_NUM_MULTI = 2;
+#else
+constexpr int32_t LCAL_BLOCK_NUM_MULTI = 1;
+#endif
+
+class SyncCollectives {
+public:
+    __aicore__ inline SyncCollectives() {}
+
+    __aicore__ inline void Init(int rank, int rankSize, GM_ADDR *shareAddrs)
+    {
+        this->rank = rank;
+        this->rankSize = rankSize;
+        this->shareAddrs = shareAddrs;
+        this->blockIdx = GetBlockIdx();
+        this->blockNum = GetBlockNum() * LCAL_BLOCK_NUM_MULTI;
+        segmentCount = GetBlockNum() * LCAL_BLOCK_NUM_MULTI * FLAG_UNIT_INT_NUM;
+        localSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]);
+        basicSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        blockOuterSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + segmentCount + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        TPipe pipe;
+        pipe.InitBuffer(tBuf, GetBlockNum() * SYNC_UNIT_SIZE);
+```
+
+The epoch encoding — 32-bit magic in the high half, event/progress id in the low half:
+
+```cpp
+    __aicore__ inline int64_t MergeMagicWithValue(int32_t magic, int32_t value)
+    {
+        return (static_cast<int64_t>(magic) << MAGIC_OFFSET) | static_cast<int64_t>(value);
+    }
+
+    __aicore__ inline __gm__ int64_t* GetInnerFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+
+    __aicore__ inline __gm__ int64_t* GetOuterFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + segmentCount + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+```
+
+The flag setters that use it:
+
+```cpp
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag(localSyncAddr + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    __aicore__ inline int32_t CalEventIdByMulBlockNum(int32_t blockMultiplier, int32_t targetCoreId)
+    {
+        return (blockMultiplier * blockNum) + targetCoreId;
+    }
+
+    __aicore__ inline void WaitSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank,
+        int32_t breakCycle = 0)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, 1, v, breakCycle);
+    }
+
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(basicSyncAddr, value);
+    }
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag((__gm__ int64_t*)(shareAddrs[setRank]) + setBlock * FLAG_UNIT_INT_NUM, value);
+    }
+
+    __aicore__ inline void WaitInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM, 1, value);
+    }
+
+    __aicore__ inline void WaitRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+
+    __aicore__ inline bool CheckRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        return CheckOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+```
+
+The stale-rejection predicate. This is the exact test the caller asked about — one word carries
+both the generation and the progress, and the waiter demands an exact generation match *and*
+monotone progress:
+
+```cpp
+    __aicore__ inline void WaitOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue,
+        int32_t breakCycle = 0)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+        do {
+            if (breakCycle > 0) {
+                int64_t systemCycleBefore = AscendC::GetSystemCycle();
+                int64_t systemCycleAfter = AscendC::GetSystemCycle();
+                while (systemCycleAfter - systemCycleBefore < breakCycle) {
+                    systemCycleAfter = AscendC::GetSystemCycle();
+                };
+            }
+            DataCopy(localWait, globalWait, flagNum * FLAG_UNIT_INT_NUM);
+            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            isSync = true;
+            for (auto i = 0; i < flagNum; ++i) {
+                int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                    isSync = false;
+                    break;
+                }
+            }
+        } while (!isSync);
+        tBuf.FreeTensor(localWait);
+    }
+```
+
+The non-blocking variant with the same predicate:
+
+```cpp
+    __aicore__ inline bool CheckOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        DataCopy(localWait, globalWait, flagNum * FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        bool isSync = true;
+        for (auto i = 0; i < flagNum; ++i) {
+            int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+            if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                isSync = false;
+                break;
+            }
+        }
+        tBuf.FreeTensor(localWait);
+        return isSync;
+```
+
+And the write path:
+
+```cpp
+    __aicore__ inline void SetFlag(__gm__ int64_t* setAddr, int64_t setValue)
+    {
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        GlobalTensor<int64_t> globalSet;
+        globalSet.SetGlobalBuffer(setAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localSet = tBuf.GetWithOffset<int64_t>(1, 0);
+        localSet.SetValue(0, setValue);
+        AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopy(globalSet, localSet, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+
+        tBuf.FreeTensor(localSet);
+    }
+```
+
+The read path:
+
+```cpp
+    __aicore__ inline int64_t GetFlag(__gm__ int64_t* waitAddr)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(1, 0);
+        DataCopy(localWait, globalWait, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        int64_t res = localWait.GetValue(0);
+        tBuf.FreeTensor(localWait);
+        return res;
+    }
+```
+
+Mechanism note worth flagging: LCCL never does a scalar load or a scalar store to a flag. Both
+directions go through the move engines — `localSet.SetValue(0, v)` then
+`SetFlag/WaitFlag<HardEvent::S_MTE3>` then `DataCopy(globalSet, localSet, ...)` on the way out,
+and `DataCopy(localWait, globalWait, ...)` then `SetFlag/WaitFlag<HardEvent::MTE2_S>` then
+`GetValue` on the way in. That is why there is no `dcci` anywhere in this file, in contrast to
+`aclshmem`'s scalar-store + `dcci_cacheline` approach (A4, A6). The `SetFlag` wrapper also opens
+with an `MTE3_S` and an `MTE2_S` pair before touching UB, which is what orders a preceding data
+`DataCopy` against the flag write.
+
+The optional `breakCycle` argument is a cycle-counted backoff inside the spin, using
+`AscendC::GetSystemCycle()`.
+
+---
+
+# TOPIC A, continued — epoch / generation tagging and one-shot all-reduce in real Ascend code
+
+Items below are verbatim quotations collected from the URLs shown. Duplicates of the
+`immengzi/shmem` headers already quoted in sections A1-A19 have been removed; one
+`raw.gitcode.com/cann/shmem` fetch is retained to anchor provenance of the mirror.
+`egretwAlker/cpl-ascend-transformer-boost` is a GitHub mirror of Huawei's
+`ascend-transformer-boost` (ATB), whose `src/kernels/lcal/` tree is LCCL — the low-latency
+collective library with the one-shot all-reduce AscendC kernels.
+
+### item 0
+
+https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/utils/inc/kernel/sync_collectives.h
+vllm-project/vllm-ascend, commit bd8be2e7592f4e16b34b6185707ed0745733cf3a by shiro-zzzz, 2025-12-10
+
+```cpp
+#ifndef SYNC_COLLECTIVES_H
+#define SYNC_COLLECTIVES_H
+
+#include "comm_args.h"
+
+using namespace AscendC;
+using namespace Moe;
+
+// Synchronization flag occupies length
+constexpr int64_t FLAG_UNIT_INT_NUM = 4;
+// Memory size occupied by each synchronization unit (Bytes)
+constexpr int64_t SYNC_UNIT_SIZE = FLAG_UNIT_INT_NUM * sizeof(int64_t);
+// High-order offset when using magic as a comparison value
+constexpr int64_t MAGIC_OFFSET = 32;
+constexpr int64_t MAGIC_MASK = ~((1LL << MAGIC_OFFSET) - 1);
+
+class SyncCollectives {
+public:
+    __aicore__ inline SyncCollectives() {}
+
+    __aicore__ inline void Init(int rank, int rankSize, GM_ADDR *shareAddrs, TBuf<QuePosition::VECCALC> &tBuf)
+    {
+        this->rank = rank;
+        this->rankSize = rankSize;
+        this->shareAddrs = shareAddrs;
+        this->blockIdx = GetBlockIdx();
+        this->blockNum = GetBlockNum();
+        // Length of a single indicator segment
+        segmentCount = GetBlockNum() * FLAG_UNIT_INT_NUM;
+        // Initialize the intra-card/inter-card synchronization address corresponding to the current core.
+        localSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]);
+        basicSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        blockOuterSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + segmentCount + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        this->tBuf = tBuf;
+    }
+
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag(localSyncAddr + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    /**
+     * @brief Set the flag for the specified eventID of the designated card, with the value being a combination of magic and value.
+     * @param magic The operator batch, which will be combined into the high 32 bits of the flag value to be set.
+     * @param value The specific value to be set, which will be the low 32 bits of the flag value to be set.
+     * @param eventID Physically, it is an offset from the shared memory base address (requires scaling, not an absolute value).
+     * @param rank This rank is the rankId corresponding to the peerMems array in the CommArgs structure, not a global or local id.
+     *              (Local is not applicable in the 91093 scenario, and global is not applicable in the 910B multi-machine scenario.)
+     */
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    __aicore__ inline int32_t CalEventIdByMulBlockNum(int32_t blockMultiplier, int32_t targetCoreId)
+    {
+        return (blockMultiplier * blockNum) + targetCoreId;
+    }
+
+    /**
+     * @brief Wait for the flag of the specified eventID on the specified card to become a value
+     *        composed of the combination of magic and value.
+     * @param magic The operator batch, which will be combined into the high 32 bits of the flag
+     *              value to be wait.
+     * @param value The specific value to be wait, which will be the low 32 bits of the flag
+     *              value to be wait.
+     * @param eventID Physically, it is an offset from the shared memory base address (requires
+     *                scaling, not an absolute value).
+     * @param rank This rank is the rankId corresponding to the peerMems array in the CommArgs
+     *              structure, not a global or local id. (Local is not applicable in the 91093
+     *              scenario, and global is not applicable in the 910B multi-machine scenario.)
+     */
+    __aicore__ inline void WaitSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, 1, v);
+    }
+
+    __aicore__ inline void WaitSyncFlag(int32_t magic, int32_t value, int32_t eventID)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[this->rank]) + eventID * FLAG_UNIT_INT_NUM, 1, v);
+    }
+
+    /**
+     * @brief Wait for the flags starting from the specified eventID on the specified card to become
+     *        a value composed of the combination of magic and value.<br>
+     *        Note: [eventID, eventID + flagNum)
+     */
+    __aicore__ inline void WaitSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank, int64_t flagNum)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, flagNum, v);
+    }
+
+    // Set inner-card synchronization flag (memory A)
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(basicSyncAddr, value);
+    }
+
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag((__gm__ int64_t*)(shareAddrs[setRank]) + setBlock * FLAG_UNIT_INT_NUM, value);
+    }
+
+    // Wait for a single inner-card synchronization flag (memory A)
+    __aicore__ inline void WaitInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM, 1, value);
+    }
+
+    // Wait for all inner-card synchronization flags within the entire rank (memory A)
+    __aicore__ inline void WaitRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+
+    // Check all inner-card synchronization flags within the entire rank (memory A)
+    __aicore__ inline bool CheckRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        return CheckOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+
+    // Set inter-card synchronization flag (memory B)
+    __aicore__ inline void SetOuterFlag(int32_t magic, int32_t eventID)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(blockOuterSyncAddr, value);
+    }
+
+    __aicore__ inline void SetOuterFlag(int32_t magic, int32_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        __gm__ int64_t* flagAddr = GetOuterFlagAddr(setRank, setBlock);
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(flagAddr, value);
+    }
+
+    // Wait for a single inter-card synchronization flag (memory B)
+    __aicore__ inline void WaitOuterFlag(int32_t magic, int32_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t* flagAddr = GetOuterFlagAddr(waitRank, waitBlock);
+        WaitOneRankPartFlag(flagAddr, 1, value);
+    }
+
+    // Wait for all inter-card synchronization flags within the entire rank (memory B)
+    __aicore__ inline void WaitOneRankOuterFlag(int32_t magic, int32_t eventID, int64_t rank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t* flagAddr;
+        flagAddr = GetOuterFlagAddr(rank, 0);
+        WaitOneRankPartFlag(flagAddr, blockNum, value);
+    }
+
+    // Wait for flagNum inter-card synchronization flags starting from startBlock for all ranks (memory B)
+    __aicore__ inline void WaitAllRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t startBlock, int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t* flagAddr;
+        int waitRank;
+        for (auto r = 0; r < rankSize; ++r) {
+            waitRank = (rank + r) % rankSize;  // Offset reading of rank flags to prevent performance impact from concurrent copying by multiple cores
+            flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+            WaitOneRankPartFlag(flagAddr, flagNum, value);
+        }
+    }
+
+    // Check flagNum inter-card synchronization flags starting from startBlock for all ranks (memory B)
+    __aicore__ inline bool CheckAllRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t startBlock,
+        int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t* flagAddr;
+        int waitRank;
+        for (auto r = 0; r < rankSize; ++r) {
+            waitRank = (rank + r) % rankSize;  // Offset reading of rank flags to prevent performance impact from concurrent copying by multiple cores
+            flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+            if (!CheckOneRankPartFlag(flagAddr, flagNum, value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Wait for all inter-card synchronization flags for all ranks, full rank synchronization (memory B)
+    __aicore__ inline void WaitAllRankOuterFlag(int32_t magic, int32_t eventID)
+    {
+        WaitAllRankPartOuterFlag(magic, eventID, 0, blockNum);
+    }
+
+    // Check all inter-card synchronization flags for all ranks, full rank synchronization (memory B)
+    __aicore__ inline bool CheckAllRankOuterFlag(int32_t magic, int32_t eventID)
+    {
+        return CheckAllRankPartOuterFlag(magic, eventID, 0, blockNum);
+    }
+
+    // Low-level interface, set synchronization flag
+    __aicore__ inline void SetFlag(__gm__ int64_t* setAddr, int64_t setValue)
+    {
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        GlobalTensor<int64_t> globalSet;
+        globalSet.SetGlobalBuffer(setAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localSet = tBuf.GetWithOffset<int64_t>(1, 0);
+        localSet.SetValue(0, setValue);
+
+        // Copy global synchronization flag to local
+        AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);  // Wait for SetValue to complete
+        DataCopy(globalSet, localSet, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);  // Wait for UB->GM to complete
+    }
+
+    // Low-level interface, wait for synchronization flag
+    __aicore__ inline void WaitFlag(__gm__ int64_t* waitAddr, int64_t waitValue)
+    {
+        WaitOneRankPartFlag(waitAddr, 1, waitValue);
+    }
+
+    // Read a flag, return an immediate number
+    __aicore__ inline int64_t GetFlag(__gm__ int64_t* waitAddr)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(1, 0);
+        // Copy global to local
+        DataCopy(localWait, globalWait, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+
+        int64_t res = localWait.GetValue(0);
+        return res;
+    }
+
+    // Get multiple consecutive synchronization flags within a single card
+    __aicore__ inline void WaitOneRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t waitRank,
+                                                    int64_t startBlock, int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t* flagAddr;
+        flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+        WaitOneRankPartFlag(flagAddr, flagNum, value);
+    }
+
+    // Get synchronization flag within a single card (memory A)
+    __aicore__ inline int64_t GetInnerFlag(int64_t waitRank, int64_t waitBlock)
+    {
+        return GetFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM);
+    }
+
+    __aicore__ inline int64_t GetOuterFlag(int64_t waitRank, int64_t waitBlock)
+    {
+        return GetFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + segmentCount + waitBlock * FLAG_UNIT_INT_NUM);
+    }
+
+    // In the rank Chunk Flag area, return success if the destRank chunk Flag value is 0, otherwise fail
+    __aicore__ inline int64_t GetChunkFlag(int64_t rank, int64_t destRank, int64_t magic, int64_t timeout)
+    {
+        int64_t value = MergeMagicWithValue(magic, 0);
+        int64_t status = GetChunkFlagValue((__gm__ int64_t*)(shareAddrs[rank]) +
+                                            IPC_CHUNK_FLAG + destRank * FLAG_UNIT_INT_NUM, value, timeout);
+        return status;
+    }
+
+    // Set the destRank chunk Flag value in the rank Chunk Flag area to value
+    __aicore__ inline void SetChunkFlag(int64_t rank, int64_t destRank, int64_t magic, int64_t eventId)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventId);
+        SetFlag((__gm__ int64_t*)(shareAddrs[rank]) + IPC_CHUNK_FLAG + destRank * FLAG_UNIT_INT_NUM, value);
+    }
+
+    __aicore__ inline int64_t GetChunkRecvLen(int64_t rank, int64_t destRank, int64_t magic, int64_t timeout)
+    {
+        int64_t len = GetChunkFlagValue((__gm__ int64_t*)(shareAddrs[rank]) + IPC_CHUNK_FLAG +
+                                        destRank * FLAG_UNIT_INT_NUM, 0, timeout, true, magic);
+        return len;
+    }
+
+private:
+    __aicore__ inline int64_t MergeMagicWithValue(int32_t magic, int32_t value)
+    {
+        // Merge magic as the high bits and eventID as the low bits into a value for comparison
+        return (static_cast<int64_t>(static_cast<uint32_t>(magic)) << MAGIC_OFFSET) | static_cast<int64_t>(value);
+    }
+
+    __aicore__ inline __gm__ int64_t* GetInnerFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+
+    __aicore__ inline __gm__ int64_t* GetOuterFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + segmentCount + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+
+    // Wait for a part of synchronization flags within a rank
+    __aicore__ inline void WaitOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+        int64_t checkedFlagNum = 0;
+        do {
+            // Copy global synchronization flags to local
+            DataCopy(localWait, globalWait[checkedFlagNum * FLAG_UNIT_INT_NUM],
+                     (flagNum - checkedFlagNum) * FLAG_UNIT_INT_NUM);
+            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+
+            // Check if the synchronization flags are equal to checkValue
+            isSync = true;
+            int64_t remainToCheck = flagNum - checkedFlagNum;
+            for (auto i = 0; i < remainToCheck; ++i) {
+                // Continue waiting if any core has not reached the checkValue phase
+                int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                    isSync = false;
+                    checkedFlagNum += i;
+                    break;
+                }
+            }
+        } while (!isSync);
+    }
+
+    // Wait for all synchronization flags within a rank
+    __aicore__ inline void WaitOneRankAllFlag(__gm__ int64_t* waitAddr, int64_t checkValue)
+    {
+        WaitOneRankPartFlag(waitAddr, blockNum, checkValue);
+    }
+
+    // Check partial synchronization flags within a rank, copy only once
+    __aicore__ inline bool CheckOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        // Copy global synchronization flags to local
+        DataCopy(localWait, globalWait, flagNum * FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+        // Check if the synchronization flags are equal to checkValue
+        bool isSync = true;
+        for (auto i = 0; i < flagNum; ++i) {
+            // Continue waiting if any core has not reached the checkValue phase
+            int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+            if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                isSync = false;
+                break;
+            }
+        }
+        return isSync;
+    }
+
+    __aicore__ inline int64_t GetChunkFlagValue(__gm__ int64_t* waitAddr, int64_t checkValue, int64_t timeout,
+                                                bool checkNonZero = false, int64_t magic = 0)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+
+        int64_t waitTimes = 0;
+        int64_t v = 0;
+
+        do {
+            // Copy global sync flag to local
+            DataCopy(localWait, globalWait[0], FLAG_UNIT_INT_NUM);
+            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+
+            isSync = true;
+            v = localWait.GetValue(0);
+            if (checkNonZero) {
+                // Non-zero check mode
+                if (((v & MAGIC_MASK) == (static_cast<int64_t>(magic) << MAGIC_OFFSET)) && (v & 0xFFFFFFFF)) {
+                    return v & 0xFFFFFFFF;  // Return lower 32 bits when non-zero
+                }
+            } else {
+                // Exact value check mode
+                if (v == checkValue) {
+                    return WAIT_SUCCESS;
+                }
+            }
+
+            isSync = false;
+            waitTimes++;
+
+            if (timeout > INT64_MAX / MAX_WAIT_ROUND_UNIT || waitTimes >= (timeout * MAX_WAIT_ROUND_UNIT)) {
+                isSync = true;
+                return v; // Return the read flag value
+            }
+        } while (!isSync);
+
+        return checkNonZero ? 0 : v;
+    }
+
+    // Check all sync flags within a rank, copy only once
+    __aicore__ inline bool CheckOneRankAllFlag(__gm__ int64_t* waitAddr, int64_t checkValue)
+    {
+        return CheckOneRankPartFlag(waitAddr, blockNum, checkValue);
+    }
+    int rank;
+    int rankSize;
+    int blockIdx;
+    int blockNum;
+    GM_ADDR *shareAddrs;
+    int64_t segmentCount;  // Length of a single sync flag segment (count in int64_t)
+    __gm__ int64_t* localSyncAddr;
+    __gm__ int64_t* basicSyncAddr;  // Intra-card sync flag address for the current block
+    __gm__ int64_t* blockOuterSyncAddr;  // Inter-card sync flag address for the current block
+    TBuf<QuePosition::VECCALC> tBuf;
+};
+
+#endif // SYNC_COLLECTIVES_H```
+
+## ITEM 2 — vllm-ascend `comm_args.h`: the shared IPC window layout the epoch flags live in (first 2MB = flag region, ping-pong buffer selected by magic parity, `WAIT_SUCCESS` sentinel, `MAX_WAIT_ROUND_UNIT` spin budget)
+
+### item 1
+
+https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/utils/inc/kernel/comm_args.h
+vllm-project/vllm-ascend, commit bd8be2e7592f4e16b34b6185707ed0745733cf3a by shiro-zzzz, 2025-12-10
+
+```cpp
+#ifndef COMM_ARGS_H
+#define COMM_ARGS_H
+#include <cstdint>
+
+#define FORCE_INLINE_AICORE __attribute__((always_inline)) inline __aicore__
+#include "kernel_operator.h"
+
+namespace Moe {
+constexpr int CAM_MAX_RANK_SIZE = 384; // Maximum number of NPU cards supported by the communication library
+
+constexpr int64_t IPC_BUFF_MAX_SIZE = 100 * 1024 * 1024;
+constexpr int64_t IPC_DATA_OFFSET = 2 * 1024 * 1024; // First 2MB as flag, then 100MB as data storage
+constexpr int64_t PING_PONG_SIZE = 2;
+constexpr int64_t UB_SINGLE_DMA_SIZE_MAX = 190 * 1024;
+constexpr int64_t SMALL_DATA_SIZE = 1 * 1024 * 1024;
+constexpr int64_t UB_SINGLE_PING_PONG_ADD_SIZE_MAX = UB_SINGLE_DMA_SIZE_MAX / 2;
+constexpr int UB_ALIGN_SIZE = 32;
+constexpr int64_t MAGIC_ALIGN_COUNT = UB_ALIGN_SIZE / sizeof(int32_t);
+
+constexpr uint8_t COMM_NUM = 2;  // Size of communication domain
+constexpr uint8_t COMM_EP_IDX = 0;
+constexpr uint8_t COMM_TP_IDX = 1;
+
+constexpr int DFX_COUNT = 50;
+constexpr int64_t WAIT_SUCCESS = 112233445566;
+constexpr int64_t IPC_CHUNK_FLAG = 0; // Start offset for send recv, chunk flag region
+constexpr int64_t MAX_WAIT_ROUND_UNIT = 10 * 1000 * 1000; // Threshold for waiting to get Flag under normal conditions within the same SIO
+
+constexpr static int32_t UB_HEAD_OFFSET = 96;
+constexpr static int32_t UB_MID_OFFSET = UB_HEAD_OFFSET + UB_SINGLE_PING_PONG_ADD_SIZE_MAX + UB_ALIGN_SIZE;
+constexpr static int64_t UB_FLAG_SIZE = 2 * 1024;
+constexpr static int64_t MAX_CORE_NUM = 48;
+constexpr static uint64_t STATE_WIN_OFFSET = 900 * 1024;
+constexpr static int64_t COMPARE_ALIGN_SIZE = 256;
+
+constexpr static int64_t UB_SINGLE_TOTAL_SIZE_MAX = 192 * 1024;
+constexpr static int64_t START_OFFSET_FOR_SHARE = 512;
+
+enum Op : int {
+    COPYONLY = -1,
+    ADD = 0,
+    MUL = 1,
+    MAX = 2,
+    MIN = 3
+};
+
+struct CommArgs {
+    int rank = 0;           // attr rank_id, global rank
+    int localRank = -1;
+    int rankSize = 0; // global rank size
+    int localRankSize = -1;  // This parameter refers to the number of cards interconnected in fullmesh
+    uint32_t extraFlag = 0; // 32 bit map, the specific meaning of each bit is above in this file
+    int testFlag = 0;
+    GM_ADDR peerMems[CAM_MAX_RANK_SIZE] = {}; // Buffer obtained from initialization, all allreduce is the same parameter
+    /**
+     * @param sendCountMatrix One-dimensional array with a size of rankSize*rankSize
+     * eg: The value of sendCountMatrix[1] corresponds to the [0][1] of the two-dimensional array, indicating the number of data that card 0 needs to send to card 1
+     */
+    int64_t sendCountMatrix[CAM_MAX_RANK_SIZE * CAM_MAX_RANK_SIZE] = {};  // for all2allvc
+    int64_t sendCounts[CAM_MAX_RANK_SIZE] = {}; // for all2allv
+    int64_t sdispls[CAM_MAX_RANK_SIZE] = {};    // for all2allv
+    int64_t recvCounts[CAM_MAX_RANK_SIZE] = {};  // for all2allv
+    int64_t rdispls[CAM_MAX_RANK_SIZE] = {};     // for all2allv
+    int64_t batchSize;
+    int64_t hiddenSize;
+    int64_t topk;
+    int64_t sharedExpertRankNum;
+    int64_t expertNumPerRank;
+    int64_t dfx[DFX_COUNT] = {};
+};
+}
+#endif // COMM_ARGS_H
+```
+
+## ITEM 3 — sgl-kernel-npu `NotifyDispatchA2`: magic is read-modify-written FROM the symmetric window itself at kernel entry (per-block, self-incrementing generation counter, no host barrier), and the magic parity selects the ping-pong half of the window
+
+### item 2
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops2/op_kernel/notify_dispatch_a2.h
+sgl-project/sgl-kernel-npu, commit 45aa6ebb54694c7c9f3e97f64f963c44bcd3937c by luanyundu, 2026-03-02
+
+```cpp
+
+    constexpr static uint32_t MAX_BS = 4096;  // 每卡支持的最大bs
+    // Synchronization flag occupies length
+    constexpr static int64_t FLAG_UNIT_INT_NUM = 4;
+    constexpr static int64_t MAGIC_MASK = ~((1LL << 32) - 1);
+
+public:
+
+// ---- (Init, lines 185-245): magic is loaded from GM, incremented, stored back, re-read ----
+        this->root = 0;
+        this->len = len;
+        this->numExperts = numExperts;
+        this->numTokens = numTokens;
+        this->topkNum = topkNum;
+        this->scale = nullptr;
+        this->magic = 0;
+        this->localRank = localRank;
+        this->localRankSize = localRankSize;
+        this->xRankSize = localRankSize;
+        this->yRankSize = rankSize / localRankSize;
+        this->xRankIdx = rank % localRankSize;
+        this->yRankIdx = rank / localRankSize;
+        this->blockIdx = GetBlockIdx();
+        this->blockNum = GetBlockNum();
+        uint8_t ctxIdx;
+
+        ctxIdx = COMM_EP_IDX;
+
+        // 初始化RDMA相关变量
+        REGISTER_TILING_DEFAULT(NotifyDispatchA2TilingData);
+        GET_TILING_DATA_WITH_STRUCT(NotifyDispatchA2TilingData, tilingData, tiling);
+
+        auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+
+        hccl_.InitV2(contextGM0, &tilingData);
+        hccl_.SetCcTilingV2(offsetof(NotifyDispatchA2TilingData, mc2CcTiling1));
+        this->winContext_[COMM_EP_IDX] = (__gm__ HcclOpResParam *)contextGM0;
+        notifyMemoryOffset = winContext_[COMM_EP_IDX]->winSize - IPC_BUFF_MAX_SIZE * 2;
+        // 设置并自增magic
+        magicTensor_.SetGlobalBuffer((__gm__ uint64_t *)(hccl_.GetWindowsInAddr(rank) + IPC_DATA_OFFSET -
+                                                         blockNum * sizeof(uint64_t) * EXP_TOKEN_COUNT_FLAG_CNT +
+                                                         notifyMemoryOffset));
+
+        pipe.InitBuffer(this->tBuf, TEMP_BUF_LEN);
+        LocalTensor<uint64_t> tempLocal = tBuf.Get<uint64_t>();
+        PipeBarrier<PIPE_ALL>();
+        tempLocal(0) = magicTensor_.GetValue(blockIdx * EXP_TOKEN_COUNT_FLAG_CNT) + 1;
+        // 使用atomic方式实现+1
+        AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);  // 等待SetValue完成
+        DataCopy(magicTensor_[blockIdx * EXP_TOKEN_COUNT_FLAG_CNT], tempLocal, EXP_TOKEN_COUNT_FLAG_CNT);
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);  // 等待DataCopy完成
+        magic = magicTensor_.GetValue(blockIdx * EXP_TOKEN_COUNT_FLAG_CNT);
+        PipeBarrier<PIPE_ALL>();
+        // 初始化目标rank的shareAddrs
+        for (int i = 0; i < rankSize; i++) {
+            this->shareAddrs[i] =
+                hccl_.GetWindowsInAddr(i) + notifyMemoryOffset + (magic % PING_PONG_SIZE) * IPC_BUFF_MAX_SIZE;
+        }
+    }
+
+    template <typename K, typename U = K>
+    __aicore__ inline void CpGM2GMPingPong(int64_t dataSizeRemain, const GlobalTensor<U> &sendDataInputGt,
+                                           const GlobalTensor<K> &recvDataOutputGT, int op);
+    template <typename F>
+    __aicore__ inline void SetAtomic(int op);
+    __aicore__ inline void UnsetAtomic(int op);
+    template <HardEvent eventType>
+
+// ---- (lines 330-390): MergeMagicWithValue / WaitOneRankPartFlag / SetInnerFlag / WaitInnerFlag ----
+    __aicore__ inline uint64_t MergeMagicWithValue(uint64_t magic, uint64_t value)
+    {
+        // magic as the high part, eventID as the low part, combined into a value for comparison
+        return (magic * 2ULL + value);
+    }
+
+    // Wait for a part of synchronization flags within a rank
+    __aicore__ inline void WaitOneRankPartFlag(__gm__ uint64_t *waitAddr, int64_t flagNum, uint64_t checkValue)
+    {
+        GlobalTensor<uint64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<uint64_t> localWait = tBuf.GetWithOffset<uint64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+        uint64_t checkedFlagNum = 0;
+        do {
+            // Copy global synchronization flags to local
+            DataCopy(localWait, globalWait[checkedFlagNum * FLAG_UNIT_INT_NUM],
+                     (flagNum - checkedFlagNum) * FLAG_UNIT_INT_NUM);
+            SetWaitEvent<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+
+            // Check if the synchronization flags are equal to checkValue
+            isSync = true;
+            uint64_t remainToCheck = flagNum - checkedFlagNum;
+            for (auto i = 0; i < remainToCheck; ++i) {
+                // Continue waiting if any core has not reached the checkValue phase
+                uint64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                    isSync = false;
+                    checkedFlagNum += i;
+                    break;
+                }
+            }
+        } while (!isSync);
+    }
+
+    __aicore__ inline void SetInnerFlag(uint64_t magic, uint64_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        uint64_t value = MergeMagicWithValue(magic, eventID);
+        // SetFlag((__gm__ uint64_t *)(shareAddrs[setRank]) + setBlock * FLAG_UNIT_INT_NUM, value);
+        __gm__ uint64_t *setAddr = (__gm__ uint64_t *)(shareAddrs[setRank]) + setBlock * FLAG_UNIT_INT_NUM;
+
+        SetWaitEvent<HardEvent::MTE3_S>(EVENT_ID0);
+        SetWaitEvent<HardEvent::MTE2_S>(EVENT_ID0);
+        GlobalTensor<uint64_t> globalSet;
+        globalSet.SetGlobalBuffer(setAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<uint64_t> localSet = tBuf.GetWithOffset<uint64_t>(1, 0);
+        localSet.SetValue(0, value);
+
+        // Copy global synchronization flag to local
+        SetWaitEvent<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopy(globalSet, localSet, FLAG_UNIT_INT_NUM);
+        SetWaitEvent<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+
+    // Wait for a single inner-card synchronization flag
+    __aicore__ inline void WaitInnerFlag(uint64_t magic, uint64_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        uint64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankPartFlag((__gm__ uint64_t *)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM, 1, value);
+    }
+
+
+// ---- (lines 1280,1296): member declarations ----
+    uint64_t magic;
+    GlobalTensor<uint64_t> magicTensor_;  // 用于存放magic，位于windowInstatusTensor_之前
+```
+
+## ITEM 4 — CANN `shmem` device API: `aclshmemx_signal_op` / `aclshmem_signal_wait_until` declarations + verbatim semantics doc (note the explicit "WARNING: Atomicity NOT Guaranteed."), and the `ACLSHMEM_SIGNAL_SET` / `ACLSHMEM_SIGNAL_ADD` / `ACLSHMEM_CMP_*` enums
+
+### item 3
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/allgather/main.cpp
+immengzi/shmem, repo pushed 2026-03-26 — host side: where the epoch comes from and how it is scaled
+
+```cpp
+46:constexpr int64_t SYNC_FLAG_INTERVAL = 16;
+49:constexpr uint32_t MAGIC_MULTIPLIER = 1024;
+113:        void *ptr = aclshmem_malloc(aiv_num * SYNC_FLAG_INTERVAL * sizeof(T) + GVA_BUFF_MAX_SIZE / sizeof(T));
+119:                              (uint8_t *)output_ptr, (uint8_t *)ptr, trans_size, magic * MAGIC_MULTIPLIER);
+
+    // magic is used to sync.
+    int magic = 1;
+
+    for (int i = 0; i < test_cases.size(); i++) {
+        if (rank_id == 0) {
+            std::cout << "Case: " << test_cases[i] << " Started." << std::endl;
+        }
+        uint32_t trans_size = test_cases[i];
+
+        //  Small data kernel needs 8 AIV core, Big data kernel needs 16 AIV.
+        if (trans_size * sizeof(T) < DATA_SIZE_THRESHOLD) {
+            BLOCK_NUM = BLOCK_NUM_SMALL_DATA;
+        } else {
+            BLOCK_NUM = BLOCK_NUM_LARGE_DATA;
+        }
+
+        void *input_ptr;
+        aclrtMalloc(&input_ptr, trans_size * sizeof(T), ACL_MEM_MALLOC_HUGE_FIRST);
+        uint8_t *input_host;
+        aclrtMallocHost(reinterpret_cast<void**>(&input_host), trans_size * sizeof(T));
+        std::string inputFile = "../../examples/allgather/golden/allgather_" + std::to_string(trans_size) + "_" +
+                                std::to_string(n_ranks) + "/input_gm_" + std::to_string(rank_id) + ".bin";
+        ReadFile(inputFile, input_host, trans_size * sizeof(T));
+        aclrtMemcpy(input_ptr, trans_size * sizeof(T), input_host, trans_size * sizeof(T), ACL_MEMCPY_HOST_TO_DEVICE);
+
+        void *output_ptr;
+        aclrtMalloc(&output_ptr, trans_size * n_ranks * sizeof(T), ACL_MEM_MALLOC_HUGE_FIRST);
+
+        // sync Buffer + data Buffer
+        int aiv_num = BLOCK_NUM;
+        void *ptr = aclshmem_malloc(aiv_num * SYNC_FLAG_INTERVAL * sizeof(T) + GVA_BUFF_MAX_SIZE / sizeof(T));
+
+        // AllGather
+        for (int zz = 0; zz < perf_times; zz++) {
+            magic++;
+            allgather_demo<T>(BLOCK_NUM, stream, fftsAddr, (uint8_t *)input_ptr,
+                              (uint8_t *)output_ptr, (uint8_t *)ptr, trans_size, magic * MAGIC_MULTIPLIER);
+        }
+        status = aclrtSynchronizeStream(stream);
+```
+
+## ITEM 9 — CANN cannbot-skills, shmem-ops-design `core-allocation.md` §7.1/§7.2: the pattern named explicitly as "Epoch / Magic Number 防脏读" (anti-stale-read), with the per-AIV flag slot address formula and false-sharing interval
+
+### item 4
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-design/references/core-allocation.md
+hicann/cannbot-skills, repo pushed 2026-10-19 (date of this file's last commit not individually resolved)
+
+```markdown
+## 7. 同步机制详解
+
+### 7.1 per-AIV 独立 Flag
+
+每个 AIV 拥有独立的同步 flag 槽，避免多核写同一地址造成竞争。
+
+**地址计算**：
+
+```
+SYNC_FLAG_INTERVAL = 16   // int32 粒度间隔，防止 false sharing
+flag_addr = gva_sync_base + (rank * aiv_num + aiv_idx) * SYNC_FLAG_INTERVAL
+```
+
+**总分配量**：`sizeof(int32_t) * n_pes * aiv_num * SYNC_FLAG_INTERVAL`
+
+**使用模式**：
+- 发送端写自己的 flag：`signal_op(my_flag_addr, value, SIGNAL_SET, target_pe)`
+- 接收端读对端的 flag：`signal_wait_until(remote_flag_addr, CMP_EQ, expected_value)`
+
+参考：`allgather`、`kv_shuffle`
+
+### 7.2 Epoch / Magic Number 防脏读
+
+多轮迭代中，上一轮的 flag 值可能残留在远端。通过 magic number 区分不同轮次：
+
+```
+// 发送端：每轮递增
+signal_value = (magic + iteration) * 1024
+
+// 接收端：通过高位比较判断 epoch
+if (remote_flag >> 10) != (expected_magic >> 10):
+    // 仍是旧 epoch 的值，继续等待
+```
+
+参考：`allgather` 大数据路径
+
+```
+
+### item 5
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-design/references/core-allocation.md
+same file, §4.3 cross-core (AIC<->AIV) flag protocol and §6 sync-primitive selection table
+
+```markdown
+AIC 核编号：coreIdx = GetBlockIdx()，coreNum = GetBlockNum()
+AIV 核编号：subcoreIdx = GetSubBlockIdx()，subcoreNum = GetSubBlockNum()
+```
+
+AIC 和 AIV 在同一 block 内通过**跨核 flag** 交替执行，不需要 Host 侧启动多个 kernel。
+
+### 4.2 两阶段流水（2-Stage Pipeline）
+
+通算融合的核心并发机制是**双 workspace 交替**：
+
+```
+时间线：
+  Stage 0    Stage 1    Stage 0    Stage 1    ...
+  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+  │AIV 通信│ │AIC 计算│ │AIV 通信│ │AIC 计算│  ← AIC 视角
+  │ws[0]   │ │ws[0]   │ │ws[1]   │ │ws[1]   │
+  └────────┘ └────────┘ └────────┘ └────────┘
+  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+  │  idle  │ │AIV 通信│ │AIC 计算│ │AIV 通信│  ← AIV 视角
+  │        │ │ws[1]   │ │ws[1]   │ │ws[0]   │
+  └────────┘ └────────┘ └────────┘ └────────┘
+
+实际重叠：
+  AIV 通信 ws[N]  与  AIC 计算 ws[N-1]  同时进行
+```
+
+- `WORKSPACE_STAGES = 2`：两块 symmetric workspace 交替使用
+- 每轮通信填充 ws[stageId]，AIC 从 ws[1-stageId] 读取上一轮数据计算
+- `commInterval` 控制每 N 个 GEMM block 触发一轮通信，直接影响流水粒度
+
+### 4.3 跨核 Flag 同步协议
+
+AIC 和 AIV 通过两组 flag 数组交替通知对方：
+
+```
+flagAicFinishStore[stageId]    // AIC → AIV：AIC 完成当前 stage 的计算/存储
+flagAivFinishCompute[stageId]  // AIV → AIC：AIV 完成当前 stage 的通信
+
+// AIC 侧循环
+for each commIdx:
+    stageId = commIdx % WORKSPACE_STAGES
+    CrossCoreWaitFlag(flagAivFinishCompute[stageId])  // 等 AIV 通信完成
+    ... 执行 GEMM ...
+    CrossCoreSetFlag<0x2, PIPE_FIX>(flagAicFinishStore[stageId])  // 通知 AIV
+
+// AIV 侧循环
+for each commIdx:
+    stageId = commIdx % WORKSPACE_STAGES
+    CrossCoreWaitFlag(flagAicFinishStore[stageId])  // 等 AIC 计算完成
+    ... 执行 AllGather / ReduceScatter ...
+    aclshmem_barrier_all()                       // 跨 PE 同步
+    CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishCompute[stageId])  // 通知 AIC
+```
+
+**关键约束**：
+- flag 数组长度 = `WORKSPACE_STAGES`，每个 stage 独立 flag
+- 双方必须在每个 stage 各 set 一次 flag，否则死锁
+- AIV 侧通信后需先做跨 PE barrier，再 set flag 给 AIC
+
+### 4.4 典型融合模式
+
+
+
+## 5. 跨 PE 同步原语选择
+
+| 原语 | 语义 | 适用场景 |
+| --- | --- | --- |
+| `signal_op` + `signal_wait_until` | 点对点 PE 同步 | 已知对端 PE、需要精确握手（如 kv_shuffle sender↔receiver） |
+| `aclshmem_barrier_all` | 全 PE 栅栏 | 所有 PE 数据一致后同步（**新算子首选**） |
+| `AscendC::SyncAll` | 同一 PE 内多 AIV 核间同步 | 纯 Vector kernel 阶段切换（如 allgather Step 1→Step 2）；见 [SyncAll](https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md) |
+| `AscendC::PipeBarrier` | 单 AIV 内流水线同步 | 同一 core 内 MTE/Vector 等 pipe 之间的顺序与可见性 |
+| `aclshmem_quiet` | 等待本 PE 已发出的**全引擎** RMA 完成（MTE + SDMA + UDMA + RDMA） | 混合引擎或收尾阶段，需一次性 drain 所有在途传输 |
+| `aclshmemx_mte_quiet` | 等待本地 MTE 完成 | **仅** MTE put/get 后确保数据落地；勿用全局 `aclshmem_quiet` 代替 |
+| `aclshmemx_sdma_quiet` | 等待本地 SDMA 完成 | SDMA 传输后确保完成 |
+| `aclshmemx_udma_quiet` | 等待指定 PE 的 UDMA 完成 | PCIE/SIO 等 UDMA 通路 |
+| `aclshmemx_roce_quiet` | 等待指定 PE 的 RDMA/RoCE 完成 | 跨机 RDMA 通路 |
+| `CrossCoreSetFlag` / `CrossCoreWaitFlag` | AIC↔AIV 跨核同步 | 通算融合的 stage 交替 |
+
+> **选型**：单引擎场景 **SHOULD** 使用 engine-specific quiet（如 MTE 用 `aclshmemx_mte_quiet`），与 `aclshmemx_sdma_quiet` 对称；仅在多引擎混用或无法区分引擎时再调用 `aclshmem_quiet`。
+
+```
+
+## ITEM 10 — CANN cannbot-skills `optimization-patterns.md` §1.1 and §3.1/§3.2: "不需要全局 barrier" (no global barrier needed) copy-to-symmetric-heap overlap, and the recommended signal encoding `flag = chunk_count + magic` with epoch validation by `(flag >> shift) == (magic >> shift)`
+
+### item 6
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-performance-optim/references/optimization-patterns.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```markdown
+## 1. 通信优化
+
+### 1.1 Copy-to-Symmetric-Heap Overlap
+
+| 项目 | 说明 |
+| --- | --- |
+| 瓶颈 | 数据 **MUST** 先从本地 GM 拷贝到 symmetric heap，再由远端 PE 读取；拷贝时间成为串行开销 |
+| 优化 | 将 core 分为 sender 组和 receiver 组，sender 按 chunk 拷贝到 symmetric heap 并逐 chunk 发 signal，receiver 轮询 signal 并立即拉取已就绪的 chunk |
+| 来源 | `examples/allgather` — `all_gather_origin` kernel |
+
+❌ 错误做法：
+```cpp
+// 所有数据拷贝完 → 全局 barrier → 再开始通信
+copy_all_to_symmetric(input, gva_data, total_size);
+aclshmem_barrier_all();
+fetch_all_from_peers(output, gva_data, total_size);
+```
+
+✅ 正确做法：
+```cpp
+// Sender core：逐 chunk 拷贝 + 逐 chunk signal
+if (aivIndex < core_group_num) {
+    while (remaining >= chunk_size) {
+        aclshmemx_mte_put_nbi(gva_data + offset, input + offset,
+                              tmp_buff, ub_size, chunk_elems, my_rank, EVENT_ID0);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        flag = ++times + magic;
+        aclshmemx_signal_op(gva_sync + flag_offset, flag, SIGNAL_SET, my_rank);
+    }
+}
+
+// Receiver core：轮询 signal，就绪即拉取
+while (!all_done) {
+    for (int g = 0; g < core_group_num; g++) {
+        aclshmem_int32_get_nbi(flag_ub, gva_sync + g * INTERVAL, 1, peer);
+        PipeBarrier<PIPE_ALL>();
+        int64_t ready = *flag_ub - magic;
+        if (ready > fetched[g]) {
+            // 立即拉取已就绪 chunk，使用 ping-pong buffer
+            fetch_chunks(output, gva_data, fetched[g], ready, ping_pong_buf);
+        }
+    }
+}
+```
+
+关键点：
+- sender 和 receiver 的 core 数量各占一半
+- signal 使用 magic + chunk_count 编码，receiver 通过解码判断就绪程度
+- 不需要全局 barrier，数据逐 chunk 流式可用
+
+
+### 3.1 Barrier → Signal/Wait
+
+| 项目 | 说明 |
+| --- | --- |
+| 瓶颈 | 全局 barrier 使所有 PE 等最慢者 |
+| 优化 | 替换为 producer-consumer 点对点 signal/wait |
+
+❌ 错误做法：
+```cpp
+aclshmem_barrier_all();  // 每个 phase 全员等待
+```
+
+✅ 正确做法：
+```cpp
+// Producer 完成后只通知消费者
+aclshmemx_signal_op(remote_sig, magic, ACLSHMEM_SIGNAL_SET, target_pe);
+// Consumer 只等自己需要的数据就绪
+aclshmem_signal_wait_until(local_sig, ACLSHMEM_CMP_EQ, magic);
+```
+
+### 3.2 Per-Chunk Signaling
+
+| 项目 | 说明 |
+| --- | --- |
+| 瓶颈 | 整块数据传输完才 signal，消费者长时间空等 |
+| 优化 | 每个 chunk 传输完立即 signal，消费者可逐 chunk 消费 |
+
+signal 编码建议：
+- `flag = chunk_count + magic`：magic 区分轮次，chunk_count 表示已就绪数量
+- receiver 通过 `(flag >> shift) == (magic >> shift)` 验证轮次有效性
+- 每个 core 使用独立 flag offset：`flag_offset = aivIndex * SYNC_FLAG_INTERVAL`
+
+### 3.3 Phase 合并
+
+| 场景 | 合并方式 |
+```
+
+## ITEM 11 — CANN cannbot-skills `atomic-add-pattern.md`: the two atomic-add mechanisms on Ascend (remote scalar AMO via `aclshmemx_{mte,udma,roce}_atomic_add` vs local bulk mode via `AscendC::SetAtomicAdd<T>()`), per-engine dtype/platform matrix, `mte_atomic_fetch_add` availability, and the explicit routing rule "单个 signal/flag 累加 -> 标量 mte_atomic_add"
+
+### item 7
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-code-gen/references/atomic-add-pattern.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```markdown
+# AtomicAdd 累加模式参考手册
+
+> 本文总结 SHMEM Device 侧使用不同引擎（MTE / UDMA / RDMA / SDMA fallback）实现跨 PE
+> reduce 累加的正确模式和效率决策。适用于需要在多 PE 间进行 reduce 操作的通信算子。
+> 集合通信算子。
+
+---
+
+## 1. 核心概念
+
+在 SHMEM Device 侧存在**两类** atomic add 机制，必须区分清楚：
+
+| 类型 | 机制 | 操作对象 | 数据规模 |
+| --- | --- | --- | --- |
+| **标量 atomic** | 通过引擎 API（`aclshmemx_mte_atomic_add` 等）对**远端**对称地址做标量加法 | 远端 PE 的 `__gm__` 地址 | 单个元素 |
+| **批量 atomic** | `SetAtomicAdd<T>()` 切换当前 core 的 GM 写入模式，后续 MTE3 写入（如 `mte_get_nbi` 的目的端）自动变为 `D += src` | **本地** GM 地址 | tile 级别 |
+
+`SetAtomicAdd<T>()` 不是"执行一次加法"，而是**把当前 core 后续的所有 GM 写入模式切换为 atomic add**。真正发生加法的是后续的 MTE3 写入操作。
+
+| 概念 | 说明 |
+| --- | --- |
+| `SetAtomicAdd<T>()` | 切换当前 core 的 GM 写模式为 atomic add，T 为元素类型（`half`/`float`/`int32`/`bfloat16`） |
+| `SetAtomicNone()` | 恢复 GM 写为普通覆盖模式 |
+| 标量 atomic 触发者 | `aclshmemx_mte_atomic_add` / `aclshmemx_udma_atomic_add` / `aclshmemx_roce_atomic_add` |
+| 批量 atomic 触发者 | `aclshmemx_mte_get_nbi` 的目的端 GM 写入 |
+| 数学语义 | 普通写：`D = src`；atomic 模式：`D = D + src` |
+
+
+### 2.2 MTE 引擎：两条路径
+
+MTE 是机内 HCCS full-mesh 场景的主力引擎，提供标量和批量两条路径。
+
+#### 2.2.1 标量：`aclshmemx_mte_atomic_add`
+
+```
+aclshmemx_mte_atomic_add((__gm__ T*)dst, value, pe);
+```
+
+| 属性 | 说明 |
+| --- | --- |
+| 操作方向 | 本 PE 写入**远端 PE** 的 dst 地址，执行 `remote_dst += value` |
+| 数据规模 | 单个标量值 |
+| 执行单元 | 910B/910C: MTE2；Ascend950: UB + MTE3（见下方平台差异表） |
+| 同步 | 需 `SetFlag<S_MTE3>` / `WaitFlag<S_MTE3>` 隔离 Scalar→MTE3 |
+| dtype | `int8_t` / `int16_t` / `int32_t` / `float` / `half` / `bfloat16_t`；Ascend950 额外支持 `uint32_t` / `int64_t` / `uint64_t` |
+
+平台差异（来自头文件注释）：
+
+| dtype | 910B/910C | Ascend950 |
+| --- | --- | --- |
+| `int8_t` / `int16_t` / `half` / `bfloat16_t` | MTE2 atomic | UB + MTE3 atomic |
+| `int32_t` / `float` | MTE2 atomic | UB + MTE3 atomic |
+| `uint32_t` / `int64_t` / `uint64_t` | 不支持 | Scalar AtomicAdd |
+
+#### 2.2.2 批量：`SetAtomicAdd<T>()` + `mte_get_nbi`
+
+```
+AscendC::SetAtomicAdd<ElementD>();
+// 所有 mte_get_nbi 的目的端 GM 写入自动变为 D += src
+reduceScatter(gmBlockSrc, ..., gmBlockDst, ..., remoteRankIdx);
+// drain MTE3
+AscendC::SetAtomicNone();
+```
+
+| 属性 | 说明 |
+| --- | --- |
+| 操作方向 | **本地** core 对本地 `D` 做 atomic add 写入 |
+| 数据规模 | tile 级别（如 `32 × 256` 元素），可多次 get 并发 in-flight |
+| 执行单元 | MTE3（目的端写回阶段） |
+| 同步 | `PipeBarrier<PIPE_ALL>()` 隔离模式切换；`SetFlag<MTE3_S>` / `WaitFlag<MTE3_S>` drain |
+| dtype | `half` / `float` / `int32` / `bfloat16`（`SetAtomicAdd` 支持的 AscendC 类型） |
+
+#### 2.2.3 两条路径对比
+
+| | 标量 `mte_atomic_add` | 批量 `SetAtomicAdd` + get |
+| --- | --- | --- |
+| 操作对象 | 远端 PE 地址 | 本地 GM 地址（目的端） |
+| 数据粒度 | 单个元素 | tile（多元素批量） |
+| 并发模型 | 逐元素调用，各自独立完成 | 多个 get 可全部 in-flight，MTE3 管道并行累加 |
+| 典型场景 | signal 计数器、flags、单元素累加 | reduce-scatter / allreduce 的 tile 级批量累加 |
+| 吞吐 | 低（标量） | 高（批量流水） |
+
+### 2.3 UDMA 引擎
+
+```
+aclshmemx_udma_atomic_add((__gm__ T*)dst, value, pe);
+aclshmemx_udma_quiet(pe);  // 确保操作在远端完成
+```
+
+| 属性 | 说明 |
+| --- | --- |
+| 操作方向 | 写入远端 PE 地址 |
+| 数据规模 | 单个标量值 |
+| 批量能力 | **无**（UDMA 不提供类似 `SetAtomicAdd` 的批量模式） |
+| 同步 | 必须在读取结果前调用 `aclshmemx_udma_quiet(pe)` |
+| dtype | `int32_t` / `uint32_t` / `int64_t` / `uint64_t` / `float` |
+| 注意事项 | 并发 RMA/AMO 到同一 PE 不支持 |
+
+### 2.4 RDMA 引擎
+
+```
+aclshmemx_roce_atomic_add((__gm__ T*)dst, value, pe);
+```
+
+| 属性 | 说明 |
+| --- | --- |
+| 平台 | Ascend950 |
+| 操作方向 | 跨 server 写入远端 PE 地址 |
+| 数据规模 | 单个标量值 |
+| 批量能力 | **无** |
+| dtype | **仅** `int32_t` / `uint32_t` / `int64_t` / `uint64_t`（不支持浮点/half） |
+| 注意事项 | 并发 RMA/AMO 到同一 PE 不支持 |
+
+### 2.5 三引擎对标总表
+
+| 引擎 | 标量 atomic API | 批量 reduce | 支持 dtype | 链路及平台 |
+| --- | --- | --- | --- | --- |
+| **MTE** | `aclshmemx_mte_atomic_add` | `SetAtomicAdd<T>()` + `mte_get_nbi` | int8/16/32, float, half, bf16 (+ uint32/64/int64 on 950) | HCCS full-mesh / 910B-950 |
+| **UDMA** | `aclshmemx_udma_atomic_add` | — | int32/uint32/int64/uint64, float | PCIE/SIO / 910B-950 |
+| **RDMA** | `aclshmemx_roce_atomic_add` | — | int32/uint32/int64/uint64 | RoCE 跨机 / Ascend950 |
+| **SDMA** | — | — | — | HCCS/PCIE/SIO（仅 Host 侧 inline reduce）/ 910B-910C |
+
+### 2.6 SDMA 引擎（现状）
+
+SDMA **没有 device 侧 atomic add API**。代码库中不存在 `aclshmemx_sdma_atomic_add` 或等价物。
+
+因此，在 SHMEM AIV kernel 中实现跨 PE reduce 时，如果 MTE 不可用（如跨 PCIE 或跨 server），
+必须使用 §4 描述的 SDMA fallback 策略。
+
+---
+
+## 3. MTE 标量 vs 批量：如何选择
+
+| 场景 | 推荐路径 | 理由 |
+| --- | --- | --- |
+| 单个 signal/flag 累加 | `aclshmemx_mte_atomic_add`（标量） | 一条调用即完成，无需切换 pipeline 模式 |
+| tile 级批量 reduce（reduce-scatter / allreduce） | `SetAtomicAdd<T>()` + `mte_get_nbi`（批量） | 所有 peer 的 get in-flight，MTE3 管道并行 |
+| 少量元素的远端累加（< 64 元素） | 标量 `mte_atomic_add` | SetAtomicAdd 模式切换开销 > 收益 |
+| 需要读取累加前旧值（fetch_add） | 标量 `mte_atomic_fetch_add`（仅 UDMA/Ascend950） | 批量模式无 fetch 语义 |
+
+---
+
+## 4. SDMA 如何实现并发 Reduce
+```
+
+## ITEM 12 — CANN cannbot-skills: signal/wait review rules naming the "magic/epoch 策略" explicitly, and a per-chunk monotone-GE wait `aclshmem_signal_wait_until(source_signal, ACLSHMEM_CMP_GE, magic + chunk_seq)` (a flag-free streaming handshake: value only ever goes up)
+
+### item 8
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-code-review/references/code-review-checklist.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```markdown
+## 3. 同步正确性
+
+### 3.1 Signal/Wait 配对
+
+【描述】每个 `signal` 必须有对应的 `wait` 或 `test`。signal 值必须与 wait 的期望值匹配（magic/epoch 策略需一致）。
+
+【错误做法】
+```cpp
+// 发送端 signal(magic=1)，接收端 wait(magic=2)
+aclshmemx_signal_op(remote_sig, 1, SIGNAL_SET, pe);
+// ...
+aclshmem_signal_wait_until(local_sig, ACLSHMEM_CMP_EQ, 2);  // 永远等不到
+```
+
+### 3.2 Phase 边界同步
+
+【描述】相邻 phase 之间的同步方式必须与 `design.md` 的 `sync` 模块一致。设计写 signal/wait 的不能实现为 Host barrier；设计写 device barrier 的不能省略。
+
+### 3.3 Quiet/Fence 使用
+
+【描述】如果 design 要求 quiet 保证远端写入可见性，实现中不能省略。单引擎 MTE 路径用 `aclshmemx_mte_quiet`；多引擎混用或收尾用 `aclshmem_quiet`。`fence` 当前实现等价于全引擎 `quiet`。
+
+### 3.4 Internal / Deprecated API
+
+【描述】custom-ops 新算子 **禁止** 调用 `aclshmemi_*`（见 [internal-api-boundary.md](../../shmem-ops-code-gen/references/internal-api-boundary.md)）。**禁止** 新增 `aclshmemx_barrier_all_vec`（用 `aclshmem_barrier_all`）。核间同步用 `AscendC::SyncAll`，勿用 `aclshmemi_barrier_core_soft`。
+
+【错误做法】
+```cpp
+aclshmemi_barrier_core_soft();
+aclshmemx_barrier_all_vec();
+```
+
+【正确做法】
+```cpp
+```
+
+### item 9
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-performance-eval/references/device-profiling-guide.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```markdown
+以下展示通信算子典型模式（信号-搬运分离）。
+
+#### 4.3.1 信号-搬运分离模式
+
+root PE 将数据搬运到对称堆并通知 receiver，非 root PE 等待 signal 后从对称堆读取：
+
+```cpp
+const int my_pe = aclshmem_my_pe();
+
+// frame 0: root 的 copy_in —— 将 input 搬运到 symmetric buffer
+if (my_pe == root_pe) {
+    SHMEMI_PROF_START(0);
+    int64_t done = 0;
+    while (done < local_len) {
+        uint32_t copy_elems = std::min((uint32_t)(local_len - done), ub_elems);
+        aclshmemx_mte_put_nbi(gva_data + start + done, input + start + done,
+                              tmp_buf, ub_size, copy_elems, root_pe, EVENT_ID0);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        aclshmemx_signal_op(gva_sync + flag_offset, magic + chunk_seq,
+                            ACLSHMEM_SIGNAL_SET, root_pe);
+        done += copy_elems;
+    }
+    SHMEMI_PROF_END(0);
+}
+
+// frame 2: read + finalize（外层包裹）
+// frame 1: signal_wait（内层嵌套，仅包裹同步等待）
+SHMEMI_PROF_START(2);
+int64_t done = 0;
+while (done < local_len) {
+    SHMEMI_PROF_START(1);
+    aclshmem_signal_wait_until(source_signal, ACLSHMEM_CMP_GE, magic + chunk_seq);
+    SHMEMI_PROF_END(1);
+    uint32_t copy_elems = std::min((uint32_t)(local_len - done), ub_elems);
+    aclshmemx_mte_get_nbi(output + start + done, gva_data + start + done,
+                          tmp_buf, ub_size, copy_elems, root_pe, EVENT_ID0);
+    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    done += copy_elems;
+}
+SHMEMI_PROF_END(2);
+```
+```
+
+## ITEM 13 — LCCL (Ascend low-latency collective lib, `ascend-transformer-boost` / `src/kernels/lcal`) ONE-SHOT ALLREDUCE kernel, complete. Its entire inter-rank synchronisation is three lines: `sync.SetInnerFlag(magic, 1); sync.WaitRankInnerFlag(magic, 1, rank); sync.WaitRankInnerFlag(magic, 1, rankIDOfBlock);` — no host barrier, no zeroing of the flag region.
+
+### item 10
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/allreduce_one_shot.h
+Huawei Technologies Co., Ltd. (file header "Copyright (c) 2024"), mirrored in GitHub repo egretwAlker/cpl-ascend-transformer-boost; exact commit date unknown
+
+```cpp
+/*
+ * Copyright (c) 2024 Huawei Technologies Co., Ltd.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef LCCL_ALLREDUCE_ONE_SHOT_H
+#define LCCL_ALLREDUCE_ONE_SHOT_H
+
+#include "sync_collectives.h"
+#include "allreduce_quant.h"
+
+using namespace AscendC;
+template <typename T, typename U = T>
+class AllReduceOneShot : protected AllReduceQuant {
+    constexpr static T oneCast = (T) 1;
+
+public:
+    FORCE_INLINE_AICORE AllReduceOneShot(int rank, int rankSize, uint32_t extraFlag)
+        : AllReduceQuant(rank, rankSize, extraFlag) {}
+    FORCE_INLINE_AICORE void Init(KERNELS_ARGS_FUN())
+    {
+        Collectives::Init(KERNELS_ARGS_CALL());
+        DumpLcclLogInfo(LogId::INIT, static_cast<Op>(op));
+        if constexpr(!std::is_same_v<T, U>) {
+            BuildScaleOffset(scale, scaleCount, offset);
+        }
+        atomOp = op;
+        blockNum = blockNum / rankSize * rankSize;
+        if (blockIdx >= blockNum) {
+            DumpLcclLogInfo(LogId::INIT, static_cast<Op>(op));
+            return;
+        }
+
+        corePerRank = blockNum / rankSize;
+        rankIDOfBlock = blockIdx / corePerRank;
+
+        dataDMAPerCore = len / rankSize / corePerRank / scaleNum * scaleNum;
+        dataReducePerCore = len / corePerRank / scaleNum * scaleNum;
+
+        blockDataNum = dataDMAPerCore;
+        if (blockIdx == rankSize * corePerRank - 1) {
+            blockDataNum = len - blockIdx * dataDMAPerCore;
+        }
+
+        blockReduceNum = dataReducePerCore;
+        if (blockIdx % corePerRank == corePerRank - 1) {
+            blockReduceNum = len - blockIdx % corePerRank * dataReducePerCore;
+        }
+
+        __gm__ U* curRankGm = (__gm__ U*)shareAddrs[rank] + IPC_DATA_OFFSET / sizeof(U);
+        __gm__ U* peerRankGm = (__gm__ U*)shareAddrs[rankIDOfBlock] + IPC_DATA_OFFSET / sizeof(U);
+        __gm__ U* intputGm = (__gm__ U*)input;
+        __gm__ T* outputGm = (__gm__ T*)output;
+
+        srcInputGlobal.SetGlobalBuffer(intputGm + blockIdx * dataDMAPerCore);
+        dstIPCGlobal.SetGlobalBuffer(curRankGm + blockIdx * dataDMAPerCore);
+        copyOutputGlobal.SetGlobalBuffer(outputGm + blockIdx * dataDMAPerCore);
+        srcIPCGlobal.SetGlobalBuffer(peerRankGm + blockIdx % corePerRank * dataReducePerCore);
+        dstOutputGlobal.SetGlobalBuffer(outputGm + blockIdx % corePerRank * dataReducePerCore);
+        DumpLcclLogInfo(LogId::INIT, static_cast<Op>(op));
+    }
+
+    FORCE_INLINE_AICORE void Process()
+    {
+        DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+        if (blockIdx >= blockNum) {
+            DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+            return;
+        }
+        CpInputToBuffAndOutput();
+        sync.SetInnerFlag(magic, 1);
+
+        sync.WaitRankInnerFlag(magic, 1, rank);
+        sync.WaitRankInnerFlag(magic, 1, rankIDOfBlock);
+        if (rankIDOfBlock != rank) {
+            if constexpr (!std::is_same_v<T, U>) {
+                if (!isEnableScale) {
+                    Collectives::CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp);
+                } else if (!isVectorScale) {
+                    CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp, firstScale, offset);
+                } else {
+                    CpGM2GM(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp, scaleGt, scaleNum, offset);
+                }
+            } else {
+                Collectives::CpGM2GM<T, U>(dstOutputGlobal, srcIPCGlobal, blockReduceNum, atomOp);
+            }
+        }
+        DumpLcclLogInfo(LogId::PROCESS, static_cast<Op>(atomOp));
+    }
+
+    FORCE_INLINE_AICORE void CpInputToBuffAndOutput()
+    {
+        Collectives::CpGM2GM<U>(dstIPCGlobal, srcInputGlobal, blockDataNum, COPYONLY);
+        if constexpr (!std::is_same_v<T, U>) {
+            if (!isEnableScale) {
+                Collectives::CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY);
+            } else if (!isVectorScale) {
+                CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY, firstScale, offset);
+            } else {
+                CpGM2GM(copyOutputGlobal, srcInputGlobal, blockDataNum, COPYONLY, scaleGt, scaleNum, offset);
+            }
+        } else {
+            Collectives::CpGM2GM<T, U>(copyOutputGlobal, srcInputGlobal, blockDataNum, -1);
+        }
+    }
+
+protected:
+    GlobalTensor<U> srcInputGlobal;
+    GlobalTensor<U> srcIPCGlobal;
+    GlobalTensor<U> dstIPCGlobal;
+    GlobalTensor<T> dstOutputGlobal;
+    GlobalTensor<T> copyOutputGlobal;
+
+    int rankIDOfBlock;
+    int corePerRank;
+    int dataDMAPerCore;
+    int dataReducePerCore;
+    int blockDataNum;
+    int blockReduceNum;
+    int atomOp;
+    GlobalTensor<T> scaleGt;
+    int64_t scaleNum = 1;
+    T firstScale = 1;
+    T offset = 0;
+    bool isEnableScale = false;
+    bool isVectorScale = false;
+
+private:
+    FORCE_INLINE_AICORE void BuildScaleOffset(GM_ADDR scale, int64_t scaleCount, GM_ADDR offset)
+    {
+        if (scale != nullptr && offset != nullptr) {
+            this->offset =* reinterpret_cast<__gm__ T*>(offset);
+            scaleGt.SetGlobalBuffer((__gm__ T*)scale);
+            this->firstScale = scaleGt.GetValue(0);
+            this->scaleNum = scaleCount < 1 ? 1 : scaleCount;
+            isVectorScale = scaleCount > 1;
+            isEnableScale = scaleCount > 0 && !(*(uint16_t *)(&(this->offset)) == 0 &&
+                scaleCount == 1 && *(uint16_t *)(&firstScale) == *(uint16_t *)(&oneCast));
+        }
+    }
+};
+
+#endif // LCCL_ALLREDUCE_ONE_SHOT_H```
+
+## ITEM 14 — LCCL `op_def.h` `SET_MAGIC` macro: the DEVICE-SIDE epoch generator. Core 0 does an atomic-add of 1 into `commArgs->magics[rankSize - 1]` via `SetAtomicOpType<int32_t>(Op::ADD)` + `DataCopyPad`, then every core reads it back after `SyncAll<true>()`. `GET_IPC_MEM_ARGS` then uses `(magic % PING_PONG_SIZE)` to pick which half of the IPC window this generation writes into. This is the exact flag-free / epoch-tagged mechanism with no host-side barrier.
+
+### item 11
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/op_def.h
+Huawei / ascend-transformer-boost LCCL, date unknown (mirror)
+
+```cpp
+/*
+ * Copyright (c) 2024 Huawei Technologies Co., Ltd.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+#ifndef LCCL_OP_DEF_H
+#define LCCL_OP_DEF_H
+#define GET_COMM_ARGS \
+    GlobalTensor<int> commArgsGm; \
+    commArgsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int *>(commArgs), 5); \
+    int rank = commArgsGm.GetValue(0); \
+    int localRank = commArgsGm.GetValue(1); \
+    int rankSize = commArgsGm.GetValue(2); \
+    int localRankSize = commArgsGm.GetValue(3); \
+    uint32_t extraFlag = commArgsGm.GetValue(4); \
+    GM_ADDR dumpAddr = (reinterpret_cast<__gm__ CommArgs *>(commArgs))->dumpAddr; \
+    int32_t lcalBlockNum = GetBlockNum()
+
+#ifdef ENABLE_LCCL_MIX
+#define SET_MAGIC \
+do { \
+    __gm__ CommArgs * commArgsTmp = reinterpret_cast<__gm__ CommArgs *>(commArgs); \
+    PipeBarrier<PIPE_ALL>(); \
+    SetAtomicNone(); \
+    SetMaskNormImpl(); \
+    SetSyncBaseAddr(commArgsTmp->fftsVal); \
+    SetVectorMask<int32_t>((uint64_t)-1, (uint64_t)-1); \
+    PipeBarrier<PIPE_ALL>(); \
+    LocalTensor<int32_t> localSet; \
+    localSet.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN); \
+    localSet.address_.bufferAddr = reinterpret_cast<uint64_t>((__ubuf__ int32_t *)96); \
+    GlobalTensor<int32_t> magicGt; \
+    magicGt.SetGlobalBuffer((__gm__ int32_t *)commArgsTmp->magics); \
+    if (GetBlockIdx() == 0) { \
+        SetAtomicOpType<int32_t>(Op::ADD); \
+        localSet.SetValue(0, 1); \
+        AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0); \
+        AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0); \
+        DataCopyExtParams dataCopyParams(1, sizeof(int32_t), 0, 0, 0); \
+        DataCopyPad(magicGt[rankSize - 1], localSet, dataCopyParams); \
+        AscendC::SetAtomicNone(); \
+        PipeBarrier<PIPE_ALL>(); \
+    } \
+    SyncAll<true>(); \
+    DataCopyExtParams dataCopyParams(1, sizeof(int32_t), 0, 0, 0); \
+    DataCopyPadExtParams<int32_t> padParams; \
+    DataCopyPad(localSet, magicGt[rankSize - 1], dataCopyParams, padParams); \
+    AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0); \
+    AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0); \
+    magic = static_cast<int64_t>(localSet.GetValue(0)); \
+    PipeBarrier<PIPE_ALL>(); \
+    constexpr int32_t aivNumPerAic = 2; \
+    lcalBlockNum = GetBlockNum() * aivNumPerAic; \
+} while (0)
+#else
+#define SET_MAGIC \
+do {} while (0)
+#endif
+
+#define GET_IPC_MEM_ARGS(type) \
+do { \
+    SET_MAGIC; \
+    GlobalTensor<GM_ADDR> peerMemsAddrGm; \
+    peerMemsAddrGm.SetGlobalBuffer(&(reinterpret_cast<__gm__ CommArgs *>(commArgs))->peerMems[0], \
+                       LCAL_MAX_RANK_SIZE); \
+    for (int i = 0; i < rankSize; ++i) { \
+        shareAddrs[i] = (__gm__ type *) (peerMemsAddrGm.GetValue(i) + \
+                        (magic % PING_PONG_SIZE) * (IPC_BUFF_MAX_SIZE + IPC_DATA_OFFSET)); \
+    } \
+    AscendC::PipeBarrier<PIPE_ALL>(); \
+} while (0) \
+
+#define CLASS_OP_LAUNCH(name, type) \
+do { \
+    name<type> opKernel(rank, rankSize, extraFlag); \
+    opKernel.Init(KERNELS_ARGS_CALL()); \
+    opKernel.Process();                 \
+} while (0)
+
+#define CLASS_OP_QUANT_910A5_LAUNCH(name, outputType, addType, inputType) \
+do { \
+    name<outputType, addType, inputType> opKernel(rank, rankSize, extraFlag); \
+    opKernel.Init(KERNELS_ARGS_CALL()); \
+    opKernel.Process();                 \
+} while (0)
+
+```
+
+## ITEM 15 — LCCL `SyncCollectives` (the ATB/LCCL original of which vllm-ascend's is a fork): `MAGIC_OFFSET = 32`, `MAGIC_MASK`, `MergeMagicWithValue`, and the stale-rejection predicate in `WaitOneRankPartFlag`: `if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue)` — i.e. the epoch must match exactly AND the in-epoch value must have reached the target. Includes the `breakCycle` bounded-spin variant absent from the vllm-ascend fork.
+
+### item 12
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/sync_collectives.h
+Huawei / ascend-transformer-boost LCCL, date unknown (mirror)
+
+```cpp
+/*
+ * Copyright (c) 2024 Huawei Technologies Co., Ltd.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef LCCL_SYNC_H
+#define LCCL_SYNC_H
+
+#include "comm_args.h"
+
+using namespace AscendC;
+using namespace Lcal;
+
+constexpr int64_t FLAG_UNIT_INT_NUM = 4;
+constexpr int64_t SYNC_UNIT_SIZE = FLAG_UNIT_INT_NUM * sizeof(int64_t);
+constexpr int64_t MAGIC_OFFSET = 32;
+constexpr int64_t MAGIC_MASK = ~((1LL << MAGIC_OFFSET) - 1);
+#ifdef ENABLE_LCCL_MIX
+constexpr int32_t LCAL_BLOCK_NUM_MULTI = 2;
+#else
+constexpr int32_t LCAL_BLOCK_NUM_MULTI = 1;
+#endif
+
+class SyncCollectives {
+public:
+    __aicore__ inline SyncCollectives() {}
+
+    __aicore__ inline void Init(int rank, int rankSize, GM_ADDR *shareAddrs)
+    {
+        this->rank = rank;
+        this->rankSize = rankSize;
+        this->shareAddrs = shareAddrs;
+        this->blockIdx = GetBlockIdx();
+        this->blockNum = GetBlockNum() * LCAL_BLOCK_NUM_MULTI;
+        segmentCount = GetBlockNum() * LCAL_BLOCK_NUM_MULTI * FLAG_UNIT_INT_NUM;
+        localSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]);
+        basicSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        blockOuterSyncAddr = (__gm__ int64_t*)(shareAddrs[rank]) + segmentCount + GetBlockIdx() * FLAG_UNIT_INT_NUM;
+        TPipe pipe;
+        pipe.InitBuffer(tBuf, GetBlockNum() * SYNC_UNIT_SIZE);
+    }
+
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag(localSyncAddr + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    __aicore__ inline void SetSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        SetFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, v);
+    }
+
+    __aicore__ inline int32_t CalEventIdByMulBlockNum(int32_t blockMultiplier, int32_t targetCoreId)
+    {
+        return (blockMultiplier * blockNum) + targetCoreId;
+    }
+
+    __aicore__ inline void WaitSyncFlag(int32_t magic, int32_t value, int32_t eventID, int32_t rank,
+        int32_t breakCycle = 0)
+    {
+        int64_t v = MergeMagicWithValue(magic, value);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[rank]) + eventID * FLAG_UNIT_INT_NUM, 1, v, breakCycle);
+    }
+
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(basicSyncAddr, value);
+    }
+    __aicore__ inline void SetInnerFlag(int32_t magic, int32_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag((__gm__ int64_t*)(shareAddrs[setRank]) + setBlock * FLAG_UNIT_INT_NUM, value);
+    }
+
+    __aicore__ inline void WaitInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankPartFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM, 1, value);
+    }
+
+    __aicore__ inline void WaitRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        WaitOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+
+    __aicore__ inline bool CheckRankInnerFlag(int32_t magic, int32_t eventID, int64_t waitRank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        return CheckOneRankAllFlag((__gm__ int64_t*)(shareAddrs[waitRank]), value);
+    }
+
+    __aicore__ inline void SetOuterFlag(int32_t magic, int32_t eventID)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(blockOuterSyncAddr, value);
+    }
+
+    __aicore__ inline void SetOuterFlag(int32_t magic, int32_t eventID, int64_t setRank, int64_t setBlock)
+    {
+        __gm__ int64_t *flagAddr = GetOuterFlagAddr(setRank, setBlock);
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        SetFlag(flagAddr, value);
+    }
+
+    __aicore__ inline void WaitOuterFlag(int32_t magic, int32_t eventID, int64_t waitRank, int64_t waitBlock)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t *flagAddr = GetOuterFlagAddr(waitRank, waitBlock);
+        WaitOneRankPartFlag(flagAddr, 1, value);
+    }
+
+    __aicore__ inline void WaitOneRankOuterFlag(int32_t magic, int32_t eventID, int64_t rank)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t *flagAddr;
+        flagAddr = GetOuterFlagAddr(rank, 0);
+        WaitOneRankPartFlag(flagAddr, blockNum, value);
+    }
+    __aicore__ inline void WaitAllRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t startBlock, int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t *flagAddr;
+        int waitRank;
+        for (auto r = 0; r < rankSize; ++r) {
+            waitRank = (rank + r) % rankSize;
+            flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+            WaitOneRankPartFlag(flagAddr, flagNum, value);
+        }
+    }
+
+    __aicore__ inline bool CheckAllRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t startBlock,
+        int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t *flagAddr;
+        int waitRank;
+        for (auto r = 0; r < rankSize; ++r) {
+            waitRank = (rank + r) % rankSize;
+            flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+            if (!CheckOneRankPartFlag(flagAddr, flagNum, value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    __aicore__ inline void WaitAllRankOuterFlag(int32_t magic, int32_t eventID)
+    {
+        WaitAllRankPartOuterFlag(magic, eventID, 0, blockNum);
+    }
+
+    __aicore__ inline bool CheckAllRankOuterFlag(int32_t magic, int32_t eventID)
+    {
+        return CheckAllRankPartOuterFlag(magic, eventID, 0, blockNum);
+    }
+
+    __aicore__ inline void SetFlag(__gm__ int64_t* setAddr, int64_t setValue)
+    {
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        GlobalTensor<int64_t> globalSet;
+        globalSet.SetGlobalBuffer(setAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localSet = tBuf.GetWithOffset<int64_t>(1, 0);
+        localSet.SetValue(0, setValue);
+        AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopy(globalSet, localSet, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+
+        tBuf.FreeTensor(localSet);
+    }
+
+    __aicore__ inline void WaitFlag(__gm__ int64_t* waitAddr, int64_t waitValue)
+    {
+        WaitOneRankPartFlag(waitAddr, 1, waitValue);
+    }
+
+    __aicore__ inline int64_t GetFlag(__gm__ int64_t* waitAddr)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(1, 0);
+        DataCopy(localWait, globalWait, FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        int64_t res = localWait.GetValue(0);
+        tBuf.FreeTensor(localWait);
+        return res;
+    }
+
+    __aicore__ inline void WaitOneRankPartOuterFlag(int32_t magic, int32_t eventID, int64_t waitRank,
+                                                    int64_t startBlock, int64_t flagNum)
+    {
+        int64_t value = MergeMagicWithValue(magic, eventID);
+        __gm__ int64_t *flagAddr;
+        flagAddr = GetOuterFlagAddr(waitRank, startBlock);
+        WaitOneRankPartFlag(flagAddr, flagNum, value);
+    }
+
+    __aicore__ inline int64_t GetInnerFlag(int64_t waitRank, int64_t waitBlock)
+    {
+        return GetFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + waitBlock * FLAG_UNIT_INT_NUM);
+    }
+
+    __aicore__ inline int64_t GetOuterFlag(int64_t waitRank, int64_t waitBlock)
+    {
+        return GetFlag((__gm__ int64_t*)(shareAddrs[waitRank]) + segmentCount + waitBlock * FLAG_UNIT_INT_NUM);
+    }
+
+private:
+    __aicore__ inline int64_t MergeMagicWithValue(int32_t magic, int32_t value)
+    {
+        return (static_cast<int64_t>(magic) << MAGIC_OFFSET) | static_cast<int64_t>(value);
+    }
+
+    __aicore__ inline __gm__ int64_t* GetInnerFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+
+    __aicore__ inline __gm__ int64_t* GetOuterFlagAddr(int64_t flagRank, int64_t flagBlock)
+    {
+        return (__gm__ int64_t*)(shareAddrs[flagRank]) + segmentCount + flagBlock * FLAG_UNIT_INT_NUM;
+    }
+
+    __aicore__ inline void WaitOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue,
+        int32_t breakCycle = 0)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+        do {
+            if (breakCycle > 0) {
+                int64_t systemCycleBefore = AscendC::GetSystemCycle();
+                int64_t systemCycleAfter = AscendC::GetSystemCycle();
+                while (systemCycleAfter - systemCycleBefore < breakCycle) {
+                    systemCycleAfter = AscendC::GetSystemCycle();
+                };
+            }
+            DataCopy(localWait, globalWait, flagNum * FLAG_UNIT_INT_NUM);
+            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            isSync = true;
+            for (auto i = 0; i < flagNum; ++i) {
+                int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                    isSync = false;
+                    break;
+                }
+            }
+        } while (!isSync);
+        tBuf.FreeTensor(localWait);
+    }
+
+    __aicore__ inline void WaitOneRankAllFlag(__gm__ int64_t* waitAddr, int64_t checkValue)
+    {
+        WaitOneRankPartFlag(waitAddr, blockNum, checkValue);
+    }
+
+    __aicore__ inline bool CheckOneRankPartFlag(__gm__ int64_t* waitAddr, int64_t flagNum, int64_t checkValue)
+    {
+        GlobalTensor<int64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<int64_t> localWait = tBuf.GetWithOffset<int64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        DataCopy(localWait, globalWait, flagNum * FLAG_UNIT_INT_NUM);
+        AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        bool isSync = true;
+        for (auto i = 0; i < flagNum; ++i) {
+            int64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+            if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                isSync = false;
+                break;
+            }
+        }
+        tBuf.FreeTensor(localWait);
+        return isSync;
+    }
+
+    __aicore__ inline bool CheckOneRankAllFlag(__gm__ int64_t* waitAddr, int64_t checkValue)
+    {
+        return CheckOneRankPartFlag(waitAddr, blockNum, checkValue);
+    }
+
+    int rank;
+    int rankSize;
+    int blockIdx;
+    int blockNum;
+    GM_ADDR *shareAddrs;
+    int64_t segmentCount;
+    __gm__ int64_t* localSyncAddr;
+    __gm__ int64_t* basicSyncAddr;
+    __gm__ int64_t* blockOuterSyncAddr;
+    TBuf<QuePosition::VECCALC> tBuf;
+};
+
+#endif // LCCL_SYNC _H```
+
+## ITEM 16 — LCCL host side: `magic` is simply a per-communicator counter `int64_t magic_ = 1;` post-incremented on EVERY collective call and passed as a kernel scalar argument (`KERNELS_ARGS_FUN()` declares `int64_t magic`). `CommArgs` carries `int32_t magics[LCAL_MAX_RANK_SIZE]` in device memory for the mix-mode device-side variant. `Collectives::Init` offsets every peer window by `(magic % PING_PONG_SIZE) * (IPC_BUFF_MAX_SIZE + IPC_DATA_OFFSET)`.
+
+### item 13
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/lccl.cpp
+Huawei / ascend-transformer-boost LCCL, date unknown (mirror)
+
+```cpp
+    if ((comm_->commArgs_.extraFlag & ExtraFlag::QUANT_FP16) != 0 &&
+        (comm_->commArgs_.extraFlag & (ExtraFlag::QUANT_DELAY | ExtraFlag::QUANT_CURRENT)) == 0) {
+        uint32_t blockDim = GetBlockNum(LcalType::ALL_REDUCE, rankSize_, Count2Size(count, dataType),
+                                        comm_->localRankSize_, comm_->commArgs_.extraFlag);
+        AscendCCLKernelArgs ascendArgs = {sendBuff, recvBuff, comm_->commArgsPtr_, count, comm_->magic_, op, 0, 0,
+            scale, scaleCount, offset};
+        comm_->magic_++;
+        return LoadMTE(LcalType::ALL_REDUCE, ascendArgs, blockDim, dataType, stream);
+    }
+
+    if (rankSize_ <= 1) {
+        return LoopBack(sendBuff, recvBuff, count, dataType, stream);
+    }
+
+    if ((comm_->commArgs_.extraFlag & (ExtraFlag::QUANT_DELAY | ExtraFlag::QUANT_CURRENT)) != 0) {
+        uint32_t blockDim = GetBlockNum(LcalType::ALL_REDUCE, rankSize_, Count2Size(count, dataType),
+                                        comm_->localRankSize_, comm_->commArgs_.extraFlag);
+        AscendCCLKernelArgs args = { sendBuff, recvBuff, comm_->commArgsPtr_, count, comm_->magic_, op, 0, 0, scale,
+            scaleCount};
+        comm_->magic_++;
+        return LoadMTE(LcalType::ALL_REDUCE, args, blockDim, dataType, stream);
+    }
+
+    uint32_t blockDim = GetBlockNum(LcalType::ALL_REDUCE, rankSize_, Count2Size(count, dataType),
+                                    comm_->localRankSize_, comm_->commArgs_.extraFlag);
+    AscendCCLKernelArgs args = {sendBuff, recvBuff, comm_->commArgsPtr_, count, comm_->magic_, op, 0};
+    comm_->magic_++;
+    return LoadMTE(LcalType::ALL_REDUCE, args, blockDim, dataType, stream);
+}
+```
+
+### item 14
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/collectives.h
+Huawei / ascend-transformer-boost LCCL — kernel arg list + `Init` ping-pong window selection + dfx recording of magic
+
+```cpp
+using namespace Lcal;
+
+#define KERNELS_ARGS_FUN() \
+GM_ADDR input, GM_ADDR output, GM_ADDR commArgs, int64_t len, int64_t magic, int op, int root, int cycleCount, \
+GM_ADDR scale, int64_t scaleCount, GM_ADDR offset
+
+#define KERNELS_ARGS_CALL() \
+input, output, commArgs, len, magic, op, root, cycleCount, scale, scaleCount, offset
+
+#define KERNELS_GATHER_TABLE_ARGS_FUN() \
+GM_ADDR embTable, GM_ADDR lookup, GM_ADDR revData, int64_t lookupLen, int64_t embTableLen, int64_t embTableDim
+
+#define KERNELS_GATHER_TABLE_ARGS_CALL() \
+embTable, lookup, revData, lookupLen, embTableLen, embTableDim
+
+enum DfxPos : int {
+    MAGIC,
+    LEN,
+    RUN_STATUS
+};
+
+class Collectives {
+    constexpr static int32_t UB_HEAD_OFFSET = 96;
+    constexpr static int32_t UB_MID_OFFSET = UB_HEAD_OFFSET + UB_SINGLE_PING_PONG_ADD_SIZE_MAX + ALIGN_SIZE;
+public:
+    FORCE_INLINE_AICORE Collectives(int rank, int rankSize, uint32_t extraFlag) : rank(rank), rankSize(rankSize),
+        extraFlag(extraFlag) {}
+
+    FORCE_INLINE_AICORE ~Collectives()
+    {
+        const int64_t notRunning = 0xdead;
+        dfx.SetValue(RUN_STATUS, notRunning);
+    }
+
+    FORCE_INLINE_AICORE void Init(KERNELS_ARGS_FUN())
+    {
+        dumpAddr_ = (reinterpret_cast<__gm__ CommArgs *>(commArgs))->dumpAddr;
+        GlobalTensor<GM_ADDR> peerMemsAddrGm;
+        peerMemsAddrGm.SetGlobalBuffer(&(reinterpret_cast<__gm__ CommArgs *>(commArgs))->peerMems[0],
+                                        LCAL_MAX_RANK_SIZE);
+        for (int i = 0; i < rankSize; ++i) {
+            shareAddrs[i] = peerMemsAddrGm.GetValue(i) +
+                            (magic % PING_PONG_SIZE) * (IPC_BUFF_MAX_SIZE + IPC_DATA_OFFSET);
+        }
+        dfx.SetGlobalBuffer((reinterpret_cast<__gm__ CommArgs *>(commArgs))->dfx,
+            DFX_COUNT);
+        this->root = root;
+        this->len = len;
+        this->magic = magic;
+        this->localRank = reinterpret_cast<__gm__ CommArgs *>(commArgs)->localRank;
+        this->localRankSize = reinterpret_cast<__gm__ CommArgs *>(commArgs)->localRankSize;
+        this->xRankSize = localRankSize;
+        this->yRankSize = rankSize / localRankSize;
+        this->xRankIdx = rank % localRankSize;
+        this->yRankIdx = rank / localRankSize;
+
+        blockIdx = GetBlockIdx();
+        blockNum = GetBlockNum() * LCAL_BLOCK_NUM_MULTI;
+
+        sync.Init(rank, rankSize, shareAddrs);
+        dfx.SetValue(MAGIC, magic);
+        dfx.SetValue(LEN, len);
+        const int64_t running = 0xbeef;
+        dfx.SetValue(RUN_STATUS, running);
+    }
+
+    template <typename T>
+```
+
+### item 15
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/include/comm_args.h
+Huawei / ascend-transformer-boost LCCL — `CommArgs` with the device-resident `magics[]` array (Chinese comments verbatim)
+
+```cpp
+/*
+ * Copyright (c) 2024 Huawei Technologies Co., Ltd.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+#ifndef LCCL_COMM_ARGS_H
+#define LCCL_COMM_ARGS_H
+#include <cstdint>
+
+#if !defined(__DAV_C220_VEC__) && !defined(__DAV_C310__) && !defined(__DAV_C220_CUBE__)
+using GM_ADDR = uint8_t*;
+#else
+#define FORCE_INLINE_AICORE __attribute__((always_inline)) inline __aicore__
+#include "kernel_operator.h"
+#endif
+namespace Lcal {
+
+constexpr int LCAL_MAX_RANK_SIZE = 128; // lcal通信库最大支持的npu卡数
+constexpr int RANK_SIZE_TWO = 2;  // 可用SIO的规模，以及是否需要跨卡搬运数据核的分界规模
+constexpr int64_t IPC_BUFF_MAX_SIZE = 100 * 1024 * 1024;
+constexpr int64_t IPC_DATA_OFFSET = 2 * 1024 * 1024; // 前2MB作为flag标志位，之后100MB作为数据存储
+constexpr int64_t SYNC_FLAG_BIT_NUM = 10;  // cce 算子在用
+constexpr int64_t MEM_DMA_UNIT_INT_NUM = 4;
+constexpr int64_t EVENT_ID_MASK = 0xFFFFFFFF;
+constexpr int64_t PING_PONG_SIZE = 2;
+constexpr int64_t UB_SINGLE_DMA_SIZE_MAX = 190 * 1024;
+
+struct CommArgs {
+    int rank = 0;           // attr rank_id, global rank
+    int localRank = -1;
+    int rankSize = 0; // global rank size
+    int localRankSize = -1;  // 此参数是指fullmesh互联的卡数
+    uint32_t extraFlag = 0; // 32 bit map，具体每一位的含义就在此文件正上方
+    GM_ADDR peerMems[LCAL_MAX_RANK_SIZE] = {}; // 传入初始化获得的buff，所有allreduce都是同一个参数
+    /**
+     * @param sendCountMatrix 大小是rankSize*rankSize的一维数组
+     * eg: sendCountMatrix[1] 的数值，对应二维数组的[0][1]，表示 卡0 要给 卡1 发送的数据个数
+     */
+    int64_t sendCountMatrix[LCAL_MAX_RANK_SIZE * LCAL_MAX_RANK_SIZE] = {}; // for all2allv
+    int64_t dfx[DFX_COUNT] = {};
+    GM_ADDR dumpAddr = nullptr;
+    int32_t magics[LCAL_MAX_RANK_SIZE] = {0};
+    uint64_t fftsVal = 0;
+};
+
+struct LcclDumpBlockInfo {
+    uint32_t len = 0;
+```
+
+## ITEM 17 — sgl-kernel-npu `CamMoeCombineNormal`: a 1-bit TOGGLE epoch stored in the symmetric window itself. `InitMagic()` reads the per-core magic slot, writes back its complement, and the magic then selects which half of the window this invocation uses (`winDataSizeOffset_ = magic_ * ((totalWinSize_ - 4*STATE_SIZE) / 2)`). Note also the orthogonal "status is a float 1.0 (0x3F800000) summed to a target then zeroed" flag protocol in `SetStatusBySrcInfo` / `WaitBuffCopy` — that one DOES reset, in contrast to the magic.
+
+### item 16
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops2/op_kernel/cam_moe_combine_normal.h
+sgl-project/sgl-kernel-npu, repo main branch as of 2026-10-20
+
+```cpp
+constexpr uint32_t TOKEN_IDX_OFFSET_IN_SRC_INFO = 1U;
+constexpr uint32_t TOPK_IDX_OFFSET_IN_SRC_INFO = 2U;
+constexpr uint64_t COMBINE_STATE_WIN_OFFSET = 8UL * 1024UL * 1024UL;
+constexpr uint64_t MAGIC_WIN_OFFSET = 975UL * 1024UL;
+constexpr uint32_t TOKEN_SRC_INFO_LEN = 3U;
+constexpr uint32_t UB_32_ALIGN = 32U;
+constexpr uint32_t MUL_256_ALIGN = 256U;
+
+// ---- InitMagic (lines 136-147): read-complement-writeback toggle epoch ----
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeCombineNormal<TemplateMC2TypeFunc>::InitMagic()
+{
+    GlobalTensor<int32_t> selfMagicTensor;
+    selfMagicTensor.SetGlobalBuffer((__gm__ int32_t *)(hccl_.GetWindowsInAddr(epRankId_) + totalWinSize_ -
+                                                       Moe::STATE_SIZE + MAGIC_WIN_OFFSET + coreIdx_ * WIN_512_ALIGN));
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfMagicTensor);
+    magic_ = selfMagicTensor(0);
+    selfMagicTensor(0) = ((magic_ == 0) ? 1 : 0);
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfMagicTensor);
+}
+
+
+// ---- Init (lines 210-218): magic picks the window half ----
+    InitGlobalBuffer(recvX, tokenSrcInfo, epRecvCount, topkWeights, tokenIdx, XOut, sendCostStatsOut);
+    InitBuffLen();
+
+    PipeBarrier<PIPE_ALL>();
+    winDataSizeOffset_ = static_cast<uint64_t>(magic_) * ((totalWinSize_ - 4 * Moe::STATE_SIZE) / 2UL);
+    localRankGM_ = GetBufferAddrByRankId(epRankId_);
+    DataCacheCleanAndInvalid<SrcInfoType, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+        epRecvCountGM_[moeExpertNum_ - 1]);
+    selfSendCnt_ = epRecvCountGM_(moeExpertNum_ - 1);
+
+// ---- status-sum flag protocol (lines 236-238, 304-352) ----
+    LocalTensor<uint32_t> statusTensor = stateBuf_.Get<uint32_t>();
+    Duplicate<uint32_t>(statusTensor, 0x3F800000, FLOAT_NUM_PER_ALIGN);
+
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeCombineNormal<TemplateMC2TypeFunc>::SetStatusBySrcInfo(uint32_t srcRankId,
+                                                                                    uint32_t srcTokenId,
+                                                                                    uint32_t srcTopkId)
+{
+    LocalTensor<uint32_t> statusTensor = stateBuf_.Get<uint32_t>();
+    GM_ADDR stateGM = GetStateAddrByRankId(srcRankId) + (srcTokenId * axisK_ + srcTopkId) * UB_32_ALIGN;
+    GlobalTensor<uint32_t> stateGMTensor;
+    stateGMTensor.SetGlobalBuffer((__gm__ uint32_t *)stateGM);
+    DataCopy<uint32_t>(stateGMTensor, statusTensor, FLOAT_NUM_PER_ALIGN);
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeCombineNormal<TemplateMC2TypeFunc>::WaitBuffCopy(uint32_t tokenIndex,
+                                                                              uint32_t startTokenIndex)
+{
+    LocalTensor<int32_t> tokenIdxLocal = tokenIdxBuf_.Get<int32_t>();
+    int tempValidCount = 0;
+    for (int topkId = 0; topkId < axisK_; ++topkId) {
+        int expertId = tokenIdxLocal.GetValue((tokenIndex - startTokenIndex) * axisK_ + topkId);
+        if (expertId < 0 || expertId >= moeExpertNum_) {
+            continue;
+        }
+        ++tempValidCount;
+    }
+    uint32_t calCount = axisK_ * FLOAT_NUM_PER_ALIGN;
+    GM_ADDR stateGM = GetStateAddrByRankId(epRankId_) + tokenIndex * axisK_ * UB_32_ALIGN;  // 计算地址偏移
+    GlobalTensor<float> stateGMTensor;
+    stateGMTensor.SetGlobalBuffer((__gm__ float *)stateGM);
+    float current = (float)0.0;
+    float target = (float)1.0 * tempValidCount * FLOAT_NUM_PER_ALIGN;
+    SumParams sumPerKParams{1, calCount, calCount};
+    LocalTensor<float> stateTensorLocal = stateBuf_.Get<float>();
+    LocalTensor<float> tempStateTensorLocal = tempStateBuf_.Get<float>();
+    while (current != target) {
+        SyncFunc<AscendC::HardEvent::S_MTE2>();
+        DataCopy<float>(stateTensorLocal, stateGMTensor, calCount);
+        SyncFunc<AscendC::HardEvent::MTE2_V>();
+        Sum(tempStateTensorLocal, stateTensorLocal, sumPerKParams);
+        SyncFunc<AscendC::HardEvent::V_S>();
+        current = tempStateTensorLocal(0);
+    }
+    SyncFunc<AscendC::HardEvent::S_V>();
+    Duplicate<float>(tempStateTensorLocal, (float)0.0, calCount);
+    SyncFunc<AscendC::HardEvent::V_MTE3>();
+    DataCopy<float>(stateGMTensor, tempStateTensorLocal, calCount);
+}
+
+template <TemplateMC2TypeClass>
+```
+
+## ITEM 18 — LCCL legacy `.cce` collectives: the bare `SetFlag` / `CheckFlag` / `CheckFlagNew` / `SyncWithinNPU` primitives where the flag value IS the magic itself (no merge, no mask). `CheckFlagNew` accepts `checkValue || checkValue + 1` — the same "peer already advanced one epoch" tolerance as shmem's `aclshmemi_signal_wait_until_eq_for_barrier`. Also note `MODIFIABLE_MAGIC_*_ARGS_CALL` macros that re-parameterise the magic for chunked multi-round launches.
+
+### item 17
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/kernels/collectives.cce
+Huawei / ascend-transformer-boost LCCL, file header "Copyright (c) 2024 Huawei Technologies Co., Ltd."; mirror commit date unknown
+
+```cpp
+
+#define ALLREDUCE_ARGS_FUN(T) \
+__gm__ T *input, __gm__ T *output, int rank, int rankSize, int64_t len, int64_t magic, int op, int root, \
+int localRankSize, int64_t loopTime, __gm__ int64_t *sendCountMatrix, GM_ADDR dumpAddr,      \
+__gm__ T *buff0, __gm__ T *buff1, __gm__ T *buff2, __gm__ T *buff3, __gm__ T *buff4,\
+__gm__ T *buff5, __gm__ T *buff6, __gm__ T *buff7
+
+#define ALLREDUCE_ARGS_CALL(type) \
+(__gm__ type *)input,  (__gm__ type *) output, rank, rankSize, len, \
+magic, op, root, localRankSize, 0, nullptr, dumpAddr, shareAddrs[0], shareAddrs[1], shareAddrs[2], \
+shareAddrs[3], shareAddrs[4], shareAddrs[5], shareAddrs[6], shareAddrs[7]
+
+#define ALLREDUCE_ARGS_FUN_16P(T) \
+__gm__ T *input, __gm__ T *output, int rank, int rankSize, int64_t len, int64_t magic, int op, int root, \
+int localRankSize, int64_t loopTime, __gm__ int64_t *sendCountMatrix, GM_ADDR dumpAddr,          \
+__gm__ T *buff0, __gm__ T *buff1, __gm__ T *buff2, __gm__ T *buff3, __gm__ T *buff4,            \
+__gm__ T *buff5, __gm__ T *buff6, __gm__ T *buff7, __gm__ T *buff8, __gm__ T *buff9,            \
+__gm__ T *buff10, __gm__ T *buff11, __gm__ T *buff12, __gm__ T *buff13, __gm__ T *buff14, __gm__ T *buff15
+
+#define ALLREDUCE_ARGS_CALL_16P(type) \
+(__gm__ type *)input,  (__gm__ type *) output, rank, rankSize, len, \
+magic, op, root, localRankSize, 0, nullptr, dumpAddr, shareAddrs[0], shareAddrs[1], shareAddrs[2], \
+shareAddrs[3], shareAddrs[4], shareAddrs[5], shareAddrs[6], shareAddrs[7], shareAddrs[8], shareAddrs[9], \
+shareAddrs[10], shareAddrs[11], shareAddrs[12], shareAddrs[13], shareAddrs[14], shareAddrs[15] \
+
+#define ALLREDUCE_ARGS_FUN_16P_Origin(T) \
+__gm__ T *input, __gm__ T *output, int rank, int rankSize, int64_t len, int64_t magic, int op, int root, \
+int localRankSize, __gm__ int64_t *sendCountMatrix, GM_ADDR dumpAddr, __gm__ T* buff[MAX_RANK_NUM_OF_ONE_910B2C]
+
+#define ALLREDUCE_ARGS_CALL_16P_Origin() \
+input, output, rank, rankSize, len, magic, op, root, localRankSize, sendCountMatrix, dumpAddr, buff
+
+#define MODIFIABLE_MAGIC_PROCESSED_NUM_ALLREDUCE_ARGS_CALL_16P_Origin(processedNum, remainNum, magic) \
+(input + (processedNum)), (output + (processedNum)), rank, rankSize, (remainNum), (magic), op, root, \
+localRankSize, sendCountMatrix, dumpAddr, buff
+
+#define MODIFIABLE_MAGIC_ALLREDUCE_ARGS_CALL_16P(magic) \
+input, output, rank, rankSize, len, (magic), op, root, localRankSize, sendCountMatrix, dumpAddr, \
+buff0, buff1, buff2, buff3, buff4, buff5, buff6, buff7, buff8, buff9, buff10, buff11, \
+buff12, buff13, buff14, buff15
+
+__attribute__((always_inline)) inline __aicore__ int64_t CeilDiv(int64_t source, int64_t cardinality)
+{
+
+// ---- flag primitives (lines 137-236) ----
+
+__attribute__((always_inline)) inline __aicore__ void SetFlag(__ubuf__ int64_t *ctrlFlagsUB, __gm__ int64_t *ctrlFlagGM,
+    int64_t checkValue)
+{
+    AscendC::PipeBarrier<PIPE_ALL>();
+    *ctrlFlagsUB = checkValue;
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID1); 
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID1);
+    CpUB2GM(ctrlFlagGM, ctrlFlagsUB, sizeof(int64_t));
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+__attribute__((always_inline)) inline __aicore__ void SetFlagNonPipeBarrier(__ubuf__ int64_t *ctrlFlagsUB, __gm__ int64_t *ctrlFlagGM,
+    int64_t checkValue)
+{
+    *ctrlFlagsUB = checkValue;
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    CpUB2GM(ctrlFlagGM, ctrlFlagsUB, sizeof(int64_t));
+}
+
+__attribute__((always_inline)) inline __aicore__ void SetFlag(__ubuf__ int64_t *ctrlFlagsUB,
+    __gm__ int64_t *ctrlFlagGM1, __gm__ int64_t *ctrlFlagGM2, int64_t checkValue)
+{
+    AscendC::PipeBarrier<PIPE_ALL>();
+    *ctrlFlagsUB = checkValue;
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    CpUB2GM(ctrlFlagGM1, ctrlFlagsUB, sizeof(int64_t));
+    CpUB2GM(ctrlFlagGM2, ctrlFlagsUB, sizeof(int64_t));
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+__attribute__((always_inline)) inline __aicore__ void SetFlagNonPipeBarrier(__ubuf__ int64_t *ctrlFlagsUB,
+    __gm__ int64_t *ctrlFlagGM1, __gm__ int64_t *ctrlFlagGM2, int64_t checkValue)
+{
+    *ctrlFlagsUB = checkValue;
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+    CpUB2GM(ctrlFlagGM1, ctrlFlagsUB, sizeof(int64_t));
+    CpUB2GM(ctrlFlagGM2, ctrlFlagsUB, sizeof(int64_t));
+}
+
+__attribute__((always_inline)) inline __aicore__ void CheckFlag(__ubuf__ int64_t *ctrlFlagsUB,
+    __gm__ int64_t *ctrlFlagGM, int64_t checkValue)
+{
+    while (true) {
+        AscendC::PipeBarrier<PIPE_ALL>();
+        CpGM2UB(ctrlFlagsUB, ctrlFlagGM, sizeof(int64_t));
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        if (*ctrlFlagsUB == checkValue) {
+            break;
+        }
+    }
+}
+
+__attribute__((always_inline)) inline __aicore__ void CheckFlagNew(__ubuf__ int64_t *ctrlFlagsUB,
+    __gm__ int64_t *ctrlFlagGM, int64_t checkValue)
+{
+    while (true) {
+        AscendC::PipeBarrier<PIPE_ALL>();
+        CpGM2UB(ctrlFlagsUB, ctrlFlagGM, sizeof(int64_t));
+        AscendC::PipeBarrier<PIPE_ALL>();
+        if (*ctrlFlagsUB == checkValue || (*ctrlFlagsUB) == (checkValue + 1)) {
+            break;
+        }
+    }
+}
+
+__attribute__((always_inline)) inline __aicore__ int64_t GetLcalBlockNum() {
+    #ifdef ENABLE_LCCL_MIX
+    constexpr int32_t aivNumPerAic = 2;
+    return GetBlockNum() * aivNumPerAic;
+    #else
+    return GetBlockNum();
+    #endif
+}
+
+__attribute__((always_inline)) inline __aicore__ void SyncWithinNPU(__ubuf__ int64_t* ctrlFlagsUB, __gm__ int64_t* buffRank, int64_t magic) {
+    SetFlag(ctrlFlagsUB, (__gm__ int64_t*)buffRank + (GetBlockIdx() * MEM_DMA_UNIT_INT_NUM), magic);
+    for (int64_t i = 0; i < GetLcalBlockNum(); i++) {
+        if (i == GetBlockIdx()) {
+            continue;
+        }
+        CheckFlag((__ubuf__ int64_t*)ctrlFlagsUB, (__gm__ int64_t*)buffRank + i * MEM_DMA_UNIT_INT_NUM, magic);
+    }
+}
+
+__attribute__((always_inline)) inline __aicore__ void SyncWithinNPUNew(__ubuf__ int64_t* ctrlFlagsUB, __gm__ int64_t* buffRank, int64_t magic) {
+    SetFlag(ctrlFlagsUB, (__gm__ int64_t*)buffRank + (GetBlockIdx() * MEM_DMA_UNIT_INT_NUM), magic);
+    for (int64_t i = 0; i < GetLcalBlockNum(); i++) {
+        if (i == GetBlockIdx()) {
+            continue;
+        }
+        CheckFlagNew((__ubuf__ int64_t*)ctrlFlagsUB, (__gm__ int64_t*)buffRank + i * MEM_DMA_UNIT_INT_NUM, magic);
+    }
+}
+
+template<typename T>
+```
+
+## ITEM 19 — CANN shmem official atomic/AMO semantics doc (Chinese): full per-op, per-engine, per-PLATFORM support matrix. Decisive for A3 (dav-2201): only `atomic_add` is listed as `A2/A3/950` (via "UB + MTE3", types int8/int16/bf16/half/int32/float). `atomic_set`, `atomic_swap`, `atomic_compare_swap`, `atomic_fetch_add`, `atomic_fetch_inc`, `atomic_inc`, and all bitwise AMOs are marked 950-only. Also documents which standard AMOs insert `PipeBarrier<PIPE_ALL>` and which are pass-through async.
+
+### item 18
+
+https://raw.githubusercontent.com/Zhangyq-1999/shmem-doc/main/_sources/api/atomic_api_sync_async_comparison.md.txt
+Zhangyq-1999/shmem-doc (rendered CANN shmem documentation mirror), repo pushed 2026-08-01
+
+```markdown
+# ACLSHMEM Atomic 原子操作接口用法语义总结
+
+> 本文档基于实际代码实现编写，覆盖各层接口：标准接口 `aclshmem_<type>_atomic_<op>`、MTE 后端 `aclshmemx_mte_atomic_<op>`、RDMA 后端 `aclshmemx_roce_atomic_<op>`。
+
+---
+
+## 一、接口层次关系
+
+atomic 接口分为两层：
+
+```text
+aclshmem_<type>_atomic_<op>()          ← 标准接口
+    │
+    ├── topo == MTE  → aclshmemx_mte_atomic_<op>()   ← MTE 后端
+    └── topo == ROCE → aclshmemx_roce_atomic_<op>()  ← RDMA 后端
+```
+
+标准接口根据 `device_state->topo_list[pe]` 自动分派到 MTE 或 RDMA 后端，并在后端调用之上额外添加同步保证。
+
+---
+
+## 二、MTE 后端接口：`aclshmemx_mte_atomic_<op>`
+
+> 头文件：`include/device/gm2gm/engine/shmem_device_mte.h`
+> 实现文件：`src/device/gm2gm/engine/shmem_device_mte.hpp`
+
+**核心特征：所有 MTE 后端接口均为异步**，不论是否带返回值。接口仅发起硬件原子操作即返回，无 quiet/fence。
+
+同步原语：`aclshmemx_mte_quiet()` 或 Kernel Runtime 级 `SetFlag/WaitFlag`。
+
+### 2.1 接口清单
+
+| 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
+|---|---|---|---|
+| `aclshmemx_mte_atomic_fetch` | T | int32, uint32, float, int64, uint64 | 950 |
+| `aclshmemx_mte_atomic_set` | void | uint32, uint64 | 950 |
+| `aclshmemx_mte_atomic_swap` | T | uint32, uint64 | 950 |
+| `aclshmemx_mte_atomic_compare_swap` | T | uint32, uint64 | 950 |
+| `aclshmemx_mte_atomic_inc` | void | int32, uint32, float, int64, uint64 | 950 |
+| `aclshmemx_mte_atomic_add` | void | int8, int16, bf16, half, int32, float (A2/A3/950) + uint32, uint64, int64 (950) | A2/A3/950 |
+| `aclshmemx_mte_atomic_fetch_inc` | T | int32, uint32, float, int64, uint64 | 950 |
+| `aclshmemx_mte_atomic_fetch_add` | T | int32, uint32, float, int64, uint64 | 950 |
+
+### 2.2 同步要求
+
+所有 MTE 后端接口调用后，如果存在**标量计算单元（Scalar）与搬运单元（MTE2/MTE3）之间的数据依赖**，开发者需根据实际数据流插入同步：
+
+| 时机 | 场景 | 同步方式 |
+|---|---|---|
+| 调用前 | 其他单元（如 MTE2）正在写同一 UB 区域 | `SetFlag/WaitFlag` on `MTE2_S` |
+| 调用后 | 后续操作依赖原子操作在 GM 中的结果 | `SetFlag/WaitFlag` on `MTE3_MTE2` |
+| 调用后 | 需要复用同一 UB 区域写入新数据 | `SetFlag/WaitFlag` on `MTE3_S` |
+
+### 2.3 `aclshmemx_mte_atomic_add` 的类型差异（重要）
+
+`aclshmemx_mte_atomic_add` 在 Ascend950 上按类型有两种实现路径：
+
+| 类型组 | 支持类型 | 实现方式 | 同步要点 |
+|---|---|---|---|
+| UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
+
+| UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
+| Scalar AtomicAdd 路径 | uint32, uint64, int64 | Scalar 单元直接执行标量 AtomicAdd 写 GM，不经过 UB 和 MTE3 | 不需要 UB/MTE3 相关 fence；仅在 Scalar↔MTE2/MTE3 有 GM 数据依赖时按通用规则同步 |
+
+---
+
+## 三、RDMA 后端接口：`aclshmemx_roce_atomic_<op>`
+
+> 头文件：`include/device/gm2gm/engine/shmem_device_rdma.h`
+> 实现文件：`src/device/gm2gm/engine/shmem_device_rdma.hpp`
+
+**核心特征：有返回值的接口为同步接口（内部 quiet），无返回值的接口为异步接口（需调用者 quiet）。**
+
+同步原语：`aclshmemx_roce_quiet(pe, buf, sync_id)`。
+
+RDMA AMO 的 target/source 参数会作为本地对称地址换算到指定 PE，因此必须指向对称内存；不能把任意
+本地 GM 地址直接用作该参数。可通过 `aclshmem_malloc` 等对称内存分配接口准备目标对象。
+
+### 3.1 接口清单（同步接口——内部完成 quiet）
+
+| 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
+|---|---|---|---|
+| `aclshmemx_roce_atomic_fetch` | T | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_fetch_add` | T | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_fetch_inc` | T | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_fetch_and` | T | int32, uint32, int64, uint64 | 950 |
+| `aclshmemx_roce_atomic_fetch_or` | T | int32, uint32, int64, uint64 | 950 |
+| `aclshmemx_roce_atomic_fetch_xor` | T | int32, uint32, int64, uint64 | 950 |
+| `aclshmemx_roce_atomic_compare_swap` | T | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_swap` | T | 32/64 位整数 | 950 |
+
+> 以上接口在返回前内部调用 `aclshmemx_roce_quiet`，**调用者无需额外同步**。
+
+### 3.2 接口清单（异步接口——需调用者 quiet）
+
+| 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
+|---|---|---|---|
+| `aclshmemx_roce_atomic_set` | void | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_add` | void | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_inc` | void | 32/64 位整数 | 950 |
+| `aclshmemx_roce_atomic_and` | void | int32, uint32, int64, uint64 | 950 |
+| `aclshmemx_roce_atomic_or` | void | int32, uint32, int64, uint64 | 950 |
+| `aclshmemx_roce_atomic_xor` | void | int32, uint32, int64, uint64 | 950 |
+
+> 以上接口仅发起操作即返回，**调用者必须在依赖结果前调用 `aclshmemx_roce_quiet(pe, buf, sync_id)`**。
+
+### 3.3 并发限制
+
+> **警告**：使用 RDMA 作为底层传输时，不支持对同一 PE 的并发 RMA/AMO 操作。请使用 `device_state.rdma_config` 中的 `sync_id` 进行流水线同步。
+
+---
+
+## 四、标准接口：`aclshmem_<type>_atomic_<op>`
+
+> 头文件：`include/device/gm2gm/shmem_device_amo.h`
+> 实现文件：`src/device/gm2gm/shmem_device_amo.hpp`
+
+标准接口根据拓扑自动分派到 MTE 或 RDMA 后端，并在后端调用之上**额外添加同步保证**。
+
+标准 AMO 接口会将用户传入的 `dst`、`dest` 或 `source` 交给 `aclshmem_ptr(..., pe)` 换算为指定 PE 上的
+目标地址，因此这些参数必须指向对称内存。该要求来自标准接口的地址换算方式，并不表示 MTE 引擎本身
+只能访问对称内存；传输层自动分派不会改变这一接口语义。
+
+```text
+aclshmem_<type>_atomic_<op>(dst, val, pe)
+    │
+    ├── topo_list[pe] & MTE
+    │   ├── fetch 变体:    调用 aclshmemx_mte_atomic_fetch_<op>() + PipeBarrier<PIPE_ALL>
+    │   ├── swap/cas:      调用 aclshmemx_mte_atomic_swap/compare_swap() + PipeBarrier<PIPE_ALL>
+    │   ├── add/inc:       透传 aclshmemx_mte_atomic_add/inc()，未加 PipeBarrier
+    │   └── set/and/or/xor: 透传底层异步接口，未加 PipeBarrier
+    │
+    └── topo_list[pe] & ROCE
+        ├── fetch 变体:    透传 aclshmemx_roce_atomic_fetch_<op>()（后端已 quiet）
+        ├── swap/cas:      透传 aclshmemx_roce_atomic_swap/compare_swap()（后端已 quiet）
+        ├── add/inc:       透传 aclshmemx_roce_atomic_add/inc()（后端异步，未加 quiet）
+        └── set/and/or/xor: 透传底层异步接口（未加 quiet）
+
+
+## 六、各标准接口支持的类型与硬件平台
+
+### 6.1 `aclshmem_<type>_atomic_add`
+
+| 传输通路 | 支持类型 | MTE 实现方式 | 硬件平台 |
+|---|---|---|---|
+| MTE | int8, int16, bf16, half, int32, float | UB + MTE3 | A2/A3/950 |
+| MTE | uint32, uint64, int64 | Scalar AtomicAdd | 950 |
+| RDMA | int32, uint32, int64, uint64 | — | 950 |
+
+### 6.2 `aclshmem_<type>_atomic_fetch_add`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | int32, uint32, uint64, int64, float | 950 |
+| RDMA | int32, uint32, int64, uint64 | 950 |
+
+### 6.3 `aclshmem_<type>_atomic_inc`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | int32, uint32, uint64, int64 | 950 |
+| RDMA | int32, uint32, int64, uint64, float | 950 |
+
+### 6.4 `aclshmem_<type>_atomic_fetch_inc`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | int32, uint32, uint64, int64, float | 950 |
+| RDMA | int32, uint32, int64, uint64 | 950 |
+
+### 6.5 位运算系列 (`atomic_and/or/xor` 及 fetch 变体)
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| RDMA | int32, uint32, int64, uint64 | 950 |
+
+> **注意**：位运算接口不支持 MTE 通路。
+
+### 6.6 `aclshmem_<type>_atomic_fetch`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | uint32, uint64, int32, int64, float | 950 |
+| RDMA | uint32, uint64, int32, int64, float | 950 |
+
+### 6.7 `aclshmem_<type>_atomic_set`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | uint32, uint64, int32, int64, float | 950 |
+| RDMA | uint32, uint64, int32, int64, float | 950 |
+
+> CAST 变体（`ACLSHMEM_TYPE_FUNC_ATOMIC_SWAP_CAST`）：int32→uint32、int64→uint64、float→uint32 通过类型转换实现。
+
+### 6.8 `aclshmem_<type>_atomic_swap`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | uint32, uint64, int32, int64, float | 950 |
+| RDMA | uint32, uint64, int32, int64, float | 950 |
+
+> CAST 变体同上。
+
+### 6.9 `aclshmem_<type>_atomic_compare_swap`
+
+| 传输通路 | 支持类型 | 硬件平台 |
+|---|---|---|
+| MTE | uint32, uint64, int32, int64 | 950 |
+| RDMA | uint32, uint64, int32, int64 | 950 |
+
+> CAST 变体（`ACLSHMEM_TYPE_FUNC_ATOMIC_CAS_CAST`）：int32→uint32、int64→uint64。
+
+---
+
+## 七、跨 PCIe（跨节点）限制
+
+**MTE 通路不支持跨 PCIe**。跨节点场景请使用 RDMA 通路。
+
+---
+
+## 八、代码示例
+```
+
+## ITEM 20 — CURRENT official CANN shmem (gitcode `cann/shmem`, master) signal API docs, which differ from the older GitHub mirror: the atomicity caveat has been REWORDED from "WARNING: Atomicity NOT Guaranteed." to "On Ascend950, RDMA is used as the communication engine, supporting signal_set with guaranteed atomicity." The host-side variant additionally documents the cross-machine matrix: SIGNAL_SET supports RDMA cross-machine; SIGNAL_ADD does NOT, and only supports MTE cross-machine when HCCS is available.
+
+### item 19
+
+https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/shmem_device_p2p_sync.h
+cann/shmem on gitcode.com (official CANN SIG repo), file header "Copyright (c) 2025 Huawei Technologies Co., Ltd."; fetched 2026-10-20
+
+```cpp
+#ifndef SHMEM_DEVICE_P2P_SYNC_H
+#define SHMEM_DEVICE_P2P_SYNC_H
+
+#include "host_device/shmem_common_types.h"
+#include "gm2gm/shmem_device_p2p_sync.hpp"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief The aclshmemx_signal_op operation updates sig_addr with signal using operation sig_op on the specified PE.
+ *        This operation can be used together with aclshmem_signal_wait_until for efficient
+ *        point-to-point synchronization.
+ *        On Ascend950, RDMA is used as the communication engine, supporting signal_set with guaranteed atomicity.
+ *
+ * @param sig_addr              [in] Symmetric address of the signal word to be updated.
+ * @param signal                [in] The value used to update sig_addr.
+ * @param sig_op                [in] Operation used to update sig_addr with signal. Supported operations:
+ *                                   ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                    [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmemx_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe);
+#define shmemx_signal_op aclshmemx_signal_op
+
+/**
+ * @brief This routine can be used to implement point-to-point synchronization between PEs or between threads within
+ *        the same PE. A call to this routine blocks until the value of sig_addr at the calling PE satisfies the wait
+ *        condition specified by the comparison operator, cmp, and comparison value, cmp_val.
+ *
+ * @param sig_addr              [in] Local address of the source signal variable.
+ * @param cmp                   [in] The comparison operator that compares sig_addr with cmp_val. Supported operators:
+ *                                   ACLSHMEM_CMP_EQ/ACLSHMEM_CMP_NE/ACLSHMEM_CMP_GT/
+ *                                   ACLSHMEM_CMP_GE/ACLSHMEM_CMP_LT/ACLSHMEM_CMP_LE.
+ * @param cmp_val               [in] The value against which the object pointed to by sig_addr will be compared.
+ * @return Return the contents of the signal data object, sig_addr, at the calling PE that satisfies the wait condition.
+ */
+ACLSHMEM_DEVICE int32_t aclshmem_signal_wait_until(__gm__ int32_t *sig_addr, int cmp, int32_t cmp_val);
+#define shmem_signal_wait_until aclshmem_signal_wait_until
+
+```
+
+### item 20
+
+https://raw.gitcode.com/cann/shmem/raw/master/include/host/data_plane/shmem_host_so.h
+cann/shmem on gitcode.com, fetched 2026-10-20
+
+```cpp
+ * @param pe                [in] PE number of the remote PE.
+ * @note The data transfer path uses MTE only.
+ */
+ACLSHMEM_HOST_API void aclshmemx_putmem_signal(
+    void* dst, void* src, size_t elem_size, void* sig_addr, int32_t signal, int sig_op, int pe);
+#define shmem_putmem_signal aclshmemx_putmem_signal
+
+/**
+ * @brief This routine performs an atomic operation on a remote signal variable at the specified PE, with the operation
+ *        executed on the given stream. It is used to modify a remote signal and is typically paired with wait routines
+ *        like aclshmemx_signal_wait_until_on_stream.
+ *
+ * @param sig_addr              [in] Symmetric address of the signal variable to update on the target PE.
+ * @param signal                [in] The value to be used in the atomic operation.
+ * @param sig_op                [in] The operation to perform on the remote signal. Supported operations:
+ *                                   ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD.
+ * @param pe                    [in] The PE number on which the remote signal variable is to be updated.
+ * @param stream                [in] Used stream(use default stream if stream == NULL).
+ *
+ * @note Cross-machine support:
+ *       - ACLSHMEM_SIGNAL_SET: Supports RDMA cross-machine.
+ *       - ACLSHMEM_SIGNAL_ADD: Does not support RDMA cross-machine. Supports MTE cross-machine when HCCS is available.
+ */
+ACLSHMEM_HOST_API void aclshmemx_signal_op_on_stream(
+    int32_t* sig_addr, int32_t signal, int sig_op, int pe, aclrtStream stream);
+#define shmem_signal_op_on_stream aclshmemx_signal_op_on_stream
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+```
+
+## ITEM 21 — CANN shmem `kv_shuffle` example: the cleanest "monotonically incremented, never reset" flag. The sync buffer is `aclrtMemset`-zeroed ONCE in the constructor and never again; `count_` is a host-side per-invocation counter (`count_++` before each launch) passed as kernel scalar `int32_t count`; the device writes `count` into the peer's per-(rank, AIV) slot with `ACLSHMEM_SIGNAL_SET` and waits `ACLSHMEM_CMP_EQ, count`. Flag slot address = `(rank * aiv_num + aiv_idx) * SYNC_FLAG_INTERVAL` with `SYNC_FLAG_INTERVAL = 16` int32 (64B stride) to avoid false sharing.
+
+### item 21
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/kv_shuffle/kv_shuffle_kernel.cpp
+immengzi/shmem (CANN shmem mirror), repo pushed 2026-03-26
+
+```cpp
+using namespace AscendC;
+using fp16_t = op::fp16_t;
+using bf16_t = op::bfloat16;
+
+constexpr int64_t SYNC_FLAG_INTERVAL = 16;
+
+extern "C" __global__ __aicore__ void ShmemKVShuffle(
+    uint64_t fftsAddr,
+    GM_ADDR k_cache,
+    GM_ADDR v_cache,
+    GM_ADDR global_shuffle_table,
+    GM_ADDR src_block_table,
+    GM_ADDR dst_block_table,
+    GM_ADDR sync_ptr,
+    int64_t block_nums,
+    int64_t kv_head_num, int64_t page_size, int64_t head_dim, int32_t count) {
+    util_set_ffts_config(fftsAddr);
+
+    int64_t n_pes = aclshmem_n_pes();
+    int64_t local_rank = aclshmem_my_pe();
+    int64_t pair_rank = *((__gm__ int64_t*)global_shuffle_table + 2 * local_rank);
+    int64_t operation = *((__gm__ int64_t*)global_shuffle_table + 2 * local_rank + 1);
+    int64_t pair_operation = *((__gm__ int64_t*)global_shuffle_table + 2 * pair_rank + 1);
+    
+    __gm__ int32_t* gva_sync_gm = (__gm__ int32_t *)sync_ptr;
+
+    const int64_t aiv_num = AscendC::GetBlockNum();
+    const int64_t aiv_idx = AscendC::GetBlockIdx();
+    
+    const int64_t local_rank_offset = (local_rank * aiv_num + aiv_idx) * SYNC_FLAG_INTERVAL;
+    const int64_t pair_rank_offset = (pair_rank * aiv_num + aiv_idx) * SYNC_FLAG_INTERVAL;
+
+    uint64_t copy_ping_k_ub = 0;
+    uint64_t copy_pong_k_ub = 32 * 1024;
+    uint64_t copy_ping_v_ub = 64 * 1024;
+    uint64_t copy_pong_v_ub = 96 * 1024;
+    uint32_t copy_ub_size = 32 * 1024;
+
+    // 0 means send
+    if (operation == 0) {
+        aclshmem_signal_wait_until(gva_sync_gm + pair_rank_offset, ACLSHMEM_CMP_EQ, count);
+
+// ---- (lines 113-158): send/recv handshake tail + host-side count_ ----
+            }
+
+            ping_pong_flag = 1 - ping_pong_flag;
+        }
+        aclshmemx_signal_op(gva_sync_gm + local_rank_offset, count, ACLSHMEM_SIGNAL_SET, pair_rank);
+    } else if (pair_operation == 0) {
+        aclshmemx_signal_op(gva_sync_gm + local_rank_offset, count, ACLSHMEM_SIGNAL_SET, pair_rank);
+        aclshmem_signal_wait_until(gva_sync_gm + pair_rank_offset, ACLSHMEM_CMP_EQ, count);
+    }
+}
+
+KVShuffleOps::KVShuffleOps(uint32_t block_dims, void* stream) : count_(0), block_dims_(block_dims), stream_(stream)
+{
+    fftsAddr_ = util_get_ffts_config();
+    sync_ptr_ = aclshmem_malloc(sizeof(int32_t) * aclshmem_n_pes() * block_dims * SYNC_FLAG_INTERVAL);
+    aclrtMemset(sync_ptr_, sizeof(int32_t) * aclshmem_n_pes() * block_dims * SYNC_FLAG_INTERVAL,
+                0, sizeof(int32_t) * aclshmem_n_pes() * block_dims * SYNC_FLAG_INTERVAL);
+}
+
+KVShuffleOps::~KVShuffleOps()
+{
+    aclshmem_free(sync_ptr_);
+}
+    
+    // 接受 Tensor 的函数
+void KVShuffleOps::compute(
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    uint8_t* global_shuffle_table,
+    uint8_t* src_block_table,
+    uint8_t* dst_block_table,
+    int64_t block_nums,
+    int64_t kv_head_num, int64_t page_size, int64_t head_dim)
+{
+    count_++;
+    ShmemKVShuffle<<<block_dims_, nullptr, stream_>>>(
+        fftsAddr_,
+        k_cache,
+        v_cache,
+        global_shuffle_table,
+        src_block_table,
+        dst_block_table,
+        (uint8_t *)sync_ptr_,
+        block_nums,
+        kv_head_num, page_size, head_dim, count_);
+}
+```
+
+## ITEM 22 — CANN shmem AMO_ADD semantics in a runnable test: `aclshmemx_signal_op_on_stream(sig_addr, add_value, ACLSHMEM_SIGNAL_ADD, next_rank, stream)` then `aclshmemx_signal_wait_until_on_stream(sig_addr, ACLSHMEM_CMP_EQ, rank_id + 10, stream)` — the signal slot starts at `rank_id` (NOT zero) and the expected value is derived by arithmetic, i.e. ADD accumulates onto whatever was there. Chinese comments verbatim.
+
+### item 22
+
+https://raw.githubusercontent.com/immengzi/shmem/master/tests/unittest/host/sync/signal/signal_host_test.cpp
+immengzi/shmem (CANN shmem mirror), repo pushed 2026-03-26
+
+```cpp
+{
+    aclrtStream stream;
+    int64_t device_id = rank_id % test_gnpu_num + test_first_npu;
+    test_init(rank_id, n_ranks, local_mem_size, &stream);
+    EXPECT_NE(stream, nullptr);
+
+    int32_t *sig_addr = static_cast<int32_t *>(aclshmem_malloc(sizeof(int32_t)));
+    EXPECT_NE(sig_addr, nullptr);
+    
+    // 所有rank初始化为rank_id
+    int init_value = rank_id;
+    EXPECT_EQ(aclrtMemcpy(sig_addr, sizeof(int32_t), &init_value, sizeof(int32_t),
+                          ACL_MEMCPY_HOST_TO_DEVICE), 0);
+    
+    int32_t host_value;
+    EXPECT_EQ(aclrtMemcpy(&host_value, sizeof(int32_t), sig_addr, sizeof(int32_t),
+                          ACL_MEMCPY_DEVICE_TO_HOST), 0);
+
+    std::cout << "[RANK " << rank_id << "] before atomicadd, host_value = " << host_value << std::endl;
+    std::cout << "[TEST] signal ADD test rank " << rank_id << " of " << n_ranks << std::endl;
+
+    int next_rank = (rank_id + 1) % n_ranks;
+    
+    // 每个rank都向后继rank的信号加一个唯一值
+    int32_t add_value = 10;  
+    aclshmemx_signal_op_on_stream(sig_addr, add_value, ACLSHMEM_SIGNAL_ADD, next_rank, stream);
+    std::cout << "[RANK " << rank_id << "] Add " << add_value << " to rank " << next_rank << std::endl;
+    
+    sleep(1);
+    EXPECT_EQ(aclrtMemcpy(&host_value, sizeof(int32_t), sig_addr, sizeof(int32_t),
+                          ACL_MEMCPY_DEVICE_TO_HOST), 0);
+
+    std::cout << "[RANK " << rank_id << "] after add, host_value = " << host_value << std::endl;
+    int32_t expected = rank_id + 10;
+    
+    // 每个rank都等待自己的信号达到expected
+    aclshmemx_signal_wait_until_on_stream(sig_addr, ACLSHMEM_CMP_EQ, expected, stream);
+    std::cout << "[RANK " << rank_id << "] Waiting for == " << expected << std::endl;
+    
+    EXPECT_EQ(aclrtSynchronizeStream(stream), 0);
+    
+    // 验证结果
+    EXPECT_EQ(aclrtMemcpy(&host_value, sizeof(int32_t), sig_addr, sizeof(int32_t),
+                          ACL_MEMCPY_DEVICE_TO_HOST), 0);
+
+    // 所有rank验证累加结果
+    EXPECT_EQ(host_value, expected);
+    std::cout << "[RANK " << rank_id << "] Verified: " << host_value << " == " << expected << std::endl;
+
+    aclshmem_free(sig_addr);
+    test_finalize(stream, device_id);
+```
+
+### item 23
+
+https://raw.githubusercontent.com/mkbk-with-circle/ascend_inc_dispatch_combine/main/shmem/tests/unittest/device/sync/p2p/p2p_kernel.cpp
+mkbk-with-circle/ascend_inc_dispatch_combine (vendored CANN shmem tree), repo pushed 2026-09-14 — in-kernel p2p chain handshake and the full set of typed `wait_until` / `wait_until_all` comparison modes exercised
+
+```cpp
+
+#define ACLSHMEM_P2P_SYNC_TYPE_VAL_FUNC(FUNC)                                                                          \
+    FUNC(float, float, 10.0f);                                                                                         \
+    FUNC(int8, int8_t, 10);                                                                                            \
+    FUNC(int16, int16_t, 10);                                                                                          \
+    FUNC(int32, int32_t, 10);                                                                                          \
+    FUNC(int64, int64_t, 10);                                                                                          \
+    FUNC(uint8, uint8_t, 10);                                                                                          \
+    FUNC(uint16, uint16_t, 10);                                                                                        \
+    FUNC(uint32, uint32_t, 10);                                                                                        \
+    FUNC(uint64, uint64_t, 10);                                                                                        \
+    FUNC(char, char, 'b')
+
+extern "C" ACLSHMEM_GLOBAL void p2p_chain(uint64_t config, GM_ADDR addr, int rank_id, int rank_size) {
+    util_set_ffts_config(config);
+    auto sig_addr = (__gm__ int32_t *)addr;
+    int32_t val = *sig_addr;
+    int next = (rank_id + 1) % rank_size;
+
+    aclshmem_barrier_all();
+
+#if defined(__DAV_C220_VEC__) || defined(__DAV_C310_VEC__)
+    if (rank_id == 0) {
+        aclshmemx_signal_op(sig_addr, 1, ACLSHMEM_SIGNAL_SET, next);
+        aclshmem_signal_wait_until(sig_addr, ACLSHMEM_CMP_EQ, 1);
+    } else {
+        aclshmem_signal_wait_until(sig_addr, ACLSHMEM_CMP_EQ, 1);
+        aclshmemx_signal_op(sig_addr, 1, ACLSHMEM_SIGNAL_SET, next);
+    }
+#endif
+
+    aclshmem_barrier_all();
+}
+
+void p2p_chain_do(void *stream, uint64_t config, uint8_t *addr, int rank_id, int rank_size)
+{
+    p2p_chain<<<1, nullptr, stream>>>(config, addr, rank_id, rank_size);
+}
+
+
+#define P2P_CHAIN_WAIT_UNTIL(NAME, TYPE, CMP_VAL)                                                                      \
+    extern "C" ACLSHMEM_GLOBAL void p2p_chain_##NAME##_wait_until(uint64_t config, GM_ADDR addr,                       \
+        int rank_id, int rank_size)                                                                                    \
+    {                                                                                                                  \
+        util_set_ffts_config(config);                                                                                  \
+        int next = (rank_id + 1) % rank_size;                                                                          \
+        auto *remote_addr = aclshmem_ptr(addr, next);                                                                  \
+        auto ivar = (__gm__ TYPE *)addr;                                                                               \
+                                                                                                                       \
+        aclshmem_barrier_all();                                                                                        \
+                                                                                                                       \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_EQ, CMP_VAL);                                                  \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_NE, (CMP_VAL) - 1);                                            \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_GT, (CMP_VAL) - 1);                                            \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_GE, CMP_VAL);                                                  \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_GE, (CMP_VAL) - 1);                                            \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_LT, (CMP_VAL) + 1);                                            \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_LE, CMP_VAL);                                                  \
+        aclshmem_##NAME##_wait_until(ivar, ACLSHMEM_CMP_LE, (CMP_VAL) + 1);                                            \
+                                                                                                                       \
+        aclshmem_##NAME##_wait(ivar, (CMP_VAL) - 1);                                                                   \
+                                                                                                                       \
+        aclshmem_barrier_all();                                                                                        \
+    }
+ACLSHMEM_P2P_SYNC_TYPE_VAL_FUNC(P2P_CHAIN_WAIT_UNTIL);
+
+#define P2P_CHAIN_DO_WAIT_UNTIL(NAME, TYPE, CMP_VAL)                                                                   \
+    void p2p_chain_do_##NAME##_wait_until(void *stream, uint64_t config, uint8_t *addr, int rank_id, int rank_size)    \
+    {                                                                                                                  \
+        p2p_chain_##NAME##_wait_until<<<1, nullptr, stream>>>(config, addr, rank_id, rank_size);                       \
+    }
+ACLSHMEM_P2P_SYNC_TYPE_VAL_FUNC(P2P_CHAIN_DO_WAIT_UNTIL);
+
+#define P2P_CHAIN_WAIT_UNTIL_ALL(NAME, TYPE, CMP_VAL)                                                                  \
+    extern "C" ACLSHMEM_GLOBAL void p2p_chain_##NAME##_wait_until_all(uint64_t config, GM_ADDR addr,                   \
+        int rank_id, int rank_size, size_t nelems, __gm__ const int *status)                                           \
+    {                                                                                                                  \
+        util_set_ffts_config(config);                                                                                  \
+        int next = (rank_id + 1) % rank_size;                                                                          \
+        auto *remote_addr = aclshmem_ptr(addr, next);                                                                  \
+        auto ivar = (__gm__ TYPE *)addr;                                                                               \
+                                                                                                                       \
+        aclshmem_barrier_all();                                                                                        \
+                                                                                                                       \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_EQ, CMP_VAL);                              \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_NE, (CMP_VAL) - 1);                        \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_GT, (CMP_VAL) - 1);                        \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_GE, CMP_VAL);                              \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_GE, (CMP_VAL) - 1);                        \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_LT, (CMP_VAL) + 1);                        \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_LE, CMP_VAL);                              \
+        aclshmem_##NAME##_wait_until_all(ivar, nelems, status, ACLSHMEM_CMP_LE, (CMP_VAL) + 1);                        \
+                                                                                                                       \
+        aclshmem_barrier_all();                                                                                        \
+    }
+ACLSHMEM_P2P_SYNC_TYPE_VAL_FUNC(P2P_CHAIN_WAIT_UNTIL_ALL);
+
+```
+
+## ITEM 23 — sgl-kernel-npu `NotifyDispatch::GetMagicValue()`: the minimal device-side epoch generator — read the per-block magic slot out of the symmetric window's STATE region (with `DataCacheCleanAndInvalid<..., DcciDst::CACHELINE_OUT>` to bypass stale cache), clamp to >= 1, write back `magic + 1`, return the OLD value. No atomics needed because exactly one core owns each slot. `magic % PING_PONG_SIZE` then picks the window half. Note also this file's alternative merge encoding `MergeMagicWithValue(magic, value) = magic * 2 + value` (1 bit of in-epoch payload instead of 32).
+
+### item 24
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops2/op_kernel/notify_dispatch.h
+sgl-project/sgl-kernel-npu, main branch as of 2026-10-20
+
+```cpp
+// Assign values to winContext_[COMM_EP_IDX] and blockIdx before calling
+template <typename T>
+__aicore__ inline uint64_t NotifyDispatch<T>::GetMagicValue(void)
+{
+    uint64_t magic = 0;
+    GlobalTensor<uint64_t> selfDataStatusTensor;
+    GM_ADDR statusDataSpaceGm = hccl_.GetWindowsInAddr(rank) + totalWinSize_ - Moe::STATE_SIZE * 3;
+    selfDataStatusTensor.SetGlobalBuffer((__gm__ uint64_t *)(statusDataSpaceGm + STATE_WIN_OFFSET));
+    DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+        selfDataStatusTensor[blockIdx * UB_ALIGN_SIZE]);
+    magic = selfDataStatusTensor(blockIdx * UB_ALIGN_SIZE);
+    if (magic <= 0) {
+        magic = 1;
+    }
+    selfDataStatusTensor(blockIdx * UB_ALIGN_SIZE) = magic + 1;
+    return magic;
+}
+
+
+// ---- Init (lines 955-966): magic selects window half ----
+    auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+
+    hccl_.InitV2(contextGM0, &tilingData);
+    hccl_.SetCcTilingV2(offsetof(NotifyDispatchTilingData, mc2CcTiling1));
+
+    winContext_[COMM_EP_IDX] = (__gm__ HcclOpResParam *)contextGM0;
+    this->magic = GetMagicValue();
+    ctxIdx = COMM_EP_IDX;
+    uint64_t winDataOffset = ((totalWinSize_ - 4 * Moe::STATE_SIZE) / 2) * (this->magic % PING_PONG_SIZE);
+
+    shareAddrs[rank] = GetWindAddrByRankId(rank, ctxIdx) + winDataOffset;
+
+
+// ---- merge + wait (lines 240-300) ----
+        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+
+    // copy input to other rank share
+    __aicore__ inline void InputToShareSlice()
+    {
+        __ubuf__ uint64_t *inputUB = (__ubuf__ uint64_t *)get_imm(0);
+        int32_t copyOffset = blockIdx * rankNumPerCore;
+        copyLen = rankSize - copyOffset < rankNumPerCore ? rankSize - copyOffset : rankNumPerCore;
+        if (copyLen > 0) {
+            readGt = sendDataInputGt[copyOffset * perRankDataNum];
+            CpGM2GMPingPong<T>(copyLen * perRankDataNum * sizeof(T), readGt, writeGt[copyOffset * perRankDataNum],
+                               COPYONLY);
+            uint64_t v = MergeMagicWithValue(magic, 1);
+            *inputUB = v;
+            AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            for (int i = copyOffset; i < copyOffset + copyLen; ++i) {
+                CpUB2GM((__gm__ uint64_t *)(shareAddrs[i]) + rank * FLAG_UNIT_INT_NUM, inputUB, sizeof(uint64_t));
+            }
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+
+    __aicore__ inline uint64_t MergeMagicWithValue(uint64_t magic, uint64_t value)
+    {
+        // magic as the high part, eventID as the low part, combined into a value for comparison
+        return (magic * 2ULL + value);
+    }
+
+    // Wait for a part of synchronization flags within a rank
+    __aicore__ inline void WaitOneRankPartFlag(__gm__ uint64_t *waitAddr, int64_t flagNum, uint64_t checkValue)
+    {
+        GlobalTensor<uint64_t> globalWait;
+        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+        LocalTensor<uint64_t> localWait = tBuf.GetWithOffset<uint64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+        bool isSync = true;
+        uint64_t checkedFlagNum = 0;
+        do {
+            // Copy global synchronization flags to local
+            DataCopy(localWait, globalWait[checkedFlagNum * FLAG_UNIT_INT_NUM],
+                     (flagNum - checkedFlagNum) * FLAG_UNIT_INT_NUM);
+            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+
+            // Check if the synchronization flags are equal to checkValue
+            isSync = true;
+            uint64_t remainToCheck = flagNum - checkedFlagNum;
+            for (auto i = 0; i < remainToCheck; ++i) {
+                // Continue waiting if any core has not reached the checkValue phase
+                uint64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+                    isSync = false;
+                    checkedFlagNum += i;
+                    break;
+                }
+            }
+        } while (!isSync);
+    }
+
+```
+
+## ITEM 24 — CANN cann-recipes-infer `ops/shmem/distributed_embedding`: real device-side AMO primitives in an AscendC/SIMT kernel — `Simt::AtomicCas`, `Simt::AtomicAdd`, `asc_atomic_inc`, and the shmem symmetric-memory CAS `simt::aclshmem_uint32_atomic_compare_swap` / `simt::aclshmem_int64_atomic_compare_swap`. Includes the comment on fixed-width type requirements for the device CAS overloads.
+
+### item 25
+
+https://raw.githubusercontent.com/hicann/cann-recipes-infer/master/ops/shmem/distributed_embedding/op_kernel/distributed_hashtable.cpp
+hicann/cann-recipes-infer, master as of 2026-10-20
+
+```cpp
+    } else {
+        simt::aclshmem_getmem(dst, src, sizeof(pair_type), pe);
+    }
+}
+
+// The device atomic CAS overloads use the fixed-width C types. In particular,
+// on this platform `long long` is a distinct type from `int64_t` even though
+// both are 64 bits wide, so convert through the supported overload while
+// preserving the key bit pattern.
+template <typename Tkey>
+__simt_callee__ inline Tkey AtomicCasKey(__gm__ Tkey *address, Tkey compare, Tkey value)
+{
+    static_assert(sizeof(Tkey) == sizeof(uint32_t) || sizeof(Tkey) == sizeof(uint64_t),
+                  "AtomicCasKey supports only 32-bit and 64-bit keys");
+    if constexpr (sizeof(Tkey) == sizeof(uint32_t)) {
+        return static_cast<Tkey>(Simt::AtomicCas(
+            reinterpret_cast<__gm__ uint32_t *>(address), static_cast<uint32_t>(compare),
+            static_cast<uint32_t>(value)));
+    } else {
+        return static_cast<Tkey>(Simt::AtomicCas(
+            reinterpret_cast<__gm__ int64_t *>(address), static_cast<int64_t>(compare),
+            static_cast<int64_t>(value)));
+    }
+}
+
+// MurMerHash3函数
+template <typename Tkey>
+__simt_callee__ inline uint32_t MurmurHash3(const __gm__ Tkey *key, int len, uint32_t seed)
+{
+    static_assert(sizeof(Tkey) == sizeof(uint32_t) || sizeof(Tkey) == sizeof(uint64_t),
+                  "MurmurHash3 supports only 32-bit and 64-bit keys");
+
+// ---- (lines 330-345, 420-440): AtomicAdd counters ----
+    for (int64_t i = threadIdx + blockIdx * threadNum; i < hashTableSize; i += blockNum * threadNum)
+    {
+        if (hashTable[i].key != unusedKey)
+        {
+            localSize++;
+        }
+    }
+    if (localSize > 0)
+    {
+        Simt::AtomicAdd(containerSize, localSize);
+    }
+}
+
+// kernel入口
+template <typename Tkey, typename Tvalue>
+__global__ __vector__ void
+
+
+    if (threadIdx == 0) { *blockAcc = 0; }
+    if (idx >= searchLength) { return; }
+    asc_syncthreads();
+
+    pair_type pair = LoadPairVectorized<Tkey, Tvalue>(tableHandle + offset + idx);
+    if (pair.key != unusedKey) {
+        uint32_t localIndex = Simt::AtomicAdd(blockAcc, static_cast<uint32_t>(1));
+        pUbKey[localIndex] = pair.key;
+        pUbValue[localIndex] = pair.value;
+    }
+    asc_syncthreads();
+
+    if (threadIdx == 0) {
+        *globalAcc = Simt::AtomicAdd(dDumpCounter, *blockAcc);
+    }
+    asc_syncthreads();
+
+    if (threadIdx < *blockAcc) {
+        d_key[*globalAcc + threadIdx] = pUbKey[threadIdx];
+        d_value[*globalAcc + threadIdx] = pUbValue[threadIdx];
+
+// ---- (lines 700-760): symmetric-memory CAS via shmem ----
+    uint32_t hashVal, uint64_t hostTblSize, uint32_t targetPe, Tkey unusedKey)
+{
+    size_t currIdx = static_cast<size_t>(hashVal) % hostTblSize;
+    size_t counts = 0;
+    while (true) {
+        if (counts++ >= hostTblSize) {
+            break;
+        }
+        // SHMEM SIMT CAS maps the HOST_SIDE symmetric address internally.
+        Tkey oldKey;
+        if constexpr (sizeof(Tkey) == sizeof(uint32_t)) {
+            oldKey = static_cast<Tkey>(simt::aclshmem_uint32_atomic_compare_swap(
+                reinterpret_cast<__gm__ uint32_t *>(&hostHashTable[currIdx].key),
+                static_cast<uint32_t>(unusedKey), static_cast<uint32_t>(insertKey),
+                static_cast<int32_t>(targetPe)));
+        } else {
+            oldKey = static_cast<Tkey>(simt::aclshmem_int64_atomic_compare_swap(
+                reinterpret_cast<__gm__ int64_t *>(&hostHashTable[currIdx].key),
+                static_cast<int64_t>(unusedKey), static_cast<int64_t>(insertKey),
+                static_cast<int32_t>(targetPe)));
+        }
+        if (oldKey == unusedKey || oldKey == insertKey) {
+            ShmemPutScalar<Tvalue>(&hostHashTable[currIdx].value, insertVal, static_cast<int32_t>(targetPe));
+            break;
+        }
+        currIdx = (currIdx + 1) % hostTblSize;
+    }
+}
+
+// Single-PE D2H consumes the original input arrays without receive-buffer staging.
+template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
+__simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtSinglePeInsert(
+    __gm__ pair_type *devHashTable, __gm__ pair_type *hostHashTable,
+    const __gm__ Tkey *keys, const __gm__ Tvalue *values, uint64_t keyNum,
+    uint64_t tableSize, uint64_t hostTblSize, uint32_t myPe, Tkey unusedKey,
+    uint32_t blockIdx, uint32_t blockNum)
+{
+    uint32_t threadIdx = Simt::GetThreadIdx();
+    uint32_t threadNum = Simt::GetThreadNum();
+    for (uint64_t idx = blockIdx * threadNum + threadIdx; idx < keyNum; idx += blockNum * threadNum) {
+        Tkey key = keys[idx];
+        if (key == unusedKey) {
+            continue;
+        }
+        Tvalue value = values[idx];
+        uint32_t hashVal = MurmurHash3<Tkey>(keys + idx, sizeof(Tkey), 0);
+        uint64_t bucket = static_cast<uint64_t>(hashVal) % tableSize;
+        for (uint64_t step = 0; step < tableSize; ++step) {
+            Tkey oldKey = AtomicCasKey(&devHashTable[bucket].key, unusedKey, key);
+            if (oldKey == unusedKey || oldKey == key) {
+                devHashTable[bucket].value = value;
+                break;
+            }
+            bucket = (bucket + 1) % tableSize;
+        }
+        // Preserve the full Host copy even when the Device table is full.
+        InsertHostPair<Tkey, Tvalue>(hostHashTable, key, value, hashVal, hostTblSize, myPe, unusedKey);
+    }
+}
+
+template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
+```
+
+## ITEM 25 — CANN cannbot-skills canonical AscendC shmem kernel TEMPLATE for a flag-free pure-communication op: symmetric buffer laid out as `[sync_flags: aivNum * SYNC_FLAG_INTERVAL int32] [data_buf ...]`, `magic` as a kernel scalar argument, sender writes `flag_val = chunk_count + magic` with `ACLSHMEM_SIGNAL_SET`, receiver waits `ACLSHMEM_CMP_GE, magic + 1`. This is the recommended skeleton, Chinese annotations verbatim.
+
+### item 26
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-code-gen/templates/communication/templates-kernel.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```cpp
+
+using namespace AscendC;
+using fp16_t = op::fp16_t;
+using bf16_t = op::bfloat16;
+
+constexpr int64_t SYNC_FLAG_INTERVAL = 16;
+constexpr int64_t UB_DMA_MAX_SIZE = 190 * 1024;
+
+// ==== 定制：按 design.md 的 schedule.phases 实现具体通信逻辑 ====
+template <typename T>
+ACLSHMEM_DEVICE void <op_name>_impl(uint64_t fftsAddr,
+                                     __gm__ T *input,
+                                     __gm__ T *output,
+                                     __gm__ T *symmetric,
+                                     int elements,
+                                     int magic)
+{
+    util_set_ffts_config(fftsAddr);
+
+    const int64_t aivNum = GetBlockNum();
+    const int64_t aivIndex = GetBlockIdx();
+    const int64_t flag_offset = aivIndex * SYNC_FLAG_INTERVAL;
+
+    int64_t my_rank = aclshmem_my_pe();
+    int64_t pe_size = aclshmem_n_pes();
+
+    // ---- 分核 ----
+    // ==== 定制：按 schedule.core_partition 划分 sender / receiver / sync 核 ====
+    // 示例：前半核为 sender（本地 → symmetric），后半核为 receiver（远端 symmetric → 本地）
+    int core_group_num = aivNum / 2;
+    bool is_sender = (aivIndex < core_group_num);
+
+    // Symmetric buffer 布局
+    __gm__ int32_t *sync_flags = (__gm__ int32_t *)symmetric;
+    __gm__ T *data_buf = (__gm__ T *)(sync_flags + aivNum * SYNC_FLAG_INTERVAL);
+
+    // UB 临时缓冲（ping-pong）
+    __ubuf__ T *ping_buf = reinterpret_cast<__ubuf__ T *>(uint64_t(1024 + 32));
+    __ubuf__ T *pong_buf = reinterpret_cast<__ubuf__ T *>(uint64_t(96 * 1024 + 32));
+
+    uint32_t ub_size = UB_DMA_MAX_SIZE;
+    uint32_t ub_elems = ub_size / sizeof(T);
+
+    if (is_sender) {
+        // ==== Phase: 本地 GM → symmetric (sender 核) ====
+        // ==== 定制：按 design.md 的 phase 逻辑调整 put 目标和 chunk 策略 ====
+        int64_t per_core = elements / core_group_num;
+        int64_t my_offset = aivIndex * per_core;
+        if (aivIndex == core_group_num - 1) {
+            per_core = elements - my_offset;
+        }
+
+        int64_t remaining = per_core * sizeof(T);
+        int64_t done_elems = 0;
+        int64_t chunk_count = 0;
+
+        while (remaining > 0) {
+            uint32_t copy_elems = (remaining > ub_size) ? ub_elems : (remaining / sizeof(T));
+
+            SHMEMI_PROF_START(0);  // copy_in phase
+            aclshmemx_mte_put_nbi(data_buf + my_offset + done_elems,
+                                  input + my_offset + done_elems,
+                                  ping_buf, ub_size, copy_elems,
+                                  my_rank, EVENT_ID0);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            SHMEMI_PROF_END(0);
+
+            chunk_count++;
+            int64_t flag_val = chunk_count + magic;
+            aclshmemx_signal_op(sync_flags + flag_offset, flag_val,
+                                ACLSHMEM_SIGNAL_SET, my_rank);
+
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+
+            done_elems += copy_elems;
+            remaining -= copy_elems * sizeof(T);
+        }
+    } else {
+        // ==== Phase: 远端 symmetric → 本地 output (receiver 核) ====
+        // ==== 定制：按 design.md 的 peer_model 和 addressing 调整 get 来源 ====
+        int receiver_idx = aivIndex - core_group_num;
+        // 示例：每个 receiver 核从一个远端 PE 拉取数据
+        int64_t src_pe = receiver_idx;  // ==== 定制：映射逻辑 ====
+
+        // 等待远端 sender 完成后 get
+        // ==== 定制：按 schedule.phases 的 dependency 和 sync 调整等待逻辑 ====
+        aclshmem_signal_wait_until(
+            (__gm__ int32_t *)aclshmem_ptr(sync_flags, src_pe) + flag_offset,
+            ACLSHMEM_CMP_GE, magic + 1);
+
+        int64_t per_core = elements;
+        int64_t dst_offset = src_pe * elements;
+        int64_t remaining = per_core * sizeof(T);
+        int64_t done_elems = 0;
+        int pingpong = 0;
+
+        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+
+        while (remaining > 0) {
+            uint32_t copy_elems = (remaining > ub_size / 2) ? (ub_size / 2 / sizeof(T))
+                                                            : (remaining / sizeof(T));
+            TEventID eid = (pingpong == 0) ? EVENT_ID0 : EVENT_ID1;
+            __ubuf__ T *buf = (pingpong == 0) ? ping_buf : pong_buf;
+
+            WaitFlag<HardEvent::MTE3_MTE2>(eid);
+
+            SHMEMI_PROF_START(1);  // remote_get phase
+            aclshmemx_mte_get_nbi(output + dst_offset + done_elems,
+                                  data_buf + done_elems,
+                                  buf, ub_size / 2, copy_elems,
+                                  src_pe, eid);
+            SHMEMI_PROF_END(1);
+
+            SetFlag<HardEvent::MTE3_MTE2>(eid);
+
+            done_elems += copy_elems;
+            remaining -= copy_elems * sizeof(T);
+            pingpong = 1 - pingpong;
+        }
+
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+    }
+}
+
+// ---- Kernel 入口（按 dtype 展开）----
+// ==== 定制：按 design.md 的 dtypes 调整支持的类型 ====
+#define <OP_NAME>_FUNC_DEF(type)                                                    \
+    extern "C" __global__ __aicore__ void Shmem<OpName>_##type(                     \
+        uint64_t fftsAddr, GM_ADDR input, GM_ADDR output,                           \
+        GM_ADDR symmetric, int elements, int magic)                                 \
+    {                                                                               \
+        <op_name>_impl<type>(fftsAddr, (__gm__ type *)input,                        \
+                             (__gm__ type *)output, (__gm__ type *)symmetric,        \
+                             elements, magic);                                      \
+    }
+
+<OP_NAME>_FUNC_DEF(int32_t);
+<OP_NAME>_FUNC_DEF(float16_t);
+<OP_NAME>_FUNC_DEF(bfloat16_t);
+
+// ---- Host-callable wrapper ----
+template <class T>
+void <op_name>_kernel(uint32_t block_dim, void *stream, uint64_t fftsAddr,
+                      uint8_t *input, uint8_t *output, uint8_t *symmetric,
+                      int elements, int magic)
+```
+
+## ITEM 26 — CANN cannbot-skills `api.md` §5 "Sync：signal、wait/test、barrier、quiet/fence": the authoritative one-paragraph Chinese contract for the signal family, including the non-atomicity caveat and the distinction between `aclshmem_sync` (local stores only) and `aclshmem_barrier` (collective)
+
+### item 27
+
+https://raw.githubusercontent.com/hicann/cannbot-skills/master/plugins-community/shmem-ops-generator/skills/shmem-ops-code-gen/references/api.md
+hicann/cannbot-skills, repo pushed 2026-10-19
+
+```markdown
+## 5. Sync：signal、wait/test、barrier、quiet/fence
+
+### 5.1 signal 与 wait/test
+
+signal 用于点对点完成通知：
+
+- `aclshmemx_signal_op` 在 Device 侧更新远端 `sig_addr`，支持 `ACLSHMEM_SIGNAL_SET` 和 `ACLSHMEM_SIGNAL_ADD`，但该接口自身不保证一般意义上的原子性。
+- `aclshmem_put_signal` 和 `aclshmem_put_signal_nbi` 将数据搬运与 signal 更新合并，适合“数据到达后通知远端”的模式。
+- `aclshmem_signal_wait_until` 按 `ACLSHMEM_CMP_EQ/NE/GT/GE/LT/LE` 等条件等待本地 signal 满足条件。
+- typed wait/test 系列支持单变量、all/any/some wait set、vector compare 等复杂等待模式。
+- Host 侧有 `aclshmemx_signal_op_on_stream`、`aclshmemx_signal_wait_until_on_stream`，用于把 signal 操作放入 stream 顺序中。
+
+### 5.2 barrier 和 sync
+
+barrier 能力同时存在于 Host 和 Device：
+
+- `aclshmem_barrier(team)`、`aclshmem_barrier_all()` 对 team 或 world 做集合同步。
+- `aclshmem_sync(team)`、`aclshmem_sync_all()` 只保证此前本地 memory stores 的完成和可见性，不保证远端 RMA 更新完成。
+- Host 侧提供 stream 版本 `aclshmemx_barrier_on_stream`、`aclshmemx_barrier_all_on_stream`。
+注意事项：
+
+| 要点 | 说明 |
+| --- | --- |
+| Device barrier 前提 | 要求 MIX kernel；纯 AIV kernel 或缺少有效 cube/vector 指令时可能被优化成不满足要求的 kernel 形态 |
+| deprecated 接口 | `aclshmemx_barrier_vec`/`aclshmemx_barrier_all_vec` 已标记 deprecated；新代码用 `aclshmem_barrier`/`aclshmem_barrier_all` |
+| Host vs Device 完成域 | CPU 发起的 barrier 只完成 CPU 通信；NPU 发起的 barrier 只完成 NPU 通信。Host 等待 kernel 内通信完成应结合 `aclrtSynchronizeStream`/`aclshmemx_handle_wait`/stream 版本接口 |
+
+### 5.3 quiet / fence
+
+Device 侧 memory ordering 能力：
+
+- `aclshmem_quiet` 确保调用 PE 之前发出的**全引擎** symmetric data object 操作完成（MTE + SDMA + UDMA + RDMA）。
+- **单引擎场景 SHOULD 使用 engine-specific quiet**：MTE → `aclshmemx_mte_quiet`；SDMA → `aclshmemx_sdma_quiet`；UDMA → `aclshmemx_udma_quiet(pe)`；RDMA/RoCE → `aclshmemx_roce_quiet`。勿在仅需 MTE drain 时调用全局 `aclshmem_quiet`。
+- `aclshmem_fence` 在当前实现中与 `aclshmem_quiet` 等价，既保证顺序也保证完成。
+- HCCS-only 场景下完成后可认为全局可见；HCCS + RDMA 场景下，当前说明只保证对目标 PE 内存的可见性。
+- 亦可配合 event/flag（如 `SetFlag/WaitFlag<MTE3_S>`）或 Host `aclrtSynchronizeStream` 等等价同步。
+
+## 6. Atomic：远端累加和本地归约辅助
+
+公开 Device atomic 能力目前集中在 atomic add：
+```
+
+---
+
+### TOPIC A — additional items (multi-round toggle epochs, LCCL ipc_queue sequence numbers)
+
+### item 0
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops/op_kernel/cam_moe_combine_normal_multi_round.h
+sgl-project/sgl-kernel-npu, main as of 2026-10-20
+
+````cpp
+#endif
+constexpr uint64_t STATE_WIN_SIZE_HALF = STATE_WIN_SIZE / 2;
+#ifdef __DAV_C310__
+constexpr uint64_t MAGIC_WIN_OFFSET = 1100UL * 1024UL;
+constexpr uint64_t HYBRID_DATA_EXTRA_OFFSET =
+    Moe::A5WindowLayout::kLlSelectorMetadataSize + Moe::A5WindowLayout::kLlStateSize +
+    Moe::A5WindowLayout::kLlSelectorMetadataSize + Moe::A5WindowLayout::kLlStateSize;
+#else
+constexpr uint64_t MAGIC_WIN_OFFSET = 975UL * 1024UL;
+constexpr uint64_t HYBRID_DATA_EXTRA_OFFSET =
+    Moe::A3WindowLayout::kLlSelectorMetadataSize + Moe::A3WindowLayout::kLlStateSize +
+
+// ---- addressing by magic_ / roundMagic_ (lines 86-110, 130-140) ----
+    __aicore__ inline void InitRoundRecvData();
+
+    __aicore__ GM_ADDR GetStateAddrByRankId(const int32_t rankId)
+    {
+        return GetBaseWindAddrByRankId(epWinContext_, rankId, epRankId_) + winDataSizeOffset_ +
+               NORMAL_NOTIFY_STATE_OFFSET;
+    }
+
+    __aicore__ GM_ADDR GetBufferAddrByRankId(const int32_t rankId)
+    {
+        uint64_t dataOffset = STATE_WIN_SIZE + roundMagic_ * combineDataBuffSize_;
+        if (isHybridDeployment_) {
+            dataOffset += HYBRID_DATA_EXTRA_OFFSET;
+        }
+        return GetStateAddrByRankId(rankId) + dataOffset;
+    }
+
+    __aicore__ inline GM_ADDR GetRoundStateAddrByRankId(const int32_t rankId)
+    {
+        return GetBaseWindStateAddrByRankId(epWinContext_, rankId, epRankId_) +
+               roundMagic_ * Moe::ROUND_STATE_MAX_SIZE + ROUND_STATE_OFFSET;
+    }
+
+    __aicore__ inline void SplitCoreCal(uint32_t totalNum, uint32_t &perCoreNum, uint32_t &startIdx, uint32_t &endIdx)
+    {
+
+    uint32_t epWorldSize_{0};
+    uint32_t epRankId_{0};
+    uint32_t coreIdx_{0};
+    uint32_t moeExpertNum_{0};
+    uint32_t moeExpertPerRankNum_{0};
+    uint32_t magic_{0};
+    uint32_t roundMagic_{0};
+    uint64_t winDataSizeOffset_{0};
+    uint64_t baseWinSize_{0};
+    uint32_t hRecvXTypeLen_{0};
+    uint32_t h32AlignFloatLen_{0};
+
+// ---- InitMagic (lines 211-226) ----
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeCombineNormalMultiRound<TemplateMC2TypeFunc>::InitMagic()
+{
+    auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+    epWinContext_ = (__gm__ HcclOpParam *)contextGM0;
+
+    GlobalTensor<int32_t> selfMagicTensor;
+    selfMagicTensor.SetGlobalBuffer(
+        (__gm__ int32_t *)(GetStatusDataSpaceGm(epWinContext_) + MAGIC_WIN_OFFSET + coreIdx_ * WIN_512_ALIGN));
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfMagicTensor);
+    magic_ = selfMagicTensor(0);
+    selfMagicTensor(0) = ((magic_ == 0) ? 1 : 0);
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfMagicTensor);
+}
+
+
+// ---- Process round loop with roundMagic_ flip (lines 798-816) ----
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeCombineNormalMultiRound<TemplateMC2TypeFunc>::Process()
+{
+    if ASCEND_IS_AIV {  // 全aiv处理
+        uint32_t realRound = (realMaxBs_ + perRoundTokens_ - 1) / perRoundTokens_;
+        while (roundIndex_ < realRound) {
+            CopyBufferToShareAndSetStatus();
+            ReadBufferFromRemote();
+            if (realRound > 1) {
+                SetRoundStatus();
+                WaitRoundStatus();
+                roundMagic_ = roundMagic_ == 0 ? 1 : 0;
+                SyncAll<true>();
+            }
+            roundIndex_ += 1;
+        }
+    }
+}
+````
+
+## ITEM 28 — LCCL `IpcQueue`: a cross-rank ring buffer whose ONLY synchronisation is the epoch-tagged flag. The flag's low bits carry a monotonically increasing sequence number (`count`), extracted with `EVENT_ID_MASK` to recover the producer's progress: `int64_t val = sync->GetInnerFlag(checkRank, checkBlock) & EVENT_ID_MASK; count = val + 1; front = (val + 1) % depth;`. Multi-producer variants take the MINIMUM of all peers' sequence numbers. No separate flag buffer, no reset.
+
+### item 1
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/src/ascendc_kernels/ipc_queue.h
+Huawei / ascend-transformer-boost LCCL, file header "Copyright (c) 2024 Huawei Technologies Co., Ltd."; mirror commit date unknown
+
+````cpp
+/*
+ * Copyright (c) 2024 Huawei Technologies Co., Ltd.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+#ifndef LCCL_IPC_QUEUE_H
+#define LCCL_IPC_QUEUE_H
+#include "sync_collectives.h"
+using namespace AscendC;
+
+template <typename T>
+class IpcQueue {
+public:
+    FORCE_INLINE_AICORE IpcQueue() {}
+
+    FORCE_INLINE_AICORE void Init(SyncCollectives *sync, int64_t magic, GM_ADDR workSpace, uint64_t bufferNum,
+                                   uint64_t blockNum)
+    {
+        this->sync = sync;
+        this->magic = magic;
+        depth = bufferNum / blockNum;
+        front = 0;
+        rear = 0;
+        count = 0;
+        this->blockNum = blockNum;
+        buff.SetGlobalBuffer((__gm__ T*)workSpace, bufferNum);
+        blockIdx = GetBlockIdx();
+    }
+
+    FORCE_INLINE_AICORE bool Full()
+    {
+        if ((rear + 1) % depth == front) {
+            return true;
+        }
+        return false;
+    }
+
+    FORCE_INLINE_AICORE GlobalTensor<T> EnQue()
+    {
+        uint64_t rearOld = rear;
+        rear = (rear + 1) % depth;
+        return buff[rearOld * blockNum];
+    }
+
+    FORCE_INLINE_AICORE void DeQue(int checkRank, int checkBlock = -1)
+    {
+        if (!Full()) {
+            return;
+        }
+        if (checkBlock == -1) {
+            checkBlock = blockIdx;
+        }
+        sync->WaitInnerFlag(magic, count, checkRank, checkBlock);
+        PipeBarrier<PIPE_ALL>();
+        int64_t val = sync->GetInnerFlag(checkRank, checkBlock) & EVENT_ID_MASK;
+        count = val + 1;
+        front = (val + 1) % depth;
+    }
+
+    FORCE_INLINE_AICORE void DeQue(int *rankList, int checkCount, int checkBlock = -1)
+    {
+        if (!Full()) {
+            return;
+        }
+        if (checkBlock == -1) {
+            checkBlock = blockIdx;
+        }
+        int64_t minIndex = LLONG_MAX;
+        for (int i = 0; i < checkCount; i++) {
+            sync->WaitInnerFlag(magic, count, rankList[i], checkBlock);
+            PipeBarrier<PIPE_ALL>();
+
+            int64_t val = sync->GetInnerFlag(rankList[i], checkBlock) & EVENT_ID_MASK;
+            if (minIndex > val) {
+                minIndex = val;
+            }
+        }
+        count = minIndex + 1;
+        front = (minIndex + 1) % depth;
+    }
+    FORCE_INLINE_AICORE void DeQue(int *rankList, int *blockIdxList, int checkCount)
+    {
+        if (!Full()) {
+            return;
+        }
+
+        int64_t minIndex = LLONG_MAX;
+        for (int i = 0; i < checkCount; i++) {
+            sync->WaitInnerFlag(magic, count, rankList[i], blockIdxList[i]);
+            PipeBarrier<PIPE_ALL>();
+
+            int64_t val = sync->GetInnerFlag(rankList[i], blockIdxList[i]) & EVENT_ID_MASK;
+            if (minIndex > val) {
+                minIndex = val;
+            }
+        }
+        count = minIndex + 1;
+        front = (minIndex + 1) % depth;
+    }
+
+    FORCE_INLINE_AICORE GlobalTensor<T> ReadFront()
+    {
+        uint64_t frontOld = front;
+        front = (front + 1) % depth;
+        return buff[frontOld * blockNum];
+    }
+
+private:
+    int64_t magic;
+    uint64_t depth;
+    uint64_t front;
+    uint64_t rear;
+    uint64_t count;
+    uint64_t blockNum;
+    GlobalTensor<T> buff;
+    SyncCollectives *sync;
+    int blockIdx;
+};
+#endif // LCCL_IPC_QUEUE_H
+````
+
+### item 2
+
+https://raw.githubusercontent.com/egretwAlker/cpl-ascend-transformer-boost/HEAD/src/kernels/lcal/include/comm_args.h
+Huawei / ascend-transformer-boost LCCL — the constants that define the epoch/payload bit split and the IPC window geometry
+
+````cpp
+#include "kernel_operator.h"
+#endif
+namespace Lcal {
+
+constexpr int LCAL_MAX_RANK_SIZE = 128; // lcal通信库最大支持的npu卡数
+constexpr int RANK_SIZE_TWO = 2;  // 可用SIO的规模，以及是否需要跨卡搬运数据核的分界规模
+constexpr int64_t IPC_BUFF_MAX_SIZE = 100 * 1024 * 1024;
+constexpr int64_t IPC_DATA_OFFSET = 2 * 1024 * 1024; // 前2MB作为flag标志位，之后100MB作为数据存储
+constexpr int64_t SYNC_FLAG_BIT_NUM = 10;  // cce 算子在用
+constexpr int64_t MEM_DMA_UNIT_INT_NUM = 4;
+constexpr int64_t EVENT_ID_MASK = 0xFFFFFFFF;
+constexpr int64_t PING_PONG_SIZE = 2;
+constexpr int64_t UB_SINGLE_DMA_SIZE_MAX = 190 * 1024;
+constexpr int64_t SMALL_DATA_SIZE = 1 * 1024 * 1024;
+constexpr int64_t UB_SINGLE_PING_PONG_ADD_SIZE_MAX = UB_SINGLE_DMA_SIZE_MAX / 2;
+constexpr int UB_ALIGN_SIZE = 32;
+
+// 2step算法中，2个aiv真正用作数据预处理
+constexpr int64_t PRE_CORE_REAL_NUM = 2;
+
+constexpr int64_t AIV_PER_AICORE = 2;
+
+constexpr int DFX_COUNT = 50;
+
+constexpr int64_t HALF_NUM = 2;
+
+constexpr int64_t THREE_NUM = 3;
+
+constexpr int64_t FOUR_NUM = 4;
+
+constexpr int64_t VADD_MAX_REPEAT = 255;
+constexpr int64_t VADD_UNIT_BYTE = 256;
+
+// vadd单位粒度是256B，vadd最大repeat次数为255，两个相乘的结果
+constexpr int64_t MAX_VADD_SIZE = VADD_MAX_REPEAT * VADD_UNIT_BYTE;
+constexpr int64_t BLOCK_UNIT_BYTE = 32;
+constexpr int64_t VADD_UNIT_TO_BLOCK_UNIT_RATIO = VADD_UNIT_BYTE / BLOCK_UNIT_BYTE;    // 8
+
+constexpr bool ATOMIC_ENABLE = false;
+
+constexpr int32_t LCCL_DUMP_UINT_SIZE = 1 * 1024 * 1024;
+enum Op : int {
+    COPYONLY = -1,
+````
+
+### TOPIC A — negative findings (sources checked that yielded nothing)
+
+NOTHING: https://github.com/sgl-project/sglang — sglang's own tree has no in-kernel Ascend collective; the only hits for `lccl` are docs telling MindSpore users to `export MS_ENABLE_LCCL=off`. The hand-written AscendC ops live in the separate `sgl-project/sgl-kernel-npu` repo (covered above).
+NOTHING: https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/utils/inc/kernel/moe_distribute_base.h — contains HCCL window/context struct definitions (`flag`, `hostStateInfo`, `aicpuStateInfo`) but no magic/epoch protocol.
+NOTHING: https://raw.gitcode.com/cann/ops-hccl/raw/master/README.md — returns `{"code":"CH.00402000","title":"Project not found","message":"Project not found:cann/ops-hccl"}`; that repo path does not exist on gitcode.
+NOTHING: https://raw.githubusercontent.com/hicann/cann-recipes-infer/master/ops/shmem/distributed_embedding/op_kernel/distributed_hashtable.h — 30-line forwarding header only; the substance is in the `.cpp` (ITEM 24).
+NOTHING: https://raw.githubusercontent.com/Zhangyq-1999/shmem-doc/main/_sources/api/device_api.rst.txt — 72 lines of Doxygen `doxygenfile::` directives only; no inline API text. The real content is generated from the headers (ITEM 4, ITEM 20).
+NOTHING: Chinese web search for 「昇腾 LCCL one-shot allreduce 低时延 原理 magic 标志位」, 「昇腾 AscendC kernel 内 跨卡 同步 标志位 magic 轮次 对称内存 轮询」, 「LCCL 昇腾 低时延通信库 AllReduce 原理 共享内存 IPC buff 博客」 — no Ascend-specific blog on zhihu/csdn/cnblogs/bbs.huaweicloud.com surfaced; results were GPU-collective papers and an unrelated "LCCL" name collision in arXiv:2512.03644. All substantive material on this question is in source, not blog prose.
+
+
+---
+
+# TOPIC A — remote-write visibility, cache maintenance, and the official memory model
+
+Items below are verbatim quotations collected from the URLs shown. Note two provenance facts the
+sweep established: the hiascend.com doc portal publishes nothing newer than CANN 9.0.0 (`900`)
+and has no `aclshmem` book at all — the normative ACLSHMEM semantics exist only in the
+`gitcode.com/cann/shmem` headers and `docs/api/*.md`; and `asc.gitcode.com` hosts the
+auto-built `asc-devkit` documentation, which contains the authoritative NPU memory-model
+chapters (items 6-8) naming `NPU架构版本2201` explicitly.
+
+### item 0
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0177.html
+Huawei / 昇腾社区 CANN 社区版 9.0.0 (CANNCommunityEdition/900) Ascend C API 参考 — 缓存控制; page date unknown (content endpoint https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0177.html)
+The official DataCacheCleanAndInvalid API-reference page: 产品支持情况 / 功能说明 / 函数原型 / 参数说明 (entireType = SINGLE_CACHE_LINE | ENTIRE_DATA_CACHE, dcciDst = CACHELINE_ALL/UB/OUT/ATOMIC) / 返回值说明 / 约束说明 / 调用示例, including 示例3 on multi-core same-cache-line random overwrite.
+```
+### DataCacheCleanAndInvalid
+
+### 产品支持情况
+
+产品
+
+|
+
+是否支持（支持配置dcciDst的原型）
+
+|
+
+是否支持（不支持配置dcciDst的原型）
+
+|
+
+Atlas 350 加速卡
+
+|
+
+√
+
+|
+
+√
+
+|
+
+Atlas A3 训练系列产品/Atlas A3 推理系列产品
+
+|
+
+√
+
+|
+
+√
+
+|
+
+Atlas A2 训练系列产品/Atlas A2 推理系列产品
+
+|
+
+√
+
+|
+
+√
+
+|
+
+Atlas 200I/500 A2 推理产品
+
+|
+
+√
+
+|
+
+√
+
+|
+
+Atlas 推理系列产品AI Core
+
+|
+
+x
+
+|
+
+√
+
+|
+
+Atlas 推理系列产品Vector Core
+
+|
+
+x
+
+|
+
+x
+
+|
+
+Atlas 训练系列产品
+
+|
+
+x
+
+|
+
+x
+
+|
+
+### 功能说明
+
+在AI Core内部，Scalar单元和DMA单元都可能对Global Memory进行访问。
+
+图1 DataCache内存层次示意图
+
+如上图所示：
+
+DMA搬运单元读写Global Memory，数据通过DataCopy等接口在UB等Local Memory和Global Memory间交互，没有Cache一致性问题；
+
+Scalar单元访问Global Memory，首先会访问每个核内的Data Cache，因此存在Data Cache与Global Memory的Cache一致性问题。
+
+该接口用来刷新Cache，保证Cache的一致性，使用场景如下：
+
+读取Global Memory的数据，但该数据可能在外部被其余核修改，此时需要使用DataCacheCleanAndInvalid接口，直接访问Global Memory，获取最新数据；
+
+用户通过Scalar单元写Global Memory的数据，希望立刻写出，也需要使用DataCacheCleanAndInvalid接口。
+
+针对Atlas 350 加速卡，原子操作过程中，如果希望改变后续数据的饱和模式，需要先使用DataCacheCleanAndInvalid接口将Cache Line中现存的数据立刻写出，再调用SetCtrlSpr设置后续数据的饱和模式。
+
+### 函数原型
+
+支持通过配置dcciDst确保Data Cache与GM存储的一致性
+
+1
+2
+
+|
+
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst)
+
+|
+
+支持通过配置dcciDst确保Data Cache与Local Memory存储的一致性
+
+1
+2
+
+|
+
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const LocalTensor<T>& dst)
+
+|
+
+不支持配置dcciDst，仅支持保证Data Cache与GM的一致性
+
+1
+2
+
+|
+
+template <typename T, CacheLine entireType>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst)
+
+|
+
+### 参数说明
+
+表1 模板参数说明
+
+参数名
+
+|
+
+描述
+
+|
+
+T
+
+|
+
+dst的数据类型。
+
+|
+
+entireType
+
+|
+
+指令操作的模式：
+
+SINGLE_CACHE_LINE：只刷新传入地址所在的Cache Line，注意如果该地址非64B对齐，只会操作传入地址到64B对齐的部分。
+
+ENTIRE_DATA_CACHE：此时传入的地址无效，核内会刷新整个Data Cache，但是耗时较大，性能敏感的场景慎用。
+
+|
+
+dcciDst
+
+|
+
+表示使用该接口来保证Data Cache与哪一种存储保持一致性，类型为DcciDst枚举类。
+
+CACHELINE_ALL：与CACHELINE_OUT效果一致。
+
+CACHELINE_UB：表示通过该接口来保证Data Cache与UB的一致性。
+
+CACHELINE_OUT：表示通过该接口来保证Data Cache与Global Memory的一致性。
+
+CACHELINE_ATOMIC：
+Atlas 350 加速卡，原子操作过程中保证Data Cache和Global Memory的一致性。
+
+Atlas A3 训练系列产品/Atlas A3 推理系列产品，预留参数，暂未支持。
+
+Atlas A2 训练系列产品/Atlas A2 推理系列产品，预留参数，暂未支持。
+
+Atlas 200I/500 A2 推理产品，预留参数，暂未支持。
+
+Atlas 推理系列产品AI Core，预留参数，暂未支持。
+
+|
+
+表2 参数说明
+
+参数名
+
+|
+
+输入/输出
+
+|
+
+描述
+
+|
+
+dst
+
+|
+
+输入
+
+|
+
+需要刷新Cache的Tensor。
+
+|
+
+### 返回值说明
+
+无
+
+### 约束说明
+
+无
+
+### 调用示例
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+
+|
+
+// 示例1：SINGLE_CACHE_LINE 模式，假设mmAddr_为0x40（64B对齐）
+AscendC::GlobalTensor<uint64_t> global;
+global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+for( int i = 0; i < 8; i++) {
+global.SetValue(i, AscendC::GetBlockIdx());
+}
+// 由于首地址64B对齐，调用DataCacheCleanAndInvalid指令后，会立刻刷新前8个数
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+// 示例2：SINGLE_CACHE_LINE 模式，假设mmAddr_为0x20（非64B对齐）
+AscendC::GlobalTensor<uint64_t> global;
+global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+for( int i = 0; i < 8; i++) {
+global.SetValue(i, AscendC::GetBlockIdx());
+}
+// 由于首地址非64B对齐，调用1条指令，只会刷新起始地址至64B字节对齐的部分，即前4个数
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+// 需要再次调用DataCacheCleanAndInvalid指令，刷新后4个数
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global[4]);
+// 示例3：SINGLE_CACHE_LINE 模式，假设mmAddr_为0x40（64B对齐），多核处理场景（本样例仅做示例说明，便于开发者理解使用限制，非正常使用样例）
+AscendC::GlobalTensor<uint64_t> global;
+global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_);
+global.SetValue(AscendC::GetBlockIdx(), AscendC::GetBlockIdx());
+// 算子中多核操作虽然不在同一个地址，但在同一个Cache Line, 会出现数据的随机覆盖，和通用CPU的行为不同
+// 调用DataCacheCleanAndInvalid指令后，由于多核操作的时间不一致，最终结果存在随机性，后执行的核会覆盖前面核的结果
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+// 示例4：ENTIRE_DATA_CACHE 模式，假设mmAddr_为0x20（非64B对齐）
+// 本样例仅做示例说明，便于开发者理解使用限制，非正常使用样例
+AscendC::GlobalTensor<uint64_t> global;
+global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+for( int i = 0; i < 8; i++) {
+global.SetValue(i, AscendC::GetBlockIdx());
+}
+// 刷新整个Data Cache，性能较差
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::ENTIRE_DATA_CACHE, AscendC::DcciDst::CACHELINE_OUT>(global);
+
+|
+
+父主题： 缓存控制
+```
+
+### item 1
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_best_practices_10_00015.html
+Huawei / 昇腾社区 CANN 社区版 9.0.0, Ascend C 算子开发（编程指南）最佳实践 — 头尾开销优化; page date unknown
+States that the compilation framework AUTO-INSERTS a DCCI at operator tail when the developer writes GM via `* __gm__` or GlobalTensor.SetValue without calling DataCacheCleanAndInvalid, and that --cce-no-dcache-flush=true downgrades it to DCI (invalidate only, no clean).
+```
+### 设置DCI编译选项来减少算子尾开销
+
+该性能优化建议适用于如下型号：
+
+Atlas 350 加速卡
+
+【优先级】高
+
+【描述】算子执行结束时，需要将DCache置为无效，防止后续算子继续使用DCache中的数据而受到影响。可以通过在编译选项中添加--cce-no-dcache-flush=true，用于在算子尾部增加DCI（DataCacheInvalid）指令来使DCache失效。如果不开启该选项，则会默认增加DCCI（DataCacheCleanAndInvalid）指令来使DCache失效。
+
+插入DCI指令相比于插入DCCI指令，其减少了数据从DCache同步到GM（Clean）的过程，性能上会有一定优势。插入DCCI是一种额外的容错保证，如果开发者使用了* __gm__的方式改写GM内存，或者调用GlobalTensor.SetValue函数时，没有正确的调用DataCacheCleanAndInvalid接口来保证Cache一致性，编译框架自动插入DCCI恰好可以保证算子精度正常。
+
+所以在如下场景，可以通过开启该编译选项来降低算子尾部开销：
+
+算子使用* __gm__的方式改写GM内存，或者调用GlobalTensor.SetValue函数时，正确的使用DataCacheCleanAndInvalid接口，手动将数据从DCache中回刷到GM上，保证Cache的一致性。不依赖编译框架自动插入DCCI指令来保证一致性。
+
+算子不包含使用* __gm__的方式改写GM内存，或者调用GlobalTensor.SetValue函数的代码。
+
+父主题： 头尾开销优化
+```
+
+### item 2
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00031.html
+Huawei / 昇腾社区 CANN 社区版 9.0.0, Ascend C 编程指南 — 内存访问原理 / Scalar读写数据; page date unknown
+The official statement of the DataCache mechanism behind Scalar GM access: per-AIC/AIV private DataCache, 64B cache line, SetValue only marks the line Dirty, and 多核间访问…需要开发者手动调用DataCacheCleanAndInvalid来保证数据的一致性.
+```
+### Scalar读写数据
+
+AI Core中Scalar计算单元负责各类型的标量数据运算和程序的流程控制。根据硬件架构设计，Scalar仅支持对Global Memory和Unified Buffer的读写操作，而不支持对L1 Buffer、L0A Buffer、L0B Buffer和L0C Buffer等其他类型存储的访问。下文分别介绍了Scalar读写Global Memory和Unified Buffer的方式和Scalar读写数据时的同步机制。
+
+### Scalar读写Global Memory
+
+如上图所示，Scalar读写GM数据时会经过DataCache，DataCache主要用于提高标量访存指令的执行效率，每一个AIC/AIV核内均有一个独立的DataCache。下面通过一个具体示例来讲解DataCache的具体工作机制。
+
+globalTensor1是位于GM上的Tensor：
+
+执行完GetValue(0)后，globalTensor1的前8个元素会进入DataCache，后续GetValue(1)~GetValue(7)不需要再访问GM，而可以直接从DataCache的Cache Line中读取数据，提高了标量连续访问的效率。
+
+执行完SetValue(8, val)后，globalTensor1的index为8~15的元素会进入DataCache，SetValue只会修改DataCache中的Cache Line数据，同时将Cache Line的状态设置为Dirty，表明Cache Line中的数据与GM中的数据不一致。
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+
+|
+
+AscendC::GlobalTensor<int64_t> globalTensor1;
+globalTensor1.SetGlobalBuffer((__gm__ int64_t *)input);
+// 从0~7共计8个uint64_t类型，DataCache的Cache Line长度为64字节
+// 执行完GetValue(0)后，GetValue(1)~GetValue(7)可以直接从Cache Line中读取，不需要再访问GM
+globalTensor1.GetValue(0);
+globalTensor1.GetValue(1);
+globalTensor1.GetValue(2);
+globalTensor1.GetValue(3);
+globalTensor1.GetValue(4);
+globalTensor1.GetValue(5);
+globalTensor1.GetValue(6);
+globalTensor1.GetValue(7);
+
+// 执行完SetValue(8)后，不会修改GM上的数据，只会修改DataCache中Cache Line数据
+// 同时Cache Line的状态置为dirty，dirty表示DataCache中Cache Line数据与GM中的数据不一致
+int64_t val = 32;
+globalTensor1.SetValue(8, val);
+globalTensor1.GetValue(8);
+
+|
+
+根据上文的工作机制（如下图所示），多核间访问globalTensor1会出现数据不一致的情况，如果其余核需要获取GM数据的变化，则需要开发者手动调用DataCacheCleanAndInvalid来保证数据的一致性。
+
+### Scalar读写Unified Buffer
+
+Scalar读写Unified Buffer时，可以使用LocalTensor的SetValue和GetValue接口。示例如下：
+
+1
+2
+3
+4
+5
+6
+7
+
+|
+
+for (int32_t i = 0; i < 16; ++i) {
+inputLocal.SetValue(i, i); // 对inputLocal中第i个位置进行赋值为i
+}
+
+for (int32_t i = 0; i < srcLen; ++i) {
+auto element = inputLocal.GetValue(i); // 获取inputLocal中第i个位置的数值
+}
+
+|
+
+### Scalar读写数据时的同步
+
+Scalar读写Global Memory和Unified Buffer时属于PIPE_S（Scalar流水）操作，当用户使用SetValue或者GetValue接口，且算子工程使能自动同步时，不需要手动插入同步事件。
+
+如果用户关闭算子工程的自动同步功能时，则需要手动插入同步事件：
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+
+|
+
+// GetValue为Scalar操作，与后续的Duplicate存在数据依赖
+// 因此Vector流水需要等待Scalar操作结束
+float inputVal = srcLocal.GetValue(0);
+SetFlag<HardEvent::S_V>(eventID1);
+WaitFlag<HardEvent::S_V>(eventID1);
+AscendC::Duplicate(dstLocal, inputVal, srcDataSize);
+
+// SetValue为Scalar操作，与后续的数据搬运操作存在数据依赖
+// 因此MTE3流水需要等待Scalar操作结束
+srcLocal.SetValue(0, value);
+SetFlag<HardEvent::S_MTE3>(eventID2);
+WaitFlag<HardEvent::S_MTE3>(eventID2);
+AscendC::DataCopy(dstGlobal, srcLocal, srcDataSize);
+
+|
+
+父主题： 内存访问原理
+```
+
+### item 3
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_00188.html
+Huawei / 昇腾社区 CANN 社区版 9.0.0, Ascend C API 参考 — AI CPU API / DataStoreBarrier; page date unknown
+The official DataStoreBarrier entry (功能说明/约束说明) PLUS the official 调用示例 showing the canonical invalidate-then-poll loop on a GM lock: `while (*(volatile __gm__ uint64_t*)lock.GetPhyAddr(0) == 0) { DataCacheCleanAndInvalid<...SINGLE_CACHE_LINE, CACHELINE_OUT>(lock); }` with the writer side using DataStoreBarrier.
+```
+### DataStoreBarrier
+
+### 产品支持情况
+
+产品
+|
+
+是否支持
+|
+
+Atlas 350 加速卡
+|
+
+√
+|
+
+Atlas A3 训练系列产品
+/
+Atlas A3 推理系列产品
+
+|
+
+√
+|
+
+Atlas A2 训练系列产品
+/
+Atlas A2 推理系列产品
+
+|
+
+√
+|
+
+Atlas 200I/500 A2 推理产品
+
+|
+
+x
+|
+
+Atlas 推理系列产品
+AI Core
+|
+
+x
+|
+
+Atlas 推理系列产品
+Vector Core
+|
+
+x
+|
+
+Atlas 训练系列产品
+
+|
+
+x
+|
+
+### 功能说明
+
+数据同步屏障指令，该指令会阻塞当前线程执行，确保所有先前的写内存操作完成并对其它硬件单元可见后，才继续执行后续指令。用于AI CPU与AI Core多核之间的数据一致性。
+
+### 需要包含的头文件
+
+1
+
+|
+
+#include "aicpu_api.h"
+
+|
+
+### 函数原型
+
+1
+
+|
+
+DataStoreBarrier(void)
+
+|
+
+### 参数说明
+
+无
+
+### 返回值说明
+
+无
+
+### 约束说明
+
+该接口仅支持通过<<<...>>>调用，并在异构编译场景使用。
+
+### 调用示例
+
+在AI CPU算子Kernel侧实现代码中调用AscendC::DataStoreBarrier()，确保AI CPU算子对Tiling数据的修改写入内存，使得AI Core算子能够正确读取Tiling数据：
+
+struct TilingInfo {
+uint64_t lock; // AI CPU/AI Core之间同步的锁
+int8_t type;
+int8_t mode;
+int8_t len;
+};
+struct KernelArgs {
+uint32_t *xDevice;
+uint32_t *yDevice;
+uint32_t *zDevice;
+TilingInfo *ti; // 与AI Core共享的参数，用于同步tiling选择
+};
+
+template<typename T, int8_t mode, int8_t len>
+__aicore__ void hello_world_impl(GM_ADDR m)
+{
+if constexpr (std::is_same_v<T, float>) {
+AscendC::printf("Hello World: float mode %u len %u.\n", mode, len);
+} else if constexpr (std::is_same_v<T, int>) {
+AscendC::printf("Hello World: int mode %u len %u.\n", mode, len);
+}
+}
+
+// AI Core算子总入口
+// tilingInfo: 和AI CPU算子共同传递的参数，用于数据共享
+template<typename T, int8_t mode, int8_t len>
+__mix__(1,2) __global__ __aicore__ void hello_world(GM_ADDR m, GM_ADDR TilingPtr)
+{
+__gm__ struct KernelInfo::TilingInfo *ti = (__gm__ struct KernelInfo::TilingInfo *)TilingPtr;
+AscendC::GlobalTensor<uint64_t> lock;
+lock.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(&ti->lock));
+if ASCEND_IS_AIV {
+if (AscendC::GetBlockIdx() == 0) {
+while (*reinterpret_cast<volatile __gm__ uint64_t*>(lock.GetPhyAddr(0)) == 0) {   // 下沉模式，AI Core等待AICPU tiling计算完成
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+AscendC::DcciDst::CACHELINE_OUT>(lock);    //直接访问Global Memory，获取最新数据
+}
+}
+}
+// 上面是1个核等待AI CPU tiling计算完成，这里进行核间同步
+AscendC::SyncAll<false>();
+// 根据tiling参数值选择不同模板
+if (ti->type ==0 && ti->mode == 1 && ti->len == 2) {
+hello_world_impl<float, 1, 2>(m);
+} else if (ti->type == 1 && ti->mode == 2 && ti->len == 4) {
+hello_world_impl<int, 2, 4>(m);
+}
+// 执行完留一个核释放lock
+if ASCEND_IS_AIV {
+if (AscendC::GetBlockIdx() == 0) {
+lock.SetValue(0, 0);  // 刷新 lock
+AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+AscendC::DcciDst::CACHELINE_OUT>(lock);    //刷新Dcache，同步与GM之间的数据
+}
+}
+}
+
+extern "C" __global__ __aicpu__ uint32_t MyAicpuKernel(void *arg)
+{
+KernelArgs* cfg = (KernelArgs*)arg;
+AscendC::printf("MyAicpuKernel inited!\n");
+cfg->ti->lock = 1;
+cfg->ti->type = 1;
+cfg->ti->mode = 2;
+cfg->ti->len = 4;
+AscendC::DataStoreBarrier(); // 对tilingInfo进行写同步
+AscendC::printf("MyAicpuKernel inited type %u mode %u len %u end!\n", cfg->ti->type, cfg->ti->mode, cfg->ti->len);
+return 0;
+}
+
+父主题： AI CPU API
+```
+
+### item 4
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/hcclug/hcclcpp_07_0069.html
+Huawei / 昇腾社区 CANN 社区版 9.0.0, HCCL API 参考 — HcclCommSymWinRegister; page date unknown
+The official definition of 对称内存 (symmetric memory) as a CANN memory model — 全局可见 but 无需显式地址交换, identical per-rank virtual layout, remote physical mapping — this is the HCCL-side counterpart of the aclshmem symmetric heap.
+```
+### HcclCommSymWinRegister
+
+### 产品支持情况
+
+产品
+|
+
+是否支持
+|
+
+Atlas 350 加速卡
+|
+
+☓
+|
+
+Atlas A3 训练系列产品
+/
+Atlas A3 推理系列产品
+
+|
+
+√
+|
+
+Atlas A2 训练系列产品
+/
+Atlas A2 推理系列产品
+
+|
+
+☓
+|
+
+Atlas 200I/500 A2 推理产品
+
+|
+
+☓
+|
+
+Atlas 推理系列产品
+
+|
+
+☓
+|
+
+Atlas 训练系列产品
+
+|
+
+☓
+|
+
+### 功能说明
+
+用户在申请虚拟内存和物理内存并完成映射后，可调用此接口将虚拟内存注册为对称内存。
+
+对称内存是一种内存管理模型，允许并行处理单元（例如每个rank）以一种“全局可见”但“无需显式地址交换”的方式访问彼此的内存。
+
+对称内存的基本实现模型如下图所示，每个rank通过提前预留相同大小、相同布局的虚拟地址来实现。
+
+为每个rank申请虚拟内存，假设每个rank对应的虚拟内存大小为heap_size，通信域中的rank数量为rank_size，则通信域中总虚拟内存大小为heap_size*rank_size。
+
+每个rank的虚拟地址布局都是相同的。
+
+不同rank的物理地址映射到每个rank对应位置的虚拟地址，实现对其他rank内存的访问。
+
+对称内存功能使得HCCL可以直接对业务传入的内存进行操作，无需经过中间缓冲区（HCCL buffer），从而减少内存拷贝开销。
+
+### 函数原型
+
+1
+
+|
+
+HcclResult HcclCommSymWinRegister(HcclComm comm, void *addr, uint64_t size, CommSymWindow *winHandle, uint32_t flag)
+
+|
+
+### 参数说明
+
+参数名
+|
+
+输入/输出
+|
+
+说明
+|
+
+comm
+|
+
+输入
+|
+
+HCCL通信域，建议使用超节点内最大的通信域，即覆盖最大卡数的通信域。
+
+初始化通信域时可以通过HcclCommConfig的hcclSymWinMaxMemSizePerRank参数设置每个rank预留的对称内存大小，若不设置hcclSymWinMaxMemSizePerRank，使用默认值16GB。
+
+当前通信域预留的总虚拟对称内存大小为：rankSize * HcclCommConfig.hcclSymWinMaxMemSizePerRank。
+|
+
+addr
+|
+
+输入
+|
+
+预留的虚拟内存地址。
+
+虚拟内存需要调用aclrtReserveMemAddress接口预留。
+|
+
+size
+|
+
+输入
+|
+
+对称内存窗口的大小，0 < size <= HcclCommConfig.hcclSymWinMaxMemSizePerRank，并且size不能超过“与addr做映射的物理内存”大小（即调用aclrtMallocPhysical接口申请的Device物理内存）。
+
+注：对称内存注册按物理内存的大小对齐，实际注册的对称内存窗口大小等于“与addr做映射的物理内存”的大小。
+|
+
+winHandle
+|
+
+输出
+|
+
+存放“对称内存窗口资源句柄“的指针。
+
+HcclCommSymWindow类型的定义请参见HcclCommSymWindow。
+|
+
+flag
+|
+
+输入
+|
+
+是否启用对称内存，当前仅支持传入1。
+|
+
+### 返回值
+
+HcclResult：接口成功返回HCCL_SUCCESS，其他失败。
+
+### 约束说明
+
+仅支持
+Atlas A3 训练系列产品
+/
+Atlas A3 推理系列产品
+的超节点内通信。
+
+仅支持通信算子展开模式为AI CPU的场景。
+
+仅支持超节点内AI Server间使用HCCS链路进行SDMA通信的场景，不支持使用RoCE进行RDMA通信的场景（即不支持设置环境变量HCCL_INTER_HCCS_DISABLE为"TRUE"，单机场景该环境变量无效）。
+
+仅支持对称组网，即每个Server内卡数相同的场景。
+
+该接口仅支持集合通信算子AllGather、ReduceScatter、AllReduce、AlltoAll。
+
+需确保通信域中的所有rank同时调用该注册接口。
+
+所有rank的输入地址映射的物理内存大小一致（对称内存注册按物理内存的大小对齐）。
+
+所有rank调用该接口时，输入的size参数需要保持一致。
+
+使用对称内存功能时，算子的输入、输出内存必须调用此接口注册为对称内存。
+
+调用该接口注册的内存需要使用HcclCommSymWinDeregister接口解注册。
+
+### 调用示例
+
+// 创建并初始化通信域配置项
+HcclCommConfig config;
+HcclCommConfigInit(&config);
+// 按需修改通信域配置
+config.hcclSymWinMaxMemSizePerRank = 10; //单位GB, 默认值为16。设置对称堆预留的虚拟内存大小 = rankSize * config.hcclSymWinMaxMemSizePerRank;
+
+// 获取通信域参数
+uint32_t rankSize = 4;
+uint32_t rankId = 0;
+int32_t deviceId;
+ACLCHECK(aclrtGetDevice(&deviceId));
+HcclRootInfo rootInfo;
+HCCLCHECK(HcclGetRootInfo(&rootInfo));
+
+// 初始化集合通信域
+HcclComm hcclComm;
+HCCLCHECK(HcclCommInitRootInfoConfig(rankSize, &rootInfo, rankId, &config, &hcclComm));
+
+// 创建任务流
+aclrtStream stream;
+ACLCHECK(aclrtCreateStream(&stream));
+
+// 物理内存属性配置
+aclrtPhysicalMemProp prop;
+prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+prop.memAttr = ACL_HBM_MEM_HUGE;
+prop.location.id = deviceId;
+prop.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+prop.reserve = 0;
+
+// 获取对齐粒度，通常为2M
+size_t granularity;
+ACLCHECK(aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_RECOMMENDED, &granularity));
+
+// size按粒度对齐
+size_t size = 2 * 1024 * 1024;
+size_t allocSize = (size + granularity - 1) / granularity * granularity;
+
+// 预留虚拟内存
+void *virPtr;
+ACLCHECK(aclrtReserveMemAddress(&virPtr, allocSize, 0, nullptr, 1));
+
+// 申请物理内存
+aclrtDrvMemHandle memHandle;
+ACLCHECK(aclrtMallocPhysical(&memHandle, allocSize, &prop, 0));
+
+// 建立物理到虚拟的映射
+ACLCHECK(aclrtMapMem(virPtr, allocSize, 0, memHandle, 0));
+
+size_t sendBytes = 1024;
+size_t recvBytes = rankSize * sendBytes;
+HcclCommSymWindow symWin;
+// 注册对称内存
+HCCLCHECK(HcclCommSymWinRegister(hcclComm, virPtr, sendBytes + recvBytes, &symWin, 1));
+
+// 使用对称内存
+void *sendBuff = virPtr;
+void *recvBuff = static_cast<char*>(sendBuff) + sendBytes;
+
+// 调用集合通信算子
+HCCLCHECK(HcclAllGather(sendBuff, recvBuff, sendBytes, HCCL_DATA_TYPE_INT8, hcclComm, stream));
+
+// 阻塞等待任务流中的集合通信任务执行完成
+ACLCHECK(aclrtSynchronizeStream(stream));
+
+// 解注册对称内存
+HCCLCHECK(HcclCommSymWinDeregister(symWin));
+
+// 释放内存
+ACLCHECK(aclrtUnmapMem(virPtr));
+ACLCHECK(aclrtFreePhysical(memHandle));
+ACLCHECK(aclrtReleaseMemAddress(virPtr));
+
+// 销毁任务流
+ACLCHECK(aclrtDestroyStream(stream));
+
+// 销毁通信域
+HCCLCHECK(HcclCommDestroy(hcclComm));
+
+父主题： 对称内存
+```
+
+### item 5
+
+https://asc.gitcode.com/guide/programming_guide/advanced_programming/memory_model/cache_coherence.html
+Huawei / cann/asc-devkit master docs (auto-built site, 版本 master 提交 5f50fc4c6ada, 构建于 2026/10/20 11:47:29); source md: https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/guide/programming_guide/advanced_programming/memory_model/cache_coherence.md
+THE authoritative Ascend cache-coherence chapter: per-core DCache 64B line sizes for NPU arch 2201 and 3510, Clean/Dirty/Invalid/DCCI definitions, the explicit statement that hardware maintains coherence ONLY for same-core Scalar DCache producer+consumer, the write-端 Dirty / 读端旧副本 taxonomy, the T0..T6 producer/consumer timelines showing DCCI needed on BOTH sides, the Atomic-bypasses-DCache cases, and the full RAW/WAW/WAR software-maintenance table (Scalar.STORE -> Scalar.DCCI -> Scalar.DSB -> sync -> reader DCCI -> LOAD).
+```
+### 缓存一致性
+
+本文介绍NPU编程中常见的缓存一致性问题，说明Data Cache（DCache）、Instruction Cache（ICache）、SIMT DCache与Global Memory（GM）的数据一致性。芯片的硬件架构参考NPU架构版本2201和NPU架构版本3510。
+
+### 缓存一致性的基本概念​
+
+### Cache、Cache Line与缓存副本​
+
+Cache用于缓存后续可能重复访问的数据或指令，降低访问GM的开销。一次Cache加载通常不是只加载被访问的单个字节或单个变量，而是把该地址所在的一段连续数据作为一个整体加载到Cache中，这个整体称为Cache Line。
+
+Cache Line是Cache加载、失效、写回的最小操作粒度。例如访问GM内存时，会将GM里一个Cache Line长度内相邻的数据加载到L2 Cache缓存，利用空间局部性提高访问效率。Cache Line是硬件真正搬入、标记、替换和写回缓存数据的最小粒度，直接影响性能和一致性。NPU架构版本3510支持L2 Cache、DCache、ICache、SIMT DCache、NDDMA Cache；NPU架构版本2201支持L2 Cache、DCache和ICache。本文讨论的通用Cache单元信息如下：
+
+NPU架构版本3510Cache单元信息
+
+存储单元 | 位置 | 数据一致性说明 | NPU架构版本3510Cache Line大小 | NPU架构版本3510Cache大小 |
+
+L2 Cache | 核外共享缓存 | 多个核共享，不考虑多个核之间的Cache副本不一致问题 | 128B/512B | 128MB |
+
+AIC ICache | Scalar取指缓存 | 只读，不考虑多个核之间的数据不一致问题 | 128B | 32KB |
+
+AIV ICache | Scalar取指缓存 | 只读，不考虑多个核之间的数据不一致问题 | 128B | 16KB |
+
+AIC DCache | Scalar数据缓存 | 每个核独立缓存，需要考虑多个核之间的数据一致性问题 | 64B | 32KB |
+
+AIV DCache | Scalar数据缓存 | 每个核独立缓存，需要考虑多个核之间的数据一致性问题 | 64B | 32KB |
+
+SIMT DCache | SIMT数据缓存 | 每个核独立缓存，需要考虑多个核之间的数据一致性问题 | 128B | 32KB~128KB |
+
+NPU架构版本2201Cache单元信息
+
+存储单元 | 位置 | 数据一致性说明 | NPU架构版本2201Cache Line大小 | NPU架构版本2201Cache大小 |
+
+L2 Cache | 核外共享缓存 | 多个核共享，不考虑多个核之间的Cache副本不一致问题 | 512B | 192MB |
+
+AIC ICache | Scalar取指缓存 | 只读，不考虑多个核之间的数据不一致问题 | 128B | 32KB |
+
+AIV ICache | Scalar取指缓存 | 只读，不考虑多个核之间的数据不一致问题 | 128B | 16KB |
+
+AIC DCache | Scalar数据缓存 | 每个核独立缓存，需要考虑多个核之间的数据一致性问题 | 64B | 16KB |
+
+AIV DCache | Scalar数据缓存 | 每个核独立缓存，需要考虑多个核之间的数据一致性问题 | 64B | 32KB |
+
+同一份数据可能同时存在于GM、L2 Cache、DCache、SIMT DCache等多个位置。对于每个核独立维护的Cache，同一地址或同一Cache Line可能在不同核内形成不同副本：
+
+某个核已经在本核Cache中修改了数据，但GM或其他核的Cache中仍保留旧值；
+
+某个核读取前已经缓存过旧值，即使GM后来被其他路径更新，后续读取仍可能继续命中旧副本。
+
+这类副本不一致就是本文关注的缓存一致性问题。
+
+### Clean、Dirty、Invalid、写策略与DCCI​
+
+Cache中的数据可以按与下一级存储的关系理解为以下几类状态：
+
+Clean：Cache Line中的数据与下一级存储中的数据一致，直接丢弃该Cache Line不会丢失更新。
+
+Dirty：Cache Line中的数据已经被当前Cache修改，但尚未写回下一级存储。此时Cache中的数据与下一级存储中的数据不一致，如果其他路径直接读取GM，可能读到旧值。
+
+Invalid：Cache Line无效，后续访问不能继续使用该Cache Line中的旧数据，需要重新从下一级存储加载。
+
+Data Cache Clean and Invalid（DCCI）用于处理Cache副本。Clean操作用于把Dirty Cache Line写回到目标存储，Invalid操作用于使Cache Line失效，避免后续继续命中旧副本。
+
+实际使用时，可根据一致性目标选择不同DCCI接口：使用asc_dcci_single刷新指定地址所在的单个Cache Line；使用asc_dcci_entire_out刷新面向GM的一致性目标；原子相关目标按产品支持情况选择asc_dcci_entire_atomic等接口。
+
+对于需要等待DCCI触发的写回真正完成的场景，还需要配合Data Sync Barrier（DSB）等待前序内存访问完成，DSB只用于阻塞后续指令执行，直到之前的内存访问指令执行结束，参数可选择DSB_ALL、DSB_DDR或DSB_UB。
+
+Cache写入策略决定写操作是否会形成Dirty副本，常见策略包括直写和写回：
+
+直写（write-through）：写操作更新Cache副本的同时，将数据写出到下一级存储。直写路径通常不会留下需要后续Clean回下一级存储的Dirty副本，但写操作是否已经完成仍需要通过DSB等同步机制确认；如果读端已经缓存旧副本，仍需要按读端路径执行Invalid。
+
+写回（write-back）：写操作先更新Cache副本，并将Cache Line标记为Dirty；下一级存储要等到DCCI Clean、Cache Line替换等时机才会被更新。写回路径更容易产生“写端已经执行Store，但GM或Unified Buffer（UB）仍是旧值”的问题。
+
+### 缓存一致性与内存一致性的区别​
+
+缓存一致性关注的是同一地址或同一Cache Line在不同缓存副本之间的值是否一致。例如，某个核的DCache已经把A修改为新值，但GM中仍是旧值；或者GM已经被其他路径更新，但当前核DCache仍保留旧副本。此时问题的关键是是否需要写回Dirty副本、失效旧副本，或者绕过Cache访问。
+
+内存一致性关注的是不同执行单元、不同线程或不同核之间的读写顺序是否符合程序预期。例如，生产者先写数据再写标志，消费者看到标志后是否一定能按预期读取到数据。同步接口、内存栅栏主要解决执行顺序和访问完成问题；DCCI主要解决Cache副本写回和失效问题。实际编程时，两类问题经常同时出现，但本文重点讨论Cache副本与GM、UB之间的数据一致性。
+
+以下以DCache为例展示缓存一致性问题，A和B位于GM上同一条64B DCache Cache Line内：
+
+Text
+
+初始状态：
+GM上64B地址长度的数据分布[A=0, B=0, ...]
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0        Scalar.LOAD A
+// Core 0 DCache缓存整条Cache Line：
+// [A=0, B=0, ...]
+
+T1                                                Scalar.LOAD B
+// Core 1 DCache缓存整条Cache Line：
+// [A=0, B=0, ...]
+
+T2        Scalar.STORE A = 1
+// Core 0 DCache变成：
+// [A=1, B=0, ...]
+
+T3                                                Scalar.STORE B = 2
+// Core 1 DCache变成：
+// [A=0, B=2, ...]
+
+两个核虽然修改的是不同字段，但各自DCache里保存的是整条Cache Line的副本。后续写回GM时，如果以整条Cache Line为单位写回，就可能出现不同结果：
+
+Text
+
+Case 1：Core 0先写回，Core 1后写回
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T4        Scalar.DCCI
+// Core 0以Cache Line为粒度写回：
+// GM Cache Line = [A=1, B=0, ...]
+
+T5                                                Scalar.DCCI
+// Core 1以Cache Line为粒度写回：
+// GM Cache Line = [A=0, B=2, ...]
+
+Case 2：Core 1先写回，Core 0后写回
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T4                                                Scalar.DCCI
+// Core 1以Cache Line为粒度写回：
+// GM Cache Line = [A=0, B=2, ...]
+
+T5        Scalar.DCCI
+// Core 0以Cache Line为粒度写回：
+// GM Cache Line = [A=1, B=0, ...]
+
+期望结果是： GM Cache Line = [A=1, B=2, ...]
+
+但是因为每个核都有自己的缓存数据，各个核都是在自己的缓存旧副本上修改同一条Cache Line中的不同字段，所以实际可能结果是：
+
+Case 1：Core 0先写回，Core 1后写回，最终GM Cache Line = [A=0, B=2, ...]
+
+Case 2：Core 1先写回，Core 0后写回，最终GM Cache Line = [A=1, B=0, ...]
+
+这个例子由于没有保证缓存一致性，最终没有得到期望的GM Cache Line = [A=1, B=2, ...]。
+
+### 缓存一致性​
+
+### DCache与GM的缓存一致性​
+
+DCache与GM的一致性是NPU缓存一致性中最常见的一类问题。Scalar普通读写GM时会经过当前核内的DCache，而每个AIC/AIV核内都有独立的DCache用于缓存GM里的数据。某个核通过DCache修改GM地址对应的数据后，新值可能先停留在本核DCache中，GM和其他核DCache中的副本不会自动更新。
+
+多个核或多条访问路径操作同一段GM数据时，DCache与GM的不一致通常来自两类副本：
+
+写端Dirty副本：生产者已经写入，但新值仍停留在生产者DCache中，GM尚未更新。
+
+读端旧副本：消费者此前已经缓存过同一地址或同一Cache Line，后续读取继续命中本核DCache旧值。
+
+Scalar对GM的普通读写行为可以概括为：
+
+Scalar读GM后，数据会进入DCache；后续读取同一条Cache Line内的数据时，可能直接从DCache读取，不再访问GM。
+
+Scalar写GM时，只会修改DCache中的Cache Line，并把该Cache Line标记为Dirty。Dirty表示DCache中的Cache Line数据与GM中的数据不一致，但是并不会立刻将Dirty数据写回GM，而是需要用户手动刷新或者该数据段被替换时才会写回GM。
+
+所以，生产侧要关心Dirty数据是否已经写回GM；消费侧要关心本核DCache里是否还保留旧副本。DCCI负责处理“副本是否写回或失效”，DSB和流水同步只负责处理“后续访问是否等到前序访问完成”。
+
+### Scalar访问GM带来的缓存一致性​
+
+Scalar普通读写GM时，Scalar.STORE已经执行不等于GM已经被改写。下面用两个核访问同一GM地址A说明生产侧Dirty副本和消费侧旧副本问题，示例中的T0、T1等时间点只表示代码逻辑先后顺序。
+
+Text
+
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+Core 1 DCache中没有缓存A
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0        Scalar.STORE A = 1
+// Core 0 DCache[A] = 1, Dirty
+// GM[A]仍可能是0
+
+T1                                                // 如果此时Scalar.LOAD A -> 0
+// Core 1可能从GM加载旧值0
+
+T2        Scalar.DCCI A
+T3        Scalar.DSB
+// Dirty Cache Line写回完成，GM[A] = 1
+
+T4                                                Scalar.LOAD A -> 1
+// 如果Core 1没有旧DCache副本，可以读到新值1
+
+如果Core 1在T3之前没有缓存过A，T4再执行Scalar.LOAD A可以从GM获取新值1；如果Core 1缓存了旧值，则需要继续处理读端旧副本。
+
+如果读端本核DCache中已经缓存过同一地址，还需要考虑旧副本。下面示例中，消费侧使用DCCI读取数据前刷新指定GM地址所在Cache Line：
+
+Text
+
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+Core 1 DCache中没有缓存A
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0        Scalar.LOAD A -> 0                      Scalar.LOAD A -> 0
+// Core 0 DCache[A] = 0                 // Core 1 DCache[A] = 0
+
+T1        Scalar.STORE A = 1
+// Core 0 DCache[A] = 1, Dirty
+// GM[A]仍可能是0
+
+T2        Scalar.DCCI A
+
+T3        Scalar.DSB
+// Dirty Cache Line写回完成，GM[A] = 1
+
+T4                                                Scalar.LOAD A -> 0
+// Core 1 DCache[A] = 0，Core 1可能继续命中本核旧DCache副本
+
+T5                                                Scalar.DCCI A
+// Core 1旧Cache副本失效
+
+T6                                                Scalar.LOAD A -> 1
+// Core 1 DCache[A] = 1，Core 1重新从GM获取新值
+
+上面两个例子分别对应写端Dirty副本和读端旧副本。Scalar路径的Cache处理原则是：
+
+生产者通过Scalar写GM后，如果消费者需要从GM或其他路径读取该数据，生产者需要执行DCCI（例如asc_dcci_single）把Dirty数据写回GM。
+
+消费者如果担心本核DCache中有旧副本，读取前需要执行DCCI使旧副本失效。
+
+如果算法本身不需要DCache缓存，可以使用ReadGmBypassDCache和WriteGmBypassDCache直接读写GM。
+
+还有一类问题来自Cache Line粒度。普通Scalar写后续以64B Cache Line为单位写回；多个核即使写的是同一条Cache Line中的不同字段，也可能在各自写回整条Cache Line时覆盖对方结果。此类场景可以通过让不同核操作的地址至少相隔Cache Line大小，或使用ReadGmBypassDCache和WriteGmBypassDCache降低风险。
+
+### Atomic访问导致的DCache缓存一致性​
+
+NPU架构版本3510支持Scalar原子操作，Scalar原子操作可以看成对某个GM地址执行的读-改-写事件，但是Scalar原子操作会绕过DCache，因此会导致缓存一致性。例如C API asc_atomic_add，该接口在指定GM地址上执行原子加操作。原子操作保证的是这一次读-改-写不会被其他原子更新打断，但它不会自动清理同一地址在DCache中的旧副本或Dirty副本。
+
+因此，如果同一GM地址此前被普通Scalar路径访问过，就需要分析原子事件和DCache事件的一致性问题：
+
+若普通Scalar写先发生，数据可能仍停留在DCache中。后续原子操作如果依赖这个写入，需要先把相关DCache Line写回GM。
+
+若原子操作先发生，本核DCache中可能仍保留旧副本。后续再用普通Scalar读同一地址时，需要先使旧副本失效，避免读到原子操作之前的值。
+
+下面用地址A和asc_atomic_add说明Atomic与DCache混用时的问题：
+
+Text
+
+Case 1：普通Scalar写在前，Atomic在后
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+
+时间点    Core 0
+======    ====================================
+T0        Scalar.STORE A = 1
+// Core 0 DCache[A] = 1, Dirty
+// GM[A]仍可能是0
+
+T1        asc_atomic_add(A, 1)
+// Atomic绕过DCache访问GM
+// 如果Atomic从GM旧值0开始累加，GM[A]可能变成1，而不是期望的2
+
+上面的关键不是asc_atomic_add本身不原子，而是原子操作看到的GM值没有包含此前停留在DCache中的普通Scalar写入。
+
+反过来，如果asc_atomic_add(A, 1)已经把GM更新为1，而本核DCache里还保留A == 0的旧副本，后续普通Scalar读也可能继续读到旧副本。
+
+Text
+
+Case 2：Atomic在前，普通Scalar读在后
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+
+时间点    Core 0
+======    ====================================
+T0        Scalar.LOAD A -> 0
+// Core 0 DCache[A] = 0, Clean
+
+T1        asc_atomic_add(A, 1)
+// Atomic绕过DCache更新GM
+// GM[A] = 1
+// Core 0 DCache[A]仍可能是0
+
+T2        Scalar.LOAD A -> 0
+// 普通Scalar读可能继续命中本核旧DCache副本
+
+为了避免上述问题，Atomic访问通常需要处理缓存一致性问题。正确的处理流程应该是：
+
+Case 1：普通Scalar写在前，Atomic在后，需要先把DCache写回GM，再执行Atomic操作。
+
+Case 2：Atomic在前，普通Scalar读在后，需要先使DCache旧副本失效，再执行普通Scalar读。
+
+以下是正确流程示例：
+
+Text
+
+Case 1：普通Scalar写在前，Atomic在后的正确处理流程
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+
+时间点    Core 0
+======    ====================================
+T0        Scalar.STORE A = 1
+// Core 0 DCache[A] = 1, Dirty
+// GM[A]仍可能是0
+
+T1        Scalar.DCCI A
+T2        Scalar.DSB
+// Dirty Cache Line写回完成，GM[A] = 1
+
+T3        asc_atomic_add(A, 1)
+// Atomic从GM[A] = 1开始累加
+// GM[A] = 2
+
+T4        Scalar.DSB
+// 等待Atomic产生的GM访问完成
+
+Text
+
+Case 2：Atomic在前，普通Scalar读在后的正确处理流程
+初始状态：
+GM[A] = 0
+Core 0 DCache中没有缓存A
+
+时间点    Core 0
+======    ====================================
+T0        Scalar.LOAD A -> 0
+// Core 0 DCache[A] = 0, Clean
+
+T1        asc_atomic_add(A, 1)
+T2        Scalar.DSB
+// 等待Atomic产生的GM访问完成，GM[A] = 1
+
+T3        Scalar.DCCI A
+// Core 0旧Cache副本失效
+
+T4        Scalar.LOAD A -> 1
+// 重新从GM获取Atomic更新后的新值
+
+### 软件维护Scalar访问GM的DCache一致性​
+
+本节介绍如何从软件层面维护Scalar访问GM时导致的DCache一致性。硬件仅维护消费者和生产者都来自同核Scalar DCache操作的场景下的缓存一致性，不会主动维护各核DCache之间的一致性，也不会主动处理Scalar DCache与其他GM访问路径之间的旧副本或Dirty副本问题。因此，当同一GM地址或同一条Cache Line被不同访问路径先后访问时，需要开发者使用DCCI、DSB、流水同步等方式从软件层面维护缓存一致性。
+
+Scalar写GM可以分为两类：
+
+cache: 普通Scalar写通过DCache修改GM，例如直接写__gm__地址；
+
+no cache: 不经过DCache，直接向GM发起写操作，例如WriteGmBypassDCache等。
+
+按照访问顺序，常见需要软件维护一致性的场景可以分为RAW、WAW和WAR三类：
+
+### RAW：先写后读​
+
+RAW（Read After Write）场景要求后序读操作读取到前序写操作产生的新值。维护RAW场景下的缓存一致性时，需要同时处理写端和读端：
+
+写端如果通过Scalar DCache写GM，可能只形成Dirty副本，GM中的数据尚未更新，因此通常需要在消费者读取前执行写端DCCI和DSB。
+
+读端如果通过可能持有旧副本的带Cache路径读取，需要在真正读取前按表执行读端DCCI。
+
+如果写端和读端位于不同流水，还需要插入对应流水同步，保证读操作不会早于写后处理执行。
+
+下表列出同一AI Core内Scalar写GM之后、消费者读取GM完整的软件维护操作序列。假设生产者和消费者访问同一地址，每个单元格都是从写后处理到读前处理的完整操作序列。
+
+表中的cache表示经过cache的访问，no cache表示不经过cache的访问,VF_SIMT表示经过cache的SIMT线程函数，MTE2表示经过MTE2的读取操作，MTE2（cache）指多维数据搬运NDDMA，MTE2.DCI指NDDMA Cache的失效操作或asc_ndim_copy_dci。
+
+后续读取方式（列，后发生）
+╲
+前序写入方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE2（cache） | MTE2（no cache） |
+
+Scalar（cache） | 先写Scalar.STORE
+后读Scalar.LOAD | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+后读Scalar.LOAD | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→V/VF
+后读SIMT.DCCI
+后读VF_SIMT.LOAD | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→V/VF
+后读VF_SIMT.LOAD | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→MTE2
+后读MTE2.DCI
+后读MTE2.LOAD | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→MTE2
+后读MTE2.LOAD |
+
+Scalar（no cache） | 先写Scalar.STORE
+先写Scalar.DSB
+后读Scalar.DCCI
+后读Scalar.LOAD | 先写Scalar.STORE
+先写Scalar.DSB
+后读Scalar.LOAD | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→V/VF
+后读SIMT.DCCI
+后读VF_SIMT.LOAD | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→V/VF
+后读VF_SIMT.LOAD | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→MTE2
+后读MTE2.DCI
+后读MTE2.LOAD | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→MTE2
+后读MTE2.LOAD |
+
+例如，前序写入方式是Scalar（cache），后续读取方式是VF_SIMT（cache）时，对应单元格要求执行：
+
+Text
+
+Scalar.STORE -> Scalar.DCCI -> Scalar.DSB -> sync S→V/VF -> SIMT.DCCI -> VF_SIMT.LOAD
+
+含义是：先通过Scalar.STORE完成写入；由于该写入可能停留在Scalar DCache中，需要执行Scalar.DCCI -> Scalar.DSB将Dirty数据写回GM并等待写回完成；随后通过sync S→V/VF保证VF_SIMT读取发生在Scalar侧处理之后；最后，VF_SIMT读前执行SIMT.DCCI，避免SIMT DCache命中旧副本，再执行VF_SIMT.LOAD读取新值。
+
+如果前序是Scalar（no cache）写，写端不会留下Dirty副本，但写入仍需要通过Scalar.DSB等待完成；如果后续读端走带Cache路径，仍要按表执行读端DCCI处理旧副本。
+
+### WAW：先写后写​
+
+WAW（Write After Write）场景要求最终写入GM的是后一次写操作的数据。因为DCache写回的原因，程序顺序上的后写不一定是内存序上的最后一次写。下面示例中，A和B位于同一条64B DCache Cache Line内。前一次写通过Scalar DCache修改A，后一次写通过MTE3修改B。虽然MTE3写发生在后，但如果Scalar DCache中的Dirty Cache Line最后才写回GM，就可能把B恢复成Scalar缓存副本中的旧值：
+
+Text
+
+初始状态：
+GM Cache Line = [A=0, B=0, ...]
+A和B位于同一条64B DCache Cache Line内。
+
+时间点    Scalar流水                              MTE3流水
+======    ====================================    ====================================
+T0        Scalar.STORE A = 1
+// Scalar DCache中形成Dirty Cache Line：
+// [A=1, B=0, ...]
+// GM Cache Line仍可能是[A=0, B=0, ...]
+
+T1                                                MTE3.STORE B = 2
+// MTE3直接写GM：
+// GM Cache Line = [A=0, B=2, ...]
+
+T2        Scalar.DCCI A
+T3        Scalar.DSB
+// Scalar Dirty Cache Line按64B写回GM：
+// GM Cache Line = [A=1, B=0, ...]
+// MTE3对B的后写被前序Scalar Dirty副本覆盖
+
+因此，WAW场景的维护重点是避免前序Scalar Dirty副本在后写之后才写回GM。软件应先按表处理前一次写留下的Dirty副本或前序GM写等待，再执行后一次写；后一次写是否需要进一步等待完成或发布，由后一次写的访问路径决定。上面的例子应改成：
+
+Text
+
+初始状态：
+GM Cache Line = [A=0, B=0, ...]
+A和B位于同一条64B DCache Cache Line内。
+
+时间点    Scalar流水                              MTE3流水
+======    ====================================    ====================================
+T0        Scalar.STORE A = 1
+// Scalar DCache中形成Dirty Cache Line：
+// [A=1, B=0, ...]
+
+T1        Scalar.DCCI A
+T2        Scalar.DSB
+// 前序Scalar Dirty Cache Line写回完成：
+// GM Cache Line = [A=1, B=0, ...]
+
+T3        sync S→MTE3
+// 建立Scalar流水到MTE3流水的执行顺序
+
+T4                                                MTE3.STORE B = 2
+// GM Cache Line = [A=1, B=2, ...]
+
+下表列出从前序写开始、完成必要的前序写处理和流水顺序、到后续写发起为止的操作序列。维护WAW场景下缓存一致性时先按行找到前一次写路径，再按列找到后一次写路径，按单元格顺序执行即可。表中的后写xxx.STORE只表示后一次写操作已经发起，如果后一次写需要立刻对GM或其他访问路径可见，仍需要在后写完成后按对应写路径执行必要的DCCI操作。
+
+后续写入方式（列，后发生）
+╲
+前序写入方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE3 | FixPipe |
+
+Scalar
+（cache） | 先写Scalar.STORE
+后写Scalar.STORE | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+后写Scalar.STORE | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→V/VF
+后写VF_SIMT.STORE | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→V/VF
+后写VF_SIMT.STORE | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→MTE3
+后写MTE3.STORE | 先写Scalar.STORE
+先写Scalar.DCCI
+先写Scalar.DSB
+sync S→FixPipe
+后写FixPipe.STORE |
+
+Scalar
+（no cache） | 先写Scalar.STORE
+先写Scalar.DSB
+后写Scalar.STORE | 先写Scalar.STORE
+先写Scalar.DSB
+后写Scalar.STORE | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→V/VF
+后写VF_SIMT.STORE | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→V/VF
+后写VF_SIMT.STORE | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→MTE3
+后写MTE3.STORE | 先写Scalar.STORE
+先写Scalar.DSB
+sync S→FixPipe
+后写FixPipe.STORE |
+
+如果用户无法保证多个写者之间的先后顺序，应避免多个核通过DCache写同一地址或同一Cache Line。
+
+### WAR：先读后写​
+
+WAR（Write After Read）场景要求前序读操作读取到后续写操作发生之前的旧值。此类场景的关键不是写入结果，而是先保证读操作已经完成，再允许后续写发起。否则，后写可能过早改变GM中的值，导致前序读观察到本不应该看到的新值。
+
+下表列出前序读取方式为Scalar（cache）或Scalar（no cache）时，从前序读开始、完成必要的等待和流水顺序、到后续写发起为止的操作序列。如果是跨核场景需要用核间通知替代表中的核内sync。
+
+后续写入方式（列，后发生）
+╲
+前序读取方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE3 | FixPipe |
+
+Scalar（cache） | 前读Scalar.LOAD
+后写Scalar.STORE | 前读Scalar.LOAD
+前读Scalar.DSB
+后写Scalar.STORE | 前读Scalar.LOAD
+sync S→V/VF
+后写VF_SIMT.STORE | 前读Scalar.LOAD
+sync S→V/VF
+后写VF_SIMT.STORE | 前读Scalar.LOAD
+sync S→MTE3
+后写MTE3.STORE | 前读Scalar.LOAD
+sync S→FixPipe
+后写FixPipe.STORE |
+
+Scalar（no cache） | 前读Scalar.LOAD
+前读Scalar.DSB
+后写Scalar.STORE | 前读Scalar.LOAD
+前读Scalar.DSB
+后写Scalar.STORE | 前读Scalar.LOAD
+sync S→V/VF
+后写VF_SIMT.STORE | 前读Scalar.LOAD
+sync S→V/VF
+后写VF_SIMT.STORE | 前读Scalar.LOAD
+sync S→MTE3
+后写MTE3.STORE | 前读Scalar.LOAD
+sync S→FixPipe
+后写FixPipe.STORE |
+
+WAR场景下维护缓存一致性的目标是读取写前旧值，维护重点是确保这个读已经完成。表中的DSB只负责等待前序GM访问完成，不能替代流水间或核间同步。sync S→V/VF、sync S→MTE3和sync S→FixPipe只用于同一AI Core内建立流水顺序。如果前序访问和后续访问位于不同AI Core，表中的核内流水同步不能跨核生效，还需要按以下顺序组织跨核通信：
+
+Text
+
+前序访问核：完成前序访问侧Cache处理和必要DSB -> 发送核间通知
+后续访问核：等待核间通知 -> Cache副本处理 -> 访问数据
+
+### ICache与GM的缓存一致性​
+
+ICache用于缓存Scalar单元最近使用或频繁使用的指令。Scalar读取GM指令时，优先从ICache读取；ICache未命中时，再从L2 Cache读取；L2 Cache也未命中时，再从GM加载指令并更新到L2 Cache和ICache。相关说明见系统缓存概述。
+
+从缓存一致性角度看，ICache缓存的是指令而不是普通数据，并且是只读Cache，因此一般不涉及普通数据路径上的Cache副本不一致问题。
+
+### SIMT DCache与GM的缓存一致性​
+
+### SIMT DCache访问路径​
+
+NPU架构版本3510新增SIMT相关硬件单元。SIMT访存会涉及SIMT DCache：SIMT DCache复用UB中的一部分空间，用于缓存SIMT线程访问GM时的数据。SIMT DCache空间可配置范围为32KB到128KB，实际大小由UB总大小扣除静态内存、动态内存和预留空间后确定，若剩余空间超过128KB，SIMT DCache大小固定为128KB。SIMT也提供asc_ldcg、asc_stcg等接口表达不占用或绕过SIMT DCache的访问意图，因此本节按带Cache路径和no cache路径分别分析。
+
+SIMT读GM的底层实现：先从SIMT DCache读取，未命中再访问L2 Cache或GM，并把数据缓存到L2 Cache和SIMT DCache中。L2 Cache与GM之间的数据一致性由硬件保证，但SIMT DCache与GM之间不保证一致性。因此，如果同一GM地址已经被其他核、Scalar路径或MTE路径更新，而当前SIMT DCache中仍有旧副本，后续SIMT读可能继续命中旧值。
+
+SIMT DCache采用直写（write-through）策略：
+
+SIMT写GM时，写入会进入SIMT DCache，同时写出到GM，不形成需要后续Clean回GM的Dirty副本；
+
+no cache写入不经过SIMT DCache，也不会在SIMT DCache中缓存写入数据。no cache写GM时会检查该地址的数据是否已缓存在SIMT DCache里，如果命中，硬件会自己执行DCCI。
+
+判断SIMT写GM后是否需要Cache处理，可以按两步看：
+
+先看写端是否需要等待GM写完成：SIMT DCache是直写Cache，写端不需要执行DCCI把Dirty副本写回GM。
+
+再看读端是否可能命中旧副本：如果消费者通过Scalar或MTE2等其他带Cache路径读取，读端路径中可能已有旧副本，需要在读前按表执行对应的DCCI。
+
+如果线程或核之间还通过GM上的标志位通信，需要另行使用asc_threadfence等内存栅栏处理写入顺序关系。内存栅栏属于内存顺序控制，不会自动写回生产者侧Cache，也不会自动失效消费者侧Cache。
+
+### 软件维护VF_SIMT访问GM的缓存一致性​
+
+本节从软件维护角度说明VF_SIMT访问GM时如何维护SIMT DCache一致性。硬件只维护单核内SIMT流水的缓存一致性，不维护SIMT和其他流水的一致性。由于SIMT DCache采用直写策略，VF_SIMT写GM不会形成需要后续Clean回GM的Dirty副本，但写操作是否已经完成、读端是否可能命中旧副本、不同流水之间是否已经建立顺序，仍需要由软件按访问依赖关系处理。
+
+表中的两类VF_SIMT访问路径含义如下：
+
+VF_SIMT（cache）：写入经过SIMT DCache直写路径，数据会缓存至SIMT DCache和L2 Cache，同时写出到GM。
+
+VF_SIMT（no cache）：写GM不经过SIMT DCache，不在SIMT DCache中缓存写入数据。
+
+由于SIMT DCache为直写Cache，且no cache路径也不会产生Dirty副本，二者在RAW、WAW、WAR场景下需要的软件一致性维护动作基本相同，下文表格将VF_SIMT（cache）和VF_SIMT（no cache）合并为VF_SIMT（cache/no cache）。
+
+下面按RAW、WAW和WAR三类依赖关系分析。本节表格同样按"先看行、再看列"阅读：行表示先发生的访问，列表示后发生的访问；单元格中的操作按从上到下的顺序执行。表中的xxx.STORE表示对应路径的写操作，xxx.LOAD表示对应路径的读操作。SIMT.DCCI用于使SIMT DCache中的旧副本失效，sync X→Y用于同一AI Core内建立流水X到流水Y的执行顺序，Scalar.DCCI和MTE2.DCI表示读端在读取前处理本路径可能存在的旧Cache副本。DSB和sync不改变Cache副本状态，不能替代DCCI。
+
+### RAW：先写后读​
+
+RAW场景要求后续读操作读取到VF_SIMT前序写操作产生的新值。由于SIMT DCache是直写Cache，写端不需要执行DCCI写回Dirty数据；如果后续读端是Scalar或MTE2等可能持有旧副本的带Cache路径，还需要在读前执行对应DCCI，避免命中旧副本。
+
+下表描述核内VF_SIMT作为生产者写GM之后、消费者真正读取之前，生产者和消费者需要按顺序执行哪些Cache处理以及必要的等待/流水顺序操作。
+
+后续读取方式（列，后发生）
+╲
+前序写入方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE2（cache） | MTE2（no cache） |
+
+VF_SIMT
+（cache/no cache） | 先写VF_SIMT.STORE
+sync V/VF→S
+后读Scalar.DCCI
+后读Scalar.LOAD | 先写VF_SIMT.STORE
+sync V/VF→S
+后读Scalar.LOAD | 先写VF_SIMT.STORE
+sync SIMT->SIMT（同线程内无需同步）
+后读VF_SIMT.LOAD | 先写VF_SIMT.STORE
+sync SIMT->SIMT（同线程内无需同步）
+后读VF_SIMT.LOAD | 先写VF_SIMT.STORE
+sync V/VF→MTE2
+后读MTE2.DCI
+后读MTE2.LOAD | 先写VF_SIMT.STORE
+sync V/VF→MTE2
+后读MTE2.LOAD |
+
+例如，前序写入方式是VF_SIMT（cache/no cache），后续读取方式是普通Scalar（cache）时，需要执行：
+
+Text
+
+VF_SIMT.STORE -> sync V/VF→S -> Scalar.DCCI -> Scalar.LOAD
+
+含义是：SIMT DCache是直写Cache，SIMT写GM时新值会写出到GM；消费者读前再通过sync V/VF→S保证同一AI Core内Scalar读取发生在VF_SIMT写入之后，并执行Scalar.DCCI避免Scalar DCache中已有旧副本；之后Scalar读取才能从正确位置获得新值。
+
+其他单元格按同样方式阅读：先完成行中描述的VF_SIMT写，再根据列中后续读取路径补充等待、流水同步以及读端Cache失效操作。是否需要读端DCCI，取决于后续读取路径是否可能命中旧Cache副本。
+
+其中，表格里的sync SIMT->SIMT（同线程内无需同步）指如果是线程间操作同地址，则需要通过asc_syncthreads建立阶段同步；如果是SIMT的某个单线程内VF_SIMT写入和读取同地址无需同步。
+
+### WAW：先写后写​
+
+WAW场景要求最终写入GM的是后一次写操作的数据。由于SIMT DCache是直写Cache，前一次VF_SIMT写不会留下待写回GM的Dirty副本；软件维护的重点是按表保证前后两次写的执行顺序，避免前一次写延迟到达GM后影响后一次写的结果。
+
+下表列出从前序写开始、完成必要的前序写等待和流水顺序、到后续写发起为止的操作序列。使用时先按行选择前一次VF_SIMT写路径，再按列选择后一次写路径，按单元格顺序执行。表中的后写xxx.STORE只表示后一次写操作已经发起，不表示后一次写已经完成，也不表示后一次写结果已经对GM或其他访问路径可见；后一次写完成后的等待和发布，需要按后写路径另行处理。
+
+后续写入方式（列，后发生）
+╲
+前序写入方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE3 | FixPipe |
+
+VF_SIMT
+（cache/no cache） | 先写VF_SIMT.STORE
+sync V/VF→S
+后写Scalar.STORE | 先写VF_SIMT.STORE
+sync V/VF→S
+后写Scalar.STORE | 先写VF_SIMT.STORE
+sync SIMT->SIMT（同线程内无需同步）
+后写VF_SIMT.STORE | 先写VF_SIMT.STORE
+sync SIMT->SIMT（同线程内无需同步）
+后写VF_SIMT.STORE | 先写VF_SIMT.STORE
+sync V/VF→MTE3
+后写MTE3.STORE | 先写VF_SIMT.STORE
+sync V/VF→FixPipe
+后写FixPipe.STORE |
+
+如果后一次写需要立刻对GM或其他访问路径可见，仍需要在后写完成后按对应写路径执行必要的等待或发布操作。例如，后写为Scalar（cache）时，需要执行后写Scalar.DCCI -> 后写Scalar.DSB；后写为VF_SIMT、MTE3或FixPipe时，需要等待对应写GM操作完成。
+
+### WAR：先读后写​
+
+WAR场景要求前序读操作读取到后续写操作发生之前的旧值。此类场景不需要把新值尽快发布给读端，而是需要先确认VF_SIMT侧读操作已经完成，再允许后续写端执行写GM操作或发送写完成通知。
+
+下表列出前序读取方式为VF_SIMT（cache/no cache）时，从前序读开始、完成必要等待和流水顺序、到后续写发起为止的操作序列。使用时先按行选择前序VF_SIMT读路径，再按列选择后续写路径；单元格中的前读VF_SIMT.LOAD表示旧值读取点，后写xxx.STORE表示新值写入点。跨核场景需要用核间通知替代表中的核内sync。
+
+后续写入方式（列，后发生）
+╲
+前序读取方式（行，先发生） | Scalar（cache） | Scalar（no cache） | VF_SIMT（cache） | VF_SIMT（no cache） | MTE3 | FixPipe |
+
+VF_SIMT
+（cache/no cache） | 前读VF_SIMT.LOAD
+sync V/VF→S
+后写Scalar.STORE | 前读VF_SIMT.LOAD
+sync V/VF→S
+后写Scalar.STORE | 前读VF_SIMT.LOAD
+sync SIMT->SIMT（同线程内无需同步）
+后写VF_SIMT.STORE | 前读VF_SIMT.LOAD
+sync SIMT->SIMT（同线程内无需同步）
+后写VF_SIMT.STORE | 前读VF_SIMT.LOAD
+sync V/VF→MTE3
+后写MTE3.STORE | 前读VF_SIMT.LOAD
+sync V/VF→FixPipe
+后写FixPipe.STORE |
+
+WAR表不要求读端失效Cache副本，因为目标是读取写前旧值；维护重点是等待前序读完成并建立到后续写路径的顺序。若前序访问和后续访问位于不同AI Core，表中的sync V/VF→S、sync V/VF→MTE3和sync V/VF→FixPipe不能跨核生效，应先在前序访问所在核完成读取之后发送核间通知；后序访问所在核收到通知后，再处理本核读端或写端可能存在的Cache副本。
+
+### UB与DCache的缓存一致性​
+
+UB与DCache的一致性问题主要出现在Scalar开启DCache模式读取UB的场景：Scalar访问UB路径时可以CTRL[49]控制Scalar读取UB时是否通过DCache读取；CTRL[49] = 1'b0时，Scalar直接从UB读取；CTRL[49] = 1'b1时，Scalar读取UB数据会经过DCache。相关说明见asc_dcci和asc_set_ctrl()。
+
+### Scalar以DCache模式访问UB带来的缓存一致性​
+
+Scalar读取UB时默认是直接读取UB，但是如果用户显式设置CTRL[49] = 1'b1，Scalar以DCache模式读取UB时，此时需要处理Scalar以DCache模式访问UB带来的缓存一致性问题。
+
+Scalar读UB后，数据进入DCache；后续Scalar再次读取同一段UB地址时，可能继续命中DCache副本，而不是直接读取UB。下面用同一核内的一个UB地址A说明旧副本问题。
+
+Text
+
+初始状态：
+UB[A] = 0
+Scalar DCache中没有缓存A
+CTRL[49] = 1'b1    // Scalar读UB时从DCache读取
+
+时间点    Vector流水                              Scalar流水
+======    ====================================    ====================================
+T0                                                Scalar.LOAD UB[A] -> 0
+// Scalar DCache缓存A所在Cache Line
+
+T1        Vector.STORE UB[A] = 1
+// UB[A] = 1
+
+T2        sync V→S
+// 保证Scalar后续读取发生在Vector写UB之后
+
+T3                                                Scalar.LOAD UB[A] -> 0
+// Scalar可能继续命中旧DCache副本
+// 即使UB[A]已经是1，也可能读到0
+
+这个场景包含两个独立问题：一是Vector写UB是否已经完成，二是Scalar DCache中是否已经缓存过旧UB副本。即使Vector写UB已经完成，Scalar也可能继续命中旧DCache副本。因此，消费者通过Scalar DCache模式读取UB前，需要同时处理流水顺序和DCache旧副本：
+
+Text
+
+初始状态：
+UB[A] = 0
+Scalar DCache中没有缓存A
+CTRL[49] = 1'b1    // Scalar读UB时从DCache读取
+
+时间点    Vector流水                              Scalar流水
+======    ====================================    ====================================
+T0                                                Scalar.LOAD UB[A] -> 0
+// Scalar DCache缓存A所在Cache Line
+
+T1        Vector.STORE UB[A] = 1
+// UB[A] = 1
+
+T2        sync V→S
+// 保证Scalar后续读取发生在Vector写UB之后
+
+T3                                                Scalar.DCCI
+// Scalar DCache中缓存的UB[A]旧副本失效
+
+T4                                                Scalar.DSB
+// 等待DCCI相关操作完成
+
+T5                                                Scalar.LOAD UB[A] -> 1
+// Scalar重新从UB获取新值
+
+其中，sync V->S用于保证同一AI Core内Scalar读取发生在Vector写UB之后；Scalar.DCCI用于处理DCache与UB的一致性，使Scalar后续读取不再使用旧DCache副本；Scalar.DSB用于等待DCCI相关操作完成。若生产者是MTE2把GM数据搬入UB，也需要先建立MTE2 -> S的流水顺序，再处理Scalar DCache中的旧UB副本。
+
+### Cache处理原则​
+
+C API中提供了asc_ub_dcci_single、asc_dcci_entire_ub等面向UB地址空间的DCCI接口。实际使用时，应根据当前产品和CANN版本选择支持的UB DCCI接口；DCCI发出后，还需要使用DSB等待相关操作完成，再执行后续Scalar读取。
+
+实际编程时，应先判断消费者从哪里读取，再选择对应的一致性目标：
+
+如果后续消费者以Scalar DCache模式直接读取UB，关注的是DCache与UB的一致性，应使用DCCI处理旧副本，并在读取前建立生产流水到Scalar流水的同步。
+
+如果Scalar读取UB时没有开启DCache模式，即CTRL[49] = 1'b0，Scalar直接从UB读取，此时通常只需要处理Scalar流水与Vector/MTE流水之间的执行顺序，不需要通过DCCI处理旧DCache副本。
+
+### 原子操作与一致性​
+
+原子操作用于多个执行单元、多个线程或多个核并发更新同一地址时，将一次读-改-写过程作为不可被其他更新打断的事件。原子操作可以避免同一地址上的更新丢失，但不等价于缓存一致性处理，也不等价于同步屏障。判断atomic操作下的缓存一致性，需要同时看两个问题：atomic操作实际更新的是GM还是UB，以及同一地址是否还被普通DCache、SIMT DCache或MTE等其他路径访问。
+
+下面按atomic事件发起路径分类说明：Scalar原子、MTE3随路原子、FixPipe随路原子和SIMT原子。本节只说明这些atomic事件放入一致性分析时需要关注的Cache行为，接口细节可参考对应API文档。
+
+### Scalar原子操作与DCache一致性​
+
+NPU架构版本3510支持Scalar原子操作，Scalar原子操作和普通Scalar读写GM混用时，需要按DCache与GM的一致性来分析，详细处理方式参考Atomic访问导致的DCache缓存一致性。
+
+### MTE3随路原子操作与DCache一致性​
+
+随路原子操作不是单独读取某个地址的Scalar事件，而是改变后续目的地址为GM的数据搬运行为。MTE3负责将UB等核内数据搬出到GM，因此UB -> GM是常见的随路原子使用路径。接口说明可参考C API asc_set_atomic_add和asc_disable_dma_atomic。
+
+从一致性角度看，MTE3随路原子的目标是GM，不会自动处理Scalar DCache中已有的副本，因此需要关注以下关系：
+
+开启随路原子前，如果GM目标地址此前被普通Scalar写过，需要先确保Scalar DCache中的Dirty数据已经写回GM，否则原子操作读取到的"GM已有内容"可能不是程序期望的初值。
+
+随路原子完成后，如果后续通过普通Scalar读取同一GM地址，需要处理读端DCache旧副本，并等待MTE3写GM完成。
+
+### FixPipe随路原子操作与DCache一致性​
+
+FixPipe常用于L0C Buffer -> GM或相关矩阵搬出路径。对一致性分析来说，FixPipe随路原子可以看成另一类"向GM写入的随路原子事件"：数据来源不同于MTE3，但最终更新的仍是GM目标地址。
+
+因此，FixPipe随路原子的缓存一致性行为与MTE3随路原子类似：它不会自动清理Scalar DCache旧副本，也不会自动把此前停留在DCache中的Dirty数据合入GM。
+
+如果GM目标地址的初值来自普通Scalar写GM，需要先按DCache缓存一致性把DCache中的Dirty数据写回GM，再执行FixPipe随路原子。
+
+如果FixPipe随路原子后，消费者通过Scalar普通路径读取GM，需要等待FixPipe写GM完成，并在读端处理DCache旧副本。
+
+如果多个流水或多个核都对同一GM地址做随路原子，原子操作只保证每次GM读-改-写不被打断；不同流水、不同核之间的启动顺序仍应由同步或算法协议保证。
+
+### SIMT原子操作与缓存一致性​
+
+NPU架构版本3510支持SIMT原子操作，SIMT原子操作可能作用于UB，也可能作用于GM；接口例子可参考asc_atomic_add。它保证的是同一地址上这一次读-改-写具有原子性，不保证多个线程之间的执行顺序。
+
+分析缓存一致性时，需要先区分目标地址：
+
+目标是UB时，主要关注同一Thread Block内线程之间对共享UB数据的可见性和执行顺序；如果同一段UB数据还被Scalar以DCache模式读取，需要结合处理DCache与UB的一致性。
+
+目标是GM时，需要把SIMT原子更新GM、SIMT普通读写GM、Scalar普通读写GM、MTE搬运GM放在同一张可见性图里分析。原子操作本身不能替代SIMT DCache或Scalar DCache的旧副本处理；若后续通过默认SIMT读或Scalar普通读读取同一GM地址，仍需要按SIMT缓存一致性或DCache缓存一致性处理读端可能存在的旧Cache副本。
+
+如果不同Thread Block或不同AI Core通过GM标志位配合SIMT原子操作通信，仍需要结合内存栅栏、原子操作、轮询协议以及必要的Cache处理建立完整同步关系，不能只依赖原子操作本身。
+
+### 预取​
+
+预取用于提前把后续可能访问的数据或指令放入Cache，目的是降低访问延迟。相关说明见系统缓存概述。从一致性角度看，预取会改变数据或指令进入Cache的时机，可能会导致一致性问题。
+
+### L2 Cache预取​
+
+L2 Cache和GM之间没有一致性问题，因此L2 Cache的预取不会导致多核间数据不一致问题。但这不表示L2 Cache预取获得的数据就是期望的：如果生产者写入的新值还停留在DCache中、MTE3写GM尚未完成，或者消费者读取顺序早于生产者写入完成，那么L2 Cache中提前加载到的仍可能是GM可见的旧值。此时仍应回到对应章节处理生产者写回、访问完成等待和读端旧副本失效。
+
+### DCache预取​
+
+asc_datacache_preload用于从指定GM地址预加载数据到DCache中，每次调用只能预加载一个Cache Line大小的数据。它的作用是让后续Scalar读取更可能命中DCache，而不是建立新的同步或一致性关系。
+
+DCache是每个核内独立的缓存，因此DCache预取会在当前核DCache中提前形成GM数据副本。如果预取之后，同一GM地址被其他核、MTE、原子操作或SIMT路径更新，当前核后续普通Scalar读可能继续命中预取形成的旧副本。需要读取最新GM数据时，仍要按DCache缓存一致性执行DCCI失效旧副本，或使用绕过DCache的读接口。
+
+### ICache预取​
+
+asc_icache_preload用于从指令所在GM地址预加载指令到ICache中。ICache预取主要影响取指性能，不参与普通数据的生产者-消费者可见性判断，也没有一致性问题。
+
+### 总结​
+
+缓存一致性问题的核心是同一份数据可能同时存在于GM、DCache、SIMT DCache、UB等不同位置。软件需要根据访问路径和RAW、WAW、WAR依赖关系，显式处理Cache副本和执行顺序。
+
+实际编程时重点关注以下规则：
+
+写端可能存在Dirty副本时，需要通过DCCI写回，并配合DSB等待完成。
+
+读端可能存在旧Cache副本时，需要在读取前通过DCCI失效旧副本。
+
+DCCI处理Cache副本状态，DSB等待前序内存访问完成，流水同步或核间通知建立执行顺序，三者不能互相替代。
+
+版本 master 提交 5f50fc4c6ada构建于 2026/10/20 11:47:29包含未提交修改
+
+在 Gitcode 上打开此页
+
+源文档更新于:
+
+Pager
+上一页2.7.2. 内存模型
+
+下一页2.7.2.2. 内存一致性
+
+免责声明：本站内容由 asc-devkit 仓 master 分支自动编译生成，属于持续开发版本，可能存在缺陷，仅供预览与参考。如需稳定及商用资料，请查阅官方 昇腾社区。
+
+Copyright Huawei Technologies Co., Ltd.
+```
+
+### item 6
+
+https://asc.gitcode.com/guide/programming_guide/advanced_programming/memory_model/memory_consistency.html
+Huawei / cann/asc-devkit master docs (auto-built site, 版本 master 提交 5f50fc4c6ada, 构建于 2026/10/20 11:47:29); source md: https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/guide/programming_guide/advanced_programming/memory_model/memory_consistency.md
+THE authoritative Ascend memory-consistency chapter. Quoted here: the flag/data producer-consumer example, the 缓存一致性 vs 内存一致性 split table, the combined T0..T7 sequence (DCCI+DSB on writer, WAIT flag, DCCI+DSB on reader, then LOAD), §4 核间内存一致性 (hardware does NOT establish global order between AI Cores; RAW/WAW/WAR risks; 核间同步原语 and the Producer/Consumer T0..T7 table), §7 快速决策参考, §8 总结 (NPU内存一致性更接近弱一致性模型).
+```
+### 内存一致性
+
+本文介绍NPU编程中的内存一致性问题，说明不同执行单元、不同AI Core、不同Stream以及Host侧和Device侧之间如何建立可预期的读写顺序。本文重点讨论“操作顺序和可见性”，缓存副本写回、失效等问题请参考缓存一致性。
+
+相关示例涉及Global Memory（GM）、Unified Buffer（UB）和Data Cache（DCache）等内存。
+
+### 内存一致性基本概念​
+
+### 什么是内存一致性​
+
+内存一致性关注的是多个访问者对同一片内存的读写顺序是否符合程序预期。典型内存一致性例子是：生产者先写数据再写标志，消费者看到标志后，是否一定能读取到生产者写入的数据：
+
+Text
+
+初始状态：
+GM[data] = 0
+GM[flag] = 0
+
+时间点    生产者                                  消费者
+======    ====================================    ====================================
+T0        STORE data = 1
+T1        STORE flag = 1
+T2  LOAD flag -> 1
+T3  LOAD data -> ?
+
+用户期望内存序和代码顺序保持一致，在flag赋值之前，data已经赋值完成，期望消费者在T2看到flag = 1后，T3一定读取到data = 1。但是在NPU上，生产者和消费者可能运行在不同流水、不同AI Core、不同Stream，甚至位于Host侧和Device侧之间。不同执行域之间通常是乱序并行的，不会自动建立全局顺序，用户需要根据访问范围插入同步、MEMBAR或通信机制，自行管理内存一致性。
+
+### 缓存一致性与内存一致性的区别​
+
+缓存一致性和内存一致性是两类不同问题：
+
+类型 | 关注点 | 典型问题 | 常用处理方式 |
+
+缓存一致性 | Cache副本和下一级存储中的值是否一致。 | DCache中保留旧值，或Dirty副本尚未写回GM。 | DCCI |
+
+内存一致性 | 多个读写操作之间的先后关系是否符合预期。 | 消费者看到flag = 1后，是否一定能读取到生产者写入的data。 | 同步、DSB等 |
+
+缓存一致性是“副本与最新值是否一致”，内存一致性是“指令实际执行顺序是否和代码顺序一致”。实际编程时，两类问题经常同时出现，例如生产者写入数据后，通过flag发布同步标志，消费者等待flag后再读取数据：
+
+Text
+
+初始状态：
+GM[data] = 0
+GM[flag] = 0
+消费者DCache[data] = 0
+
+时间点    生产者                                  消费者
+======    ====================================    ====================================
+T0        Scalar.STORE data = 1
+T1        DCCI data
+T2        Scalar.DSB
+// 保证data写回GM完成
+
+T3        STORE flag = 1
+// 发布标志，flag本身就是同步通知
+
+T4  WAIT flag == 1
+// 等待flag变为1
+
+T5  DCCI data
+T6  Scalar.DSB
+// 处理消费者侧存在的旧DCache副本
+
+T7  Scalar.LOAD data -> 1
+
+上例中，flag是同步标志。生产者写flag = 1表示发布通知，消费者等待flag == 1表示接收通知。DCCI用于维护data对应的Cache副本，属于缓存一致性处理；Scalar.DSB用于等待写回或失效相关操作完成；STORE flag和WAIT flag用于建立生产者和消费者之间的执行先后关系，属于内存一致性处理。
+
+只做同步但不处理DCache副本，可能仍读到旧值；
+
+只做DCCI但不建立执行顺序，消费者也可能过早读取。
+
+缓存一致性或内存一致性任意一类问题没有处理好，都可能导致最终读取到的数据不符合预期。
+
+
+[... §2/§3 omitted — see page ...]
+
+### Case 4：DCache和不经过DCache的访问混合同地址访问​
+
+同一GM地址混用DCache路径和不经过DCache路径时，硬件不保证两条路径之间自动维护顺序和Cache副本。例如前序DCache写形成Dirty副本，后序不经过DCache的写虽然直接更新GM，但后续DCache Dirty副本写回时会覆盖不经过DCache的写入：
+
+Text
+
+时间点    Scalar流水
+======    ====================================
+T0        Scalar.STORE_GM_DCache(addr) = 1
+// DCache[addr] = 1，Dirty；GM[addr]仍可能是旧值
+
+T1        Scalar.STORE_GM_no_cache(addr) = 2
+// GM[addr] = 2
+
+T2        DCache Dirty副本后续写回
+// GM[addr]被覆盖为1
+
+正确处理方式是在不经过DCache的写之前，先把同地址所在Cache Line中已经存在的DCache Dirty副本写回GM，并等待写回完成：
+
+Text
+
+时间点    Scalar流水
+======    ====================================
+T0        Scalar.STORE_GM_DCache(addr) = 1
+T1        Scalar.DCCI(addr)
+T2        Scalar.DSB
+// 等待DCache Dirty副本写回GM完成
+
+T3        Scalar.STORE_GM_no_cache(addr) = 2
+
+反过来，如果不经过DCache的访问已经更新GM，而当前核DCache中已经缓存过同一地址所在Cache Line，后续要通过DCache路径读取该地址时，需要先处理DCache中的旧副本，处理方式请参考缓存一致性中DCache与GM一致性的读端维护方法。如果当前核DCache中已有同一地址所在Cache Line的Dirty副本，应在不经过DCache写之前先按前一个流程执行DCCI和Scalar.DSB，避免旧Dirty副本覆盖不经过DCache的写入。
+
+### Scalar和其他硬件单元的内存一致性​
+
+当Scalar和其他硬件单元之间存在数据依赖时，需要用户自行插入同步保证内存一致性。例如Scalar先写GM，后续MTE2、Vector、Fixpipe或SIMT再读取该数据，不能只依赖代码书写顺序推断后续硬件单元一定能看到Scalar写入。
+
+下面以Scalar写GM后，MTE2读取GM为例：
+
+Text
+
+时间点    Scalar流水                              MTE2流水
+======    ====================================    ====================================
+T0        Scalar.STORE_GM(data) = 1
+T1        Scalar.DCCI
+// Scalar写GM经过DCache时添加DCCI
+T2        Scalar.DSB
+// 等待Scalar写GM完成
+
+T3        sync S->MTE2
+// 通知MTE2可以读取
+
+T3  WAIT S->MTE2
+T4  MTE2.LOAD_GM(data)
+
+其中，Scalar.DSB可通过asc_sync_data_barrier实现，用于等待Scalar侧前序GM访问完成；sync S->MTE2可通过asc_sync_notify/asc_sync_wait建立Scalar流水到MTE2流水的先后关系：
+
+DSB和流水同步只处理访问完成顺序和执行先后关系，保证内存一致性，不负责写回或失效DCache副本。如果Scalar写GM经过DCache，或者后续读取路径可能命中旧Cache副本，还需要参考缓存一致性处理DCache相关问题。
+
+
+[... omitted ...]
+
+### 核间内存一致性​
+
+### 核间一致性问题与多核访问GM的顺序风险​
+
+不同AI Core之间通常通过GM共享数据。硬件不会自动为多个AI Core建立全局读写顺序：一个核写入GM、另一个核读取GM时，如果没有显式同步，读写操作的实际完成顺序或对外可见顺序可能与代码期望不一致。如果访问路径经过DCache，还会叠加写端Dirty副本、读端旧副本等缓存一致性问题。
+
+核间访问GM时，常见风险可以按RAW、WAW、WAR三类依赖理解。
+
+RAW（Read After Write）要求后续读操作读取前序写操作的新值。如果消费者没有等待生产者发布数据，可能提前读到旧值；如果读端DCache中已有旧副本，也可能在同步后仍读到旧值。
+
+Text
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0        STORE data = 1
+T1  LOAD data -> 旧值或不确定值
+
+WAW（Write After Write）要求最终保留在GM中的是后一次写操作的数据。如果两个核对同一地址或同一Cache Line内的数据写入顺序没有建立，最终结果可能不符合“后写覆盖前写”的期望；如果前序写经过DCache形成Dirty副本，后续写还可能被前序Dirty写回覆盖。
+
+Text
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0        STORE data = 1
+T1  STORE data = 2
+T2        前序写入或Dirty副本晚于Core 1写入对GM可见
+结果      GM中可能不是Core 1期望保留的值
+
+WAR（Write After Read）要求前序读操作先读取到后续写操作之前的旧值。如果后写核过早发布新值，前读核可能读取到新值，破坏“先读旧值、再写新值”的阶段关系。
+
+Text
+
+时间点    Core 0                                  Core 1
+======    ====================================    ====================================
+T0                                                STORE data = 1
+T1        LOAD data -> 新值
+结果      Core 0没有读取到后写前的旧值
+
+这些场景下的核间内存一致性全部需要用户手动维护。
+
+### 核间同步原语​
+
+核间同步原语用于在多个AI Core之间建立到达、等待或屏障关系。选择接口时，首先要确认同步范围：是所有参与核都需要对齐，还是只需要某些group之间、同一group内部的block/subblock之间建立顺序。
+
+在分离模式下，AIC（Cube Core）与AIV（Vector Core）按group划分。一个group由1个block（主核）和N个subblock（从核）组成，比例为1:N。因此，组间同步指不同group之间的block同步，组内同步指同一个group内block和subblock之间的同步。
+
+接口 | 同步范围 | 作用边界 |
+
+asc_sync_inter_arrive/asc_sync_inter_wait | 组间block同步，即不同group之间的block同步。 | 通过flag_id传递同步信号，适合group之间的生产者-消费者同步。 |
+
+asc_sync_block_arrive/asc_sync_block_wait | 组内block和subblock同步，即同一个group内AIC和AIV之间同步。 | 通过flag_id传递同步信号，适合同一group内部Cube侧和Vector侧建立顺序。 |
+
+arrive/wait类接口只传递同步信号；flag_id需要配对使用，并避免计数器溢出和ID冲突。使用这些接口后，仍需要根据数据访问路径判断是否需要DCCI和DSB。
+
+以核间生产者-消费者场景为例，展示生产者负责写入GM数据并发布同步信号，消费者等待同步信号后再读取GM数据的抽象流程：
+
+Text
+
+时间点    Producer Core                          Consumer Core
+======    ====================================   ====================================
+T0        STORE data = value
+T1        DCCI data
+T2        Scalar.DSB
+T3        ARRIVE sync_point
+T4  WAIT sync_point
+T5  DCCI data
+T6  Scalar.DSB
+T7  LOAD data -> value
+
+其中，T1和T2时刻处理生产者通过DCache写入后可能形成的Dirty副本，确保数据已经写回到GM；T3和T4时刻建立核间发布/获取顺序；T5和T6处理消费者本核可能存在的旧DCache副本。若生产者和消费者的数据访问路径均不经过DCache，可以按实际路径省略对应DCCI，但仍需要用同步原语建立跨核执行顺序。
+
+上例中的ARRIVE sync_point和WAIT sync_point表示抽象的核间同步动作。组间block同步可以使用asc_sync_inter_arrive/asc_sync_inter_wait实现；同一group内block和subblock之间的同步可以使用asc_sync_block_arrive/asc_sync_block_wait实现。
+
+
+[... omitted ...]
+
+### 快速决策参考​
+
+判断是否需要用户维护内存一致性时，可以先确认访问跨过了哪一类一致性边界：
+
+一致性边界 | 首选机制 | 责任方 |
+
+同流水内 | 同流水同步，例如asc_sync_pipe(PIPE_xxx)；Scalar访问完成使用asc_sync_data_barrier。 | 用户在同地址、重叠地址或前后访问存在依赖的位置等待前序访问完成。 |
+
+核内跨流水 | 流水间同步，例如asc_sync_notify/asc_sync_wait、asc_lock/asc_unlock。 | 用户在生产者流水发布同步信号，在消费者流水等待后再访问数据。 |
+
+Scalar访问GM | asc_sync_data_barrier配合必要的DCCI。 | 用户等待Scalar侧GM访问完成；若访问经过DCache，还需要按缓存一致性处理Dirty副本或旧副本。 |
+
+多核间 | 核间同步、原子操作、必要时配合DCCI和DSB。 | 用户建立生产者Core和消费者Core之间的顺序；多核同地址读-改-写使用原子操作，普通数据传递仍需处理可见性。 |
+
+跨Stream | Event任务级依赖。 | 用户需要通过Event处理Stream间同步。 |
+
+Host等Device | Host侧显式同步接口，例如aclrtSynchronizeStream、aclrtSynchronizeDevice、aclrtSynchronizeEvent。 | 用户需要添加同步接口保证Host侧在读取Device结果或复用相关资源前等待对应Device任务完成。 |
+
+### 总结​
+
+NPU内存一致性更接近弱一致性模型。普通内存访问默认只具备有限的局部顺序，硬件不会为跨流水、跨AI Core、跨Stream以及Host-Device之间的访问自动建立全局一致的读写顺序。
+
+因此，用户需要根据数据依赖主动维护内存一致性：在生产者和消费者之间建立同步关系，在需要时等待前序内存访问完成，并在涉及Cache副本时配合缓存一致性维护。
+```
+
+### item 7
+
+https://asc.gitcode.com/api/SIMD-API/c_api/cache_ctrl/asc_dcci.html
+Huawei / cann/asc-devkit master docs (auto-built site, 版本 master 提交 5f50fc4c6ada, 构建于 2026/10/20 11:47:29); source md: https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/api/SIMD-API/c_api/cache_ctrl/asc_dcci.md
+The next-gen intrinsic-level doc for the same instruction: asc_dcci_single / asc_ub_dcci_single / asc_dcci_entire_all / _ub / _out / _atomic, the Clean+Invalid decomposition, 流水类型 PIPE_S, the note that asc_load_dev/asc_store_dev bypass DCache entirely, CTRL[49] for UB-through-DCache, and the runnable example pairing asc_dcci_entire_out with asc_sync_data_barrier(mem_dsb_t::DSB_DDR).
+```
+### asc_dcci
+
+### 产品支持情况​
+
+Ascend 950PR&950DT系列产品：支持
+
+Atlas A3系列产品：支持
+
+Atlas A2系列产品：支持
+
+Atlas 200I/500 A2推理产品：不支持
+
+Atlas推理系列产品AI Core：不支持
+
+Atlas推理系列产品Vector Core：不支持
+
+Atlas训练系列产品：不支持
+
+### 功能说明​
+
+头文件路径为："c_api/cache_ctrl/cache_ctrl.h"。
+
+如图1所示，在AI Core内部，访问Global Memory（GM）与Unified Buffer（UB）的方式分为以下两种：
+
+DMA搬运单元读写GM，数据通过asc_copy_ub2gm和asc_copy_gm2ub等接口在UB等Local Memory和GM间交互，不经过Data Cache（DCache），因此不需要考虑Cache一致性问题。
+
+Scalar单元访问GM，若经过DCache，首先会访问每个核内的DCache，因此存在DCache与GM的Cache一致性问题，具体原因请参考缓存一致性。
+
+图1 DCache内存层次示意图
+
+asc_dcci接口用于解决上述一致性问题，其功能可以拆解为两部分：
+
+Clean：将缓存中被修改过的数据（脏数据，Dirty Data）写回到GM中，避免数据丢失。
+
+Invalid：
+将指定地址范围的Cache Line标记为“无效”，使其从缓存中移除。
+
+保证下一次访问这些内存地址时，会从GM重新加载数据，而不是使用可能过期的缓存数据。
+
+该接口的典型使用场景如下（以读写GM为例）：
+
+读取GM的数据，但该数据可能在外部被其余核修改，此时需要使用asc_dcci接口，直接访问GM，获取最新数据。
+
+用户通过Scalar单元写GM的数据，希望立刻写出，也需要使用asc_dcci接口。
+
+说明
+
+Scalar单元读写GM时，若调用的是asc_load_dev和asc_store_dev这一对接口，则读写数据不经过DCache，无需调用asc_dcci接口。
+
+Scalar单元读写UB时是否经过DCache，由asc_set_ctrl接口配置的CTRL[49]位控制，该bit位默认值为1'b0，即默认不经过DCache。CTRL[49]的详细说明请参考asc_set_ctrl的常用CTRL寄存器比特位说明。
+
+### 函数原型​
+
+C
+
+// 刷新传入GM地址所在的单个Cache Line
+__aicore__ inline void asc_dcci_single(__gm__ void* dst)
+
+// 刷新传入的UB地址所在的单个Cache Line
+__aicore__ inline void asc_ub_dcci_single(__ubuf__ void* dst)
+
+// 根据目标域刷新DCache中所有valid的Cache Line，目标域有以下四种取值：
+
+// 刷新整个DCache中所有valid的Cache Line
+__aicore__ inline void asc_dcci_entire_all()
+
+// 刷新整个DCache中包含UB地址的所有valid的Cache Line
+__aicore__ inline void asc_dcci_entire_ub()
+
+// 刷新整个DCache中包含GM地址的所有valid的Cache Line
+__aicore__ inline void asc_dcci_entire_out()
+
+// 刷新整个DCache中包含与标量原子操作相关的GM地址的所有valid的Cache Line
+__aicore__ inline void asc_dcci_entire_atomic()
+
+### 参数说明​
+
+表1 参数说明
+
+参数名 | 输入/输出 | 描述 |
+
+dst | 输入 | 待清理与失效的Cache Line所在地址。
+硬件按Cache Line边界对齐定位目标行，传入地址无需满足Cache Line对齐。 |
+
+### 返回值说明​
+
+无
+
+### 流水类型​
+
+PIPE_S
+
+### 约束说明​
+
+dst为__ubuf__ void*类型的函数原型仅支持在AIV中调用。
+
+### 调用示例​
+
+将代码保存为example.asc后，可通过bisheng命令编译运行，其中--npu-arch参数需根据实际产品型号指定对应的NPU架构，具体产品与NPU架构的映射关系请参考__NPU_ARCH__。
+
+以Ascend 950PR&950DT系列产品（对应NPU架构为dav-3510）为例，编译运行命令如下：
+
+Bash
+
+bisheng example.asc -o main --npu-arch=dav-3510 && ./main
+
+C++
+
+// 本示例验证asc_dcci_entire_out对GM脏数据的回写效果。Scalar先在两个不同Cache Line中
+// 写入101，再调用asc_dcci_entire_out将DCache中的脏数据回写到GM。Host回读后应得到101。
+#include <array>
+#include <cstdint>
+#include <iostream>
+
+#include "c_api/asc_simd.h"
+#include "acl/acl.h"
+
+namespace {
+constexpr int32_t GM_VALUE = 11;
+constexpr int32_t DIRTY_VALUE = 101;
+constexpr uint32_t SECOND_LINE_OFFSET = 32;
+constexpr uint32_t DATA_COUNT = 64;
+
+__global__ __vector__ void AscDcciEntireOutKernel(__gm__ int32_t* data)
+{
+asc_init();
+volatile __gm__ int32_t* data_gm = data;
+// 两个元素相隔128B，位于不同Cache Line。普通Scalar写GM会经过DCache。
+data_gm[0] = DIRTY_VALUE;
+data_gm[SECOND_LINE_OFFSET] = DIRTY_VALUE;
+
+// 刷新DCache中包含GM地址的Cache Line，并等待脏数据写回GM。
+asc_dcci_entire_out();
+asc_sync_data_barrier(mem_dsb_t::DSB_DDR);
+}
+
+bool CheckResult(const std::array<int32_t, DATA_COUNT>& output)
+{
+return output[0] == DIRTY_VALUE && output[SECOND_LINE_OFFSET] == DIRTY_VALUE;
+}
+} // namespace
+
+int main()
+{
+std::array<int32_t, DATA_COUNT> input{};
+input.fill(GM_VALUE);
+aclInit(nullptr);
+aclrtSetDevice(0);
+
+int32_t* input_device = nullptr;
+aclrtMalloc(reinterpret_cast<void**>(&input_device), input.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST);
+aclrtMemcpy(input_device, input.size() * sizeof(int32_t), input.data(), input.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE);
+AscDcciEntireOutKernel<<<1, 0>>>(input_device);
+const aclError ret = aclrtSynchronizeDevice();
+aclrtMemcpy(input.data(), input.size() * sizeof(int32_t), input_device, input.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST);
+
+const bool passed = ret == ACL_SUCCESS && CheckResult(input);
+std::cout << (passed ? "[Success] asc_dcci passed." : "[Failed] asc_dcci failed.") << std::endl;
+aclrtFree(input_device);
+aclrtResetDevice(0);
+aclFinalize();
+return passed ? 0 : 1;
+}
+
+版本 master 提交 5f50fc4c6ada构建于 2026/10/20 11:47:29包含未提交修改
+
+在 Gitcode 上打开此页
+
+源文档更新于:
+
+Pager
+上一页2.3.13.2. asc_datacache_preload
+
+下一页2.3.13.4. asc_dci
+
+免责声明：本站内容由 asc-devkit 仓 master 分支自动编译生成，属于持续开发版本，可能存在缺陷，仅供预览与参考。如需稳定及商用资料，请查阅官方 昇腾社区。
+
+Copyright Huawei Technologies Co., Ltd.
+```
+
+### item 8
+
+https://gitcode.com/cann/asc-devkit/blob/master/include/basic_api/kernel_operator_cache_intf.h
+Huawei / cann/asc-devkit, master branch (raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/include/basic_api/kernel_operator_cache_intf.h); commit date unknown
+The three real DataCacheCleanAndInvalid declarations as shipped (GlobalTensor with dcciDst, LocalTensor with dcciDst, GlobalTensor without dcciDst) — the signature the API-reference page documents.
+```cpp
+
+template <typename T>
+class LocalTensor;
+
+template <typename T>
+__aicore__ inline void DataCachePreload(const GlobalTensor<uint64_t>& src, const T cacheOffset);
+
+template <typename T>
+__aicore__ inline void MultiDataCachelinePreload(const GlobalTensor<T>& src, const uint32_t cachelineNum);
+
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst);
+
+template <typename T, CacheLine entireType, DcciDst dcciDst>
+__aicore__ inline void DataCacheCleanAndInvalid(const LocalTensor<T>& dst);
+
+template <typename T, CacheLine entireType>
+__aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst);
+
+enum class UnitSize {
+```
+
+### item 9
+
+https://gitcode.com/cann/asc-devkit/blob/master/include/c_api/cache_ctrl/cache_ctrl.h
+Huawei / cann/asc-devkit, master branch (raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/include/c_api/cache_ctrl/cache_ctrl.h); commit date unknown
+The intrinsic-level header behind asc_dcci, including the arch gating (__NPU_ARCH__ 2201 memory_base_impl vs 3510 reg_base_impl).
+```cpp
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#if defined(__NPU_COMPILER_INTERNAL_PURE_SIMT__)
+#error "cache_ctrl.h cannot be used with compile flag --enable-simt enabled."
+#endif
+
+#if !defined(ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS)
+#define ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS
+#define UNDEF_ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS_CACHE_CTRL_CACHE_CTRL_H
+#endif
+
+#ifndef INCLUDE_C_API_CACHE_CTRL_CACHE_CTRL_H
+#define INCLUDE_C_API_CACHE_CTRL_CACHE_CTRL_H
+#include "c_api/defs/defs.h"
+
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+#include "impl/c_api/memory_base_impl/cache_ctrl_intf_impl.h"
+#elif defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+#include "impl/c_api/reg_base_impl/cache_ctrl_intf_impl.h"
+#endif
+
+__aicore__ inline void asc_icache_preload(const void* addr, int64_t prefetch_len);
+
+namespace __asc_aicore {
+__aicore__ inline void asc_dcci_single(__gm__ void* dst);
+}
+
+__aicore__ inline void asc_ub_dcci_single(__ubuf__ void* dst);
+
+__aicore__ inline void asc_dcci_entire_ub();
+
+__aicore__ inline void asc_dcci_entire_out();
+
+__aicore__ inline void asc_dcci_entire_all();
+
+__aicore__ inline void asc_dcci_entire_atomic();
+
+__aicore__ inline int64_t asc_get_icache_preload_status();
+
+__aicore__ inline void asc_datacache_preload(__gm__ uint64_t* address, int64_t offset);
+
+__aicore__ inline void asc_dci();
+
+__aicore__ inline void asc_set_scalar_cache_mode(asc_load_l2_cache_mode l2_cache_mode);
+
+__aicore__ inline void asc_set_scalar_cache_mode(asc_store_l2_cache_mode l2_cache_mode);
+
+__aicore__ inline asc_load_l2_cache_mode asc_get_scalar_load_cache_mode();
+
+__aicore__ inline asc_store_l2_cache_mode asc_get_scalar_store_cache_mode();
+
+#endif
+
+#if defined(UNDEF_ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS_CACHE_CTRL_CACHE_CTRL_H)
+#undef ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS
+#undef UNDEF_ASCENDC_C_API_INCLUDE_COMPILER_INTERNAL_HEADERS_CACHE_CTRL_CACHE_CTRL_H
+#endif
+```
+
+### item 10
+
+https://gitcode.com/cann/shmem/blob/master/include/device/gm2gm/shmem_device_mo.h
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/shmem_device_mo.h); Copyright 2025, commit date unknown
+The complete memory-ordering header: the ONLY normative visibility text for aclshmem_quiet and aclshmem_fence — HCCS-only => globally visible; HCCS+RDMA => only a PE's own memory updates guaranteed visible to that PE; fence is implemented identically to quiet; CPU-issued and NPU-issued quiet/fence cover only their own side.
+```cpp
+/**
+ * @cond IGNORE_COPYRIGHT
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * @endcond
+ */
+
+#ifndef SHMEM_DEVICE_MO_H
+#define SHMEM_DEVICE_MO_H
+
+#include "host_device/shmem_common_types.h"
+#include "gm2gm/shmem_device_mo.hpp"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief The aclshmem_quiet routine ensures completion of all operations on symmetric data objects issued by the
+ *        calling PE.
+ *        On systems with only scale-up network (HCCS), updates are globally visible, whereas on systems with
+ *        both scale-up network HCCS and scale-out network (RDMA), ACLSHMEM only guarantees that updates to the
+ *        memory of a given PE are visible to that PE.
+ *        Quiet operations issued on the CPU and the NPU only complete communication operations that were
+ *        issued from the CPU and the NPU, respectively. To ensure completion of NPU-side operations from
+ *        the CPU, using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_quiet(void);
+#define shmem_quiet aclshmem_quiet
+
+/**
+ * @brief In OpenACLSHMEM specification, aclshmem_fence assures ordering of delivery of Put, AMOs, and memory store routines
+ *        to symmetric data objects, but does not guarantee the completion of these operations.
+ *        However, due to hardware capabilities, we implemented aclshmem_fence same as aclshmem_quiet, ensuring both ordering
+ *        and completion.
+ *        Fence operations issued on the CPU and the NPU only order communication operations that were issued from the
+ *        CPU and the NPU, respectively. To ensure completion of NPU-side operations from the CPU,
+ *        using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_fence(void);
+#define shmem_fence aclshmem_fence
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+```
+
+### item 11
+
+https://gitcode.com/cann/shmem/blob/master/docs/api/sync_barrier_api_usage.md
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/docs/api/sync_barrier_api_usage.md); commit date unknown
+The project's own Chinese ordering contract: §二 语义 (lines 28-31) separating sync / quiet / barrier / fence, and §三 Device kernel 中的使用顺序 + 约束 5/6 — 'fence 仅用于建立顺序，不作为通用的通信完成保证', 'Cube 标量单元不在这些 API 的同步保证范围内'.
+````
+
+**阻塞与流的区别：**
+
+- **阻塞式接口**（`aclshmem_barrier` / `aclshmem_barrier_all` / `aclshmem_sync` / `aclshmem_team_sync` / `aclshmem_sync_all`）：内部会等待流上操作完成（调用 `aclrtSynchronizeStream`），返回时集合同步已经完成。
+- **流式接口**（`aclshmemx_barrier_on_stream` / `aclshmemx_barrier_all_on_stream` / `aclshmemx_sync_on_stream` / `aclshmemx_sync_all_on_stream`）：仅把同步操作排队到指定流上，返回不代表同步完成；调用者需自行 `aclrtSynchronizeStream` 或依赖后续流操作保证顺序。传入 `NULL` 时使用库管理的默认流，与 Host RMA/quiet 的 on-stream 接口一致。
+
+**屏障、同步与通信完成：**
+
+- sync 表示指定 team 的 PE 到达同一同步点；对参与核此前的普通对称内存存储提供适用范围内的同步与可见性，但不保证此前发出的非阻塞通信已完成。Host 的 aclshmem_team_sync 与流式 sync 均应按这一最低保证使用；不要以 sync 代替通信完成操作。
+- quiet 完成调用 PE 在对应 Host 或 Device 执行范围内先前发出的通信，但不等待其他 PE 到达同步点。
+- barrier 先完成相应执行范围内此前发出的通信，再等待指定 team 的所有 PE 到达同步点。所有集体调用必须由 team 内 PE 按相同顺序参与。
+- 在 Device kernel 中，NBI 后如需读取远端结果或复用源缓冲区，使用 barrier；或者先 quiet 完成本 PE 通信，再 sync 等待其他 PE。fence 仅用于建立顺序，不作为通用的通信完成保证。
+
+***
+
+## 二、接口说明
+
+[... interface-by-interface entries omitted ...]
+
+```
+
+***
+
+## 三、Device kernel 中的使用顺序
+
+以下两种顺序均要求 team 内所有 PE 和声明参与范围内的核按相同顺序调用集体接口：
+
+    // 方式一：NBI -> barrier
+    aclshmem_putmem_nbi(dst, src, bytes, peer);
+    aclshmem_barrier_all();
+    // barrier 返回后，先前通信完成；可读取对应目标数据、复用源缓冲区。
+
+    // 方式二：NBI -> quiet -> sync
+    aclshmem_putmem_nbi(dst, src, bytes, peer);
+    aclshmem_quiet();     // 本 PE 的先前通信完成，可复用本地源缓冲区
+    aclshmem_sync_all();  // 等待所有 PE 到达；之后再读取其他 PE 的写入结果
+
+普通对称内存 store 的同步/可见性与通信 API 的完成范围不同：sync 同步参与核在受支持的 HCCS/UB 内存域中的普通存储，但不能代替 quiet 完成 NBI；barrier 同时提供通信完成与 PE 到达同步。对混合核，Cube 标量单元不在这些 API 的同步保证范围内；参与核范围见 Device public header。Host 发出的通信应使用 Host 对应接口完成，Device 发出的通信应在 Device 执行范围内完成。
+
+***
+
+## 四、注意事项
+
+1. **初始化检查**：调用前需完成 `aclshmemx_init_attr` 初始化；未初始化时，返回状态码的接口会返回 `ACLSHMEM_NOT_INITED`，`void` 接口会打印错误日志后直接返回。
+2. **team 有效性**：非成员传入哨兵值 `ACLSHMEM_TEAM_INVALID` 时，`aclshmem_barrier` / `aclshmem_sync` / `aclshmem_team_sync` / `aclshmemx_barrier_on_stream` / `aclshmemx_sync_on_stream` 为空操作并返回成功。
+3. **阻塞式接口内部同步**：阻塞式接口内部会 `aclrtSynchronizeStream`，因此调用返回即代表集合同步完成；流式接口则需要调用者自行同步流。
+4. **参与范围**：集合同步要求 team 内所有 PE 都调用相同接口，否则会阻塞等待直至超时或卡死。
+5. **完成与缓冲区复用**：sync 仅保证 PE 到达同步点，不能单独保证 NBI 完成。完成本 PE 通信后才能复用该通信的源缓冲区；所有相关 PE 完成通信并到达同步点后，才读取其它 PE 写入的目标数据。Device 使用 barrier，或按 quiet 再 sync 的顺序调用。
+6. **Host 流的等待范围**：Host 阻塞接口使用并等待库默认流；流式接口仅排队，须等待该集体操作所在流或建立明确的跨流依赖。对先前在其他流发出的工作，先建立到集体操作所在流的依赖；仅等待另一条流不能证明该集体操作已完成。单独同步启动 Device kernel 的流，也不能替代 kernel 内对异步通信的 quiet 或 barrier。
+````
+
+### item 12
+
+https://gitcode.com/cann/shmem/blob/master/docs/api/atomic_api_sync_async_comparison.md
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/docs/api/atomic_api_sync_async_comparison.md); commit date unknown
+Engine-by-engine completion semantics in Chinese: MTE-backend atomics are ALL asynchronous with no quiet/fence inside, synchronised by aclshmemx_mte_quiet or kernel-runtime SetFlag/WaitFlag; the UB+MTE3 path needs MTE2_S/MTE3_S UB fences plus the MTE3_MTE2 GM fence; the Scalar AtomicAdd path bypasses UB/MTE3; RDMA fetch variants quiet internally while void variants do not.
+````
+---
+
+## 二、MTE 后端接口：`aclshmemx_mte_atomic_<op>`
+
+> 头文件：`include/device/gm2gm/engine/shmem_device_mte.h`
+> 实现文件：`src/device/gm2gm/engine/shmem_device_mte.hpp`
+
+**核心特征：所有 MTE 后端接口均为异步**，不论是否带返回值。接口仅发起硬件原子操作即返回，无 quiet/fence。
+
+同步原语：`aclshmemx_mte_quiet()` 或 Kernel Runtime 级 `SetFlag/WaitFlag`。
+
+### 2.1 接口清单
+
+| 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
+|---|---|---|---|
+| `aclshmemx_mte_atomic_fetch` | T | int32, uint32, float, int64, uint64 | 950 |
+
+[... interface tables omitted ...]
+
+| 调用前 | 其他单元（如 MTE2）正在写同一 UB 区域 | `SetFlag/WaitFlag` on `MTE2_S` |
+| 调用后 | 后续操作依赖原子操作在 GM 中的结果 | `SetFlag/WaitFlag` on `MTE3_MTE2` |
+| 调用后 | 需要复用同一 UB 区域写入新数据 | `SetFlag/WaitFlag` on `MTE3_S` |
+
+### 2.3 `aclshmemx_mte_atomic_add` 的类型差异（重要）
+
+`aclshmemx_mte_atomic_add` 在 Ascend950 上按类型有两种实现路径：
+
+| 类型组 | 支持类型 | 实现方式 | 同步要点 |
+|---|---|---|---|
+| UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
+| Scalar AtomicAdd 路径 | uint32, uint64, int64 | Scalar 单元直接执行标量 AtomicAdd 写 GM，不经过 UB 和 MTE3 | 不需要 UB/MTE3 相关 fence；仅在 Scalar↔MTE2/MTE3 有 GM 数据依赖时按通用规则同步 |
+
+---
+
+## 三、RDMA 后端接口：`aclshmemx_roce_atomic_<op>`
+
+
+[... omitted ...]
+
+
+### 8.1 异步接口 + RDMA（`aclshmem_int32_atomic_add`）
+
+```c
+// 异步 atomic add，RDMA 通路
+aclshmem_int32_atomic_add(dst, 42, pe);
+
+// ... 其他不依赖 dst 的计算 ...
+
+// 读取结果前必须 quiet
+aclshmemx_roce_quiet(pe, ub_buf, sync_id);
+
+// 现在可以安全使用 dst 的值
+int32_t result = *dst;
+```
+
+### 8.2 同步接口（`aclshmem_int32_atomic_fetch_add`）
+
+```c
+// 同步接口，调用返回即可直接使用返回值
+int32_t old_val = aclshmem_int32_atomic_fetch_add(dst, 42, pe);
+// old_val 是可靠的旧值，无需额外 quiet
+```
+
+### 8.3 MTE 路径 + UB 复用（`aclshmem_int32_atomic_add`，UB+MTE3 路径）
+
+```c
+aclshmemx_set_mte_config(0, 256, sync_id);
+
+// fence MTE2 写 UB 完成（如果 MTE2 之前写入了同一 UB 区域）
+SetFlag<HardEvent::MTE2_S>(sync_id);
+WaitFlag<HardEvent::MTE2_S>(sync_id);
+
+// 异步 atomic add（Scalar 写 UB → MTE3 读 UB → MTE3 写 GM）
+aclshmem_int32_atomic_add(dst, 1, pe);
+
+// fence MTE3 写 GM 完成——后续需要读 GM 结果
+SetFlag<HardEvent::MTE3_MTE2>(sync_id);
+WaitFlag<HardEvent::MTE3_MTE2>(sync_id);
+
+// fence MTE3 读 UB 完成——如果要复用 UB
+SetFlag<HardEvent::MTE3_S>(sync_id);
+WaitFlag<HardEvent::MTE3_S>(sync_id);
+
+// 现在可以安全读 GM 结果和复用 UB
+```
+````
+
+### item 13
+
+https://gitcode.com/cann/shmem/blob/master/include/device/gm2gm/engine/shmem_device_mte.h
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/engine/shmem_device_mte.h); Copyright 2025, commit date unknown
+Three ordering-relevant doc comments from the MTE engine header: aclshmem_ptr ('supported access method for the returned address depends on the transport and topology'), aclshmemx_mte_quiet ('Clear instruction pipes and flush data cache to GM') — i.e. the engine quiet IS the dcci on this path — and the four aclshmemx_mte_put_nbi overloads with their UB staging buffer and sync_id.
+```cpp
+/**
+ * @brief Translate a local symmetric address to the corresponding symmetric address on the specified PE.
+ *
+ * @param ptr               [in] Symmetric address on local PE.
+ * @param pe                [in] Target PE number.
+ * @return The corresponding symmetric address on the specified PE.
+ * @note The supported access method for the returned address depends on the transport and topology.
+ */
+ACLSHMEM_DEVICE __gm__ void* aclshmem_ptr(__gm__ void* ptr, int pe);
+#define shmem_ptr aclshmem_ptr
+
+[... RMA declarations omitted ...]
+
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, AscendC::LocalTensor<T> buf,
+    const non_contiguous_copy_param& copy_params, int pe, uint32_t sync_id);
+#define shmem_mte_put_mem_nbi aclshmemx_mte_put_nbi
+
+/**
+ * @brief Asynchronous interface. Clear instruction pipes and flush data cache to GM.
+ */
+ACLSHMEM_DEVICE void aclshmemx_mte_quiet();
+
+/**
+ * @brief Atomic fetch operation. Returns the value at the source address on the specified PE.
+ *        Supported hardware platform: Ascend950.
+ *        WARNING: Use sync_id in device_state.mte_config for pipeline synchronization.
+ *        NOTE: This is an asynchronous interface. Atomic operations involve scalar computation (Scalar).
+ *              If there are data dependencies between the scalar computation unit and the move unit (MTE2/MTE3)
+ *              when reading/writing GM, developers need to insert synchronization according to actual situations.
+ * @note T only supports int32_t/uint32_t/float/int64_t/uint64_t.
+ * @note The MTE transport operates over the in-die interconnect and does not support
+ *       cross-PCIe (inter-node) communication.
+ *
+ * @param src               [in] Symmetric address of the source data.
+ * @param pe                [in] PE number of the remote PE.
+ * @return The value at the source address.
+ */
+template <typename T>
+ACLSHMEM_DEVICE T aclshmemx_mte_atomic_fetch(__gm__ T* src, int32_t pe);
+
+
+[... omitted ...]
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size, uint32_t elem_size, int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Provide a high-performance way to copy non-contiguous data
+ *        on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param ub_size           [in] The size of temp Buffer on UB. (In Bytes)
+ * @param copy_params       [in] Params to describe how non-contiguous data is organized in src and dst.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    __gm__ T* dst, __gm__ T* src, __ubuf__ T* buf, uint32_t ub_size, const non_contiguous_copy_param& copy_params,
+    int pe, uint32_t sync_id);
+
+/**
+ * @brief Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ *
+ * @param dst               [in] GlobalTensor on Symmetric memory of the destination data.
+ * @param src               [in] GlobalTensor on local device of the source data.
+ * @param buf               [in] Pointer on local UB.
+ * @param elem_size         [in] Number of elements in the destination and source arrays.
+ * @param pe                [in] PE number of the remote PE.
+ * @param sync_id           [in] ID used to sync pipeline.
+ */
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_mte_put_nbi(
+    AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, AscendC::LocalTensor<T> buf, uint32_t elem_size, int pe,
+    uint32_t sync_id);
+```
+
+### item 14
+
+https://gitcode.com/cann/shmem/blob/master/include/device/gm2gm/shmem_device_p2p_sync.h
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/shmem_device_p2p_sync.h); Copyright 2025, commit date unknown
+The device-side signal doc comments. NOTE WHAT IS ABSENT: neither aclshmemx_signal_op nor aclshmem_signal_wait_until states that a delivered signal implies prior puts to the same PE are visible — the only atomicity claim is 'On Ascend950, RDMA is used as the communication engine, supporting signal_set with guaranteed atomicity'.
+```cpp
+
+/**
+ * @brief The aclshmemx_signal_op operation updates sig_addr with signal using operation sig_op on the specified PE.
+ *        This operation can be used together with aclshmem_signal_wait_until for efficient
+ *        point-to-point synchronization.
+ *        On Ascend950, RDMA is used as the communication engine, supporting signal_set with guaranteed atomicity.
+ *
+ * @param sig_addr              [in] Symmetric address of the signal word to be updated.
+ * @param signal                [in] The value used to update sig_addr.
+ * @param sig_op                [in] Operation used to update sig_addr with signal. Supported operations:
+ *                                   ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                    [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmemx_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe);
+#define shmemx_signal_op aclshmemx_signal_op
+
+/**
+ * @brief This routine can be used to implement point-to-point synchronization between PEs or between threads within
+ *        the same PE. A call to this routine blocks until the value of sig_addr at the calling PE satisfies the wait
+ *        condition specified by the comparison operator, cmp, and comparison value, cmp_val.
+ *
+ * @param sig_addr              [in] Local address of the source signal variable.
+ * @param cmp                   [in] The comparison operator that compares sig_addr with cmp_val. Supported operators:
+ *                                   ACLSHMEM_CMP_EQ/ACLSHMEM_CMP_NE/ACLSHMEM_CMP_GT/
+ *                                   ACLSHMEM_CMP_GE/ACLSHMEM_CMP_LT/ACLSHMEM_CMP_LE.
+ * @param cmp_val               [in] The value against which the object pointed to by sig_addr will be compared.
+ * @return Return the contents of the signal data object, sig_addr, at the calling PE that satisfies the wait condition.
+ */
+ACLSHMEM_DEVICE int32_t aclshmem_signal_wait_until(__gm__ int32_t *sig_addr, int cmp, int32_t cmp_val);
+#define shmem_signal_wait_until aclshmem_signal_wait_until
+```
+
+### item 15
+
+https://github.com/immengzi/shmem/blob/master/include/device/gm2gm/shmem_device_cc.h
+immengzi/shmem (GitHub mirror of Huawei cann/shmem) — file last committed 2026-01-30
+The device-side barrier header's top-of-file WARNING block — the normative barrier visibility statement ('All operations of all pes of a team on excuting stream before the barrier are visiable to all pes of the team after the barrier', HCCS-only), the MIX-kernel/SyncAll restrictions, and item 4: 'The scalar unit of cube core is not affected by aclshmem_barrier_xxx.' Followed by the aclshmem_barrier / aclshmem_barrier_all declarations with their HCCS vs HCCS+RDMA caveat.
+```cpp
+/*
+    WARNING：Restrictions of Barrier APIs.
+
+    1. Barrier APIs can be used only in MIX kernels. The compiler will optimize the kernel to VEC or CUBE if
+       it lacks effective cube instructions (eg. Mmad) or vector instructions (eg: DataCopy).
+    Need compiler updates to remove this feature, or insert Mmad/DataCopy calls manully.
+
+    2. Barrier APIs conflict with SyncAll. Avoid mixing them together.
+
+    3. We provide 2 kinds of barrier:
+        a. aclshmem_barrier_xxx
+            Barrier of all cores. On systems with only HCCS: All operations of all pes of a team on excuting
+            stream before the barrier are visiable to all pes of the team after the barrier.
+        b. aclshmemx_barrier_xxx_vec
+            Barrier of all VEC cores. On systems with only HCCS: All operations of ALL VEC CORES of all pes of a
+            team on excuting stream before the barrier are visiable to ALL VEC CORES of all pes of the team after
+            the barrier.
+
+    4. The scalar unit of cube core is not affected by aclshmem_barrier_xxx. Make sure don't use that.
+*/
+
+[... includes omitted ...]
+
+
+/**
+ * @brief aclshmem_barrier is a collective synchronization routine over a team. Control returns from aclshmem_barrier
+ *        after all PEs in the team have called aclshmem_barrier.
+ *        aclshmem_barrier ensures that all previously issued stores and remote memory updates, including AMOs and
+ *        RMA operations, done by any of the PEs in the active set are complete before returning. On systems with
+ *        only scale-up network (HCCS), updates are globally visible, whereas on systems with both scale-up network
+ *        HCCS and scale-out network (RDMA), ACLSHMEM only guarantees that updates to the memory of a given PE are
+ *        visible to that PE.
+ *        Barrier operations issued on the CPU and the NPU only complete communication operations that were issued
+ *        from the CPU and the NPU, respectively. To ensure completion of GPU-side operations from the CPU, using
+ *        aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ * @param team              [in] team to do barrier
+ */
+ACLSHMEM_DEVICE void aclshmem_barrier(aclshmem_team_t team);
+#define shmem_barrier aclshmem_barrier
+
+/**
+ * @brief aclshmem_barrier of all PEs.
+ */
+ACLSHMEM_DEVICE void aclshmem_barrier_all(void);
+#define shmem_barrier_all aclshmem_barrier_all
+```
+
+### item 16
+
+https://gitcode.com/cann/shmem/blob/master/include/host/mem/shmem_host_heap.h
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/include/host/mem/shmem_host_heap.h); Copyright 2025, commit date unknown
+The symmetric-heap allocation entries: aclshmem_malloc / calloc / align / free and the aclshmemx_* variants with mem_type, plus aclshmemx_get_heap_base whose '@note Remote visibility: The returned address is local-only, not directly accessible by remote PEs.' is the only visibility statement on the allocation side.
+```cpp
+/**
+ * @cond IGNORE_COPYRIGHT
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * @endcond
+ */
+#ifndef SHMEM_HOST_HEAP_H
+#define SHMEM_HOST_HEAP_H
+
+#include "host/shmem_host_def.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief allocate <i>size</i> bytes and returns a pointer to the allocated memory. The memory is not initialized.
+ *        If <i>size</i> is 0, then <b>aclshmem_malloc()</b> returns NULL.
+ *
+ * @param size             [in] bytes to be allocated
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void* aclshmem_malloc(size_t size);
+#define shmem_malloc aclshmem_malloc
+
+/**
+ * @brief allocate memory for an array of <i>nmemb</i> elements of <i>size</i> bytes each and returns a pointer to the
+ *        allocated memory. The memory is set to zero. If <i>nmemb</i> or <i>size</i> is 0, then
+ * <b>aclshmem_calloc()</b> returns either NULL.
+ *
+ * @param nmemb            [in] elements count
+ * @param size             [in] each element size in bytes
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void* aclshmem_calloc(size_t nmemb, size_t size);
+#define shmem_calloc aclshmem_calloc
+
+/**
+ * @brief allocate <i>size</i> bytes and returns a pointer to the allocated memory. The memory address will be a
+ *        multiple of <i>alignment</i>, which must be a power of two.
+ *
+ * @param alignment        [in] memory address alignment
+ * @param size             [in] bytes allocated
+ * @return pointer to the allocated memory.
+ */
+ACLSHMEM_HOST_API void* aclshmem_align(size_t alignment, size_t size);
+#define shmem_align aclshmem_align
+
+/**
+ * @brief Free the memory space pointed to by <i>ptr</i>, which must have been returned by a previous call to
+ *       <b>aclshmem_malloc()</b>, <b>aclshmem_calloc()</b> or <b>aclshmem_align()</b>. If <i>ptr</i> is NULL,
+ *       no operation is performed.
+ * @param ptr              [in] point to memory block to be free.
+ */
+ACLSHMEM_HOST_API void aclshmem_free(void* ptr);
+#define shmem_free aclshmem_free
+
+/**
+ * @brief Allocates a block of ACLSHMEM symmetric memory, the data in this memory is uninitialized
+ *
+ * @param size          [in] Memory allocation size (in bytes)
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the symmetric memory
+ *
+ */
+ACLSHMEM_HOST_API void* aclshmemx_malloc(size_t size, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Allocates a block of SHMEM symmetric memory and initializes all content to zero
+ *
+ * @param count         [in] Number of elements
+ * @param size          [in] Number of bytes occupied by each element
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the symmetric memory
+ */
+ACLSHMEM_HOST_API void* aclshmemx_calloc(size_t count, size_t size, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Allocates a block of SHMEM symmetric memory with alignment to the specified length
+ *
+ * @param alignment     [in] Alignment length (in bytes)
+ * @param size          [in] Memory allocation size (in bytes)
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the symmetric memory
+ */
+ACLSHMEM_HOST_API void* aclshmemx_align(size_t alignment, size_t size, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Frees the allocated symmetric memory
+ *
+ * @param ptr           [in] Pointer to the memory to be freed
+ * @param mem_type      [in] Allocation location of the symmetric memory (Host/Device)
+ */
+ACLSHMEM_HOST_API void aclshmemx_free(void* ptr, aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Returns the start address (heap_base) of the local symmetric memory heap.
+ *        If <i>mem_type</i> is DEVICE_SIDE, returns the device heap base address.
+ *        If <i>mem_type</i> is HOST_SIDE, returns the host heap base address.
+ *        Must be called after ACLSHMEM initialization, otherwise returns NULL.
+ *
+ * @param mem_type      [in] Allocation location of symmetric memory (Host/Device)
+ * @return Pointer to the start address of the symmetric memory heap, or NULL if not initialized.
+ * @note Thread safety: This function is thread-safe for reading heap_base after initialization.
+ *       The heap_base value is set during initialization and does not change afterwards.
+ * @note Remote visibility: The returned address is local-only, not directly accessible by remote PEs.
+ * @note Failure conditions: Returns NULL if ACLSHMEM is not initialized or the heap has not been allocated.
+ */
+ACLSHMEM_HOST_API void* aclshmemx_get_heap_base(aclshmem_mem_type_t mem_type = DEVICE_SIDE);
+
+/**
+ * @brief Translate a pointer in a caller-provided source buffer to the corresponding local symmetric pointer.
+ *
+ * The query uses the current active ACLSHMEM instance initialized by aclshmemx_init_attr_with_buffers(). An interior
+ * source pointer retains its byte offset within the matching source buffer. The result identifies the same byte in
+ * the local symmetric heap and can be used as a local symmetric-address argument to SHMEM APIs.
+ *
+ * @param local_ptr [in] Pointer in one of the source intervals supplied during initialization.
+ * @return The corresponding local symmetric pointer, or NULL if no active user-buffer-heap instance or interval
+ *         matches local_ptr.
+ * @note Execution domain: Host only. This query is non-collective and does not perform communication.
+ * @note Thread safety: Concurrent read-only queries are supported after initialization. Do not race this call with
+ *       finalization of the active instance.
+ */
+ACLSHMEM_HOST_API void* aclshmemx_get_buffer_ptr(const void* local_ptr);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### item 17
+
+https://gitcode.com/cann/shmem/blob/master/include/device/gm2gm/shmem_device_rma.h
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/include/device/gm2gm/shmem_device_rma.h); Copyright 2025, commit date unknown
+The generic (non-engine-specific) device put_nbi doc comment: 'Supports MTE, RDMA, SDMA, or UDMA as the underlying transport', the dst-must-be-symmetric / src-may-be-any-local-GM address rule, and the @warning that concurrent RMA/AMO to the same PE is NOT supported under RDMA and that rdma_config/sdma_config sync_id is used for pipeline synchronization.
+```cpp
+/**
+ * @brief  Automatically generates aclshmem put nbi functions for different data types (e.g., float, int8_t).
+ *        The macro parameters: NAME is the function name suffix, TYPE is the operation data type.
+ *
+ * \remark ACLSHMEM_DEVICE void aclshmem_NAME_put_nbi(\_\_gm\_\_ TYPE *dst, \_\_gm\_\_ TYPE *src, uint32_t elem_size,
+ * int32_t pe)
+ *
+ * @par Function Description
+ * Asynchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE.
+ * Supports MTE, RDMA, SDMA, or UDMA as the underlying transport.
+ *
+ * @par Parameters
+ * - **dst**         - [in] Pointer on Symmetric memory of the destination data.
+ * - **src**         - [in] Pointer on local device of the source data.
+ * - **elem_size**   - [in] Number of elements in the destination and source arrays.
+ * - **pe**          - [in] PE number of the remote PE.
+ *
+ * @note Address requirements: dst must point to symmetric memory because it is translated to the corresponding
+ *       address on pe. src is used as supplied and may be any valid local device GM address.
+ * @note RDMA-enabled configuration: If initialization enables RDMA by setting ACLSHMEM_DATA_OP_ROCE, complete transfer
+ * ranges for both operands must remain within their respective symmetric memory allocations. Runtime dispatch may
+ * select RDMA for the target PE; callers do not need to determine the engine selected for an individual operation.
+ *
+ * @warning Concurrent RMA/AMO operations to the same PE are NOT supported when using RDMA
+ *          as the underlying transport. When using RDMA or SDMA, the corresponding
+ *          sync_id from device_state's rdma_config or sdma_config is used for pipeline
+ *          synchronization.
+ */
+#define ACLSHMEM_PUT_TYPENAME_MEM_NBI(NAME, TYPE) \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_put_nbi(__gm__ TYPE* dst, __gm__ TYPE* src, uint32_t elem_size, int32_t pe)
+
+/** \cond */
+ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_NBI);
+```
+
+### item 18
+
+https://gitcode.com/cann/shmem/blob/master/docs/coding_style_guide.md
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/docs/coding_style_guide.md); commit date unknown
+The project's mandated doc-comment template for every asynchronous API — the normative phrasing of what a caller must do 'before reusing resources or assuming remote visibility', and §10.3's requirement that examples show the completion operation explicitly.
+````
+推荐模板：
+
+```c
+/**
+ * @brief Submit a non-blocking put operation to a remote PE.
+ *
+ * @param[in] dst Destination symmetric address on the remote PE. Must not be NULL.
+ * @param[in] src Source buffer on the local PE. Must not be NULL.
+ * @param[in] size Number of bytes to transfer.
+ * @param[in] pe Remote PE number. Must be in the valid PE range.
+ *
+ * @note Address requirements: dst points to symmetric memory on pe. src is
+ *       used as supplied and may be any valid local device GM buffer.
+ * @note RDMA-enabled configuration: If initialization enables RDMA by setting
+ *       ACLSHMEM_DATA_OP_ROCE, complete transfer ranges for both operands must
+ *       remain within their respective symmetric memory allocations. Runtime
+ *       dispatch may select RDMA
+ *       for the target PE; callers need not determine the per-operation engine.
+ * @note Execution domain: Host.
+ * @note Blocking semantics: non-blocking. Returning from this void API only
+ *       means the submission path has returned; it is not a completion signal.
+ * @note Completion semantics: the caller must call aclshmem_quiet(),
+ *       aclshmem_barrier(), aclshmem_sync(), an engine-specific quiet API,
+ *       or synchronize the associated stream as documented before reusing
+ *       resources or assuming remote visibility.
+ * @note Failure behavior: this existing API does not return a status code.
+ *       Implementations must document diagnostics and error propagation
+ *       through the established project mechanism.
+ * @note Thread safety: thread-safe after successful initialization unless
+ *       otherwise documented.
+ */
+ACLSHMEM_HOST_API void aclshmem_putmem_nbi(void *dst, void *src, size_t elem_size, int32_t pe);
+```
+
+[... omitted ...]
+
+
+```c
+/**
+ * @brief Put data from the current device execution context to a remote PE.
+ *
+ * @param[in] dst Destination symmetric address on the remote PE.
+ * @param[in] src Source address in device global memory.
+ * @param[in] size Number of bytes to transfer.
+ * @param[in] pe Remote PE number.
+ *
+ * @note Address requirements: dst points to symmetric memory on pe. src is
+ *       used as supplied and may be any valid address in device global memory.
+ * @note RDMA-enabled configuration: If initialization enables RDMA by setting
+ *       ACLSHMEM_DATA_OP_ROCE, complete transfer ranges for both operands must
+ *       remain within their respective symmetric memory allocations. Runtime
+ *       dispatch may select RDMA
+ *       for the target PE; callers need not determine the per-operation engine.
+ * @note Execution domain: Device.
+ * @note The caller must ensure that dst and src are non-NULL, properly aligned,
+ *       and that pe is valid. These conditions may be checked only in debug
+ *       builds. Release device code does not perform defensive fallback checks.
+ * @note Completion semantics: the caller must use the documented quiet or sync
+ *       operation before assuming remote visibility.
+ */
+/* device-side public API declaration */
+```
+
+---
+
+[... omitted ...]
+
+### 10.2 完成性接口
+
+异步接口必须说明需要哪个完成性接口，例如：
+
+- `aclshmem_quiet`
+- `aclshmem_fence`
+- `aclshmem_barrier`
+- `aclshmem_sync`
+- stream 同步接口
+- device 同步接口
+- engine-specific quiet，例如 MTE、SDMA、RDMA、UDMA 对应的 quiet 或 wait 接口
+
+### 10.3 示例代码要求
+
+示例代码中，如果使用异步接口，必须显式展示完成性操作，例如：
+
+```c
+aclshmem_putmem_nbi(dst, src, size, pe);
+
+/* Required before reusing src or assuming remote visibility. */
+aclshmem_quiet();
+```
+````
+
+### item 19
+
+https://gitcode.com/cann/shmem/blob/master/docs/example/example.md
+Huawei / cann/shmem (ACLSHMEM), master branch (raw: https://raw.gitcode.com/cann/shmem/raw/master/docs/example/example.md); commit date unknown
+The official AllGather kernel example showing the exact ordering the library expects: mte_put_nbi -> aclshmem_quiet() -> aclshmemx_signal_op(..., my_rank) -> aclshmem_signal_wait_until(aclshmem_ptr(gva_sync_gm, x) + flag_offset, ...) — quiet BEFORE the signal, and the wait polls through aclshmem_ptr into the peer's symmetric address.
+```cpp
+
+    // data move parameters
+    const uint32_t ub_size = UB_DMA_MAX_SIZE;
+    uint32_t input_offset, output_offset, gva_offset, num_per_core;
+
+    // [AllGather Step 1] local input gm -> symmetric mem.
+    num_per_core = elements / aivNum;
+    input_offset = aivIndex * num_per_core;
+    gva_offset = aivIndex * num_per_core;
+    if (aivIndex == aivNum - 1) {
+        num_per_core = elements - num_per_core * aivIndex;
+    }
+    aclshmemx_mte_put_nbi(gva_data_gm + gva_offset, input_gm + input_offset, tmp_buff, ub_size, num_per_core, my_rank, EVENT_ID0);
+
+    const int64_t core_per_rank = aivNum / pe_size;
+    const int64_t core_rank_idx = aivIndex % core_per_rank;
+    const int64_t x = aivIndex / core_per_rank;
+
+    // Sync Ensure Corresponding Tasks Done.
+    aclshmem_quiet();
+
+    aclshmemx_signal_op(gva_sync_gm + flag_offset, magic, ACLSHMEM_SIGNAL_SET, my_rank);
+    aclshmem_signal_wait_until((__gm__ int32_t *)aclshmem_ptr(gva_sync_gm, x) + flag_offset, ACLSHMEM_CMP_EQ, magic);
+
+    // [AllGather Step 2] symmetric mem -> local output.
+    num_per_core = elements / core_per_rank;
+    output_offset = x * elements + core_rank_idx * num_per_core;
+    gva_offset = core_rank_idx * num_per_core;
+    if (core_rank_idx == core_per_rank - 1) {
+        num_per_core = elements - num_per_core * core_rank_idx;
+    }
+    aclshmemx_mte_get_nbi(output_gm + output_offset, gva_data_gm + gva_offset, tmp_buff, ub_size, num_per_core, x, EVENT_ID0);
+}
+```
+
+### item 20
+
+https://github.com/mindspore-ai/hyper-parallel/blob/master/hyper_parallel/core/multicore/ops/runtime/worker_kernel.h
+mindspore-ai/hyper-parallel — file last committed 2026-10-15
+A real megakernel invalidate-then-poll implementation. WaitForDependency re-issues DataCacheCleanAndInvalid<int32_t, SINGLE_CACHE_LINE, CACHELINE_OUT> before EVERY re-read of the GM event counter inside the spin loop (rate-limited by GetSystemCycle), and PublishDeviceReady does dcci -> GetValue -> SetValue -> dcci -> PipeBarrier<PIPE_ALL>() before aclshmemx_signal_op / aclshmem_signal_wait_until; note DATA_CACHE_LINE_SIZE/INT32_T_SIZE is used as the per-slot stride.
+```cpp
+  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
+#ifndef __DAV_C220_CUBE__
+    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+    int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
+    constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+    if (completion) {
+      ready += (ep + 1) * ready_stride;
+    }
+
+    GlobalTensor<int32_t> ready_state;
+    ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
+    uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      ready_state[generation_index]);
+    int32_t previous_generation = ready_state.GetValue(generation_index);
+    if (previous_generation == INT32_MAX) {
+      AscendC::Trap();
+    }
+    int32_t generation = previous_generation + 1;
+    ready_state.SetValue(generation_index, generation);
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      ready_state[generation_index]);
+    PipeBarrier<PIPE_ALL>();
+
+    uint32_t round = 0;
+    for (int64_t distance = 1; distance < ep; distance *= READY_SIGNAL_RADIX, ++round) {
+      int64_t target = (rank + distance) % ep;
+      __gm__ int32_t *round_ready = ready + round * ready_stride;
+      aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
+      aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
+    }
+    if (!completion) {
+      TriggerEvent(meta.ready_event);
+    }
+#endif
+  }
+
+[... omitted ...]
+
+  __aicore__ inline void WaitForDependency(uint32_t event_index, uint32_t poll_interval_us = 0) {
+    // Pull producers signal locally after MTE3 completion. Observe short-lived
+    // GMM/SwiGLU dependencies promptly while retaining a bounded refresh rate.
+#ifdef __DAV_C220_CUBE__
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 10 : CUBE_EVENT_REFRESH_INTERVAL_UNITS;
+#else
+    const uint32_t default_poll_interval_us = pull_protocol_ ? 30 : VECTOR_EVENT_REFRESH_INTERVAL_UNITS;
+#endif
+    if (poll_interval_us == 0) {
+      poll_interval_us = default_poll_interval_us;
+    }
+    constexpr int64_t cycles_per_us = EVENT_REFRESH_TIME_UNIT_CYCLES;
+    int32_t needed = all_event_num_triggers.GetValue(event_index);
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      all_event_counters[event_index]);
+    int32_t current = all_event_counters.GetValue(event_index);
+    PipeBarrier<PIPE_ALL>();
+    int64_t previous_cycle = AscendC::GetSystemCycle();
+    while (current < needed) {
+      int64_t elapsed_cycles = AscendC::GetSystemCycle() - previous_cycle;
+      if (elapsed_cycles / cycles_per_us > poll_interval_us) {
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+          all_event_counters[event_index]);
+        current = all_event_counters.GetValue(event_index);
+        previous_cycle = AscendC::GetSystemCycle();
+      }
+    }
+  }
+```
+
+### item 21
+
+https://github.com/mindspore-ai/hyper-parallel/blob/master/hyper_parallel/core/multicore/docs/shmem.md
+mindspore-ai/hyper-parallel — file last committed 2026-10-15
+A detailed Chinese analysis of the CANN shmem data plane's protocol constraints: Push vs Pull one-sided modes, 'Signal热点的64B隔离' (concurrently-updated independent signals on one target PE must not share a 64B cacheline; give each signal an alignment=64 allocation or 64B stride), and '跨 rank 初始化收敛' (a late local zero_()/fill_() will overwrite an already-delivered remote write), plus the warning that the device barrier spins without timeout and trips aicore 507015 under interconnect contention.
+```
+## 单边通信模式
+
+单边接口组合成两种数据面模式，`signal`/`wait_signal` 提供跨 PE 的完成通知：
+
+- **Push（推）**：发送方 `put` 把数据直接写进接收方的对称槽，再 `signal` 通知；接收方
+  `wait_signal` 后读自己的本地对称槽。数据落点在接收方，适合接收方持有消费缓冲的场景。
+- **Pull（拉）**：发送方把数据写进自己的对称槽（本地写或收到的 put），`signal` 通知接收方；
+  接收方 `wait_signal` 后 `get` 从发送方的对称槽拉取。数据落点在发送方，适合发送方
+  复用同一缓冲多轮发布的场景。
+
+两种模式都必须遵守两条协议约束，均来自 CANN 数据面的既定行为：
+
+1. **Signal热点的64B隔离**：当多个来源PE或设备任务会并发更新同一目标PE上的多个独立Signal位置时，
+   这些位置不能共享64B cacheline。热点消费者应让每个Signal独占一个`alignment=64`的分配，或在同一
+   分配内按64B步长排布。没有并发写入邻居的单个Signal不因通用接口本身而要求64B基址对齐。
+2. **跨 rank 初始化收敛**：任何远端可见写（`signal`、`put` 到对端槽位）之前，所有 rank
+   必须完成对相应槽位的本地初始化（`zero_()`/`fill_()`）并经 `host_barrier()` 收敛；否则一个
+   迟到的本地初始化会覆盖已送达的远端写，表现为信号永远等不到或数据读回全零。
+   设备 barrier（`shmem.barrier()`）不得用作跨 rank 收敛点：其远端等待为无超时自旋，
+   互连竞争下会触发 aicore 507015（见 bug_issue：
+   `shmem_device_barrier_unbounded_spin_interconnect_contention.md`）。
+```
+
+### item 22
+
+https://github.com/huawei-csl/pto-kernels/blob/master/examples/aicpu/hello-world/README.md
+huawei-csl/pto-kernels — file last committed 2026-08-24
+Reproduces the official CANN example (from hiascend atlasascendc_api_07_00188.html) of an AI Core spinning on an AI-CPU-written GM lock with dcci inside the loop, and independently reports that AscendC::DataStoreBarrier() is only `dsb st` on the device.
+````
+# AICPU Hello world example
+
+Copied from
+
+### item 23
+
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_10_00050.html
+
+## `--cce-aicpu-no-firmware` is required
+
+The compile commands in the documentation linked above omit this flag, and without
+it the kernel never executes. Measured on Ascend 910B2, CANN 9.0.0, driver
+26.0.rc1, 10 runs per build:
+
+| build | runs that print |
+|---|---|
+| exactly as documented | 0/10 |
+| as documented, plus `-fPIC` | 0/10 |
+| plus `--cce-aicpu-no-firmware` | 9/10 |
+
+`-fPIC` and `-g` make no difference; only the flag does.
+
+When the flag is missing, `aclrtSynchronizeStream` returns `507018`
+(`aicpu exception`) and the device reports `errCode=11003` ("get kernel failed") in
+`~/ascend/atrace/*/schedule_event_*/schedule_tracer_*.txt`. A kernel with an empty
+body fails identically, so this is unrelated to `printf`.
+
+**Why the flag is needed is not established.** Both builds embed an `ET_DYN`
+AArch64 shared object with identical symbols and no `SONAME`, differing only in
+size, so the compiler's own help text is the only available explanation:
+
+```
+--cce-aicpu-no-firmware
+      Compile AICpu code with operating system support instead
+      of for firmware-only device
+```
+
+The flag is undocumented, and the documentation section that would cover AI CPU
+compilation -- 2.3.3 "AI CPU算子编译", referenced by 2.2.5 -- is absent from the
+CANN 9.0.0 documentation set. Maintainer input welcome.
+
+### Note on printf reliability
+
+With the flag applied, roughly 6% of runs still lose the output (47/50 printed over
+50 runs). `AscendC::printf` writes into a dump buffer drained by a host-side thread,
+and `DataStoreBarrier()` is only `dsb st` on the device, so teardown can race the
+drain. Inserting a wait before `aclrtDestroyStream` makes it 50/50, but the
+documentation prescribes no such wait, so this looks like a CANN-side issue rather
+than a missing step here.
+
+
+
+
+### Second example
+
+Interesting example from https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/API/ascendcopapi/atlasascendc_api_07_00188.html
+
+
+
+```
+struct TilingInfo {
+    uint64_t lock; // AI CPU/AI Core之间同步的锁
+    int8_t type;
+    int8_t mode;
+    int8_t len;
+};
+struct KernelArgs {
+    uint32_t *xDevice;
+    uint32_t *yDevice;
+    uint32_t *zDevice;
+    TilingInfo *ti; // 与AI Core共享的参数，用于同步tiling选择
+};
+
+template<typename T, int8_t mode, int8_t len>
+__aicore__ void hello_world_impl(GM_ADDR m)
+{
+    if constexpr (std::is_same_v<T, float>) {
+       AscendC::printf("Hello World: float mode %u len %u.\n", mode, len);
+    } else if constexpr (std::is_same_v<T, int>) {
+       AscendC::printf("Hello World: int mode %u len %u.\n", mode, len);
+    }
+}
+
+// AI Core算子总入口
+// tilingInfo: 和AI CPU算子共同传递的参数，用于数据共享
+template<typename T, int8_t mode, int8_t len>
+__mix__(1,2) __global__ __aicore__ void hello_world(GM_ADDR m, GM_ADDR TilingPtr)
+{
+     __gm__ struct KernelInfo::TilingInfo *ti = (__gm__ struct KernelInfo::TilingInfo *)TilingPtr;
+    AscendC::GlobalTensor<uint64_t> lock;
+    lock.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(&ti->lock));
+    if ASCEND_IS_AIV {
+        if (AscendC::GetBlockIdx() == 0) {
+            while (*reinterpret_cast<volatile __gm__ uint64_t*>(lock.GetPhyAddr(0)) == 0) {   // 下沉模式，AI Core等待AICPU tiling计算完成
+                AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                    AscendC::DcciDst::CACHELINE_OUT>(lock);    //直接访问Global Memory，获取最新数据
+            }
+        }
+    }
+    // 上面是1个核等待AI CPU tiling计算完成，这里进行核间同步
+    AscendC::SyncAll<false>();
+    // 根据tiling参数值选择不同模板
+    if (ti->type ==0 && ti->mode == 1 && ti->len == 2) {
+        hello_world_impl<float, 1, 2>(m);
+    } else if (ti->type == 1 && ti->mode == 2 && ti->len == 4) {
+        hello_world_impl<int, 2, 4>(m);
+    }
+    // 执行完留一个核释放lock
+    if ASCEND_IS_AIV {
+        if (AscendC::GetBlockIdx() == 0) {
+            lock.SetValue(0, 0);  // 刷新 lock
+            AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                AscendC::DcciDst::CACHELINE_OUT>(lock);    //刷新Dcache，同步与GM之间的数据
+        }
+    }
+}
+
+extern "C" __global__ __aicpu__ uint32_t MyAicpuKernel(void *arg)
+{
+    KernelArgs* cfg = (KernelArgs*)arg;
+    AscendC::printf("MyAicpuKernel inited!\n");
+    cfg->ti->lock = 1;
+    cfg->ti->type = 1;
+    cfg->ti->mode = 2;
+    cfg->ti->len = 4;
+    AscendC::DataStoreBarrier(); // 对tilingInfo进行写同步
+    AscendC::printf("MyAicpuKernel inited type %u mode %u len %u end!\n", cfg->ti->type, cfg->ti->mode, cfg->ti->len);
+    return 0;
+}
+```
+````
+
+### item 24
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/deepep/ops/op_kernel/moe_distribute_base.h
+sgl-project/sgl-kernel-npu — file last committed 2026-08-28
+Production helper `cacheWriteThrough(__gm__ uint8_t*, uint64_t)` that walks an arbitrary GM range at AscendC::CACHE_LINE_SIZE granularity issuing one SINGLE_CACHE_LINE / CACHELINE_OUT dcci per line — the idiom for flushing/invalidating a multi-cacheline remotely-written buffer.
+```cpp
+__aicore__ inline void cacheWriteThrough(__gm__ uint8_t *sourceAddr, uint64_t length)
+{
+    __gm__ uint8_t *start =
+        (__gm__ uint8_t *)((uint64_t)sourceAddr / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
+    if (length == 0) {
+        return;
+    }
+    __gm__ uint8_t *end =
+        (__gm__ uint8_t *)(((uint64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
+    AscendC::GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(start);
+    for (uint32_t i = 0; i <= end - start; i += AscendC::CACHE_LINE_SIZE) {
+        AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(global[i]);
+    }
+}
+```
+
+### item 25
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/deepep/ops/op_kernel/moe_distribute_v2_base.h
+sgl-project/sgl-kernel-npu — commit date unknown (same tree as above, fetched 2026-10-20)
+The DATA_FULSH macro: the full belt-and-braces flush sequence actually used in shipped code — AscendC::Barrier(), then ENTIRE_DATA_CACHE / CACHELINE_OUT dcci, then a NOP, then dsb(DSB_ALL).
+```cpp
+#define DATA_FULSH(_gm_tensor, _type)                                                                  \
+    AscendC::Barrier();                                                                                \
+    DataCacheCleanAndInvalid<_type, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(_gm_tensor); \
+    __asm__("NOP");                                                                                    \
+    dsb(DSB_ALL);
+```
+
+### item 26
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/deepep/ops/op_kernel/notify_dispatch.h
+sgl-project/sgl-kernel-npu — file last committed 2026-08-28
+GetMagicValue: dcci the per-block status slot, GetValue it, then write back the incremented magic — the read-modify-write-on-a-remotely-visible-flag pattern, with UB_ALIGN_SIZE used as the per-block stride to keep blocks off each other's cache line.
+```cpp
+// Assign values to winContext_[COMM_EP_IDX] and blockIdx before calling
+template <typename T>
+__aicore__ inline uint64_t NotifyDispatch<T>::GetMagicValue(void)
+{
+    uint64_t magic = 0;
+    GlobalTensor<uint64_t> selfDataStatusTensor;
+    GM_ADDR statusDataSpaceGm = (GM_ADDR)(winContext_[COMM_EP_IDX]->localWindowsExp);
+    selfDataStatusTensor.SetGlobalBuffer((__gm__ uint64_t *)(statusDataSpaceGm + STATE_WIN_OFFSET));
+    DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+        selfDataStatusTensor[blockIdx * UB_ALIGN_SIZE]);
+    magic = selfDataStatusTensor(blockIdx * UB_ALIGN_SIZE);
+    if (magic <= 0) {
+        magic = 1;
+    }
+    selfDataStatusTensor(blockIdx * UB_ALIGN_SIZE) = magic + 1;
+    return magic;
+}
+```
+
+### item 27
+
+https://github.com/sgl-project/sgl-kernel-npu/blob/main/csrc/deepep/ops/op_kernel/cam_moe_dispatch_normal.h
+sgl-project/sgl-kernel-npu — commit date unknown (fetched 2026-10-20)
+The double-buffer state flip at kernel entry: dcci the self data-status flag, read it, flip it, dcci again, then PipeBarrier<PIPE_ALL>() — the dcci/dcci/PipeBarrier sandwich around a scalar RMW on a GM flag that peers also write.
+```cpp
+    stateOffset = STATE_OFFSET;
+    srcRankOffset = startStatusId / moeExpertNumPerRank;
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfDataStatusTensor);
+    dataState = selfDataStatusTensor(0);
+    if (dataState == 0) {
+        selfDataStatusTensor(0) = 1;
+    } else {
+        selfDataStatusTensor(0) = 0;
+    }
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(selfDataStatusTensor);
+    PipeBarrier<PIPE_ALL>();
+```
+
+### TOPIC A visibility sweep — negative findings
+
+NOTHING: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920/... — CANN 9.2.0 is not published on the hiascend doc portal under any probed version code. /doc_center/source/ returns HTTP 403 for 920, 92RC1, 920alpha001, 92RC1alpha001, 910, 901, 900beta3, `9.2.0` and `latest`; only 900 (CANN 9.0.0), 900beta1, 900beta2, 850 and 82RC1 resolve, for both CANNCommunityEdition and canncommercial. The 900 pages quoted above are the newest published text and already list "Atlas 350 加速卡" alongside A3, so they cover the dav-2201 A3 target.
+
+NOTHING: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/<book>/ for any aclshmem/ACLSHMEM book — there is NO aclshmem API-reference book on the hiascend doc portal. Probed book names shmemapi, aclshmemapi, shmemug, shmemdevg, shmem, aclshmem, symmemapi all return HTTP 403 under /doc_center/source/zh/CANNCommunityEdition/900/API/. Repeated WebSearch ("aclshmem API 参考", "aclshmemx_signal_op 接口", "昇腾 对称内存 shmem 接口 参考", site:hiascend.com) returns only gitcode.com/cann/shmem source mirrors. The authoritative ACLSHMEM documentation is the in-repo headers and docs/ quoted above; hiascend.com carries only the HCCL-side symmetric-memory APIs (HcclCommSymWinRegister etc.).
+
+NOTHING: aclshmemx_quiet / aclshmemx_fence — no such symbols exist. The memory-ordering header declares only `aclshmem_quiet` and `aclshmem_fence` (no `aclshmemx_` spelling). The `aclshmemx_` prefix is used for the per-engine variants: aclshmemx_mte_quiet, aclshmemx_sdma_quiet, aclshmemx_udma_quiet, aclshmemx_roce_quiet.
+
+NOTHING: aclshmemx_signal_wait_until — no device-side symbol with this name. The device header declares `aclshmem_signal_wait_until` (int32_t return) and the host header declares `aclshmem_signal_wait_until` plus `aclshmemx_signal_wait_until_on_stream`. Only the `_on_stream` host variant carries the `x`.
+
+NOTHING: AscendC::DcciDst::CACHE_LINE_SINGLE — the enumerator does not exist. The CacheLine enum values are `SINGLE_CACHE_LINE` and `ENTIRE_DATA_CACHE`; the DcciDst enum values are `CACHELINE_ALL`, `CACHELINE_UB`, `CACHELINE_OUT`, `CACHELINE_ATOMIC`.
+
+NOTHING: zhihu.com / csdn.net / cnblogs.com / bbs.huaweicloud.com / juejin.cn — four separate WebSearches ("aclshmem 单边 put 可见性", "昇腾 远端写 cache 一致性 dcci", "DataCacheCleanAndInvalid 用法", "昇腾 GM 标志位 轮询 cache", plus zhihu- and CSDN-targeted phrasings) surfaced no third-party Chinese blog post on this topic. Every result resolved back to hiascend.com official docs, asc.gitcode.com, or gitcode.com/cann/*. The Chinese-language technical writing on remote-write visibility and dcci that does exist is vendor-authored and is captured above (asc.gitcode.com 缓存一致性 / 内存一致性, cann/shmem docs/api/*.md) plus the third-party mindspore-ai/hyper-parallel docs/shmem.md.
+
+NOTHING: openeuler-mirror/umdk src/cam/ — not searched for dcci/visibility material; the UMDK/CAM tree is a host-side URMA transport library and `gh search code "DataCacheCleanAndInvalid"` / `"DcciDst::CACHELINE_OUT"` returned zero hits in it, so it carries no AI-core-side cache-maintenance code.
+
+NOTHING: tile-ai/tilelang-ascend, Ascend/AscendNPU-IR, ByteDance-Seed/Triton-distributed (ascend/) — these appear in `gh search code "aclshmem_quiet"` only as thin FFI/MLIR wrappers (e.g. AscendNPU-IR bishengir/lib/Template/lib/Shmem/Shmem.cpp `_mlir_ciface_aclshmem_quiet` calling `aclshmem_quiet()`, Triton-distributed ascend/python/triton_dist/language/extra/ascend/libaclshmem_device.py mapping `(): ("aclshmem_quiet", ())`). They restate no ordering or visibility guarantee, so nothing verbatim is worth quoting.
+
+
+
 ## Gaps
 
 Looked for and could not find:
@@ -3527,3 +12774,19 @@ Looked for and could not find:
 - **A multimem/NVLS equivalent on Ascend.** No Ascend hardware multicast or in-switch reduction primitive was found; SiFAR's `redundant pull` therefore has no A3 counterpart. `WriteReduceNbi` is the nearest remote-reduce primitive and is explicitly UB_CTP/URMA-only, i.e. Ascend 950 and later.
 - **`DistributedGEMM` as a distinct project.** Searches returned TensorRT-LLM's `cutlass_kernels/allreduce_gemm` tree (file list quoted in Part 1's source enumeration: `gemm_universal_allreduce.hpp`, `sm90_allreduce_nvls_warpspecialized.hpp`, `sm100_visitor_allreduce_tma_warpspecialized.hpp`) rather than a separate library; no standalone documentation or measurement was retrieved.
 - **Chinese-language first-party analysis of小包 AllReduce on Ascend.** Searched `昇腾 allreduce 小包 延迟`, `昇腾 AllReduce 小数据量 延迟 优化 零拷贝 AIV`, `MC2 融合通信 昇腾`, `通信计算融合`. The returns were either the official hiascend pages already quoted or third-party reposts with no measurements. No Zhihu article with primary numbers was found.
+
+### Part 7 (in-kernel collective) negative findings, reported as found
+- https://github.com/sgl-project/sglang — sglang's own tree has no in-kernel Ascend collective; the only hits for `lccl` are docs telling MindSpore users to `export MS_ENABLE_LCCL=off`. The hand-written AscendC ops live in the separate `sgl-project/sgl-kernel-npu` repo (covered above).
+- https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/utils/inc/kernel/moe_distribute_base.h — contains HCCL window/context struct definitions (`flag`, `hostStateInfo`, `aicpuStateInfo`) but no magic/epoch protocol.
+- https://raw.gitcode.com/cann/ops-hccl/raw/master/README.md — returns `{"code":"CH.00402000","title":"Project not found","message":"Project not found:cann/ops-hccl"}`; that repo path does not exist on gitcode.
+- https://raw.githubusercontent.com/hicann/cann-recipes-infer/master/ops/shmem/distributed_embedding/op_kernel/distributed_hashtable.h — 30-line forwarding header only; the substance is in the `.cpp` (ITEM 24).
+- https://raw.githubusercontent.com/Zhangyq-1999/shmem-doc/main/_sources/api/device_api.rst.txt — 72 lines of Doxygen `doxygenfile::` directives only; no inline API text. The real content is generated from the headers (ITEM 4, ITEM 20).
+- Chinese web search for 「昇腾 LCCL one-shot allreduce 低时延 原理 magic 标志位」, 「昇腾 AscendC kernel 内 跨卡 同步 标志位 magic 轮次 对称内存 轮询」, 「LCCL 昇腾 低时延通信库 AllReduce 原理 共享内存 IPC buff 博客」 — no Ascend-specific blog on zhihu/csdn/cnblogs/bbs.huaweicloud.com surfaced; results were GPU-collective papers and an unrelated "LCCL" name collision in arXiv:2512.03644. All substantive material on this question is in source, not blog prose.
+- https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920/... — CANN 9.2.0 is not published on the hiascend doc portal under any probed version code. /doc_center/source/ returns HTTP 403 for 920, 92RC1, 920alpha001, 92RC1alpha001, 910, 901, 900beta3, `9.2.0` and `latest`; only 900 (CANN 9.0.0), 900beta1, 900beta2, 850 and 82RC1 resolve, for both CANNCommunityEdition and canncommercial. The 900 pages quoted above are the newest published text and already list "Atlas 350 加速卡" alongside A3, so they cover the dav-2201 A3 target.
+- https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/<book>/ for any aclshmem/ACLSHMEM book — there is NO aclshmem API-reference book on the hiascend doc portal. Probed book names shmemapi, aclshmemapi, shmemug, shmemdevg, shmem, aclshmem, symmemapi all return HTTP 403 under /doc_center/source/zh/CANNCommunityEdition/900/API/. Repeated WebSearch ("aclshmem API 参考", "aclshmemx_signal_op 接口", "昇腾 对称内存 shmem 接口 参考", site:hiascend.com) returns only gitcode.com/cann/shmem source mirrors. The authoritative ACLSHMEM documentation is the in-repo headers and docs/ quoted above; hiascend.com carries only the HCCL-side symmetric-memory APIs (HcclCommSymWinRegister etc.).
+- aclshmemx_quiet / aclshmemx_fence — no such symbols exist. The memory-ordering header declares only `aclshmem_quiet` and `aclshmem_fence` (no `aclshmemx_` spelling). The `aclshmemx_` prefix is used for the per-engine variants: aclshmemx_mte_quiet, aclshmemx_sdma_quiet, aclshmemx_udma_quiet, aclshmemx_roce_quiet.
+- aclshmemx_signal_wait_until — no device-side symbol with this name. The device header declares `aclshmem_signal_wait_until` (int32_t return) and the host header declares `aclshmem_signal_wait_until` plus `aclshmemx_signal_wait_until_on_stream`. Only the `_on_stream` host variant carries the `x`.
+- AscendC::DcciDst::CACHE_LINE_SINGLE — the enumerator does not exist. The CacheLine enum values are `SINGLE_CACHE_LINE` and `ENTIRE_DATA_CACHE`; the DcciDst enum values are `CACHELINE_ALL`, `CACHELINE_UB`, `CACHELINE_OUT`, `CACHELINE_ATOMIC`.
+- zhihu.com / csdn.net / cnblogs.com / bbs.huaweicloud.com / juejin.cn — four separate WebSearches ("aclshmem 单边 put 可见性", "昇腾 远端写 cache 一致性 dcci", "DataCacheCleanAndInvalid 用法", "昇腾 GM 标志位 轮询 cache", plus zhihu- and CSDN-targeted phrasings) surfaced no third-party Chinese blog post on this topic. Every result resolved back to hiascend.com official docs, asc.gitcode.com, or gitcode.com/cann/*. The Chinese-language technical writing on remote-write visibility and dcci that does exist is vendor-authored and is captured above (asc.gitcode.com 缓存一致性 / 内存一致性, cann/shmem docs/api/*.md) plus the third-party mindspore-ai/hyper-parallel docs/shmem.md.
+- openeuler-mirror/umdk src/cam/ — not searched for dcci/visibility material; the UMDK/CAM tree is a host-side URMA transport library and `gh search code "DataCacheCleanAndInvalid"` / `"DcciDst::CACHELINE_OUT"` returned zero hits in it, so it carries no AI-core-side cache-maintenance code.
+- tile-ai/tilelang-ascend, Ascend/AscendNPU-IR, ByteDance-Seed/Triton-distributed (ascend/) — these appear in `gh search code "aclshmem_quiet"` only as thin FFI/MLIR wrappers (e.g. AscendNPU-IR bishengir/lib/Template/lib/Shmem/Shmem.cpp `_mlir_ciface_aclshmem_quiet` calling `aclshmem_quiet()`, Triton-distributed ascend/python/triton_dist/language/extra/ascend/libaclshmem_device.py mapping `(): ("aclshmem_quiet", ())`). They restate no ordering or visibility guarantee, so nothing verbatim is worth quoting.

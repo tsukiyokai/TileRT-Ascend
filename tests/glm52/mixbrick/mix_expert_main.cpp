@@ -71,7 +71,9 @@ int main(int argc, char** argv)
     std::vector<uint8_t> tiling_host(TILING_BYTES, 0);
     const int tiling_status = mix_build_tiling(
         static_cast<int>(rows),
-        static_cast<int>(HALF_CHANNELS / blocks), tiling_host.data());
+        static_cast<int>((stages & 32) ? 2 * HALF_CHANNELS
+                                       : HALF_CHANNELS / blocks),
+        tiling_host.data());
     if (tiling_status != 0) {
         std::printf("mix_build_tiling returned %d\n", tiling_status);
         return 1;

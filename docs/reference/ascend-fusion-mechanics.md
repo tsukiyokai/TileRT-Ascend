@@ -7062,6 +7062,4950 @@ constexpr SyncAllConfig DEFAULT_SYNC_ALL_CONFIG = {PIPE_ALL, PIPE_ALL};
   support explicitly on every page.
 
 
+---
+
+## 36. Grid-wide (cross-block) reduction on A3: `SyncAll` verified first-hand, the atomics that exist, and the canonical per-token row max
+
+Collected 2026-10-20 for question 2.4, "the dynamic-quantisation row maximum as a cross-block
+reduction". Everything below is verbatim. This complements §35.5, which quotes the `SyncAll` API
+page; this section quotes the **implementation** and the kernels that use it.
+
+## Relevance
+The answer to "how do hand-written kernels do a grid-wide reduction on A3" turns out to be
+"mostly they don't", and that is the useful result.
+- **The canonical CANN grid-wide row max is not atomics.**
+  `ops-nn/quant/dynamic_quant/.../pertoken_large_multicore.h` does
+  `ProcessScaleRow(); SyncAll(); ProcessScaleCol();` — one float per core published into a GM
+  workspace by `DataCopyPad` (MTE3, so inside the barrier's reach), then a second reduce pass. A
+  sweep of `hicann/ops-nn` found **no** kernel using `SetAtomicMax` for a row max.
+- `SetAtomicMax` does exist on A3 (UB/L0C/L1 → GM; int8/int16/half/bf16/int32/float), but it does
+  not auto-zero GM, and on arch 2201 integers and bf16 are **non-saturating by default** with
+  saturation settable only via `npu-smi` — two sharp edges for a W4A8 dynamic-quant path.
+- The no-argument `SyncAll<isAIVOnly>()` is **two FFTS instructions**, needs no workspace, and
+  performs no cache maintenance. Flag 14 for AIV-only, 11/12/13 for mixed — matching the §35.5
+  table. The `SyncAllConfig` overload is gated to `__NPU_ARCH__ ∈ {3510, 5102, 5162, 9201, 9202}`:
+  **2201 is excluded**, and there is no `dav_2201` impl directory — A3 is served by `dav_c220`.
+- The soft form takes a GM workspace and is **itself epoch-counted** —
+  `curValue = *localUb + 1`, terminate on `count >= totalBlocks * curValue` — so it never needs the
+  workspace zeroed between calls. That is the pattern to copy for a 78-layer kernel: a counter that
+  only goes up, compared against `blocks × generation`, rather than a flag that must be reset.
+- Two best-case results for us: B4 and B5 show per-token dynamic quant done with **no grid
+  reduction at all** — per-core row ownership with a two-pass sweep over column tiles, and the row
+  max never leaving the core inside a Catlass-style matmul epilogue. At batch=1, seq_len 8K, our
+  row count is 1, so the row-ownership form degenerates to "one core owns the row" and the
+  cross-block reduction disappears. Check that before building a barrier.
+- The official memory-model chapter at `asc.gitcode.com/.../cache_coherence.html` names
+  `NPU架构版本2201` and gives its cache geometry: L2 line 512 B / 192 MB, AIC DCache 64 B / 16 KB,
+  AIV DCache 64 B / 32 KB — and requires a DSB **after** DCCI to wait for the write-back, which
+  `shmem`'s own `dcci_cacheline` does not do (it uses only `__asm__ __volatile__("")` compiler
+  barriers). That sharpens §35: DCCI alone does not wait, so any hand-written flag protocol that
+  uses DCCI must follow it with `DataSyncBarrier<MemDsbT::DDR>()`.
+- `SyncAll` is **mutually exclusive with the shmem barriers** and both depend on the `ffts` config
+  being set at kernel entry — so a layer kernel cannot use `SyncAll` for its inter-layer boundary
+  and `aclshmem_barrier_all` for its TP edge. Pick one.
+
+# TOPIC B — grid-wide (cross-block) reduction on A3 in a hand-written kernel
+
+## B1. A hand-written cross-rank + cross-core sync in a real fused megakernel — `SyncAll` sandwiching an epoch-counted remote flag
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/dispatch_gmm_combine/include/sync_util.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 — complete file
+
+This is the closest published artifact to a hand-rolled `tp_push`: no host barrier, `SyncAll`
+for the intra-die grid barrier, a monotone epoch `count` for the inter-die flags, a 16 × int32
+(= 64 B, one cacheline) stride per rank slot, and `dcci` on both sides.
+
+```cpp
+#ifndef SYNC_UTIL_H
+#define SYNC_UTIL_H
+#include "kernel_operator.h"
+using namespace AscendC;
+
+#define FORCE_INLINE_AICORE inline __attribute__((always_inline)) __aicore__
+constexpr int32_t BUFF_SIZE = 500 * 1024 * 1024;
+constexpr int32_t FLAG_OFFSET = 500 * 1024 * 1024 / sizeof(int32_t);
+
+
+template<typename T>
+FORCE_INLINE_AICORE void gm_store(__gm__ T *addr, T val) {
+    *((__gm__ T *)addr) = val;
+}
+
+template<typename T>
+FORCE_INLINE_AICORE T gm_load(__gm__ T *cache) {
+    return *((__gm__ T *)cache);
+}
+
+FORCE_INLINE_AICORE void gm_dcci(__gm__ uint8_t * addr) {
+    using namespace AscendC;
+    GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(addr);
+
+    // Important: add hint to avoid dcci being optimized by compiler
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(global);
+    __asm__ __volatile__("");
+}
+
+FORCE_INLINE_AICORE int32_t gm_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val) {
+    do {
+        gm_dcci((__gm__ uint8_t *)sig_addr);
+
+        if (*sig_addr == cmp_val) {
+            return *sig_addr;
+        }
+
+        // in case when peer pe enters next barrier
+        if (*sig_addr == cmp_val + 1) {
+            return *sig_addr;
+        }
+    } while (true);
+
+    return -1;
+}
+ 
+FORCE_INLINE_AICORE void CrossRankSync(GM_ADDR symmetricPtr, int32_t rank, int32_t rankSize)
+{
+    // 全核同步
+    __gm__ int32_t* sync_counter = (__gm__ int32_t*)symmetricPtr + FLAG_OFFSET;
+    __gm__ int32_t* sync_base = (__gm__ int32_t*)symmetricPtr + FLAG_OFFSET + 1024;
+    int count = gm_load(sync_base) + 1;
+    int vec_id = AscendC::GetBlockIdx();
+    int vec_size = AscendC::GetBlockNum() * AscendC::GetTaskRation();
+    for (int i = vec_id; i < rankSize; i += vec_size) {
+        __gm__ int32_t* sync_remote = (__gm__ int32_t*)(aclshmem_ptr(symmetricPtr, i)) + FLAG_OFFSET + rank * 16;
+        gm_store(sync_remote, count);
+        gm_dcci((__gm__ uint8_t*)sync_remote);
+        auto sync_check = sync_counter + i * 16;
+        gm_signal_wait_until_eq_for_barrier(sync_check, count);
+    }
+
+    AscendC::SyncAll<true>();
+    gm_store(sync_base, count);
+}
+
+// 全卡同步接口
+FORCE_INLINE_AICORE void CrossRankSyncV1(GM_ADDR symmetricPtr, int32_t rank, int32_t rankSize)
+{
+    // 全核同步
+    AscendC::SyncAll<true>();
+    __gm__ int32_t* sync_counter = (__gm__ int32_t*)symmetricPtr + FLAG_OFFSET;
+    __gm__ int32_t* sync_base = (__gm__ int32_t*)symmetricPtr + FLAG_OFFSET + 32;
+    int count = gm_load(sync_base) + 1;
+    int vec_id = AscendC::GetBlockIdx();
+    int vec_size = AscendC::GetBlockNum() * AscendC::GetTaskRation();
+    for (int i = vec_id; i < rankSize; i += vec_size) {
+        __gm__ int32_t* sync_remote = (__gm__ int32_t*)(aclshmem_ptr(symmetricPtr, i)) + FLAG_OFFSET + rank * 16;
+        gm_store(sync_remote, count);
+        gm_dcci((__gm__ uint8_t*)sync_remote);
+        auto sync_check = sync_counter + i * 16;
+        gm_signal_wait_until_eq_for_barrier(sync_check, count);
+    }
+
+    AscendC::SyncAll<true>();
+    gm_store(sync_base, count);
+}
+#endif
+```
+
+Note the signature difference between the two: `CrossRankSync` does flag exchange *then*
+`SyncAll`; `CrossRankSyncV1` brackets it with `SyncAll` on both sides. `AscendC::SyncAll<true>()`
+is the AIV-only template form, called with no workspace argument (i.e. the hard-sync form).
+
+## B2. The two forms of intra-die grid barrier, side by side, with the selection condition
+
+https://raw.githubusercontent.com/immengzi/shmem/master/src/device/gm2gm/shmemi_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 74-83)
+
+```cpp
+/* Level 1: barrier between vec cores (within a device) */
+template<bool IS_AIV_ONLY>
+ACLSHMEM_DEVICE void aclshmemi_barrier_core()
+{
+#ifdef __CCE_AICORE_ENABLE_MIX__
+    AscendC::SyncAll<IS_AIV_ONLY>();
+#else
+    aclshmemi_barrier_core_soft();
+#endif
+}
+```
+
+i.e. the library uses the hardware `SyncAll` *only* in MIX kernels, and falls back to its own
+GM-flag dissemination barrier (`aclshmemi_barrier_core_soft`, quoted verbatim in A9) otherwise.
+The soft form needs two GM regions (`core_sync_pool`, `core_sync_counter`) that are allocated at
+`aclshmem_init` time, uses `ACLSHMEM_LOG_MAX_AIV_PER_NPU` slots per core, and is epoch-counted
+rather than zeroed.
+
+## B3. `SyncAll` is mutually exclusive with the shmem barriers, and both depend on the `ffts` config
+
+https://raw.githubusercontent.com/immengzi/shmem/master/include/device/gm2gm/shmem_device_cc.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04 (lines 13-33)
+
+```c
+/*
+    WARNING：Restrictions of Barrier APIs.
+
+    1. Barrier APIs can be used only in MIX kernels. The compiler will optimize the kernel to VEC or CUBE if
+       it lacks effective cube instructions (eg. Mmad) or vector instructions (eg: DataCopy).
+    Need compiler updates to remove this feature, or insert Mmad/DataCopy calls manully.
+
+    2. Barrier APIs conflict with SyncAll. Avoid mixing them together.
+
+    3. We provide 2 kinds of barrier:
+        a. aclshmem_barrier_xxx
+            Barrier of all cores. On systems with only HCCS: All operations of all pes of a team on excuting
+            stream before the barrier are visiable to all pes of the team after the barrier.
+        b. aclshmemx_barrier_xxx_vec
+            Barrier of all VEC cores. On systems with only HCCS: All operations of ALL VEC CORES of all pes of a
+            team on excuting stream before the barrier are visiable to ALL VEC CORES of all pes of the team after
+            the barrier.
+
+    4. The scalar unit of cube core is not affected by aclshmem_barrier_xxx. Make sure don't use that.
+*/
+```
+
+https://raw.githubusercontent.com/immengzi/shmem/master/docs/principles.md
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+```
+<p style="text-indent: 2em;">该部分仅获取一个ffts地址，后续可通过<code>shmemx_get_ffts_config</code>获得，在算子内通过<code>shmemx_set_ffts_config</code>设置，用于runtime同步，AscendC层面会影响的<code>SyncAll</code>、<code>CrossCoreSetFlag</code>和<code>CrossCoreWaitFlag</code>接口，shmem层面会影响到barrier相关接口。（</ode>shmemx_set_ffts_config</code>开销较小，建议算子内都调用一次该接口）。</p>
+```
+
+## B4. Per-token dynamic quant with NO grid reduction — per-core row ownership, two-pass over column tiles
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/dispatch_gmm_combine/include/moe_init_routing_quant_v2/moe_v2_gather_dynamic_quant.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+Single-pass path (whole row fits one UB tile) — `ReduceMax` then `GetValue(0)`, all inside one core:
+
+```cpp
+    Abs(tempLocal, inLocal, this->cols);
+    pipe_barrier(PIPE_V);
+
+    ReduceMax(dynamicQuantLocal, tempLocal, tempLocal, this->cols);
+    pipe_barrier(PIPE_V);
+
+    float maxValue = dynamicQuantLocal.GetValue(0) / 127.0f;
+
+    Duplicate<float>(dynamicQuantLocal, maxValue, 8);
+    Duplicate<float>(tempLocal, maxValue, this->cols);
+    pipe_barrier(PIPE_V);
+
+    Div(tempLocal, inLocal, tempLocal, this->cols);
+    pipe_barrier(PIPE_V);
+
+    Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, this->cols);
+    pipe_barrier(PIPE_V);
+
+    Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, this->cols);
+```
+
+Tiled path — the explicit two-pass structure. Pass 1 (`ComputeMax` per column tile) accumulates
+`reduceMax` in a *scalar register*, spilling the fp32 row to a GM scratch (`quantSrcGm`) so pass 2
+can re-read it. Note `rowOffset` is derived from `blockIdx`, i.e. each core owns whole rows, which
+is precisely why no cross-block reduction is needed. Note also the hex-literal `-FLT_MAX` init:
+
+```cpp
+    for (int64_t i = 0; i < this->currentLoopRows; i++) {
+        int64_t rowOffset = this->gatherOutTilingData->perCoreRows * this->blockIdx + this->perLoopRows * progress;
+        if (this->dropPadMode == DROPLESS_MODE && rowOffset + i >= this->activateRows) {
+            break;
+        }
+        int32_t srcIdx = indicesLocal.GetValue(i);
+        int32_t expertIdx = indicesLocal.GetValue(currentLoopRowsAlign + i);
+
+        LocalTensor<float> inLocal = inputXInQueue.AllocTensor<float>();
+        LocalTensor<float> tempLocal = calcQueue.AllocTensor<float>();
+        LocalTensor<float> quantScaleLocal = scaleOutQueue.AllocTensor<float>();
+
+        uint32_t tmp = 0xFF7FFFFF;
+        float reduceMax = *((float *) &tmp);
+        for (int64_t j = 0; j < this->colLoops; j++) {
+            colsTileLength = this->perLoopCols;
+            if (j == this->colLoops - 1) {
+                colsTileLength = this->lastLoopCols;
+            }
+            float tileMax = ComputeMax(inLocal, tempLocal, quantScaleLocal, srcIdx / this->k, expertIdx, j);
+            reduceMax = (reduceMax > tileMax) ? reduceMax : tileMax;
+        }
+
+        float scaleTemp = reduceMax / 127.0f;
+        Duplicate<float>(quantScaleLocal, scaleTemp, 8);
+        scaleOutQueue.EnQue(quantScaleLocal);
+        quantScaleLocal = scaleOutQueue.DeQue<float>();
+
+        DataCopyPad(dynamicQuantScaleGm[(rowOffset + i)], quantScaleLocal, {1, 4, 0, 0, 0});
+
+        for (int64_t j = 0; j < this->colLoops; j++) {
+            colsTileLength = this->perLoopCols;
+            if (j == this->colLoops - 1) {
+                colsTileLength = this->lastLoopCols;
+            }
+
+            ComputeScale(inLocal, tempLocal, scaleTemp, rowOffset + i, j);
+        }
+
+        inputXInQueue.FreeTensor(inLocal);
+        calcQueue.FreeTensor(tempLocal);
+        scaleOutQueue.FreeTensor(quantScaleLocal);
+    }
+```
+
+`ComputeMax` — the per-tile half. The max lands at `dynamicQuantLocal[8]` and is read back with
+`GetValue(8)`; the fp32 input is written to the GM scratch in the same pass, with
+`SetWaitFlag<HardEvent::MTE3_MTE2>` as the only ordering:
+
+```cpp
+    Abs(tempLocal, inLocal, colsTileLength);
+    pipe_barrier(PIPE_V);
+
+    ReduceMax(dynamicQuantLocal[8], tempLocal, tempLocal, colsTileLength);
+
+    DataCopyPad(quantSrcGm[j * this->perLoopCols], inLocal, intriParamsFp32);
+    smoothInQueue.FreeTensor(smoothLocal);
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+
+    return dynamicQuantLocal.GetValue(8);
+```
+
+`ComputeScale` — pass 2 re-reads the staged fp32 row from GM and applies the scalar scale:
+
+```cpp
+    DataCopyPad(inLocal, quantSrcGm[j * this->perLoopCols], copyInParams, {false, 0, 0, 0});
+    inputXInQueue.EnQue<float>(inLocal);
+    inLocal = inputXInQueue.DeQue<float>();
+
+    Duplicate<float>(tempLocal, scaleTemp, colsTileLength);
+    pipe_barrier(PIPE_V);
+
+    Div(tempLocal, inLocal, tempLocal, colsTileLength);
+    pipe_barrier(PIPE_V);
+
+    Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, colsTileLength);
+    pipe_barrier(PIPE_V);
+
+    Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, colsTileLength);
+```
+
+## B5. Per-token quant inside a Catlass-style matmul epilogue — row max never leaves the core
+
+https://raw.githubusercontent.com/immengzi/shmem/master/examples/dispatch_gmm_combine/include/block_epilogue_pertoken_swiglu.h
+Huawei Technologies Co., Ltd. (CANN `shmem`), mirror HEAD 2026-03-04
+
+Row-to-core assignment (`epilogueCoreIdx`), then a per-row SwiGLU + `Abs` + `ReduceMax` fused
+in the epilogue. The `false` final argument to `ReduceMax<float>` suppresses the index output,
+and `sharedUbTmpBuffer` is aliased onto the max buffer:
+
+```cpp
+        uint32_t tasksForIdx  = epilogueCoreIdx < remainderData ? perCoreData + 1 : perCoreData;
+        uint32_t loopStartIdx = epilogueCoreIdx * perCoreData +
+            (epilogueCoreIdx < remainderData? epilogueCoreIdx : remainderData);
+
+        uint32_t alignedPerCoreData = RoundUp<BYTE_PER_BLK / sizeof(ElementPerTokenScale)>(perCoreData + 1);
+
+        uint32_t ChunkTileLen = blockN / 2;
+        uint32_t HalfChunkTileLen = ChunkTileLen / 2;
+
+        for (uint32_t loopIdx = loopStartIdx; loopIdx < loopStartIdx + tasksForIdx; ++loopIdx) {
+            auto gmTileC = gmC[loopIdx * blockN];
+
+            auto &ubC = ubCList[ubListId];
+            auto &ubD = ubDList[ubListId];
+
+            auto &ubCFp32 = ubCFp32List[ubListId];
+            auto &ubCFp32ChunkN = ubCFp32ChunkNList[ubListId];
+            auto &ubAbs = ubCFp32ChunkNAbsList[ubListId];
+            auto &ubReduceMax = ubCFp32ChunkNMaxList[ubListId];
+            auto &ubOutputTmp = ubAbs;
+            auto &sharedUbTmpBuffer = ubReduceMax;
+            auto &ubQuantS32 = ubQuantS32List[ubListId];
+            auto &ubQuantF16 = ubQuantF16List[ubListId];
+
+            auto gmTileD = gmD[loopIdx * ChunkTileLen];
+            LayoutC layoutUbC{1, blockN};
+
+            // 把C从GM workspace搬到UB
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
+            copyGmToUbC(ubC, gmTileC, layoutUbC, layoutUbC);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[ubListId]);
+
+            // 在UB上做把C cast成FP32
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[ubListId]);
+            AscendC::Cast(ubCFp32, ubC, AscendC::RoundMode::CAST_NONE, blockN);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
+
+            // 获取pertoken scale值，gmPerTokenScale的第loopIdx行
+            ElementPerTokenScale perTokenScale = gmPerTokenScale1(loopIdx);
+```
+
+```cpp
+            AscendC::Muls(ubCFp32, ubCFp32, perTokenScale, blockN);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // swiglue计算过程
+            AscendC::Muls(ubCFp32ChunkN, ubCFp32, -1.0f, ChunkTileLen);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp(ubCFp32ChunkN, ubCFp32ChunkN, ChunkTileLen);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(ubCFp32ChunkN, ubCFp32ChunkN, 1.0f, ChunkTileLen);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(ubCFp32ChunkN, ubCFp32, ubCFp32ChunkN, ChunkTileLen);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(ubCFp32ChunkN, ubCFp32ChunkN, ubCFp32[ChunkTileLen], ChunkTileLen);
+            
+            // quant过程，两种方式区别；
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Abs(ubAbs, ubCFp32ChunkN, ChunkTileLen);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ReduceMax<float>(ubReduceMax, ubAbs, sharedUbTmpBuffer, ChunkTileLen, false);
+            AscendC::PipeBarrier<PIPE_V>();
+```
+
+Zero-max guard (relevant if a row can be all zeros in a quantised decode step):
+
+```cpp
+            ElementPerTokenScale GMubDequantScale = ubReduceMax.GetValue(0) == float(0) ? 1 : ubReduceMax.GetValue(0);
+```
+
+---
+
+# TOPIC B, addendum — `SyncAll` verified first-hand from `hicann/asc-devkit`
+
+I re-fetched these myself rather than relying on the delegated sweep, because the arch gating is
+the load-bearing detail for a `dav-2201` target.
+
+## B0a. The declared `SyncAll` / `IBSet` / `IBWait` surface, and the arch gate on the no-argument form
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/include/basic_api/kernel_operator_block_sync_intf.h
+hicann / asc-devkit, `master` (fetched 2026-10-20); file header `Copyright (c) 2025 Huawei Technologies Co., Ltd.`
+
+```cpp
+/*
+ * @ingroup：IBSet, IBWait
+ * @brief：Set the flag bit of a core
+ * @param [in] gmWorkspace GlobalTensor to store core state
+ * @param [in] ubWorkspce LocalTensor for current core
+ * @param [in] blockIdx the idx number waiting for the core
+ * @param [in] eventID Set and wait events
+ */
+template <bool isAIVOnly = true>
+__aicore__ inline void IBSet(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, int32_t blockIdx,
+    int32_t eventID);
+
+template <bool isAIVOnly = true>
+__aicore__ inline void IBWait(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, int32_t blockIdx,
+    int32_t eventID);
+/*
+ * @ingroup：SyncALL
+ * @brief：Set flag bits of all cores
+ * @param [in] gmWorkspace GlobalTensor to store core state
+ * @param [in] ubWorkspce LocalTensor for current core
+ */
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAll(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, const int32_t usedCores = 0);
+
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 5162) || \
+                              (__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))
+template <bool isAIVOnly = true, const SyncAllConfig& config = DEFAULT_SYNC_ALL_CONFIG>
+__aicore__ inline void SyncAll();
+#else
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAll();
+#endif
+```
+
+Read the gate carefully: the `SyncAllConfig`-carrying no-argument overload exists only for
+`__NPU_ARCH__` in {3510, 5102, 5162, 9201, 9202}. `2201` is *not* in that set, so on A3 the
+no-argument form is the plain `template <bool isAIVOnly = true> SyncAll()`.
+
+Corroboration that 2201 is a live, recognised arch id in the same tree (it sits in the
+V200/V210 group that gets `QUE_MAX_EVENT = 8`):
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/impl/basic_api/kernel_macros.h
+hicann / asc-devkit, `master` (fetched 2026-10-20)
+
+```cpp
+namespace AscendC {
+#if defined(__NPU_ARCH__) &&                                                                                 \
+    ((__NPU_ARCH__ == 2002) || (__NPU_ARCH__ == 2201) || (__NPU_ARCH__ == 3002) || (__NPU_ARCH__ == 3102) || \
+     (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113) || \
+     (__NPU_ARCH__ == 5101) || (__NPU_ARCH__ == 5161) || (__NPU_ARCH__ == 5165) || (__NPU_ARCH__ == 5163) || \
+     (__NPU_ARCH__ == 5162) || (__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202)) // Available for V200 and V210
+constexpr int32_t QUE_MAX_EVENT = 8;
+#else
+constexpr int32_t QUE_MAX_EVENT = 4;
+#endif
+```
+
+There is no `impl/basic_api/dav_2201/` directory in the repository. The arch directories present
+under `impl/basic_api/` are, exactly:
+`dav_3510, dav_5161, dav_5162, dav_9201, dav_c100, dav_c220, dav_l300, dav_l311, dav_m200,
+dav_m300, dav_m310, dav_m510` (plus `reg_compute`, `utils`). `2201` appears only under
+`tests/api/c_api/npu_arch_2201/` and in `docs/.../deprecated_interface/*_arch_2201_deprecated.md`.
+The implementation that serves it is `dav_c220`.
+
+## B0b. Hard sync — `SyncAll<isAIVOnly>()` with no workspace is two FFTS instructions
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+hicann / asc-devkit, `master` (fetched 2026-10-20)
+
+```cpp
+
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+
+__aicore__ inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
+
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAllImpl()
+{
+#if defined(__ASCENDC_SUPERKERNEL_AUTO_SYNC_ALL__)
+    if (g_superKernelAutoSyncAllEnable) {
+        if (GetBlockIdxImpl() == 0) {
+            g_superKernelAutoSyncAllSyncIdx += 1;
+            // |    32bits  |   16bits  |   8bits   |   8bits   |
+            // |  sync idx  | sync type |   is end  | is valid  |
+            *reinterpret_cast<__gm__ uint64_t*>(g_superKernelAutoSyncAllConfigGmAddr) =
+                (static_cast<uint64_t>(g_superKernelAutoSyncAllSyncIdx)
+                 << SK_AUTO_SYNC_ALL_SYNC_IDX_CONFIG_BIT_OFFSET) |
+                (static_cast<uint64_t>(isAIVOnly) << SK_AUTO_SYNC_ALL_SYNC_TYPE_CONFIG_BIT_OFFSET) |
+                static_cast<uint64_t>(SK_AUTO_SYNC_ALL_VALID_MAGIC_NUM);
+            dcci(
+                reinterpret_cast<__gm__ uint64_t*>(g_superKernelAutoSyncAllConfigGmAddr),
+                cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        }
+    }
+#endif
+
+    PipeBarrier<PIPE_ALL>();
+    if constexpr (isAIVOnly) {
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+        wait_flag_dev(SYNC_AIV_ONLY_ALL);
+        return;
+    }
+    // trans software sync to hardware sync
+    if ASCEND_IS_AIC {
+        wait_flag_dev(SYNC_AIV_FLAG);
+        ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+        wait_flag_dev(SYNC_AIC_FLAG);
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+        return;
+    }
+    if ASCEND_IS_AIV {
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+        wait_flag_dev(SYNC_AIC_AIV_FLAG);
+        return;
+    }
+```
+
+So: AIV-only is one `ffts_cross_core_sync` + one `wait_flag_dev` on flag 14; the mixed form is a
+three-hop V→C→V handshake on flags 12 / 11 / 13. `PipeBarrier<PIPE_ALL>()` first, and *no* cache
+maintenance at all — which is why it orders cores but says nothing about a remotely written line.
+
+## B0c. Soft sync — `SoftSyncAllImpl` needs a GM workspace, and is itself epoch-counted
+
+Same file. Note `curValue = *localUb + 1` and the termination test
+`count >= totalBlocks * curValue`: the workspace is never reset between barriers, it just keeps
+counting, which is the same generation-tag discipline as A8/A9/B1. `DEFAULT_BLK_NUM` /
+`ONE_BLK_FLOAT_NUM` striding gives each block its own 32-byte slot.
+
+```cpp
+__aicore__ inline int64_t GetBlockNum();
+template <bool isAIVOnly = true>
+__aicore__ inline void SoftSyncAllImpl(
+    __gm__ int32_t* gmWorkspaceAddr, __ubuf__ int32_t* ubWorkspaceAddr, const int usedCores)
+{
+    if ASCEND_IS_AIC {
+        return;
+    }
+    __sync_all_stub(usedCores, isAIVOnly);
+    PipeBarrier<PIPE_ALL>();
+
+    int32_t totalBlocks = isAIVOnly ? GetBlockNum() : (GetTaskRationImpl() * GetBlockNum());
+    totalBlocks = usedCores != 0 ? usedCores : totalBlocks;
+#ifdef __ASCENDC_ENABLE_SUPER_KERNEL__
+    int32_t blockIdx = GetBlockIdxImpl();
+#else
+    int32_t blockIdx = isAIVOnly ? get_block_idx() : GetBlockIdxImpl();
+#endif
+
+    __gm__ int32_t* localSyncGM = gmWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+    __ubuf__ int32_t* localUbAddr = ubWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+
+    copy_gm_to_ubuf(static_cast<__ubuf__ void*>(localUbAddr), static_cast<__gm__ void*>(localSyncGM), 0, 1, 1, 0, 0);
+    event_t eventIdMte2ToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+    SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    int32_t curValue = *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) + 1;
+    bool isFirst = curValue == 1 ? true : false;
+    *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) = curValue;
+    event_t eventIdSToMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+    SetFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+    WaitFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+    copy_ubuf_to_gm(static_cast<__gm__ void*>(localSyncGM), static_cast<__ubuf__ void*>(localUbAddr), 0, 1, 1, 0, 0);
+    event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+    SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+    WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+    int32_t totalBlockCount = ONE_BLK_FLOAT_NUM * totalBlocks;
+    uint16_t blockLen = totalBlockCount / AscendCUtils::GetC0Count(sizeof(int32_t));
+    while (true) {
+        copy_gm_to_ubuf(
+            static_cast<__ubuf__ void*>(ubWorkspaceAddr), static_cast<__gm__ void*>(gmWorkspaceAddr), 0, 1, blockLen, 0,
+            0);
+        SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        int32_t count = 0;
+        ClcSyncCount(localSyncGM, ubWorkspaceAddr, blockIdx, totalBlocks, isFirst, count);
+        event_t eventIdSToMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
+        SetFlag<HardEvent::S_MTE2>(eventIdSToMte2);
+        WaitFlag<HardEvent::S_MTE2>(eventIdSToMte2);
+        if (count >= (totalBlocks * curValue)) {
+            break;
+        }
+```
+
+The counting helper it calls, including the `isFirst` special case that avoids counting your own
+stale slot:
+
+```cpp
+#include "../../../include/basic_api/kernel_tpipe.h"
+#if !defined(__ASCENDC_INCLUDE_INTERNAL_HEADERS__)
+#define __ASCENDC_INCLUDE_INTERNAL_HEADERS__
+#define __UNDEF_ASCENDC_INCLUDE_INTERNAL_HEADERS_KERNEL_TPIPE_H__
+#endif
+#include "../../../include/basic_api/kernel_common.h"
+namespace AscendC {
+
+__aicore__ inline void ClcSyncCount(
+    __gm__ int32_t* localSyncGM, __ubuf__ int32_t* ubWorkspaceAddr, const int32_t blockIdx, const int32_t totalBlocks,
+    bool isFirst, int32_t& count)
+{
+    if (isFirst) {
+        __ubuf__ int32_t* localUbAddr = ubWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+        *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) = 1;
+        event_t eventIdSToMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+        SetFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+        WaitFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+        copy_ubuf_to_gm(
+            static_cast<__gm__ void*>(localSyncGM), static_cast<__ubuf__ void*>(localUbAddr), 0, 1, 1, 0, 0);
+        event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+        WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+        count = 1;
+        for (int32_t i = 0; i < totalBlocks; i++) {
+            if (i != blockIdx) {
+                count += *(reinterpret_cast<__ubuf__ int32_t*>(ubWorkspaceAddr) + i * ONE_BLK_FLOAT_NUM);
+            }
+        }
+    } else {
+        for (int32_t i = 0; i < totalBlocks; i++) {
+            count += *(reinterpret_cast<__ubuf__ int32_t*>(ubWorkspaceAddr) + i * ONE_BLK_FLOAT_NUM);
+        }
+    }
+}
+```
+
+## B0d. The canonical grid-wide row max in CANN, verified first-hand: partials-in-workspace + `SyncAll()` + second reduce pass
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/dynamic_quant/op_kernel/arch35/dynamic_quant_regbase_pertoken_large_multicore.h
+hicann / ops-nn, `master` (fetched 2026-10-20)
+
+This is the one `DynamicQuant` template in the open operator library where a token's row is wider
+than one core's slice, so the per-token max genuinely must cross blocks. The whole mechanism is
+three lines:
+
+```cpp
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::ProcessScale()
+{
+    ProcessScaleRow();
+    SyncAll();
+    ProcessScaleCol();
+}
+```
+
+Core→(token, slice) mapping. `coreNumPerToken` cores cooperate on one token; `coreLocalIdx` is
+the slice index within the token:
+
+```cpp
+    coreNumPerToken = tilingData_.headCoreNum;
+
+    totalTokenNum = tilingData_.coreNum / coreNumPerToken;
+    tokenIdx = blockIdx / coreNumPerToken;
+    coreLocalIdx = blockIdx % coreNumPerToken;
+    headSlices = tilingData_.multiRowNumHeadCore;
+
+    elePerHeadCore = tilingData_.rowPerHeadCore;
+    elePerTailCore = tilingData_.rowPerTailCore;
+    eleCount = (coreLocalIdx < headSlices) ? elePerHeadCore : elePerTailCore;
+
+    if (coreLocalIdx < headSlices) {
+        coreStartOffset = static_cast<int64_t>(coreLocalIdx) * static_cast<int64_t>(elePerHeadCore);
+    } else {
+        coreStartOffset = static_cast<int64_t>(headSlices) * static_cast<int64_t>(elePerHeadCore) +
+                          static_cast<int64_t>(coreLocalIdx - headSlices) * static_cast<int64_t>(elePerTailCore);
+    }
+```
+
+Workspace layout — exactly one float per core (two arrays when asymmetric: max and min), sized
+`tilingData_.coreNum`, no padding, no per-core cacheline isolation:
+
+```cpp
+    if constexpr (isSymmetrical == false) {
+        workspaceTmp1.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace), tilingData_.coreNum);
+        workspaceTmp2.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace + tilingData_.coreNum * sizeof(float)),
+                                      tilingData_.coreNum);
+    } else {
+        workspaceTmp1.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace), tilingData_.coreNum);
+    }
+```
+
+Pass 1 — each core seeds its accumulator to `MIN_FLOAT_VALUE` / `MAX_FLOAT_VALUE`, reduces its
+own column slice, and publishes one float:
+
+```cpp
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::ProcessScaleRow()
+{
+    LocalTensor<float> MaxToWorkSpaceLocal;
+    LocalTensor<float> MinToWorkSpaceLocal;
+    LocalTensor<float> scaleToWorkSpaceLocal;
+
+    if constexpr (isSymmetrical == false) {
+        MaxToWorkSpaceLocal = MaxToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(MaxToWorkSpaceLocal, MIN_FLOAT_VALUE, 64, 1, 1, 8);
+        MaxToWorkSpaceQueue.EnQue(MaxToWorkSpaceLocal);
+
+        MinToWorkSpaceLocal = MinToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(MinToWorkSpaceLocal, MAX_FLOAT_VALUE, 64, 1, 1, 8);
+        MinToWorkSpaceQueue.EnQue(MinToWorkSpaceLocal);
+    } else {
+        scaleToWorkSpaceLocal = scaleToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(scaleToWorkSpaceLocal, (float)0.0, 64, 1, 1, 8);
+        scaleToWorkSpaceQueue.EnQue(scaleToWorkSpaceLocal);
+    }
+
+    ProcessScaleRowLoop(0, 0);
+
+    CopyUB2Workspace(1);
+}
+```
+
+The publish itself. Note it is `DataCopyPad` (MTE3 traffic), not a scalar store — which is what
+puts it inside `SyncAll`'s reach:
+
+```cpp
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::CopyUB2Workspace(
+    int64_t size)
+{
+    if constexpr (isSymmetrical == false) {
+        auto tmp1 = MaxToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp1[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp1, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        MaxToWorkSpaceQueue.FreeTensor(tmp1);
+
+        auto tmp2 = MinToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp2[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp2, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        MinToWorkSpaceQueue.FreeTensor(tmp2);
+    } else {
+        auto tmp = scaleToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp1[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        scaleToWorkSpaceQueue.FreeTensor(tmp);
+    }
+}
+```
+
+Pass 2 — read back all `coreNumPerToken` partials as one contiguous vector and reduce them:
+
+```cpp
+    }
+    scaleOffset = 0;
+    CopyInScaleByEle(static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken), coreNumPerToken);
+    ComputeMaxColScale(coreNumPerToken, MaxOutLocalAddr, MinOutLocalAddr, scaleOutLocalAddr, offsetLocalAddr);
+    if constexpr (isSymmetrical == false) {
+```
+
+```cpp
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::CopyInScaleByEle(
+    int64_t offset, uint32_t elementNum)
+{
+    DataCopyParams copyParams{1, (uint16_t)(elementNum * sizeof(float)), 0, 0};
+    if constexpr (isSymmetrical == false) {
+        LocalTensor<float> MaxFromWorkSpaceLocal = MaxFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(MaxFromWorkSpaceLocal, workspaceTmp1[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        MaxFromWorkSpaceQueue.EnQue(MaxFromWorkSpaceLocal);
+
+        LocalTensor<float> MinFromWorkSpaceLocal = MinFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(MinFromWorkSpaceLocal, workspaceTmp2[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        MinFromWorkSpaceQueue.EnQue(MinFromWorkSpaceLocal);
+    } else {
+        LocalTensor<float> scaleFromWorkSpaceLocal = scaleFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(scaleFromWorkSpaceLocal, workspaceTmp1[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        scaleFromWorkSpaceQueue.EnQue(scaleFromWorkSpaceLocal);
+    }
+}
+```
+
+And the per-token scale is written out by one core only:
+
+```cpp
+    ProcessYRow(0, 0, scaleOutLocalAddr, offsetLocalAddr);
+
+    if (coreLocalIdx == 0) {
+        DataCopyParams copyParams{1, (uint16_t)(sizeof(float)), 0, 0};
+        DataCopyPad(scaleGm[tokenIdx], scaleOutLocal, copyParams);
+        if constexpr (isSymmetrical == false) {
+            DataCopyPad(offsetGm[tokenIdx], offsetLocal, copyParams);
+```
+
+No atomic. No `dcci`. No flag. The barrier is the only synchronisation, and the published data
+rides MTE3.
+
+---
+
+# TOPIC B — official `SyncAll` docs, cross-core sync primitives, atomics, and real DynamicQuant kernel source
+
+Items below are verbatim quotations collected from the URLs shown. `hicann/asc-devkit` is the
+open AscendC SIMD-API devkit (docs + headers + impl, including the per-architecture
+`impl/basic_api/dav_c220/` sources); `hicann/ops-nn` is the open CANN operator library
+(`arch35` subtrees are the newest generation).
+
+### item 0
+
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/82RC1/API/ascendcopapi/atlasascendc_api_07_0204.html
+Huawei, CANN Community Edition 8.2.RC1 「Ascend C API 参考」; retrieved 2026-10-20, page date not stated
+Official CANN Ascend C API reference topic for SyncAll / 核间同步, text-extracted verbatim from the rendered page (tables flattened to lines). Same topic id on the commercial host: https://www.hiascend.com/document/detail/zh/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0204.html
+```text
+SyncAll
+产品支持情况
+产品
+是否支持（软同步原型）
+是否支持（硬同步原型）
+Atlas A3 训练系列产品/Atlas A3 推理系列产品
+√
+√
+Atlas A2 训练系列产品/Atlas 800I A2 推理产品/A200I A2 Box 异构组件
+√
+√
+Atlas 200I/500 A2 推理产品
+x
+x
+Atlas 推理系列产品
+AI Core
+√
+x
+Atlas 推理系列产品
+Vector Core
+x
+x
+Atlas 训练系列产品
+√
+x
+Atlas 200/300/500 推理产品
+x
+x
+功能说明
+当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用该函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬件同步是利用硬件自带的全核同步指令由硬件保证多核同步，软件同步是使用软件算法模拟实现。
+函数原型
+软同步
+1
+2
+template
+<
+bool
+isAIVOnly
+=
+true
+>
+__aicore__
+inline
+void
+SyncAll
+(
+const
+GlobalTensor
+<
+int32_t
+>&
+gmWorkspace
+,
+const
+LocalTensor
+<
+int32_t
+>&
+ubWorkspace
+,
+const
+int32_t
+usedCores
+=
+0
+)
+硬同步
+1
+2
+template
+<
+bool
+isAIVOnly
+=
+true
+>
+__aicore__
+inline
+void
+SyncAll
+()
+参数说明
+表1
+模板参数说明
+参数名
+描述
+isAIVOnly
+控制SyncAll作用于纯Vector算子或融合（Cube和Vector融合）算子。可选值：
+true
+（默认值）：纯Vector算子的全核同步，仅执行Vector核的全核同步。
+false
+：融合算子的全核同步，先分别完成Vector核和Cube核的全核同步，再执行两者之间的同步。
+表2
+参数说明
+参数名称
+输入/输出
+含义
+gmWorkspace
+输入
+gmWorkspace为用户定义的全局Global空间，作为所有核共用的缓存，用于保存每个核的状态标记，类型为GlobalTensor，支持的数据类型为int32_t。GlobalTensor数据结构的定义请参考
+GlobalTensor
+。
+所需空间大小和使用注意项参见
+约束说明
+。
+硬同步接口不支持该参数。
+ubWorkspace
+输入
+ubWorkspace为用户定义的局部Local空间，每个核单独自用，用于标记当前核的状态。
+类型为
+LocalTensor
+，支持的TPosition为VECIN/VECCALC/VECOUT，支持的数据类型为int32_t。
+所需空间大小参见
+约束说明
+。
+硬同步接口不支持该参数。
+usedCores
+输入
+指定多少个核之间的同步，传入数值不能超过算子调用时指定的逻辑blockDim。此参数为默认参数，不传此参数表示全核软同步。
+仅在软同步接口中支持，硬同步接口不支持该参数。
+返回值
+无
+约束说明
+gmWorkspace缓存申请的空间大小要求大于等于核数*32Bytes，并且缓存的值需要初始化为0。目前常见的有两种初始化方式：
+通过在host侧进行初始化操作，确保传入该接口时，gmWorkspace缓存已经初始化为0；
+在kernel侧初始化的时候对gmWorkspace缓存初始化，需要注意的是，每个核上都需要初始化全部的gmWorkspace缓存空间。
+ubWorkspace申请的空间大小要求大于等于核数*32Bytes。
+使用该接口进行多核控制时，算子调用时指定的逻辑blockDim必须保证不大于实际运行该算子的AI处理器核数，否则框架进行多轮调度时会插入异常同步，导致Kernel“卡死”现象。
+在分离架构中，建议使用硬同步接口而非软同步接口。软同步接口仅适用于纯Vector场景，且性能较低。使用硬同步接口时，需根据场景设置Kernel类型：
+在纯Vector/Cube场景下，需设置Kernel类型为KERNEL_TYPE_MIX_AIV_1_0或KERNEL_TYPE_MIX_AIC_1_0。
+对于Vector和Cube混合场景，需根据实际情况灵活配置Kernel类型。
+调用示例
+本示例实现功能为使用8个核进行数据处理，每个核均是处理32个float类型数据，对该数据乘2后再与其他核上进行同样乘2的数据进行相加，中间结果保存到workGm，因此多个核之间需要进行数据同步。此样例中，使用软同步，入口函数传入的syncGm里的值都已经在host侧初始化为0。若以下用例改成使用硬同步，则不需要传入syncGm，并且不需要使用workQueue。
+```
+
+## ITEM 2
+
+### item 1
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md
+hicann/asc-devkit, last commit 2026-10-16 by munanhw
+Current-master official SyncAll doc: all three prototypes (soft / hard-without-config / hard-with-config), per-product support, 参数说明, and the complete split 约束说明 (software-sync vs hardware-sync vs common).
+````markdown
+# SyncAll<a id="ZH-CN_TOPIC_0000001538296817"></a>
+
+## 产品支持情况<a id="section1550532418810"></a>
+
+### 软同步原型
+
+<!-- npu="950" id1 -->
+- Ascend 950PR&950DT系列产品：支持
+<!-- end id1 -->
+<!-- npu="A3" id2 -->
+- Atlas A3系列产品：支持
+<!-- end id2 -->
+<!-- npu="910b" id3 -->
+- Atlas A2系列产品：支持
+<!-- end id3 -->
+<!-- npu="310b" id4 -->
+- Atlas 200I/500 A2推理产品：不支持
+<!-- end id4 -->
+<!-- npu="310p" id5 -->
+- Atlas推理系列产品AI Core：支持
+<!-- end id5 -->
+<!-- npu="310p" id6 -->
+- Atlas推理系列产品Vector Core：不支持
+<!-- end id6 -->
+<!-- npu="910" id7 -->
+- Atlas训练系列产品：支持
+<!-- end id7 -->
+<!-- npu="x90" id8 -->
+- Kirin X90处理器系列产品：支持
+<!-- end id8 -->
+<!-- npu="9030" id9 -->
+- Kirin 9030处理器系列产品：支持
+<!-- end id9 -->
+<!-- @ref: asc-devkit/res/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll_res.md#id1 -->
+
+### 硬同步（不支持config指定流水）原型
+
+<!-- npu="950" id10 -->
+- Ascend 950PR&950DT系列产品：支持
+<!-- end id10 -->
+<!-- npu="A3" id11 -->
+- Atlas A3系列产品：支持
+<!-- end id11 -->
+<!-- npu="910b" id12 -->
+- Atlas A2系列产品：支持
+<!-- end id12 -->
+<!-- npu="310b" id13 -->
+- Atlas 200I/500 A2推理产品：不支持
+<!-- end id13 -->
+<!-- npu="310p" id14 -->
+- Atlas推理系列产品AI Core：不支持
+<!-- end id14 -->
+<!-- npu="310p" id15 -->
+- Atlas推理系列产品Vector Core：不支持
+<!-- end id15 -->
+<!-- npu="910" id16 -->
+- Atlas训练系列产品：不支持
+<!-- end id16 -->
+<!-- npu="x90" id17 -->
+- Kirin X90处理器系列产品：支持
+<!-- end id17 -->
+<!-- npu="9030" id18 -->
+- Kirin 9030处理器系列产品：支持
+<!-- end id18 -->
+<!-- @ref: asc-devkit/res/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll_res.md#id2 -->
+
+### 硬同步（支持config指定流水）原型
+
+<!-- npu="950" id19 -->
+- Ascend 950PR&950DT系列产品：支持
+<!-- end id19 -->
+<!-- npu="A3" id20 -->
+- Atlas A3系列产品：不支持
+<!-- end id20 -->
+<!-- npu="910b" id21 -->
+- Atlas A2系列产品：不支持
+<!-- end id21 -->
+<!-- npu="310b" id22 -->
+- Atlas 200I/500 A2推理产品：不支持
+<!-- end id22 -->
+<!-- npu="310p" id23 -->
+- Atlas推理系列产品AI Core：不支持
+<!-- end id23 -->
+<!-- npu="310p" id24 -->
+- Atlas推理系列产品Vector Core：不支持
+<!-- end id24 -->
+<!-- npu="910" id25 -->
+- Atlas训练系列产品：不支持
+<!-- end id25 -->
+<!-- npu="x90" id26 -->
+- Kirin X90处理器系列产品：不支持
+<!-- end id26 -->
+<!-- npu="9030" id27 -->
+- Kirin 9030处理器系列产品：不支持
+<!-- end id27 -->
+<!-- @ref: asc-devkit/res/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll_res.md#id3 -->
+
+## 功能说明<a id="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_block_sync_intf.h"`。
+
+SyncAll是核间同步控制接口，根据不同的函数原型介绍其功能：
+
+- 硬件同步接口：
+    用于多个核之间的同步控制，支持以下同步场景：
+    - 纯Vector算子的全核同步，可参考[CrossCoreSetFlag的模式0](key_features.md)。
+    - 融合算子的全核同步，一次性实现三个核间同步能力（参考[CrossCoreSetFlag的关键特性说明](key_features.md)）：首先完成单个AI Core内，AIC与所有AIV同步（AIC等AIV）；接着完成多个AI Core间，所有AIC的同步；最后完成单个AI Core内，所有AIV与AIC同步（AIV等AIC）。
+
+- 软件同步接口：
+    仅支持纯Vector算子的多核（参与同步的核数可通过入参指定）同步。每一个AIV都向全局内存对应位置写入信号值1，接着每一个AIV都持续轮询全局内存中所有AIV对应的信号值，直到所有AIV核对应的信号值都变为1。
+
+在纯Vector算子场景中，若所有AIV核默认参与同步，推荐采用性能更优的硬件同步接口；若需指定部分AIV核参与同步，则应使用软件同步接口，并通过入参usedCores完成配置。
+
+## 函数原型<a id="section620mcpsimp"></a>
+
+- 软同步
+
+    ```cpp
+    template <bool isAIVOnly = true>
+    __aicore__ inline void SyncAll(const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, const int32_t usedCores = 0)
+    ```
+
+- 硬同步
+    - 不支持config指定流水
+
+        ```cpp
+        template <bool isAIVOnly = true>
+        __aicore__ inline void SyncAll()
+        ```
+
+    - 支持config指定流水
+
+        ```cpp
+        template <bool isAIVOnly = true, const SyncAllConfig& config = DEFAULT_SYNC_ALL_CONFIG>
+        __aicore__ inline void SyncAll()
+        ```
+
+## 参数说明<a id="section622mcpsimp"></a>
+
+**表1**  模板参数说明
+
+| 参数名 | 描述 |
+| --- | --- |
+| isAIVOnly | 控制SyncAll作用于纯Vector算子或Mix（包含Cube和Vector计算）算子。可选值：<br>&bull; **true**（默认值）：纯Vector算子的全核同步，仅执行Vector核的全核同步。<br>&bull; **false**：Mix（包含Cube和Vector计算）算子的全核同步，先分别完成Vector核和Cube核的全核同步，再执行两者之间的同步（软同步接口不支持此功能）。 |
+| config | **该配置仅当isAIVOnly=True时有效。**<br>struct SyncAllConfig {&#x000A;    pipe_t triggerPipe;&#x000A;    pipe_t waitPipe;&#x000A;};&#x000A;&#x000A;// 默认使用全部流水来进行触发和等待行为。<br>constexpr SyncAllConfig DEFAULT_SYNC_ALL_CONFIG = {PIPE_ALL, PIPE_ALL};<br>控制SyncAll函数的行为，在多个AI Core之间进行流水同步时，指定哪些流水（pipe）用于触发和等待。<br>&bull; **triggerPipe**：指定哪个流水用于“发送触发信号”。仅支持MTE2、MTE3、PIPE_ALL。<br>&bull; **waitPipe**：指定哪个流水用于“接收等待信号”。仅支持MTE2、MTE3、PIPE_ALL。<br>// 多个AIV进行计算&#x000A;<br>Compute();&#x000A;<br>// 多个AIV将计算结果搬出到GM&#x000A;<br>CopyToGM();&#x000A;<br>// 等待所有数据拷贝到GM后，进行累加&#x000A;<br>constexpr AscendC::SyncAllConfig CustomConfig = {PIPE_MTE3, PIPE_ALL};&#x000A;<br>AscendC::SyncAll&lt;true, CustomConfig&gt;();&#x000A;<br>for (int i = 0; i &lt; blockNum; i++) {&#x000A;<br>    if (i != blockIdx) {&#x000A;<br>        CopyFromGm();&#x000A;<br>        Accumulate();&#x000A;<br>    }&#x000A;<br>}&#x000A;<br>// 累加后的数据写回&#x000A;<br>CopyToGm(); |
+
+**表2**  参数说明
+
+| 参数名称 | 输入/输出 | 含义 |
+| --- | --- | --- |
+| gmWorkspace | 输入 | gmWorkspace为用户定义的全局空间，作为所有核共用的缓存，用于保存每个核的状态标记，类型为GlobalTensor，支持的数据类型为int32_t。GlobalTensor数据结构的定义请参考[GlobalTensor](../../data_structures/GlobalTensor/GlobalTensor.md)。<br>所需空间大小和使用注意项参见[约束说明](#section633mcpsimp)。<br>硬同步接口不支持该参数。 |
+| ubWorkspace | 输入 | ubWorkspace为用户定义的局部空间，每个核单独自用，用于标记当前核的状态。<br>类型为[LocalTensor](../../data_structures/LocalTensor/LocalTensor.md)，支持的TPosition为VECIN、VECCALC、VECOUT，支持的数据类型为int32_t。<br>所需空间大小参见[约束说明](#section633mcpsimp)。<br>硬同步接口不支持该参数。 |
+| usedCores | 输入 | 指定多少个核之间的同步，传入数值不能超过算子调用时指定的逻辑numBlocks。此参数为默认参数，不传此参数表示全核软同步。<br>仅在软同步接口中支持，硬同步接口不支持该参数。 |
+
+## 返回值说明<a id="section91032023123812"></a>
+
+无
+
+## 约束说明<a id="section633mcpsimp"></a>
+
+SyncAll硬件同步和软件同步接口的内部实现不同，约束条件也有所区别。
+
+- 软件同步接口约束：
+    - gmWorkspace缓存申请的空间大小要求大于等于GetBlockNum()*32Bytes，并且缓存的值需要初始化为0。目前常见的有两种初始化方式：
+        - 通过在host侧进行初始化操作，确保传入该接口时，gmWorkspace缓存已经初始化为0；
+        - 在核函数（Kernel）侧初始化的时候对gmWorkspace缓存初始化，需要注意的是，每个核上都需要初始化全部的gmWorkspace缓存空间。
+    - ubWorkspace申请的空间大小要求大于等于GetBlockNum()*32Bytes。
+    - 在纯Vector算子场景中，若所有AIV核默认参与同步，推荐采用性能更优的硬件同步接口；若需指定部分AIV核参与同步，则应使用软件同步接口，并通过入参usedCores完成配置。
+    - usedCores传入数值不能超过算子调用时指定的逻辑AI Core中AIV的数量：GetBlockNum()*GetTaskRatio()，不传此参数表示全核软同步。
+
+- 硬件同步接口约束：
+    - 使用硬同步接口时，需根据场景使用合适的核函数（Kernel）修饰符：
+        - 在纯Vector算子，需使用\_\_mix\_\_\(0, 1\)修饰核函数（Kernel），而不是使用\_\_vector\_\_，具体原因请参考[CrossCoreSetFlag约束说明](CrossCoreSetFlag_ISASI.md#约束说明)中的核函数（Kernel）类型配置说明。
+        - 对于Mix（包含Cube和Vector计算）算子，需使用\_\_mix\_\_\(1, 1\)或\_\_mix\_\_\(1, 2\)修饰核函数（Kernel）。
+    - 对于纯Vector算子，模板参数isAIVOnly必须设置为true，否则会导致程序卡死。
+    - 对于Mix（包含Cube和Vector计算）算子，模板参数isAIVOnly设置为true，会导致接口实际只能完成Vector全核同步与预期同步行为不符。
+    - 使用该接口时，建议开启batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+        - 多流并发场景（≥2条执行流）。
+        - ≥2个算子并发执行。
+        - 所有并发算子的核数总和超过物理核数。
+        - ≥2个并发算子使用了核间同步功能。
+
+        具体而言，在多流场景下，某条流的核间同步算子虽分配到n个物理核，但可能仅有n-m个核先被调度执行，而其余m个核因被其他流的核间同步算子抢占而尚未启动。先启动的n-m个核执行到核间同步时等待剩余m核完成，而剩余m核因被其他流的核间同步算子占用而无法释放，形成死锁。
+        核函数（Kernel）直调场景下通过[\_\_schedmode\_\_\(mode\)](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)限定符来设置batchmode模式；工程化算子开发场景下，通过TilingContext的SetScheduleMode接口来设置batchmode模式，具体请参考[《基础数据结构和接口》](https://gitcode.com/cann/metadef/blob/master/docs/zh/api/README.md)。
+    - SyncAll硬件同步接口内部实现中使用了[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)进行核间同步控制，因此开发者同时使用CrossCoreSetFlag（或CrossCoreWaitFlag）和SyncAll硬件同步接口时，需注意避免flagId冲突，各接口flagId占用的完整说明参见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+
+- 硬件同步接口和软件同步接口公共约束：使用该接口进行多核控制时，算子调用时指定的逻辑AI Core核数numBlocks必须保证不大于实际运行该算子的AI处理器核数，否则框架进行多轮调度时会插入异常同步，导致核函数（Kernel）“卡死”现象。
+
+## 调用示例<a id="section642mcpsimp"></a>
+
+本示例实现功能为使用8个核进行数据处理，每个核均是处理32个float类型数据，对该数据乘2后再与其他核上进行同样乘2的数据进行相加，中间结果保存到workGm，因此多个核之间需要进行数据同步。此样例中，使用软同步，入口函数传入的syncGm里的值都已经在host侧初始化为0。若以下用例改成使用硬同步，则不需要传入syncGm，并且不需要使用workQueue。
+
+```cpp
+// syncGlobal为用户定义的全局空间，作为所有核共用的缓存，类型为GlobalTensor；workLocal为用户定义的局部空间，每个核单独自用，类型为LocalTensor。
+int srcDataSize = 256; // 参与计算的元素个数。
+int32_t blockNum = AscendC::GetBlockNum(); // 获取核总数。
+int32_t blockIdx = AscendC::GetBlockIdx(); // 获取当前工作的核ID。
+uint32_t perBlockSize = srcDataSize / blockNum; // 每个核平分处理相同个数。
+// 当前工作核计算后的数据先保存到外部工作空间，workGlobal为GlobalTensor，dstLocal为LocalTensor。
+AscendC::DataCopy(workGlobal[blockIdx * perBlockSize], dstLocal, perBlockSize);
+// 等待所有核都完成计算。
+AscendC::SyncAll(syncGlobal, workLocal);
+```
+
+完整样例请参考[SyncAll样例](../../../../../../../examples/01_simd_cpp_api/03_basic_api/05_sync_control/sync_all)。
+````
+
+## ITEM 3
+
+### item 2
+
+https://gitcode.com/cann/asc-devkit/blob/9.1.0-beta.1/docs/api/context/SyncAll.md
+cann/asc-devkit on GitCode, tag 9.1.0-beta.1 (release date of 9.1.0-beta.1; commit date unknown)
+CANN 9.1.0-beta.1 wording of SyncAll 功能说明 / 函数原型 / 约束说明 / 调用示例 — this release states the workspace size as 核数*32Bytes and makes SetScheduleMode batchmode mandatory ('必须通过SetScheduleMode使能batchmode模式'), stronger than master's '建议'. Raw: https://raw.gitcode.com/cann/asc-devkit/raw/9.1.0-beta.1/docs/api/context/SyncAll.md
+````markdown
+## 功能说明<a name="section618mcpsimp"></a>
+
+当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用该函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。目前多核同步分为硬同步和软同步，硬件同步是利用硬件自带的全核同步指令由硬件保证多核同步，软件同步是使用软件算法模拟实现。
+
+## 函数原型<a name="section620mcpsimp"></a>
+
+-   软同步
+
+    ```
+    template <bool isAIVOnly = true>
+    __aicore__ inline void SyncAll(const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, const int32_t usedCores = 0)
+    ```
+
+-   硬同步
+
+    ```
+    template <bool isAIVOnly = true, const SyncAllConfig& config = DEFAULT_SYNC_ALL_CONFIG>
+    __aicore__ inline void SyncAll()
+    ```
+
+## 参数说明<a name="section622mcpsimp"></a>
+
+**表 1**  模板参数说明
+
+<a name="table1596943217411"></a>
+<table><thead align="left"><tr id="row1596916326417"><th class="cellrowborder" valign="top" width="13.43%" id="mcps1.2.3.1.1"><p id="p17970143211417"><a name="p17970143211417"></a><a name="p17970143211417"></a>参数名</p>
+</th>
+<th class="cellrowborder" valign="top" width="86.57000000000001%" id="mcps1.2.3.1.2"><p id="p8970163210416"><a name="p8970163210416"></a><a name="p8970163210416"></a>描述</p>
+</th>
+</tr>
+</thead>
+<tbody><tr id="row12970113214410"><td class="cellrowborder" valign="top" width="13.43%" headers="mcps1.2.3.1.1 "><p id="p9970193217417"><a name="p9970193217417"></a><a name="p9970193217417"></a>isAIVOnly</p>
+</td>
+<td class="cellrowborder" valign="top" width="86.57000000000001%" headers="mcps1.2.3.1.2 "><p id="p6912194943411"><a name="p6912194943411"></a><a name="p6912194943411"></a>控制SyncAll作用于纯Vector算子或融合（Cube和Vector融合）算子。可选值：</p>
+<a name="ul1034511561784"></a><a name="ul1034511561784"></a><ul id="ul1034511561784"><li><strong id="b891244983410"><a name="b891244983410"></a><a name="b891244983410"></a>true</strong>（默认值）：纯Vector算子的全核同步，仅执行Vector核的全核同步。</li><li><strong id="b79121249133420"><a name="b79121249133420"></a><a name="b79121249133420"></a>false</strong>：融合算子的全核同步，先分别完成Vector核和Cube核的全核同步，再执行两者之间的同步（软同步接口不支持此功能）。</li></ul>
+</td>
+</tr>
+<tr id="row47986408408"><td class="cellrowborder" valign="top" width="13.43%" headers="mcps1.2.3.1.1 "><p id="p18798194094017"><a name="p18798194094017"></a><a name="p18798194094017"></a>config</p>
+</td>
+<td class="cellrowborder" valign="top" width="86.57000000000001%" headers="mcps1.2.3.1.2 "><p id="p479815400409"><a name="p479815400409"></a><a name="p479815400409"></a>控制SyncAll函数的行为 ，在多个AI Core之间进行流水线同步时，指定哪些管道（pipe）用于触发和等待。</p>
+<a name="ul047327174317"></a><a name="ul047327174317"></a><ul id="ul047327174317"><li><strong id="b7762111519458"><a name="b7762111519458"></a><a name="b7762111519458"></a>triggerPipe</strong>：指定哪个管道用于“发送触发信号”。</li><li><strong id="b1849919164510"><a name="b1849919164510"></a><a name="b1849919164510"></a>waitPipe</strong>：指定哪个管道用于“接收等待信号”。</li></ul>
+<p id="p16336151565418"><a name="p16336151565418"></a><a name="p16336151565418"></a>默认为SyncAllConfig  DEFAULT_SYNC_ALL_CONFIG= {PIPE_ALL, PIPE_ALL} ，使用全部管道来进行触发和等待行为。</p>
+<p id="p141061754195214"><a name="p141061754195214"></a><a name="p141061754195214"></a>该参数仅支持如下型号：</p>
+<p id="p468305719192"><a name="p468305719192"></a><a name="p468305719192"></a><span id="ph126252025205"><a name="ph126252025205"></a><a name="ph126252025205"></a>Ascend 950PR/Ascend 950DT</span></p>
+</td>
+</tr>
+</tbody>
+</table>
+
+**表 2**  参数说明
+
+<a name="table62161631132810"></a>
+<table><thead align="left"><tr id="row12216103118284"><th class="cellrowborder" valign="top" width="13.661366136613662%" id="mcps1.2.4.1.1"><p id="p1421643114288"><a name="p1421643114288"></a><a name="p1421643114288"></a>参数名称</p>
+</th>
+<th class="cellrowborder" valign="top" width="12.591259125912593%" id="mcps1.2.4.1.2"><p id="p82165310285"><a name="p82165310285"></a><a name="p82165310285"></a>输入/输出</p>
+</th>
+<th class="cellrowborder" valign="top" width="73.74737473747375%" id="mcps1.2.4.1.3"><p id="p1121663111288"><a name="p1121663111288"></a><a name="p1121663111288"></a>含义</p>
+</th>
+</tr>
+</thead>
+<tbody><tr id="row82161131182810"><td class="cellrowborder" valign="top" width="13.661366136613662%" headers="mcps1.2.4.1.1 "><p id="p68529181952"><a name="p68529181952"></a><a name="p68529181952"></a>gmWorkspace</p>
+</td>
+<td class="cellrowborder" valign="top" width="12.591259125912593%" headers="mcps1.2.4.1.2 "><p id="p208511818357"><a name="p208511818357"></a><a name="p208511818357"></a>输入</p>
+</td>
+<td class="cellrowborder" valign="top" width="73.74737473747375%" headers="mcps1.2.4.1.3 "><p id="p223862673213"><a name="p223862673213"></a><a name="p223862673213"></a>gmWorkspace为用户定义的全局Global空间，作为所有核共用的缓存，用于保存每个核的状态标记，类型为GlobalTensor，支持的数据类型为int32_t。GlobalTensor数据结构的定义请参考<a href="GlobalTensor.md">GlobalTensor</a>。</p>
+<p id="p1585111181855"><a name="p1585111181855"></a><a name="p1585111181855"></a>所需空间大小和使用注意项参见<a href="#section633mcpsimp">约束说明</a>。</p>
+<p id="p377231420357"><a name="p377231420357"></a><a name="p377231420357"></a>硬同步接口不支持该参数。</p>
+</td>
+</tr>
+<tr id="row5216163192815"><td class="cellrowborder" valign="top" width="13.661366136613662%" headers="mcps1.2.4.1.1 "><p id="p17849918857"><a name="p17849918857"></a><a name="p17849918857"></a>ubWorkspace</p>
+</td>
+<td class="cellrowborder" valign="top" width="12.591259125912593%" headers="mcps1.2.4.1.2 "><p id="p1484911181458"><a name="p1484911181458"></a><a name="p1484911181458"></a>输入</p>
+</td>
+<td class="cellrowborder" valign="top" width="73.74737473747375%" headers="mcps1.2.4.1.3 "><p id="p01242034135414"><a name="p01242034135414"></a><a name="p01242034135414"></a>ubWorkspace为用户定义的局部Local空间，每个核单独自用，用于标记当前核的状态。</p>
+<p id="p16703131355116"><a name="p16703131355116"></a><a name="p16703131355116"></a>类型为<a href="LocalTensor.md">LocalTensor</a>，支持的TPosition为VECIN/VECCALC/VECOUT，支持的数据类型为int32_t。</p>
+<p id="p684819181755"><a name="p684819181755"></a><a name="p684819181755"></a>所需空间大小参见<a href="#section633mcpsimp">约束说明</a>。</p>
+<p id="p1139714285356"><a name="p1139714285356"></a><a name="p1139714285356"></a>硬同步接口不支持该参数。</p>
+</td>
+</tr>
+<tr id="row0101323102711"><td class="cellrowborder" valign="top" width="13.661366136613662%" headers="mcps1.2.4.1.1 "><p id="p2010172315276"><a name="p2010172315276"></a><a name="p2010172315276"></a>usedCores</p>
+</td>
+<td class="cellrowborder" valign="top" width="12.591259125912593%" headers="mcps1.2.4.1.2 "><p id="p131012372711"><a name="p131012372711"></a><a name="p131012372711"></a>输入</p>
+</td>
+<td class="cellrowborder" valign="top" width="73.74737473747375%" headers="mcps1.2.4.1.3 "><p id="p15101023102712"><a name="p15101023102712"></a><a name="p15101023102712"></a>指定多少个核之间的同步，传入数值不能超过算子调用时指定的逻辑numBlocks。此参数为默认参数，不传此参数表示全核软同步。</p>
+<p id="p13881143914351"><a name="p13881143914351"></a><a name="p13881143914351"></a>仅在软同步接口中支持，硬同步接口不支持该参数。</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## 返回值说明<a name="section91032023123812"></a>
+
+无
+
+## 约束说明<a name="section633mcpsimp"></a>
+
+-   gmWorkspace缓存申请的空间大小要求大于等于核数\*32Bytes，并且缓存的值需要初始化为0。目前常见的有两种初始化方式：
+    -   通过在host侧进行初始化操作，确保传入该接口时，gmWorkspace缓存已经初始化为0；
+    -   在kernel侧初始化的时候对gmWorkspace缓存初始化，需要注意的是，每个核上都需要初始化全部的gmWorkspace缓存空间。
+
+-   ubWorkspace申请的空间大小要求大于等于核数\*32Bytes。
+-   使用该接口进行多核控制时，算子调用时指定的逻辑numBlocks必须保证不大于实际运行该算子的AI处理器核数，否则框架进行多轮调度时会插入异常同步，导致Kernel“卡死”现象。
+-   在分离模式下，建议使用硬同步接口而非软同步接口。软同步接口仅适用于纯Vector场景，且性能较低。使用硬同步接口时，需根据场景设置Kernel类型：
+    -   在纯Vector/Cube场景下，需设置Kernel类型为KERNEL\_TYPE\_MIX\_AIV\_1\_0或KERNEL\_TYPE\_MIX\_AIC\_1\_0。
+    -   对于Vector和Cube混合场景，需根据实际情况灵活配置Kernel类型。
+
+-   使用该接口时，必须通过[SetScheduleMode](https://www.hiascend.com/document/detail/zh/canncommercial/850/API/basicdataapi/atlasopapi_07_00248.html)使能batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+    -   多流并发场景（≥2条执行流）。
+    -   ≥2个算子并发执行。
+    -   所有并发算子的核数总和超过物理核数。
+    -   ≥2个并发算子使用了核间同步功能。
+
+        具体而言，在多流场景下，某条流的核间同步算子虽分配到n个物理核，但可能仅有n-m个核先被调度执行，而其余m个核因被其他流的核间同步算子抢占而尚未启动。先启动的n-m个核执行到核间同步时等待剩余m核完成，而剩余m核因被其他流的核间同步算子占用而无法释放，形成死锁。
+
+## 调用示例<a name="section642mcpsimp"></a>
+
+本示例实现功能为使用8个核进行数据处理，每个核均是处理32个float类型数据，对该数据乘2后再与其他核上进行同样乘2的数据进行相加，中间结果保存到workGm，因此多个核之间需要进行数据同步。此样例中，使用软同步，入口函数传入的syncGm里的值都已经在host侧初始化为0。若以下用例改成使用硬同步，则不需要传入syncGm，并且不需要使用workQueue。
+
+```
+#include "kernel_operator.h"
+
+const int32_t DEFAULT_SYNCALL_NEED_SIZE = 8;
+
+class KernelSyncAll {
+public:
+    __aicore__ inline KernelSyncAll() {}
+    __aicore__ inline void Init(__gm__ uint8_t* srcGm, __gm__ uint8_t* dstGm, __gm__ uint8_t* workGm,
+        __gm__ uint8_t* syncGm)
+    {
+        blockNum = AscendC::GetBlockNum(); // 获取核总数
+        perBlockSize = srcDataSize / blockNum; // 每个核平分处理相同个数
+        blockIdx = AscendC::GetBlockIdx(); // 获取当前工作的核ID
+        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(srcGm + blockIdx * perBlockSize * sizeof(float)),
+            perBlockSize);
+        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(dstGm + blockIdx * perBlockSize * sizeof(float)),
+            perBlockSize);
+        workGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workGm), srcDataSize);
+        syncGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(syncGm), blockNum * DEFAULT_SYNCALL_NEED_SIZE);
+        pipe.InitBuffer(inQueueSrc1, 1, perBlockSize * sizeof(float));
+        pipe.InitBuffer(inQueueSrc2, 1, perBlockSize * sizeof(float));
+        pipe.InitBuffer(workQueue, 1, blockNum * DEFAULT_SYNCALL_NEED_SIZE * sizeof(int32_t));
+        pipe.InitBuffer(outQueueDst, 1, perBlockSize * sizeof(float));
+    }
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        FirstCompute();
+        CopyToWorkGlobal(); // 当前工作核计算后的数据先保存到外部工作空间
+        // 等待所有核都完成计算
+        AscendC::LocalTensor<int32_t> workLocal = workQueue.AllocTensor<int32_t>();
+        AscendC::SyncAll(syncGlobal, workLocal);
+        workQueue.FreeTensor(workLocal);
+        // 最终累加结果需要等所有核都计算完成
+        AscendC::LocalTensor<float> srcLocal2 = inQueueSrc2.DeQue<float>();
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.AllocTensor<float>();
+        AscendC::DataCopy(dstLocal,srcLocal2,perBlockSize); // 当前核计算结果先保存到目的空间
+        inQueueSrc2.FreeTensor(srcLocal2);
+        for (int i = 0; i < blockNum; i++) {
+            if (i != blockIdx) {
+                CopyFromOtherCore(i); // 从外部工作空间读取数据
+                Accumulate(dstLocal); // 所有数据都累加到目的空间
+            }
+        }
+        outQueueDst.EnQue(dstLocal);
+        CopyOut();
+    }
+private:
+    __aicore__ inline void CopyToWorkGlobal()
+    {
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.DeQue<float>();
+        AscendC::DataCopy(workGlobal[blockIdx * perBlockSize], dstLocal, perBlockSize);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+    __aicore__ inline void CopyFromOtherCore(int index)
+    {
+        AscendC::LocalTensor<float> srcLocal = inQueueSrc1.AllocTensor<float>();
+        AscendC::DataCopy(srcLocal, workGlobal[index * perBlockSize], perBlockSize);
+        inQueueSrc1.EnQue(srcLocal);
+    }
+    __aicore__ inline void Accumulate(const AscendC::LocalTensor<float> &dstLocal)
+    {
+        AscendC::LocalTensor<float> srcLocal1 = inQueueSrc1.DeQue<float>();
+        AscendC::Add(dstLocal, dstLocal, srcLocal1, perBlockSize);
+        inQueueSrc1.FreeTensor(srcLocal1);
+    }
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<float> srcLocal = inQueueSrc1.AllocTensor<float>();
+        AscendC::DataCopy(srcLocal, srcGlobal, perBlockSize);
+        inQueueSrc1.EnQue(srcLocal);
+    }
+    __aicore__ inline void FirstCompute()
+    {
+        AscendC::LocalTensor<float> srcLocal1 = inQueueSrc1.DeQue<float>();
+        AscendC::LocalTensor<float> srcLocal2 = inQueueSrc2.AllocTensor<float>();
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.AllocTensor<float>();
+        float scalarValue(2.0);
+        AscendC::Muls(dstLocal, srcLocal1, scalarValue, perBlockSize);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(srcLocal2,dstLocal,perBlockSize);
+        inQueueSrc1.FreeTensor(srcLocal1);
+        inQueueSrc2.EnQue(srcLocal2);
+        outQueueDst.EnQue(dstLocal);
+    }
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.DeQue<float>();
+        AscendC::DataCopy(dstGlobal, dstLocal, perBlockSize);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueSrc1;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueSrc2;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> workQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueDst;
+    AscendC::GlobalTensor<float> srcGlobal;
+    AscendC::GlobalTensor<float> dstGlobal;
+    AscendC::GlobalTensor<float> workGlobal;
+    AscendC::GlobalTensor<int32_t> syncGlobal;
+    int srcDataSize = 256;
+    int32_t blockNum = 0;
+    int32_t blockIdx = 0;
+    uint32_t perBlockSize = 0;
+};
+
+extern "C" __global__ __aicore__ void kernel_syncAll_float(__gm__ uint8_t* srcGm, __gm__ uint8_t* dstGm,
+    __gm__ uint8_t* workGm, __gm__ uint8_t* syncGm)
+{
+    KernelSyncAll op;
+    op.Init(srcGm, dstGm, workGm, syncGm);
+    op.Process();
+}
+```
+
+```
+输入数据(srcGm):
+[1,1,1,1,1,...,1]
+输出数据(dstGm):
+[16,16,16,16,16,...,16]
+```
+````
+
+## ITEM 4
+
+### item 3
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/inter_core_sync_overview.md
+hicann/asc-devkit, master
+核间同步 overview table that classifies SyncAll's two prototypes as 硬件同步 vs 软件同步 and states the soft-sync algorithm (write 1 to own GM slot, then poll all AIV slots until all are 1).
+```markdown
+# 核间同步能力概述<a name="ZH-CN_TOPIC_0000002555803758"></a>
+
+核间同步的使用场景通常是：一个核计算所依赖的数据，需要等待其他相关核的计算全部完成后才能获取。  
+
+以图1为例，AIC需要依赖于AIV的ReduceSum计算结果。由于整体矢量较大，必须拆分为多个部分，由每个AIV分别完成部分计算。每个AIV将其部分计算结果通过原子累加写入GM。AIC需要读取的必须是所有AIV均完成累加后的最终结果，因此需要通过核间同步来保证AIC读取ReduceSum结果时的时序正确性。
+
+**图1**  核间同步业务场景示例图（AIC:AIV为1 : 2）<a name="zh-cn_topic_0000002542605351_fig1180684585013"></a>  
+![](../../../../figures/inter_core_sync_scenario_example.png "核间同步业务场景示例图（AIC-AIV为1-2）")
+
+AIC/AIV多核结构如下图2所示，AIC/AIV按group划分。一个group内包含1个block和N个subblock（N≥1），其中block表示“主核”，每个subblock表示一个“从核”。
+
+算子按计算特征可分为三类：Cube算子（矩阵计算）、Vector算子（矢量计算）和Mix算子（同时包含矩阵和矢量计算）。如表1所示，算子类型决定了其所需的核间同步方式和可选的group配置模式。其中Mix算子通过函数执行空间限定符指定AIC与AIV的block/subblock关系；Cube算子和Vector算子为单类核执行，不涉及block/subblock划分。AIV为block且AIC为subblock的配置（即Vector核为主、Cube核为辅的模式）当前不支持。表2总结了核间同步接口及其支持的同步场景。
+
+**图2**  block和subblock之间关系（灰色部分表示一个group，即1个block和N个subblock）<a name="zh-cn_topic_0000002542605351_fig52727114018"></a>
+![](../../../../figures/block_subblock_relationship_3510.png "（NPU架构版本3510）block和subblock之间关系（灰色部分表示一个group，即1个block和N个subblock）")
+
+**表1**  group配置<a name="zh-cn_topic_0000002542605351_table17238184964217"></a>
+
+| 算子类型 | 函数执行空间限定符 | 核函数（Kernel）类型 | block/subblock | 1 ：N |
+| --- | --- | --- | --- | --- |
+| Cube算子 | \_\_cube\_\_ | KERNEL_TYPE_AIC_ONLY | AIC为block，无subblock | 不涉及 |
+| Vector算子 | \_\_vector\_\_ | KERNEL_TYPE_AIV_ONLY | AIV为block，无subblock | 不涉及 |
+| Mix算子 | \_\_mix\_\_(1, 0) | KERNEL_TYPE_MIX_AIC_1_0 | AIC为block，无subblock | 不涉及 |
+| Mix算子 | \_\_mix\_\_(0, 1) | KERNEL_TYPE_MIX_AIV_1_0 | AIV为block，无subblock | 不涉及 |
+| Mix算子 | \_\_mix\_\_(1, 1) | KERNEL_TYPE_MIX_AIC_1_1 | AIC为block，AIV为subblock | 1：1 |
+| Mix算子 | \_\_mix\_\_(1, 2) | KERNEL_TYPE_MIX_AIC_1_2 | AIC为block，AIV为subblock | 1：2 |
+
+**表2**  支持的核间同步场景
+
+| 接口名称 | 核间同步场景概述 | 同步类别 |
+| --- | --- | --- |
+| [CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)/[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md) | 多个AIC或AIV之间的同步控制。CrossCoreSetFlag负责发送通知，CrossCoreWaitFlag负责阻塞直到CrossCoreSetFlag发送通知。<br>支持以下同步场景：<br>&bull;（模式0）同步等待全部AIC或者同步等待全部AIV执行结束。<br>&bull;（模式1）单个AI Core内，全部AIV之间的同步。<br>&bull;（模式2）单个AI Core内，AIC与全部AIV之间的同步。<br>&bull;（模式4）单个AI Core内，AIC核与单个AIV之间同步。 | 硬件同步 |
+| [IBSet](IBSet.md)/[IBWait](IBWait.md) | IBSet和IBWait配合使用，用于一对AIV间的同步：等待核调用IBWait阻塞本核后续指令的执行，被等待核调用IBSet通知等待核解除阻塞。上述同步过程的原理如下：被等待核中调用IBSet，通过将值1写入全局内存中某块地址来通知等待核；而等待核中调用IBWait，持续读取全局内存中相应地址块的值，直到其值变为1。 | 软件同步 |
+| [SyncAll](SyncAll.md) | 用于多个核之间的同步控制，支持以下同步场景：<br>&bull;纯Vector算子的全核同步，可参考[CrossCoreSetFlag的模式0](key_features.md)。<br>&bull;融合算子的全核同步，一次性实现三个核间同步能力（参考[CrossCoreSetFlag的关键特性说明](key_features.md)）：首先完成单个AI Core内，AIC与全部AIV之间的同步（AIC等AIV）；接着完成多个AI Core间，所有AIC的同步；最后完成单个AI Core内，所有AIV与AIC同步（AIV等AIC）。 | 硬件同步 |
+| [SyncAll](SyncAll.md) | 仅支持纯Vector算子的多核（参与同步的核数可通过入参指定）同步。每一个AIV都向全局内存对应位置写入信号值1，接着每一个AIV都持续轮询全局内存中所有AIV对应的信号值，直到所有AIV核对应的信号值都变为1。 | 软件同步 |
+| [InitDetermineComputeWorkspace](InitDetermineComputeWorkspace.md)/[NotifyNextBlock](NotifyNextBlock.md)/[WaitPreBlock](WaitPreBlock.md) | &bull; InitDetermineComputeWorkspace、NotifyNextBlock和WaitPreBlock三个接口必须组合使用，能够确保多个AIV核严格按照blockIdx的升序执行，适用于要求确定性计算的场景。<br>&bull; InitDetermineComputeWorkspace初始化GM共享内存的值，完成初始化后才可以调用NotifyNextBlock和WaitPreBlock。<br>&bull; NotifyNextBlock通过写全局内存来通知其他核当前核已执行完成，其他核可以继续往下执行；WaitPreBlock通过读取全局内存，判断当前核是否可以继续往下执行。 | 软件同步 |
+```
+
+## ITEM 5
+
+### item 4
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/include/basic_api/kernel_operator_block_sync_intf.h
+hicann/asc-devkit, last commit 2026-10-16 by maohaodi
+Declaration header: the exact SyncAll overloads as declared (soft 3-arg with default usedCores=0; hard templated on isAIVOnly and, only for __NPU_ARCH__ in {3510,5102,5162,9201,9202}, on SyncAllConfig), plus IBSet/IBWait and CrossCoreSetFlag/CrossCoreWaitFlag declarations in the same header. Note the hard-sync config overload is NOT declared for __NPU_ARCH__==2201.
+```cpp
+
+template <HardEvent event>
+__aicore__ inline void SetFlag(int32_t eventID);
+
+template <HardEvent event>
+__aicore__ inline void WaitFlag(int32_t eventID);
+
+template <pipe_t pipe>
+__aicore__ inline void PipeBarrier();
+
+template <MemDsbT arg0>
+__aicore__ inline void DataSyncBarrier();
+
+/*
+ * @ingroup：IBSet, IBWait
+ * @brief：Set the flag bit of a core
+ * @param [in] gmWorkspace GlobalTensor to store core state
+ * @param [in] ubWorkspce LocalTensor for current core
+ * @param [in] blockIdx the idx number waiting for the core
+ * @param [in] eventID Set and wait events
+ */
+template <bool isAIVOnly = true>
+__aicore__ inline void IBSet(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, int32_t blockIdx,
+    int32_t eventID);
+
+template <bool isAIVOnly = true>
+__aicore__ inline void IBWait(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, int32_t blockIdx,
+    int32_t eventID);
+/*
+ * @ingroup：SyncALL
+ * @brief：Set flag bits of all cores
+ * @param [in] gmWorkspace GlobalTensor to store core state
+ * @param [in] ubWorkspce LocalTensor for current core
+ */
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAll(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, const int32_t usedCores = 0);
+
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 5162) || \
+                              (__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))
+template <bool isAIVOnly = true, const SyncAllConfig& config = DEFAULT_SYNC_ALL_CONFIG>
+__aicore__ inline void SyncAll();
+#else
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAll();
+#endif
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId);
+
+template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId);
+
+template <pipe_t src, pipe_t dst>
+class TQueSync {
+public:
+    __aicore__ inline void SetFlag(TEventID id);
+    __aicore__ inline void WaitFlag(TEventID id);
+```
+
+## ITEM 6
+
+### item 5
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/impl/basic_api/kernel_operator_block_sync_intf_impl.h
+hicann/asc-devkit, last commit 2026-10-16 by maohaodi
+Dispatch impl: __NPU_ARCH__==2201 selects dav_c220/kernel_operator_sync_impl.h; SyncAll(gm,ub,usedCores) forwards to SoftSyncAllImpl, SyncAll<isAIVOnly>() forwards to SyncAllImpl, and CrossCoreSetFlag/CrossCoreWaitFlag forward to NotifyEventImpl/WaitEventImpl.
+```cpp
+#include "dav_c100/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 2002
+#include "dav_m200/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 2201
+#include "dav_c220/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 3002
+#include "dav_m300/kernel_operator_common_impl.h"
+#elif __NPU_ARCH__ == 3003
+#include "dav_l300/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 3102
+#include "dav_m310/kernel_operator_common_impl.h"
+#elif __NPU_ARCH__ == 3510
+#include "dav_3510/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 9201
+#include "dav_9201/kernel_operator_sync_impl.h"
+#elif __NPU_ARCH__ == 9202
+#include "dav_9202/kernel_operator_sync_impl.h"
+#elif (__NPU_ARCH__ == 5102)
+#include "dav_m510/kernel_operator_sync_impl.h"
+#elif (__NPU_ARCH__ == 5162)
+#include "dav_5162/kernel_operator_sync_impl.h"
+#elif (__NPU_ARCH__ == 3113)
+#include "dav_l311/kernel_operator_sync_impl.h"
+#elif (__NPU_ARCH__ == 5101) || (__NPU_ARCH__ == 5161) || (__NPU_ARCH__ == 5165) || (__NPU_ARCH__ == 5163)
+#include "dav_5161/kernel_operator_sync_impl.h"
+#endif
+
+namespace AscendC {
+
+
+/* ... */
+
+/*
+ * @ingroup：SyncALL
+ * @brief：Set flag bits of all cores
+ * @param [in] gmWorkspace GlobalTensor to store core state
+ * @param [in] ubWorkspce LocalTensor for current core
+ */
+template <bool isAIVOnly>
+__aicore__ inline void SyncAll(
+    const GlobalTensor<int32_t>& gmWorkspace, const LocalTensor<int32_t>& ubWorkspace, const int usedCores)
+{
+#if ASCENDC_CPU_DEBUG
+    SoftSyncAllImpl<false>(
+        (__gm__ int32_t*)gmWorkspace.GetPhyAddr(), (__ubuf__ int32_t*)ubWorkspace.GetPhyAddr(), usedCores);
+#else
+    SoftSyncAllImpl<isAIVOnly>(
+        (__gm__ int32_t*)gmWorkspace.GetPhyAddr(), (__ubuf__ int32_t*)ubWorkspace.GetPhyAddr(), usedCores);
+#endif
+}
+
+#if (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 5162) || (__NPU_ARCH__ == 9201) || \
+    (__NPU_ARCH__ == 9202)
+template <bool isAIVOnly, const SyncAllConfig& config>
+__aicore__ inline void SyncAll()
+{
+    SyncAllImpl<isAIVOnly, config.triggerPipe, config.waitPipe>();
+}
+#else
+template <bool isAIVOnly>
+__aicore__ inline void SyncAll()
+{
+    SyncAllImpl<isAIVOnly>();
+}
+#endif
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId)
+{
+    NotifyEventImpl<modeId, pipe>(flagId);
+}
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId)
+{
+    WaitEventImpl<modeId, pipe>(flagId);
+}
+
+#if (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 5162) || (__NPU_ARCH__ == 9201) || \
+    (__NPU_ARCH__ == 9202)
+template <pipe_t pipe, uint8_t subBlockSyncMode = 2>
+__aicore__ inline void NotifyEvent(uint16_t flagId)
+{
+    NotifyEventImpl<subBlockSyncMode, pipe>(flagId);
+}
+
+template <pipe_t pipe = PIPE_S, uint8_t mode = 0>
+__aicore__ inline void WaitEvent(uint16_t flagId)
+{
+    WaitEventImpl<mode, pipe>(flagId);
+}
+#else
+template <pipe_t pipe>
+__aicore__ inline void NotifyEvent(uint16_t flagId)
+{
+    constexpr uint8_t subBlockSyncMode = 0x02;
+    NotifyEventImpl<subBlockSyncMode, pipe>(flagId);
+}
+
+template <pipe_t pipe = PIPE_S>
+__aicore__ inline void WaitEvent(uint16_t flagId)
+{
+    constexpr uint8_t mode = 0;
+    WaitEventImpl<mode, pipe>(flagId);
+}
+#endif
+```
+
+## ITEM 7
+
+### item 6
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+hicann/asc-devkit, last commit 2026-07-11 by haipingmao
+THE dav-2201 soft-sync implementation (__NPU_ARCH__==2201 maps to dav_c220). SoftSyncAllImpl + ClcSyncCount: GM slot per core at blockIdx*DEFAULT_BLK_NUM, read-modify-write own slot, then a `while(true)` loop re-copying the whole gmWorkspace GM->UB and summing all slots until count >= totalBlocks*curValue. AIC returns immediately. totalBlocks = usedCores if nonzero else GetBlockNum() (x GetTaskRation() when !isAIVOnly).
+```cpp
+namespace AscendC {
+
+__aicore__ inline void ClcSyncCount(
+    __gm__ int32_t* localSyncGM, __ubuf__ int32_t* ubWorkspaceAddr, const int32_t blockIdx, const int32_t totalBlocks,
+    bool isFirst, int32_t& count)
+{
+    if (isFirst) {
+        __ubuf__ int32_t* localUbAddr = ubWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+        *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) = 1;
+        event_t eventIdSToMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+        SetFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+        WaitFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+        copy_ubuf_to_gm(
+            static_cast<__gm__ void*>(localSyncGM), static_cast<__ubuf__ void*>(localUbAddr), 0, 1, 1, 0, 0);
+        event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+        WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+        count = 1;
+        for (int32_t i = 0; i < totalBlocks; i++) {
+            if (i != blockIdx) {
+                count += *(reinterpret_cast<__ubuf__ int32_t*>(ubWorkspaceAddr) + i * ONE_BLK_FLOAT_NUM);
+            }
+        }
+    } else {
+        for (int32_t i = 0; i < totalBlocks; i++) {
+            count += *(reinterpret_cast<__ubuf__ int32_t*>(ubWorkspaceAddr) + i * ONE_BLK_FLOAT_NUM);
+        }
+    }
+}
+
+__aicore__ inline int64_t GetBlockNum();
+template <bool isAIVOnly = true>
+__aicore__ inline void SoftSyncAllImpl(
+    __gm__ int32_t* gmWorkspaceAddr, __ubuf__ int32_t* ubWorkspaceAddr, const int usedCores)
+{
+    if ASCEND_IS_AIC {
+        return;
+    }
+    __sync_all_stub(usedCores, isAIVOnly);
+    PipeBarrier<PIPE_ALL>();
+
+    int32_t totalBlocks = isAIVOnly ? GetBlockNum() : (GetTaskRationImpl() * GetBlockNum());
+    totalBlocks = usedCores != 0 ? usedCores : totalBlocks;
+#ifdef __ASCENDC_ENABLE_SUPER_KERNEL__
+    int32_t blockIdx = GetBlockIdxImpl();
+#else
+    int32_t blockIdx = isAIVOnly ? get_block_idx() : GetBlockIdxImpl();
+#endif
+
+    __gm__ int32_t* localSyncGM = gmWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+    __ubuf__ int32_t* localUbAddr = ubWorkspaceAddr + (blockIdx * DEFAULT_BLK_NUM);
+
+    copy_gm_to_ubuf(static_cast<__ubuf__ void*>(localUbAddr), static_cast<__gm__ void*>(localSyncGM), 0, 1, 1, 0, 0);
+    event_t eventIdMte2ToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+    SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    int32_t curValue = *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) + 1;
+    bool isFirst = curValue == 1 ? true : false;
+    *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) = curValue;
+    event_t eventIdSToMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+    SetFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+    WaitFlag<HardEvent::S_MTE3>(eventIdSToMte3);
+    copy_ubuf_to_gm(static_cast<__gm__ void*>(localSyncGM), static_cast<__ubuf__ void*>(localUbAddr), 0, 1, 1, 0, 0);
+    event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+    SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+    WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
+    int32_t totalBlockCount = ONE_BLK_FLOAT_NUM * totalBlocks;
+    uint16_t blockLen = totalBlockCount / AscendCUtils::GetC0Count(sizeof(int32_t));
+    while (true) {
+        copy_gm_to_ubuf(
+            static_cast<__ubuf__ void*>(ubWorkspaceAddr), static_cast<__gm__ void*>(gmWorkspaceAddr), 0, 1, blockLen, 0,
+            0);
+        SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+        int32_t count = 0;
+        ClcSyncCount(localSyncGM, ubWorkspaceAddr, blockIdx, totalBlocks, isFirst, count);
+        event_t eventIdSToMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
+        SetFlag<HardEvent::S_MTE2>(eventIdSToMte2);
+        WaitFlag<HardEvent::S_MTE2>(eventIdSToMte2);
+        if (count >= (totalBlocks * curValue)) {
+            break;
+        }
+    }
+    __sync_all_stub(usedCores, isAIVOnly);
+}
+```
+
+## ITEM 8
+
+### item 7
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+hicann/asc-devkit, last commit 2026-07-11 by haipingmao
+THE dav-2201 hard-sync implementation: flag constants (SYNC_AIV_FLAG=12, SYNC_AIC_FLAG=11, SYNC_AIC_AIV_FLAG=13, SYNC_AIV_ONLY_ALL=14), GetffstMsg bit packing, SyncAllImpl itself (PipeBarrier<PIPE_ALL> then ffts_cross_core_sync(PIPE_MTE3, ...) + wait_flag_dev for isAIVOnly; the three-stage AIC/AIV handshake otherwise), and NotifyEventImpl/WaitEventImpl = the primitives behind CrossCoreSetFlag/CrossCoreWaitFlag.
+```cpp
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+
+__aicore__ inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
+{
+    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) + ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+
+/* ... */
+
+
+template <bool isAIVOnly = true>
+__aicore__ inline void SyncAllImpl()
+{
+#if defined(__ASCENDC_SUPERKERNEL_AUTO_SYNC_ALL__)
+    if (g_superKernelAutoSyncAllEnable) {
+        if (GetBlockIdxImpl() == 0) {
+            g_superKernelAutoSyncAllSyncIdx += 1;
+            // |    32bits  |   16bits  |   8bits   |   8bits   |
+            // |  sync idx  | sync type |   is end  | is valid  |
+            *reinterpret_cast<__gm__ uint64_t*>(g_superKernelAutoSyncAllConfigGmAddr) =
+                (static_cast<uint64_t>(g_superKernelAutoSyncAllSyncIdx)
+                 << SK_AUTO_SYNC_ALL_SYNC_IDX_CONFIG_BIT_OFFSET) |
+                (static_cast<uint64_t>(isAIVOnly) << SK_AUTO_SYNC_ALL_SYNC_TYPE_CONFIG_BIT_OFFSET) |
+                static_cast<uint64_t>(SK_AUTO_SYNC_ALL_VALID_MAGIC_NUM);
+            dcci(
+                reinterpret_cast<__gm__ uint64_t*>(g_superKernelAutoSyncAllConfigGmAddr),
+                cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        }
+    }
+#endif
+
+    PipeBarrier<PIPE_ALL>();
+    if constexpr (isAIVOnly) {
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+        wait_flag_dev(SYNC_AIV_ONLY_ALL);
+        return;
+    }
+    // trans software sync to hardware sync
+    if ASCEND_IS_AIC {
+        wait_flag_dev(SYNC_AIV_FLAG);
+        ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+        wait_flag_dev(SYNC_AIC_FLAG);
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+        return;
+    }
+    if ASCEND_IS_AIV {
+        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+        wait_flag_dev(SYNC_AIC_AIV_FLAG);
+        return;
+    }
+}
+
+/* ... */
+
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void NotifyEventImpl(uint16_t flagId)
+{
+    ffts_cross_core_sync(pipe, GetffstMsg(modeId, flagId));
+}
+
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void WaitEventImpl(uint16_t flagId)
+{
+    (void)modeId;
+    wait_flag_dev(flagId);
+}
+
+__aicore__ inline void SetSyncBaseAddrImpl(uint64_t config) { set_ffts_base_addr(config); }
+
+__aicore__ inline void SetSyncBaseAddr(uint64_t config) { SetSyncBaseAddrImpl(config); }
+```
+
+## ITEM 9
+
+### item 8
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/key_features.md
+hicann/asc-devkit, last commit 2026-09-30 by ai_xin
+核间同步 flagId 占用说明: which flagIds SyncAll consumes internally on NPU 架构版本 2201 (isAIVOnly=true -> 14 on AIV; isAIVOnly=false -> 11/12/13), and the conflict failure modes. This is the CrossCoreSetFlag/CrossCoreWaitFlag-vs-SyncAll relationship stated normatively.
+```markdown
+## 核间同步flagId占用说明<a id="inter_core_sync_flagid_usage"></a>
+
+### 概述
+
+开发者使用[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)接口进行核间同步时，需要传入核间同步标记**flagId**，每个flagId对应一个用于控制同步的计数器。
+
+部分接口的内部实现也会占用一部分flagId。当开发者同时使用这些接口与CrossCoreSetFlag/CrossCoreWaitFlag时，若flagId发生冲突（即相互独立的同步操作复用了同一个flagId），其对应的计数器会被错误地共享和修改，导致核间同步行为异常：可能出现阻塞无法解除而使程序卡死，或同步提前完成、阻塞提前解除而导致计算结果错误。
+
+因此，当开发者同时调用CrossCoreSetFlag/CrossCoreWaitFlag与这些占用flagId的接口时，应**避开各接口内部已占用的flagId**，选用未被占用的flagId。
+
+核间同步分为**模式0、1、2**与**模式4**，两者的底层硬件指令不同，flagId相互独立，因此各接口flagId的占用情况按**所属模式**和**NPU架构版本**分别参见[模式0、1、2的flagId占用](#inter_core_sync_flagid_mode012)和[模式4的flagId占用](#inter_core_sync_flagid_mode4)。
+
+### 模式0、1、2的flagId占用<a id="inter_core_sync_flagid_mode012"></a>
+
+**表1**  模式0、1、2flagId占用情况
+
+| 接口 | 限定条件 | 占用flagId | 各计算核占用情况 | NPU架构版本 |
+| :--- | :--- | :--- | :--- | :--- |
+| [SyncAll](SyncAll.md) | `isAIVOnly=true` | 14 | AIV：14 | 2201、3510 |
+| [SyncAll](SyncAll.md) | `isAIVOnly=false` | 11、12、13 | AIC：11、12、13；AIV：12、13 | 2201、3510 |
+| [SetNextTaskStart](../inter_task_sync/SetNextTaskStart.md) | SuperKernel子核函数（Kernel）中调用 | 11、14 | AIC：11；AIV：14 | 2201、3510 |
+| [WaitPreTaskEnd](../inter_task_sync/WaitPreTaskEnd.md) | SuperKernel子核函数（Kernel）中调用 | 11、12、13、14 | AIC：11、12、13；AIV：12、13、14 | 2201、3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | 定义N个Matmul对象 | `[0, 2N-1]` | AIV/AIC按对象与subBlock分配 | 2201 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | SuperKernel融合场景（[GetTaskRatio](../../tool_interface/system_resources_and_variables/GetTaskRatio.md)返回2，即1:2配比） | 15 | AIV：15 | 2201 |
+
+### 模式4的flagId占用<a id="inter_core_sync_flagid_mode4"></a>
+
+**表2**  模式4flagId占用情况
+
+| 接口 | 限定条件 | 占用flagId | 各计算核占用情况 | NPU架构版本 |
+| :--- | :--- | :--- | :--- | :--- |
+| [SyncAll](SyncAll.md) | `isAIVOnly=false`（核函数（Kernel）使用`__mix__(1, 2)`修饰时） | 12、13、28、29 | AIC：12、13、28、29；AIV：12、13 | 3510 |
+| [WaitPreTaskEnd](../inter_task_sync/WaitPreTaskEnd.md) | SuperKernel子核函数（Kernel）中调用 | 12、13、28、29 | AIC：12、13、28、29；AIV：12、13 | 3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | 定义N个[Matmul对象](../../../adv_api/cube_compute/Matmul_Kernel/REGIST_MATMUL_OBJ.md) | `[0, N+17]` | AIC/AIV按对象、eventType、subBlock分配 | 3510 |
+| [Matmul](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_Kernel.md) | A矩阵和B矩阵同时开启[IBSHARE](../../../adv_api/cube_compute/Matmul_Kernel/Matmul_usage.md#p84551411817)的场景 | 15 | AIV：15 | 3510 |
+| [TSCM](../../resource_management/TSCM/TSCM.md) | 从UB发起的L1 Buffer（TSCM）队列 | 0~11（从11向下逐个分配） | AIV | 3510 |
+| [DataCopy（GM→L1）](../../cube_compute_ISASI/cube_compute_load/DataCopy_GMToL1_continuous.md) | 无 | 1、17 | AIC：1、17；AIV：1 | 3510 |
+
+### 各接口限定条件说明
+
+#### SyncAll
+
+- **isAIVOnly=true**：纯Vector算子的全核同步，占用模式0、1、2的flagId为14（AIV）。
+- **isAIVOnly=false**：Mix（包含Cube和Vector计算）算子的全核同步，占用情况随NPU架构与核函数（Kernel）类型不同：
+    - **2201架构**：占用模式0、1、2的flagId为11、12、13。
+    - **3510架构**：
+        - 核函数（Kernel）使用`__mix__(1, 1)`修饰时，占用模式0、1、2的flagId为11、12、13。
+        - 核函数（Kernel）使用`__mix__(1, 2)`修饰时，占用模式0、1、2的flagId为11，以及模式4的flagId为12、13、28、29。
+
+    以上`isAIVOnly`模板参数的说明参见[SyncAll](SyncAll.md)；`__mix__(1, 1)`/`__mix__(1, 2)`修饰符的说明参见[函数执行空间限定符](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md#函数执行空间限定符)。
+
+#### SetNextTaskStart / WaitPreTaskEnd
+
+- 二者为**SuperKernel**场景专用接口，仅在算子以[SuperKernel](../../../../../guide/programming_guide/advanced_programming/super_kernel/principles.md)方式融合、且子核函数（Kernel）中调用时才生效。
+- **SetNextTaskStart**：占用模式0、1、2的flagId为11（AIC）、14（AIV）。参见[SetNextTaskStart](../inter_task_sync/SetNextTaskStart.md)。
+- **WaitPreTaskEnd**：参见[WaitPreTaskEnd](../inter_task_sync/WaitPreTaskEnd.md)。
+    - **2201架构**：占用模式0、1、2的flagId为11、12、13、14。
+    - **3510架构**：占用模式0、1、2的flagId为11、12、13、14，以及模式4的flagId为12、13、28、29。
+```
+
+## ITEM 10
+
+### item 9
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreSetFlag_ISASI.md
+hicann/asc-devkit, last commit 2026-09-21 by munanhw
+CrossCoreSetFlag official doc: the four sync modes, pipe restrictions (no PIPE_S / PIPE_ALL for modes 0/1/2), flagId ranges and the 0-15 counter saturation rule, the mode-to-kernel-type table (mode 0 needs __mix__(0,1)/__mix__(1,0)/..., KERNEL_TYPE_MIX_AIV_1_0 etc. because AIV_ONLY/AIC_ONLY does not start the scheduler), out-of-order sets, and the batchmode deadlock condition.
+````markdown
+## 功能说明<a id="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_block_sync_intf.h"`。
+
+在核间同步场景中，CrossCoreSetFlag接口和[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)接口配对工作，使用时需传入核间同步的标记ID（flagId），每个ID对应一个用于控制同步的计数器。
+
+- CrossCoreSetFlag：AI Core中的AIC/AIV在完成本核前置位的pipe流水任务后，调用该接口，向调度模块上报本核任务已完成。调度模块收集所有参与核的上报信息，作为全局完成标志。
+- CrossCoreWaitFlag：用于阻塞本核后续指令的下发（已下发指令可正常执行），直至调度模块确认所有应调用CrossCoreSetFlag的核均已上报完成，随即解除阻塞，允许该核继续下发指令。
+
+如[图1](#fig37581010773)所示（图中block代表AIC，sub_block代表AIV），同步控制分为以下几种模式：
+
+- 模式0：AI Core核间的同步控制。对于AIC场景，同步所有的AIC核，直到所有的AIC核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行；对于AIV场景，同步所有的AIV核，直到所有的AIV核都执行到CrossCoreSetFlag时，CrossCoreWaitFlag后续的指令才会执行。
+- 模式1：AI Core内部，AIV核之间的同步控制。如果两个AIV核都运行了CrossCoreSetFlag，CrossCoreWaitFlag后续的指令才会执行。
+- 模式2：AI Core内部，AIC与所有AIV之间的同步控制。在AIC核执行CrossCoreSetFlag之后，两个AIV上CrossCoreWaitFlag后续的指令才会继续执行；两个AIV都执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+- 模式4：AI Core内部，AIC与单个AIV之间的同步控制。当在AIC核执行CrossCoreSetFlag之后，AIV0或者AIV1上CrossCoreWaitFlag后续的指令才会继续执行；AIV0或者AIV1执行CrossCoreSetFlag后，AIC上CrossCoreWaitFlag后续的指令才能执行。
+
+> [!NOTE]说明
+> - 不同型号支持的模式不同，具体支持情况请参考[modeId支持的取值说明](#modeId支持的取值说明)。
+> - 每个模式的具体执行逻辑与细节可以参考[关键特性说明](key_features.md)。
+
+**图1**  同步控制模式示意图<a id="fig37581010773"></a>  
+![](../../../../figures/block_subblock_relationship_3510.png "同步控制模式示意图")
+
+## 函数原型<a id="section620mcpsimp"></a>
+
+```cpp
+template <uint8_t modeId, pipe_t pipe>
+__aicore__ inline void CrossCoreSetFlag(uint16_t flagId)
+```
+
+## 参数说明<a id="section622mcpsimp"></a>
+
+### 模板参数及输入参数说明
+
+CrossCoreSetFlag的模板参数`modeId`和`pipe`均**没有默认值**，其取值用于配置硬件指令，调用接口时必须**显式传入**。与本接口不同，CrossCoreWaitFlag的两个模板参数均具有默认值，且在不同产品和同步模式下的生效情况不同，因此**两个接口对模板参数的传入要求并不相同**。具体请参见[CrossCoreWaitFlag模板参数说明](CrossCoreWaitFlag_ISASI.md#template-parameter-defaults)。
+
+**表1**  模板参数说明
+
+| 参数名 | 描述 |
+| --- | --- |
+| modeId | 核间同步的模式，不同产品对同步模式的支持情况请参见[modeId支持的取值说明](#modeId支持的取值说明)。<br>各个模式支持的对应核函数（Kernel）类型请参照[表3](#table3)。 |
+| pipe | 标识在哪条流水的前序指令完成后，CrossCoreSetFlag才向调度模块发送通知。支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX，不支持PIPE_S和PIPE_ALL。不同产品对流水类型的支持情况请参见[pipe支持的流水类型说明](#pipe支持的流水类型说明)。 |
+
+**表2**  参数说明
+
+| 参数名 | 输入/输出 | 描述 |
+| --- | --- | --- |
+| flagId | 输入 | 核间同步的标记。不同产品对flagId的取值范围说明请参见[flagId取值范围说明](#flagId取值范围说明)。 |
+
+### modeId支持的取值说明<a id="modeId支持的取值说明"></a>
+
+不同产品对同步模式的支持情况如下：
+<!-- npu="950" id8 -->
+- 针对Ascend 950PR&950DT系列产品，支持的同步模式为：模式0、模式1、模式2、模式4。
+<!-- end id8 -->
+<!-- npu="A3,910b" id9 -->
+- 针对如下产品，支持的同步模式为：模式0、模式1、模式2。
+    <!-- npu="A3" id10 -->
+    - Atlas A3系列产品
+    <!-- end id10 -->
+    <!-- npu="910b" id11 -->
+    - Atlas A2系列产品
+    <!-- end id11 -->
+<!-- end id9 -->
+
+### pipe支持的流水类型说明<a id="pipe支持的流水类型说明"></a>
+
+- 核间同步的模式为模式0、1、2时，
+    - 支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX。
+    - 不支持的流水类型为PIPE_ALL、PIPE_S。
+<!-- npu="950" id12 -->
+- 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，
+    - 支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX、PIPE_S。
+    - 不支持的流水类型为PIPE_ALL。
+<!-- end id12 -->
+
+### flagId取值范围说明<a id="flagId取值范围说明"></a>
+
+- 核间同步的模式为模式0、1、2时，支持的取值范围为0-15。
+<!-- npu="950" id13 -->
+- 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，支持的取值范围情况如下：
+    - AIV0发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIV1发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 16-31的操作。
+    - AIC发起的flagId 0-15的CrossCoreSetFlag操作对应AIV0 CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIC发起的flagId 16-31的CrossCoreSetFlag操作对应AIV1 CrossCoreWaitFlag中flagId 0-15的操作。
+<!-- end id13 -->
+
+此外，当本接口与Matmul高阶API或SyncAll接口同时使用时，开发者自行使用的flagId还需注意避免与这些接口内部已占用的flagId冲突，详见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+
+## 返回值说明<a id="section640mcpsimp"></a>
+
+无
+
+## 约束说明<a id="section633mcpsimp"></a>
+
+- 由于当核函数（Kernel）类型为KERNEL_TYPE_AIC_ONLY或KERNEL_TYPE_AIV_ONLY时，硬件不会开启调度模块，也就无法正常进行核间同步，因此不同的同步模式配置[核函数（Kernel）类型](../../Kernel-Tiling/set_Kernel_type.md)或[函数执行空间限定符](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md#函数执行空间限定符)的情况如下：
+    - 在纯Vector/Cube场景下（模式0或模式1），建议设置核函数（Kernel）类型为KERNEL\_TYPE\_MIX\_AIV\_1\_0或KERNEL\_TYPE\_MIX\_AIC\_1\_0，其它支持的核函数（Kernel）类型请参考表3。
+    - 对于Vector和Cube混合场景（模式2和模式4），需根据AI Core中AIC和AIV的比例灵活配置核函数（Kernel）类型，不同模式支持的函数执行空间限定符和核函数（Kernel）类型请参照表3。
+
+        **表3**  模式与支持的核函数（Kernel）类型配置<a id="table3"></a>
+
+        | 模式 | 支持的函数执行空间限定符 | 支持的核函数（Kernel）类型配置 |
+        | --- | --- | --- |
+        | 0 | \_\_mix\_\_(0, 1)、\_\_mix\_\_(1, 0)、\_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIV\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 1 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 2 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 4 | \_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+
+- 以下接口内部实现中使用了CrossCoreSetFlag和CrossCoreWaitFlag会占用一部分flagId，开发者同时使用CrossCoreSetFlag/CrossCoreWaitFlag与这些接口时，需注意避免flagId使用冲突，各接口flagId占用的完整说明参见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+
+- 用户需要确保配套使用CrossCoreSetFlag和CrossCoreWaitFlag，否则会出现未定义行为。
+- 核间同步的模式为模式0、1、2时，模板参数pipe不支持设置为PIPE\_ALL，PIPE\_S。
+<!-- npu="950" id14 -->
+- 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，模板参数pipe不支持配置为PIPE\_ALL。
+<!-- end id14 -->
+- 一个核连续发出的CrossCoreSetFlag，硬件不保证执行顺序。例如AIV依次发射CrossCoreSetFlag<0, PIPE\_V\>\(0\)，CrossCoreSetFlag<0, PIPE\_V\>\(1\)，实际的执行顺序可能是flagId=1的先执行。
+- flagId相关的约束：
+    - 对于模式0、1、2，每个AIC和每个AIV都各自有16个flagId，支持的取值范围为0-15。如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- npu="950" id15 -->
+    - 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，AIC有32个flagId，支持的取值范围为0-31，如果flagId的值超出该范围，则截取低5bit（例如，flagId=35时，截取后为3）；AIV有16个flagId，支持的取值范围为0-15，如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- end id15 -->
+    - 每个flagId都对应一个计数器，当调用[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)时，若计数器值为0则会阻塞后续指令下发，已下发指令可正常执行；当调度模块感知到所有参与同步的核（具体包含哪些核与设置的核间同步模式有关）完成（调用了CrossCoreSetFlag）同步后，会将与设置的flagId对应的计数器的值增加1。此时，计数器值为非0，阻塞解除，并且将对应计数器的值减去1进行还原。具体执行逻辑与细节可以参考[关键特性说明](key_features.md)。每一个计数器计数范围为0-15。如果调用CrossCoreSetFlag的次数超过15次，计数器的值超出该范围，则会异常报错，中断流程。
+- 核间同步的模式为模式0、1、2时，同一个flagId用于不同核间同步模式的约束：
+    - 同一核上，若同一个flagId需用于不同核间同步模式，须在模式切换前完成前一个模式的所有同步操作——即确保该flagId关联的所有CrossCoreSetFlag与配套CrossCoreWaitFlag调用均已执行完毕。
+    - 对于不同的核，可以直接将同一flagId用于不同的核间同步模式，具体包括以下2种场景：
+        - 多个AI Core之间，使用flagId=0同步所有的AIC（模式0）；单个AI Core内，使用flagId=0同步所有AIV（模式1）。
+        - 单个AI Core内，使用flagId=0同步所有AIV（模式1）；另一个AI Core内，使用flagId=0同步AIC与所有AIV（模式2）。
+- 使用该接口模式0时，建议开启batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+    - 多流并发场景（≥2条执行流）。
+    - ≥2个算子并发执行。
+    - 所有并发算子的核数总和超过物理核数。
+    - ≥2个并发算子使用了核间同步功能。
+
+    具体而言，在多流场景下，某条流的核间同步算子虽分配到n个物理核，但可能仅有n-m个核先被调度执行，而其余m个核因被其他流的核间同步算子抢占而尚未启动。先启动的n-m个核执行到核间同步时等待剩余m核完成，而剩余m核因被其他流的核间同步算子占用而无法释放，形成死锁。
+    核函数（Kernel）直调场景下通过[\_\_schedmode\_\_\(mode\)](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)限定符来设置batchmode模式；工程化算子开发场景下，通过TilingContext的SetScheduleMode接口来设置batchmode模式，具体请参考《[基础数据结构和接口](https://gitcode.com/cann/metadef/blob/master/docs/zh/api/README.md)》。
+
+## 调用示例<a id="section837496171220"></a>
+
+**表4**  样例描述
+
+| SCENARIO_NUM取值 | 业务场景 | 使用的同步模式 |
+| --- | --- | --- |
+| 0 | 纯Vector计算场景（16个AIV） | mode0（AIV全核同步） |
+| 1 | 纯Vector计算场景（2个AIV） | mode1 |
+| 2 | Cube与Vector融合计算场景 | mode2（AIC等AIV）、mode2（AIV等AIC）、mode0（AIC全核同步） |
+
+如上表所示，当SCENARIO_NUM取不同值时，会分别演示纯Vector计算场景和Cube与Vector融合计算场景下三种同步模式的具体使用方法，下面展示了纯Vector计算场景的部分调用代码：
+
+```cpp
+    AscendC::Muls(xLocal, xLocal, float(AscendC::GetBlockIdx()), this->blockLength);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+    // Unified Buffer（UB）到GM搬运启用原子累加。
+    AscendC::SetAtomicAdd<float>();
+    // DataCopy属于PIPE_MTE3流水操作。
+    AscendC::DataCopy(atomicResultGm, xLocal, this->blockLength);
+    // 当本AIV完成前置PIPE_MTE3(DataCopy)流水操作后，通知其他AIV核，本AIV已经完成。
+    AscendC::CrossCoreSetFlag<0, PIPE_MTE3>(0);
+    // 阻塞本AIV继续往下执行指令，直到其他AIV全部都完成PIPE_MTE3流水操作，才解除阻塞往下执行。
+    AscendC::CrossCoreWaitFlag<0>(0);
+    // 关闭原子累加。
+    AscendC::DisableDmaAtomic();
+
+    if (AscendC::GetBlockIdx() == 0) {
+        AscendC::DataCopy(yLocal, atomicResultGm, this->blockLength);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::DataCopy(atomicResultGm, yLocal, this->blockLength);
+        return;
+    }
+```
+
+完整样例请参考[CrossCoreSetFlag和CrossCoreWaitFlag核间同步样例](../../../../../../../examples/01_simd_cpp_api/03_basic_api/05_sync_control/cross_core_set_wait_flag)。
+````
+
+## ITEM 11
+
+### item 10
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/CrossCoreWaitFlag_ISASI.md
+hicann/asc-devkit, last commit 2026-09-21 by munanhw
+CrossCoreWaitFlag official doc: prototype with defaults (modeId=0, pipe=PIPE_S), which template params actually take effect per product/mode, and its constraints.
+````markdown
+## 功能说明<a id="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_block_sync_intf.h"`。
+
+在核间同步场景中，CrossCoreSetFlag接口和CrossCoreWaitFlag接口配对工作，具体功能请参考[CrossCoreSetFlag功能说明](CrossCoreSetFlag_ISASI.md#section618mcpsimp)。
+
+## 函数原型<a id="section620mcpsimp"></a>
+
+```cpp
+template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId)
+```
+
+## 参数说明<a id="section622mcpsimp"></a>
+
+### 模板参数及输入参数说明
+
+**表1**  模板参数说明
+
+| 参数名 | 描述 |
+| --- | --- |
+| modeId | 核间同步的模式，默认值为0。不同产品对该参数的生效情况及支持的流水类型请参见[模板参数默认值及生效情况](#template-parameter-defaults)。<br>不同产品对同步模式的支持情况请参见[modeId支持的取值说明](#modeId支持的取值说明)。<br>各个模式支持的对应核函数（Kernel）类型请参照[表3](#table3)。 |
+| pipe | 设置该接口阻塞的流水类型，默认值为PIPE_S。不同产品对该参数的生效情况及支持的流水类型请参见[模板参数默认值及生效情况](#template-parameter-defaults)。 |
+
+### 模板参数默认值及生效情况<a id="template-parameter-defaults"></a>
+
+<!-- npu="950" id8 -->
+- 针对Ascend 950PR&950DT系列产品，两个模板参数的使用描述如下：
+
+    - modeId
+        - `modeId`不直接作为硬件指令的输入，CrossCoreWaitFlag会根据该参数选择对应的硬件指令。
+        - 模式0、模式1和模式2使用相同的硬件指令。省略`modeId`时使用默认值`0`，不影响接口功能；但**建议显式传入与CrossCoreSetFlag相同的`modeId`**，便于确认两个接口的同步模式匹配。
+        - 模式4使用的硬件指令与模式0、模式1和模式2不同，**必须显式传入`modeId=4`**，否则接口会按照默认的模式0执行，导致同步行为不符合预期。
+    - pipe
+        - `pipe`作为硬件指令的输入，参数取值**生效**，用于指定CrossCoreWaitFlag阻塞的流水。
+        - 省略`pipe`时使用默认值`PIPE_S`。
+        - 模式0、模式1、模式2和模式4支持`PIPE_S`、`PIPE_V`、`PIPE_M`、`PIPE_MTE1`、`PIPE_MTE2`、`PIPE_MTE3`、`PIPE_FIX`，不支持`PIPE_ALL`。
+<!-- end id8 -->
+<!-- npu="A3,910b" id9 -->
+- 针对如下产品，**参数取值不影响硬件指令功能**，两个模板参数的使用描述如下：
+
+    <!-- npu="A3" id10 -->
+    - Atlas A3系列产品
+    <!-- end id10 -->
+    <!-- npu="910b" id11 -->
+    - Atlas A2系列产品
+    <!-- end id11 -->
+
+    `modeId`和`pipe`均不作为硬件指令的输入，建议按如下方式配置：
+
+    - modeId：省略该参数不影响接口功能；但**建议显式传入与CrossCoreSetFlag相同的`modeId`**，便于确认两个接口的同步模式匹配。
+    - pipe：**建议省略该参数并使用默认值`PIPE_S`**。无论`pipe`取值为何，CrossCoreWaitFlag都会阻塞**全部流水**的后续指令。
+<!-- end id9 -->
+
+**表2**  参数说明
+
+| 参数名 | 输入/输出 | 描述 |
+| --- | --- | --- |
+| flagId | 输入 | 核间同步的标记。不同产品对flagId的取值范围说明请参见[flagId取值范围说明](#flagId取值范围说明)。 |
+
+### modeId支持的取值说明<a id="modeId支持的取值说明"></a>
+
+不同产品对同步模式的支持情况如下：
+<!-- npu="950" id12 -->
+- 针对Ascend 950PR&950DT系列产品，支持的同步模式为：模式0、模式1、模式2、模式4。
+<!-- end id12 -->
+<!-- npu="A3,910b" id13 -->
+- 针对如下产品，支持的同步模式为：模式0、模式1、模式2。
+    <!-- npu="A3" id14 -->
+    - Atlas A3系列产品
+    <!-- end id14 -->
+    <!-- npu="910b" id15 -->
+    - Atlas A2系列产品
+    <!-- end id15 -->
+<!-- end id13 -->
+
+### flagId取值范围说明<a id="flagId取值范围说明"></a>
+
+- 核间同步的模式为模式0、1、2时，支持的取值范围为0-15。
+<!-- npu="950" id16 -->
+- 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，支持的取值范围情况如下：
+    - AIV0发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIV1发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 16-31的操作。
+    - AIC发起的flagId 0-15的CrossCoreSetFlag操作对应AIV0 CrossCoreWaitFlag中flagId 0-15的操作。
+    - AIC发起的flagId 16-31的CrossCoreSetFlag操作对应AIV1 CrossCoreWaitFlag中flagId 0-15的操作。
+<!-- end id16 -->
+
+此外，当与Matmul高阶API或SyncAll接口同时使用时，开发者自行使用的flagId还需注意避免与这些接口内部已占用的flagId冲突，详见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+
+## 返回值说明<a id="section640mcpsimp"></a>
+
+无
+
+## 约束说明<a id="section633mcpsimp"></a>
+
+- 由于当核函数（Kernel）类型为KERNEL_TYPE_AIC_ONLY或KERNEL_TYPE_AIV_ONLY时，硬件不会开启调度模块，也就无法正常进行核间同步，因此不同的同步模式配置[核函数（Kernel）类型](../../Kernel-Tiling/set_Kernel_type.md)或[函数执行空间限定符](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md#函数执行空间限定符)的情况如下：
+    - 在纯Vector/Cube场景下（模式0或模式1），建议设置核函数（Kernel）类型为KERNEL\_TYPE\_MIX\_AIV\_1\_0或KERNEL\_TYPE\_MIX\_AIC\_1\_0，其它支持的核函数（Kernel）类型请参考表3。
+    - 对于Vector和Cube混合场景（模式2和模式4），需根据AI Core中AIC和AIV的比例灵活配置核函数（Kernel）类型，不同模式支持的函数执行空间限定符和核函数（Kernel）类型请参照表3。
+
+        **表3**  模式与支持的核函数（Kernel）类型配置<a id="table3"></a>
+
+        | 模式 | 支持的函数执行空间限定符 | 支持的核函数（Kernel）类型配置 |
+        | --- | --- | --- |
+        | 0 | \_\_mix\_\_(0, 1)、\_\_mix\_\_(1, 0)、\_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIV\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_0、KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 1 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 2 | \_\_mix\_\_(1, 1)、\_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_1、KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+        | 4 | \_\_mix\_\_(1, 2) | KERNEL\_TYPE\_MIX\_AIC\_1\_2 |
+
+- CrossCoreWaitFlag必须与[CrossCoreSetFlag](CrossCoreSetFlag_ISASI.md)接口配合使用，避免计算核一直处于阻塞阶段。建议显式配置与配对CrossCoreSetFlag相同的modeId，以便确认Set与Wait使用相同的同步模式。
+
+- 以下接口内部实现中使用了CrossCoreSetFlag和CrossCoreWaitFlag会占用一部分flagId，开发者同时使用CrossCoreSetFlag/CrossCoreWaitFlag与这些接口时，需注意避免flagId使用冲突，各接口flagId占用的完整说明参见[核间同步flagId占用说明](key_features.md#inter_core_sync_flagid_usage)。
+
+- flagId相关的约束：
+    - 对于模式0、1、2，每个AIC和每个AIV都各自有16个flagId，支持的取值范围为0-15。如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- npu="950" id17 -->
+    - 针对Ascend 950PR&950DT系列产品，核间同步的模式为模式4时，AIC有32个flagId，支持的取值范围为0-31，如果flagId的值超出该范围，则截取低5bit（例如，flagId=35时，截取后为3）；AIV有16个flagId，支持的取值范围为0-15，如果flagId的值超出该范围，则截取低4bit（例如，flagId=17时，截取后为1）。
+    <!-- end id17 -->
+    - 每个flagId都对应一个计数器，当调用[CrossCoreWaitFlag](CrossCoreWaitFlag_ISASI.md)时，若计数器值为0则会阻塞后续指令下发，已下发指令可正常执行；当调度模块感知到核间同步（CrossCoreSetFlag）全部完成后，会将对应CrossCoreWaitFlag的计数器的值增加1。此时，计数器值为非0，阻塞解除，并且将对应计数器的值减去1进行还原。具体执行逻辑与细节可以参考[关键特性说明](key_features.md)。flagId对应的计数器计数范围为0-15。如果计数器的值超出该范围，则会异常报错，中断流程。
+- 模式0、1、2下，同一个flagId用于不同核间同步模式的约束：
+    - 同一核上，若同一个flagId需用于不同核间同步模式，须在模式切换前完成前一个模式的所有同步操作——即确保该flagId关联的所有CrossCoreSetFlag与配套CrossCoreWaitFlag调用均已执行完毕。
+    - 对于不同的核，可以直接将同一flagId用于不同的核间同步模式，具体包括以下2种场景：
+        - 多个AI Core之间，使用flagId=0同步所有的AIC（模式0）；单个AI Core内，使用flagId=0同步所有AIV（模式1）。
+        - 单个AI Core内，使用flagId=0同步所有AIV（模式1）；另一个AI Core内，使用flagId=0同步AIC与所有AIV（模式2）。
+- 使用该接口模式0时，建议开启batchmode模式，使算子独占全部所需核资源，否则可能因满足以下条件导致死锁：
+    - 多流并发场景（≥2条执行流）。
+    - ≥2个算子并发执行。
+    - 所有并发算子的核数总和超过物理核数。
+    - ≥2个并发算子使用了核间同步功能。
+
+    具体而言，在多流场景下，某条流的核间同步算子虽分配到n个物理核，但可能仅有n-m个核先被调度执行，而其余m个核因被其他流的核间同步算子抢占而尚未启动。先启动的n-m个核执行到核间同步时等待剩余m核完成，而剩余m核因被其他流的核间同步算子占用而无法释放，形成死锁。
+
+    核函数（Kernel）直调场景下通过[\_\_schedmode\_\_\(mode\)](../../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)限定符来设置batchmode模式；工程化算子开发场景下，通过TilingContext的SetScheduleMode接口来设置batchmode模式，具体请参考《[基础数据结构和接口](https://gitcode.com/cann/metadef/blob/master/docs/zh/api/README.md)》。
+
+## 调用示例<a id="section837496171220"></a>
+
+**表4**  样例描述
+
+| SCENARIO_NUM取值 | 业务场景 | 使用的同步模式 |
+| --- | --- | --- |
+| 0 | 纯Vector计算场景（16个AIV） | mode0（AIV全核同步） |
+| 1 | 纯Vector计算场景（2个AIV） | mode1 |
+| 2 | Cube与Vector融合计算场景 | mode2（AIC等AIV）、mode2（AIV等AIC）、mode0（AIC全核同步） |
+
+如上表所示，当SCENARIO_NUM取不同值时，会分别演示纯Vector计算场景和Cube与Vector融合计算场景下三种同步模式的具体使用方法，下面展示了纯Vector计算场景的部分调用代码：
+
+```cpp
+    AscendC::Muls(xLocal, xLocal, float(AscendC::GetBlockIdx()), this->blockLength);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+    // Unified Buffer（UB）到GM搬运启用原子累加。
+    AscendC::SetAtomicAdd<float>();
+    // DataCopy属于PIPE_MTE3流水操作。
+    AscendC::DataCopy(atomicResultGm, xLocal, this->blockLength);
+    // 当本AIV完成前置PIPE_MTE3(DataCopy)流水操作后，通知其他AIV核，本AIV已经完成。
+    AscendC::CrossCoreSetFlag<0, PIPE_MTE3>(0);
+    // 阻塞本AIV继续往下执行指令，直到其他AIV全部都完成PIPE_MTE3流水操作，才解除阻塞往下执行。
+    AscendC::CrossCoreWaitFlag<0>(0);
+    // 关闭原子累加。
+    AscendC::DisableDmaAtomic();
+
+    if (AscendC::GetBlockIdx() == 0) {
+        AscendC::DataCopy(yLocal, atomicResultGm, this->blockLength);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::DataCopy(atomicResultGm, yLocal, this->blockLength);
+        return;
+    }
+```
+
+完整样例请参考[CrossCoreSetFlag和CrossCoreWaitFlag核间同步样例](../../../../../../../examples/01_simd_cpp_api/03_basic_api/05_sync_control/cross_core_set_wait_flag)。
+````
+
+## ITEM 12
+
+### item 11
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/examples/01_simd_cpp_api/03_basic_api/05_sync_control/sync_all/sync_all.asc
+hicann/asc-devkit, last commit 2026-08-06 by Geminiver
+Complete official SyncAll sample (8 cores, 32 floats each, partials via workGm). Shows the soft-sync call site, the syncGm sizing blockNum*DEFAULT_SYNCALL_NEED_SIZE (=8 int32 = 32B per core) and the host-side zero-init via input_sync.bin.
+```cpp
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/* !
+ * \file sync_all.asc
+ * \brief 本样例演示SyncAll核间同步接口的使用方法，适用于不同核操作同一块全局内存且存在读后写、
+ *        写后读、写后写等数据依赖的场景。样例使用8个核进行数据处理，每个核处理32个float类型数据，
+ *        对数据乘2后再与其他核的结果累加，通过SyncAll实现核间同步。
+ */
+#include "acl/acl.h"
+#include "data_utils.h"
+#include "kernel_operator.h"
+
+const int32_t DEFAULT_SYNCALL_NEED_SIZE = 8;
+const int32_t TOTAL_LENGTH = 256;
+const int32_t TILE_LENGTH = 32;
+
+/**
+ * @brief SyncAll核间同步样例的Kernel实现类，实现多核数据累加并通过SyncAll进行核间同步
+ */
+class KernelSyncAll {
+public:
+    __aicore__ inline KernelSyncAll() {}
+    __aicore__ inline void Init(
+        __gm__ uint8_t* srcGm, __gm__ uint8_t* dstGm, __gm__ uint8_t* workGm, __gm__ uint8_t* syncGm)
+    {
+        blockNum = AscendC::GetBlockNum(); // 获取核总数
+        blockIdx = AscendC::GetBlockIdx(); // 获取当前工作的核ID
+        srcGlobal.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float*>(srcGm + blockIdx * TILE_LENGTH * sizeof(float)), TILE_LENGTH);
+        dstGlobal.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float*>(dstGm + blockIdx * TILE_LENGTH * sizeof(float)), TILE_LENGTH);
+        workGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workGm), TOTAL_LENGTH);
+        syncGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(syncGm), blockNum * DEFAULT_SYNCALL_NEED_SIZE);
+    }
+    __aicore__ inline void Process()
+    {
+        AscendC::LocalMemAllocator<AscendC::Hardware::UB> ubAllocator;
+        AscendC::LocalTensor<float> srcLocal1 = ubAllocator.Alloc<float, 32>();
+        AscendC::LocalTensor<float> dstLocal = ubAllocator.Alloc<float, 32>();
+
+        AscendC::DataCopy(srcLocal1, srcGlobal, TILE_LENGTH);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+
+        FirstCompute(srcLocal1, dstLocal);
+        CopyToWorkGlobal(dstLocal); // 当前工作核计算后的数据先保存到外部工作空间
+        // 等待所有核都完成计算
+        AscendC::SyncAll();
+        // 最终累加结果需要等所有核都计算完成，dstLocal保留当前核计算结果。
+        for (int i = 0; i < blockNum; i++) {
+            if (i != blockIdx) {
+                CopyFromOtherCore(i, srcLocal1); // 从外部工作空间读取数据
+                Accumulate(dstLocal, srcLocal1); // 所有数据都累加到目的空间
+            }
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::DataCopy(dstGlobal, dstLocal, TILE_LENGTH);
+    }
+
+private:
+    __aicore__ inline void CopyToWorkGlobal(const AscendC::LocalTensor<float>& dstLocal)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::DataCopy(workGlobal[blockIdx * TILE_LENGTH], dstLocal, TILE_LENGTH);
+    }
+    __aicore__ inline void CopyFromOtherCore(int index, const AscendC::LocalTensor<float>& srcLocal)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        AscendC::DataCopy(srcLocal, workGlobal[index * TILE_LENGTH], TILE_LENGTH);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+    }
+    __aicore__ inline void Accumulate(
+        const AscendC::LocalTensor<float>& dstLocal, const AscendC::LocalTensor<float>& srcLocal)
+    {
+        AscendC::Add(dstLocal, dstLocal, srcLocal, TILE_LENGTH);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline void FirstCompute(
+        const AscendC::LocalTensor<float>& srcLocal1, const AscendC::LocalTensor<float>& dstLocal)
+    {
+        float scalarValue(2.0);
+        AscendC::Muls(dstLocal, srcLocal1, scalarValue, TILE_LENGTH);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+private:
+    AscendC::GlobalTensor<float> srcGlobal;
+    AscendC::GlobalTensor<float> dstGlobal;
+    AscendC::GlobalTensor<float> workGlobal;
+    AscendC::GlobalTensor<int32_t> syncGlobal;
+    int32_t blockNum = 0;
+    int32_t blockIdx = 0;
+};
+
+__global__ __vector__ void sync_all_custom(
+    __gm__ uint8_t* srcGm, __gm__ uint8_t* dstGm, __gm__ uint8_t* workGm, __gm__ uint8_t* syncGm)
+{
+    AscendC::InitSocState();
+    KernelSyncAll op;
+    op.Init(srcGm, dstGm, workGm, syncGm);
+    op.Process();
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+int32_t main(int32_t argc, char* argv[])
+{
+    uint32_t numBlocks = TOTAL_LENGTH / TILE_LENGTH;
+    size_t inputByteSize = TOTAL_LENGTH * sizeof(float);
+    size_t outputByteSize = inputByteSize;
+    size_t inputSyncByteSize = numBlocks * DEFAULT_SYNCALL_NEED_SIZE * sizeof(float);
+    size_t inputWorkByteSize = inputByteSize;
+
+    int32_t deviceId = 0;
+    aclrtSetDevice(deviceId);
+    aclrtStream stream = nullptr;
+    aclrtCreateStream(&stream);
+
+    uint8_t *xHost, *zHost, *workHost, *syncHost;
+    uint8_t *xDevice, *zDevice, *workDevice, *syncDevice;
+
+    aclrtMallocHost((void**)(&xHost), inputByteSize);
+    aclrtMallocHost((void**)(&zHost), outputByteSize);
+    aclrtMallocHost((void**)(&workHost), inputWorkByteSize);
+    aclrtMallocHost((void**)(&syncHost), inputSyncByteSize);
+    aclrtMalloc((void**)&xDevice, inputByteSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&zDevice, outputByteSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&workDevice, inputWorkByteSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&syncDevice, inputSyncByteSize, ACL_MEM_MALLOC_HUGE_FIRST);
+
+    ReadFile("./input/input_x.bin", inputByteSize, xHost, inputByteSize);
+    ReadFile("./input/input_work.bin", inputWorkByteSize, workHost, inputWorkByteSize);
+    ReadFile("./input/input_sync.bin", inputSyncByteSize, syncHost, inputSyncByteSize);
+    aclrtMemcpy(xDevice, inputByteSize, xHost, inputByteSize, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtMemcpy(workDevice, inputWorkByteSize, workHost, inputWorkByteSize, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtMemcpy(syncDevice, inputSyncByteSize, syncHost, inputSyncByteSize, ACL_MEMCPY_HOST_TO_DEVICE);
+    sync_all_custom<<<numBlocks, 0, stream>>>(xDevice, zDevice, workDevice, syncDevice);
+    aclrtSynchronizeStream(stream);
+
+    aclrtMemcpy(zHost, outputByteSize, zDevice, outputByteSize, ACL_MEMCPY_DEVICE_TO_HOST);
+    WriteFile("./output/output.bin", zHost, outputByteSize);
+
+    aclrtFree(xDevice);
+    aclrtFree(zDevice);
+    aclrtFree(workDevice);
+    aclrtFree(syncDevice);
+    aclrtFreeHost(xHost);
+    aclrtFreeHost(zHost);
+    aclrtFreeHost(workHost);
+    aclrtFreeHost(syncHost);
+    aclrtDestroyStream(stream);
+    aclrtResetDevice(deviceId);
+    aclFinalize();
+
+    return 0;
+}
+```
+
+## ITEM 13
+
+### item 12
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/atomic_operations/SetAtomicMax_ISASI.md
+hicann/asc-devkit, last commit 2026-09-21 by munanhw
+SetAtomicMax official doc: prototype `template <typename T> __aicore__ inline void SetAtomicMax()`, supported dtypes, A3 data paths (UB/L0C/L1 -> GM), the 'does not auto-zero GM' warning, the 2201 non-saturating default note, and a 3-core atomic-max example that calls AscendC::SyncAll() between copy-in and atomic copy-out.
+````markdown
+## 功能说明<a name="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_set_atomic_intf.h"`。
+
+设置后续搬运到GM的数据是否执行原子比较：将待拷贝的内容和GM已有内容进行比较，然后将最大值写入GM。SetAtomicMax接口可通过设置模板参数来设定不同的数据类型。
+
+## 函数原型<a name="section620mcpsimp"></a>
+
+```cpp
+template <typename T>
+__aicore__ inline void SetAtomicMax() 
+```
+
+## 参数说明<a name="section622mcpsimp"></a>
+
+**表1**  模板参数说明
+
+| 参数名 | 描述 |
+|--------|------|
+| T | 设定不同的原子最大操作数据类型。 |
+
+## 数据类型
+
+支持的数据类型为int8_t、int16_t、half、bfloat16_t、int32_t、float。
+
+## 返回值说明<a name="section640mcpsimp"></a>
+
+无
+
+## 约束说明<a name="section633mcpsimp"></a>
+
+<!-- npu="950" id1 -->
+- Ascend 950PR&950DT系列产品，支持的数据通路为UB/L0C Buffer->GM。
+<!-- end id1 -->
+
+<!-- npu="A3" id2 -->
+- Atlas A3系列产品，支持的数据通路为UB/L0C Buffer/L1 Buffer->GM。
+<!-- end id2 -->
+
+<!-- npu="910b" id3 -->
+- Atlas A2系列产品，支持的数据通路为UB/L0C Buffer/L1 Buffer->GM。
+<!-- end id3 -->
+
+- 使用完后，建议通过[DisableDmaAtomic](DisableDmaAtomic.md)关闭原子最大操作，以免影响后续相关功能。
+- 该接口执行前不会自动清零GM数据。开发者需根据算子逻辑判断是否清零，如需清零，请在执行前手动完成。
+- SetAtomicMax内部已集成与[SetAtomicType](SetAtomicType.md)相同的功能。建议调用上述接口时，通过设置模板参数显式指定原子操作的数据类型，无需额外调用SetAtomicType接口。
+<!-- npu="A3,910b" id4 -->
+- 针对[NPU架构版本2201](../../../../guide/programming_guide/language_extension/simd_builtin_keywords.md)，整数类型和bfloat16_t数据类型**默认均为非饱和模式**，原子最大操作时的饱和模式无法通过[SetSaturationStrategy](../special_register_access/SetSaturationStrategy.md)或[SetCtrlSpr](../special_register_access/SetCtrlSpr_ISASI.md)设置，需要通过`npu-smi`命令进行设备级设置，具体设置方法请参考[SetAtomicAdd约束说明](SetAtomicAdd.md#npu_smi_saturation_mode)。
+<!-- end id4 -->
+
+## 调用示例<a name="section177231425115410"></a>
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr uint32_t SIZE = 256;
+__aicore__ inline void CopyIn()
+{
+    AscendC::LocalTensor<T> srcLocal = queueSrc.AllocTensor<T>();
+    // 清空原子操作的状态
+    AscendC::DisableDmaAtomic();
+    AscendC::DataCopy(srcLocal, srcGlobal, SIZE);
+    queueSrc.EnQue(srcLocal);
+    // 核间同步
+    AscendC::SyncAll();
+}
+
+__aicore__ inline void CopyOut()
+{
+    AscendC::LocalTensor<T> srcLocal = queueSrc.DeQue<T>();
+    // 开启原子MAX模式，3个核取最大值
+    AscendC::SetAtomicMax<T>();
+    AscendC::DataCopy(dstGlobal, srcLocal, SIZE);
+    // 关闭原子操作
+    AscendC::DisableDmaAtomic();
+    queueSrc.FreeTensor(srcLocal);
+}
+
+/*
+每个核的输入数据为: 
+Src0: [1,1,1,1,1,...,1] // 256个1
+Src1: [2,2,2,2,2,...,2] // 256个2
+最终输出数据: [2,2,2,2,2,...,2] // 256个2
+*/
+```
+
+完整样例请参考[DataMovementWithAtomicOperations样例](../../../../../../examples/01_simd_cpp_api/03_basic_api/06_atomic/data_movement_with_atomic_operations)。
+````
+
+## ITEM 14
+
+### item 13
+
+https://raw.githubusercontent.com/hicann/asc-devkit/master/docs/zh/api/SIMD-API/basic_api/cache_control/DataCacheCleanAndInvalid.md
+hicann/asc-devkit, last commit 2026-09-29 by wang_shuli
+DataCacheCleanAndInvalid official doc: why scalar GM reads need it (DCache vs DMA), the three prototypes, SINGLE_CACHE_LINE (64B-aligned caveat) vs ENTIRE_DATA_CACHE (expensive), DcciDst::CACHELINE_OUT/UB/ATOMIC, and the constraint table. CACHELINE_ATOMIC is explicitly NOT yet supported on Atlas A3.
+````markdown
+## 功能说明<a name="section618mcpsimp"></a>
+
+头文件路径为：`"basic_api/kernel_operator_cache_intf.h"`。
+
+如图1所示，在AI Core内部，Scalar单元和DMA单元都可能对GM进行访问：
+
+- DMA搬运单元读写GM，数据通过DataCopy等接口在Unified Buffer（UB）等Local Memory和GM间交互，没有Cache一致性问题。
+- Scalar单元访问GM，首先会访问每个核内的Data Cache（DCache），因此存在DCache与GM的Cache一致性问题，具体原因请参考[缓存一致性](../../../../guide/programming_guide/advanced_programming/memory_model/cache_coherence.md)。
+
+**图1**  DCache内存层次示意图<a name="zh-cn_topic_0000002530021782_fig1161014168448"></a>
+
+![](../../../figures/datacache.png)
+
+DataCacheCleanAndInvalid接口用于解决上述一致性问题，其功能可以拆解为两部分：
+
+- Clean：将缓存中被修改过的数据（脏数据，Dirty Data）写回到GM中，避免数据丢失。
+- Invalid：
+    - 将指定地址范围的Cache Line标记为“无效”，使其从缓存中移除。
+    - 保证下一次访问这些内存地址时，会从GM重新加载数据，而不是使用可能过期的缓存数据。
+
+该接口的典型使用场景如下：
+
+- 读取GM的数据，但该数据可能在外部被其余核修改，此时需要使用DataCacheCleanAndInvalid接口，直接访问GM，获取最新数据。
+- 用户通过Scalar单元写GM的数据，希望立刻写出，也需要使用DataCacheCleanAndInvalid接口。
+
+<!-- npu="950" id15 -->
+- 针对Ascend 950PR&950DT系列产品，原子操作过程中，如果希望改变后续数据的饱和模式，需要先使用DataCacheCleanAndInvalid接口将Cache Line中现存的数据立刻写出，再调用[SetCtrlSpr](../special_register_access/SetCtrlSpr_ISASI.md)设置后续数据的饱和模式。
+<!-- end id15 -->
+
+## 函数原型<a name="section620mcpsimp"></a>
+
+- 配置dcciDst的原型
+
+  ```cpp
+  // 支持通过配置dcciDst确保DCache与GM存储的一致性。
+  template <typename T, CacheLine entireType, DcciDst dcciDst>
+  __aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst)
+  // 支持通过配置dcciDst确保DCache与Local Memory存储的一致性。
+  template <typename T, CacheLine entireType, DcciDst dcciDst>
+  __aicore__ inline void DataCacheCleanAndInvalid(const LocalTensor<T>& dst)
+  ```
+
+- 不支持配置dcciDst，仅支持保证DCache与GM的一致性。
+
+    ```cpp
+    template <typename T, CacheLine entireType>
+    __aicore__ inline void DataCacheCleanAndInvalid(const GlobalTensor<T>& dst)
+    ```
+
+<!-- npu="310p" id14 -->
+> [!NOTE]说明 
+> 对于Atlas推理系列产品AI Core，仅支持不配置dcciDst参数的原型。
+<!-- end id14 -->
+
+
+## 参数说明<a name="section622mcpsimp"></a>
+
+**表1**  模板参数说明
+
+| 参数名 | 描述 |
+|--------|------|
+| T | dst的数据类型。 |
+| entireType | 指令操作的模式：<br>SINGLE_CACHE_LINE：只刷新传入地址所在的Cache Line，**注意如果该地址非64B对齐，只会操作传入地址到64B对齐的部分。**<br>ENTIRE_DATA_CACHE：此时传入的地址无效，核内会刷新整个DCache，但是耗时较大，**性能敏感的场景慎用**。 |
+| dcciDst | 表示使用该接口来保证DCache与哪一种存储保持一致性，类型为DcciDst枚举类。<br>&bull; CACHELINE_ALL：与CACHELINE_OUT效果一致。<br>&bull; CACHELINE_UB：表示通过该接口来保证DCache与UB的一致性。<br>&bull; CACHELINE_OUT：表示通过该接口来保证DCache与GM的一致性。<br>&bull; CACHELINE_ATOMIC：原子操作过程中保证DCache和GM的一致性。<br><!-- npu="950" id16 -->&ensp;&ensp;- Ascend 950PR&950DT系列产品，支持。<br><!-- end id16 --><!-- npu="A3" id10 -->&ensp;&ensp;- Atlas A3系列产品，暂未支持。<br><!-- end id10 --><!-- npu="910b" id11 -->&ensp;&ensp;- Atlas A2系列产品，暂未支持。<br><!-- end id11 --><!-- npu="310b" id12 -->&ensp;&ensp;- Atlas 200I/500 A2推理产品，暂未支持。<br><!-- end id12 --><!-- npu="310p" id13 -->&ensp;&ensp;- Atlas推理系列产品AI Core，暂未支持。<!-- end id13 --> |
+
+**表2**  参数说明
+
+| 参数名 | 输入/输出 | 描述 |
+|--------|-----------|------|
+| dst | 输入 | 需要刷新Cache的Tensor。 |
+
+## 返回值说明<a name="section640mcpsimp"></a>
+
+无
+
+## 约束说明<a name="section633mcpsimp"></a>
+
+- 当`entireType`为`SINGLE_CACHE_LINE`时，`dst`生效，`dcciDst`不生效。
+- 当`entireType`为`ENTIRE_DATA_CACHE`时，`dst`不生效，`dcciDst`生效。
+- `dst`为`LocalTensor`类型的函数原型仅支持在AIV中调用。
+
+## 调用示例<a name="section837496171220"></a>
+
+- **示例1：SINGLE\_CACHE\_LINE模式（64B对齐场景）**  
+  假设mmAddr\_为0x40（64B对齐），调用一次指令即可刷新整个Cache Line。
+
+    ```cpp
+    AscendC::GlobalTensor<uint64_t> global;
+    global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+    for( int i = 0; i < 8; i++) {
+        global.SetValue(i, AscendC::GetBlockIdx());
+    }
+    // 由于首地址64B对齐，调用DataCacheCleanAndInvalid指令后，会立刻刷新前8个数。
+    AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+    ```
+
+- **示例2：SINGLE\_CACHE\_LINE模式（非64B对齐场景）**  
+  假设mmAddr\_为0x20（非64B对齐），需要调用两次指令才能刷新完整Cache Line。
+
+    ```cpp
+    AscendC::GlobalTensor<uint64_t> global;
+    global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+    for( int i = 0; i < 8; i++) {
+        global.SetValue(i, AscendC::GetBlockIdx());
+    }
+    // 由于首地址非64B对齐，调用1条指令，只会刷新起始地址至64B字节对齐的部分，即前4个数。
+    AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+    // 需要再次调用DataCacheCleanAndInvalid指令，刷新后4个数。
+    AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global[4]);
+    ```
+
+- **<a name="example3_multi_core"></a>示例3：SINGLE\_CACHE\_LINE模式（多核处理场景）**  
+  假设mmAddr\_为0x40（64B对齐），多核操作同一条Cache Line时可能出现随机覆盖。本样例仅做示例说明，便于开发者理解使用限制，非正常使用样例。
+
+    ```cpp
+    AscendC::GlobalTensor<uint64_t> global;
+    global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_);
+    global.SetValue(AscendC::GetBlockIdx(), AscendC::GetBlockIdx());
+    // 算子中多核操作虽然不在同一个地址，但在同一个Cache Line，会出现数据的随机覆盖，和通用CPU的行为不同。
+    // 调用DataCacheCleanAndInvalid指令后，由于多核操作的时间不一致，最终结果存在随机性，后执行的核会覆盖前面核的结果。
+    AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(global);
+    ```
+
+- **示例4：ENTIRE\_DATA\_CACHE模式**  
+  假设mmAddr\_为0x20（非64B对齐），刷新整个DCache。本样例仅做示例说明，便于开发者理解使用限制，非正常使用样例。
+
+    ```cpp
+    AscendC::GlobalTensor<uint64_t> global;
+    global.SetGlobalBuffer((__gm__ uint64_t*)mmAddr_ + AscendC::GetBlockIdx() * 1024);
+    for( int i = 0; i < 8; i++) {
+        global.SetValue(i, AscendC::GetBlockIdx());
+    }
+    // 刷新整个DCache，性能较差。
+    AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::ENTIRE_DATA_CACHE, AscendC::DcciDst::CACHELINE_OUT>(global);
+    ```
+````
+
+## ITEM 15
+
+### item 14
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops/op_kernel/dispatch_ffn_combine_kernel/utils/hccl_shmem.hpp
+sgl-project/sgl-kernel-npu, last commit 2026-03-12 by ZFA
+The canonical hand-written dcci spin-wait: gm_dcci() wraps DataCacheCleanAndInvalid<uint8_t, SINGLE_CACHE_LINE, CACHELINE_OUT> between two empty __asm__ __volatile__("") barriers so the compiler cannot hoist it; gm_signal_wait_until_eq_for_barrier / gm_signal_wait_until_ne are the `do { dcci; read; } while(true)` polling loops; CrossRankSync publishes a counter, polls peers, then calls AscendC::SyncAll<true>(). AicSyncAll() shows the AIC-side CrossCoreSetFlag<0x0,PIPE_FIX>(8)/CrossCoreWaitFlag<0x0>(8) barrier.
+```cpp
+#define FORCE_INLINE_AICORE inline __attribute__((always_inline)) __aicore__
+constexpr int32_t MAX_RANK_SIZE = 32;
+constexpr int32_t SHMEM_MEM = 700 * MB_SIZE;
+
+constexpr uint16_t SEND_SYNC_EVENT_ID = 9;
+constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
+
+constexpr uint32_t SELF_STATE_OFFSET = 256 * 1024;
+constexpr uint32_t STATE_OFFSET = 512;
+
+FORCE_INLINE_AICORE void AicSyncAll()
+{
+    AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(8);
+    AscendC::CrossCoreWaitFlag<0x0>(8);
+}
+
+template <typename T>
+FORCE_INLINE_AICORE void gm_store(__gm__ T *addr, T val)
+{
+    *((__gm__ T *)addr) = val;
+}
+
+template <typename T>
+FORCE_INLINE_AICORE T gm_load(__gm__ T *cache)
+{
+    return *((__gm__ T *)cache);
+}
+
+template <typename T>
+FORCE_INLINE_AICORE void gm_dcci(__gm__ T *addr)
+{
+    using namespace AscendC;
+    GlobalTensor<uint8_t> global;
+    global.SetGlobalBuffer(reinterpret_cast<GM_ADDR>(addr));
+
+    // Important: add hint to avoid dcci being optimized by compiler
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(global);
+    __asm__ __volatile__("");
+}
+
+FORCE_INLINE_AICORE int32_t gm_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val)
+{
+    do {
+        gm_dcci((__gm__ uint8_t *)sig_addr);
+        if (*sig_addr == cmp_val) {
+            return *sig_addr;
+        }
+        if (*sig_addr == cmp_val + 1) {
+            return *sig_addr;
+        }
+    } while (true);
+    return -1;
+}
+
+FORCE_INLINE_AICORE void gm_signal_wait_until_ne(__gm__ int32_t *sig_addr, int32_t cmp_val)
+{
+    do {
+        AscendC::LocalTensor<int32_t> ub;
+        ub.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+        ub.address_.bufferAddr = 0;
+        AscendC::GlobalTensor<int32_t> sig;
+        sig.SetGlobalBuffer(sig_addr);
+        AscendC::DataCopy(ub, sig, 8);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        if (ub(0) != cmp_val) {
+            return;
+        }
+    } while (true);
+    return;
+
+/* ... */
+
+
+    FORCE_INLINE_AICORE
+    void CrossRankSync()
+    {
+        uint64_t flag_offset = (m_segmentSize - MB_SIZE) / sizeof(int32_t);
+        __gm__ int32_t *sync_counter = (__gm__ int32_t *)(*this)() + flag_offset;
+        __gm__ int32_t *sync_base = (__gm__ int32_t *)(*this)() + flag_offset + 2048;
+        int count = gm_load(sync_base) + 1;
+        int vec_id = AscendC::GetBlockIdx();
+        int vec_size = AscendC::GetBlockNum() * AscendC::GetTaskRation();
+        for (int i = vec_id; i < m_rankSize; i += vec_size) {
+            __gm__ int32_t *sync_remote = (__gm__ int32_t *)((*this)(i)) + flag_offset + m_rank * 16;
+            gm_store(sync_remote, count);
+            gm_dcci((__gm__ uint8_t *)sync_remote);
+            auto sync_check = sync_counter + i * 16;
+            gm_signal_wait_until_eq_for_barrier(sync_check, count);
+        }
+
+        AscendC::SyncAll<true>();
+        gm_store(sync_base, count);
+    }
+```
+
+## ITEM 16
+
+### item 15
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops/op_kernel/dispatch_ffn_combine_kernel.hpp
+sgl-project/sgl-kernel-npu, last commit 2026-08-28 by 探照灯
+UpdateAicFlags: a real GM polling loop (`while (flag < flagBase)`) that re-DataCopies the flag region GM->UB every iteration, reduces it with ReduceMin, reads it back with a V_S event pair, and publishes progress with a scalar GM store + gm_dcci. Also shows gm_signal_wait_until_ne used as a per-cacheline arrival check before a cross-rank DataCopy, followed by AscendC::SyncAll<true>().
+```cpp
+        for (int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
+            if (dstEpIdx != params.rank) {
+                int32_t intPer512 = CACHE_LINE / sizeof(int);
+                for (int32_t checkIdx = 0; checkIdx < AlignUp(params.EP * params.expertPerRank, 128);
+                     checkIdx += intPer512) {
+                    __gm__ int32_t *sync_check =
+                        reinterpret_cast<__gm__ int32_t *>(shmem() + peermemInfo.offsetPeerTokenPerExpert) +
+                        tokenPerExpertLayout(dstEpIdx, 0, checkIdx);
+                    gm_signal_wait_until_ne(sync_check, 0);
+                }
+                AscendC::DataCopy(tmpBuffer, tokenPerExpert[tokenPerExpertLayout(dstEpIdx, 0, 0)], numPerCore);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::Adds(tmpBuffer, tmpBuffer, -0x800000, numPerCore);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::DataCopy(tokenPerExpert[tokenPerExpertLayout(dstEpIdx, 0, 0)], tmpBuffer, numPerCore);
+            } else {
+                AscendC::DataCopy(tmpBuffer, tokenPerExpert[tokenPerExpertLayout(dstEpIdx, 0, 0)], numPerCore);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            int32_t prevSum = 0;
+            int32_t j = 0;
+            for (int32_t i = 0; i < (params.rank + 1) * params.expertPerRank; i++) {
+                if (i >= params.rank * params.expertPerRank) {
+                    prevSumBuf(j) = prevSum;
+                    j++;
+                }
+                prevSum += tmpBuffer(i);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopyPad(
+                preSumBeforeRank[dstEpIdx * params.expertPerRank], prevSumBuf,
+                AscendC::DataCopyParams{1, static_cast<uint16_t>(params.expertPerRank * sizeof(int32_t)), 0, 0});
+        }
+
+        AscendC::SyncAll<true>();
+    }
+
+
+/* ... */
+
+    void UpdateAicFlags(const Params &params)
+    {
+        float flagBase = 1.0f * params.expertPerRank;
+        __gm__ float *aicFinishPtr = workspaceInfo.ptrSoftFlagBase + params.EP * FLAGSTRIDE;
+        float flag = 0.0f;
+        float lastflag = -1.0f;
+        AscendC::LocalTensor<float> tmpBuffer1 = resource.ubBuf.template GetBufferByByte<float>(0);
+        __gm__ float *flagPtr = workspaceInfo.ptrSoftFlagBase;
+        AscendC::GlobalTensor<float> flagGM;
+        flagGM.SetGlobalBuffer(flagPtr);
+        int64_t flagBufferSize = static_cast<int64_t>(max(4, params.EP)) * static_cast<int64_t>(FLAGSTRIDE);
+        AscendC::LocalTensor<float> dstValueBuffer = resource.ubBuf.template GetBufferByByte<float>(flagBufferSize);
+        AscendC::LocalTensor<float> sharedTmpBuffer =
+            resource.ubBuf.template GetBufferByByte<float>((flagBufferSize + 64));
+        uint64_t mask[1] = {0};
+        uint32_t repeatNum = (flagBufferSize / (4 * FLAGSTRIDE));
+        for (int32_t i = 0; i < 4; i++) {
+            if (i < params.EP) {
+                mask[0] |= 1ull * (1ull << (i * 16));
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        while (flag < flagBase) {
+            flag = flagBase;
+            AscendC::DataCopy(tmpBuffer1, flagGM, params.EP * FLAGSTRIDE);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+
+            AscendC::ReduceMin<float>(dstValueBuffer, tmpBuffer1, sharedTmpBuffer, mask, repeatNum, 8, false);
+
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            flag = min(flag, dstValueBuffer.GetValue(0));
+
+            if (flag > lastflag) {
+                *aicFinishPtr = flag;
+                gm_dcci(aicFinishPtr);
+                lastflag = flag;
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void CombineSetFlag()
+    {
+```
+
+## ITEM 17
+
+### item 16
+
+https://raw.githubusercontent.com/sgl-project/sgl-kernel-npu/main/csrc/deepep/ops/op_kernel/data_copy.h
+sgl-project/sgl-kernel-npu, last commit 2025-09-04 by BourneSun0527
+SetAtomicOpType<T>: the SetAtomicAdd / SetAtomicMax / SetAtomicMin / SetAtomicNone selector used before a GM->GM DataCopy, i.e. the atomic-max reduction primitive in template form.
+```cpp
+#ifndef CAM_DATACOPY_GM2GM_H
+#define CAM_DATACOPY_GM2GM_H
+#include <type_traits>
+#include "comm_args.h"
+
+using namespace AscendC;
+using namespace Moe;
+
+template <typename T>
+FORCE_INLINE_AICORE void SetAtomicOpType(int op)
+{
+    switch (op) {
+        case ADD:
+            AscendC::SetAtomicAdd<T>();
+            break;
+        case MUL:
+            // Ignore setting the atomic register when performing mul
+            break;
+        case MAX:
+            AscendC::SetAtomicMax<T>();
+            break;
+        case MIN:
+            AscendC::SetAtomicMin<T>();
+            break;
+        default:
+            AscendC::SetAtomicNone();
+    }
+}
+```
+
+## ITEM 18
+
+### item 17
+
+https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/attention/k2q_csr/k2q_csr_common/op_kernel/k2q_csr_common.h
+vllm-project/vllm-ascend, last commit 2026-08-20 by Haoxin Zong
+AtomicAddOutInt32 (SetAtomicAdd<int32_t> -> DataCopyPad -> SetAtomicNone -> PipeBarrier<PIPE_ALL>), FlushGmInt32 (ENTIRE_DATA_CACHE + CACHELINE_OUT), and StoreScalarInt32 — with the in-source note that a single-point GM write must go through MTE3 because GlobalTensor::SetValue loses the write-back under multi-core concurrency.
+```cpp
+__aicore__ inline void CopyOutInt32(const AscendC::GlobalTensor<int32_t> &dst,
+                                    const AscendC::LocalTensor<int32_t> &src, int64_t nElems)
+{
+    if (nElems <= 0) {
+        return;
+    }
+    AscendC::DataCopyExtParams params{1, static_cast<uint32_t>(nElems * sizeof(int32_t)), 0, 0, 0};
+    AscendC::DataCopyPad(dst, src, params);
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+/** 整段 AtomicAdd 写 GM（对齐 CUDA Hist→row_counts） */
+__aicore__ inline void AtomicAddOutInt32(const AscendC::GlobalTensor<int32_t> &dst,
+                                         const AscendC::LocalTensor<int32_t> &src, int64_t nElems)
+{
+    if (nElems <= 0) {
+        return;
+    }
+    AscendC::SetAtomicAdd<int32_t>();
+    AscendC::DataCopyExtParams params{1, static_cast<uint32_t>(nElems * sizeof(int32_t)), 0, 0, 0};
+    AscendC::DataCopyPad(dst, src, params);
+    AscendC::SetAtomicNone();
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+__aicore__ inline void FlushGmInt32(const AscendC::GlobalTensor<int32_t> &gm)
+{
+    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                      AscendC::DcciDst::CACHELINE_OUT>(gm);
+}
+
+/** 单点写 GM（MTE3），多核并发安全；避免 GlobalTensor.SetValue 写回丢失 */
+__aicore__ inline void StoreScalarInt32(const AscendC::GlobalTensor<int32_t> &dst, int64_t index, int32_t value,
+                                        const AscendC::LocalTensor<int32_t> &tmp)
+{
+    tmp.SetValue(0, value);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::DataCopyExtParams params{1, static_cast<uint32_t>(sizeof(int32_t)), 0, 0, 0};
+    AscendC::DataCopyPad(dst[index], tmp, params);
+}
+
+/**
+ * 同 pos 写 q_ind + slot：一次 barrier + 两次 4B MTE3。
+ * tmpQ/tmpS 须各自 32B 对齐（不可用 tmp[1] 作源）。
+ */
+```
+
+## ITEM 19
+
+### item 18
+
+https://raw.githubusercontent.com/inclusionAI/AReno/main/areno/accel/csrc/npu/fused_experts_matmul_kernel.cpp
+inclusionAI/AReno, last commit 2026-10-08 by sule
+Cross-kernel (vector-launch -> cube-launch) metadata handoff: DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(total) immediately before `total.GetValue(0)`, repeated per-row for the expert id. The comment states scalar GM reads need explicit invalidation including during graph replay.
+```cpp
+template<uint32_t Storage>
+__global__ __aicore__ void expert_matmul_kernel(GM_ADDR in, GM_ADDR w, GM_ADDR out,
+    GM_ADDR expertIds, GM_ADDR paddedTotal, int64_t capacity, int64_t n, int64_t k, int64_t outputStride, GM_ADDR workspace) {
+    using T = typename areno_npu::KernelDtype<Storage>::type;
+    using namespace AscendC;
+    using namespace areno_npu;
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    using A = MatmulType<TPosition::GM, CubeFormat::ND, T>;
+    using B = MatmulType<TPosition::GM, CubeFormat::ND, T, true>;
+    using C = MatmulType<TPosition::GM, CubeFormat::ND, float>;
+    constexpr static auto config = GetMatmulApiTiling<A, B, C, C>(expert_matmul_config());
+    Matmul<A, B, C, C, config> mm;
+    TPipe pipe;
+    SetSysWorkspace(workspace);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, (TCubeTiling*)nullptr);
+    GlobalTensor<T> input, weight;
+    GlobalTensor<float> output;
+    GlobalTensor<int32_t> experts, total;
+    input.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(in));
+    weight.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(w));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(out));
+    experts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(expertIds));
+    total.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(paddedTotal));
+    // The preceding vector launches wrote this metadata. Scalar GM reads
+    // need explicit cache invalidation, including during graph replay.
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(total);
+    int64_t used = total.GetValue(0);
+    int64_t columns = (n + kExpertN - 1) / kExpertN;
+    for (int64_t task = GetBlockIdx(); task < capacity / kExpertM * columns; task += GetBlockNum()) {
+        int64_t row = task / columns * kExpertM, col = task % columns * kExpertN;
+        if (row >= used) continue;
+        auto id = experts[row / kExpertM];
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(id);
+        int64_t expert = id.GetValue(0);
+        if (expert < 0) continue;
+        int32_t tailN = n - col < kExpertN ? n - col : kExpertN;
+        for (int64_t inner = 0; inner < k; inner += kExpertK) {
+            int32_t tailK = k - inner < kExpertK ? k - inner : kExpertK;
+            // Keep FP32 GM rows aligned for Fixpipe, including odd N tails.
+            mm.SetOrgShape(kExpertM, n, k, k, outputStride);
+            mm.SetTensorA(input[row * k + inner]);
+```
+
+## ITEM 20
+
+### item 19
+
+https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage.cpp
+vllm-project/vllm-ascend, last commit 2026-09-24 by xieqiang
+A decode-path kernel that mixes `if ASCEND_IS_AIV { SyncAll(); }` grid barriers with a SINGLE_CACHE_LINE dcci placed between a scalar probe read and a DMA overwrite of the same line (the probe populated the DCache line; without the invalidate a later writeback would restore the stale value). Owner-per-AIV decomposition is chosen so owners publish disjoint chunks before the outer SyncAll.
+```cpp
+    slots.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsAddr);
+    queryEnds.SetGlobalBuffer((__gm__ int32_t *)actualSeqQueryAddr);
+    keyLengths.SetGlobalBuffer((__gm__ int32_t *)actualSeqKeyAddr);
+    offloadLengths.SetGlobalBuffer((__gm__ int32_t *)offloadSeqKeyAddr);
+    cacheTokens.SetGlobalBuffer((__gm__ int32_t *)cacheTokensAddr);
+    const uint32_t owner = GetBlockIdx() / LIMConfig::AIVS_PER_AIC;
+    // KERNEL_TYPE_MIX_AIC_1_2 exposes 2 * GetBlockNum() AIV blocks.  Even
+    // AIVs therefore provide exactly GetBlockNum() independent owners.
+    const uint32_t owners = GetBlockNum();
+    TBuf<TPosition::VECCALC> identityBaseBuf;
+    TBuf<TPosition::VECCALC> identityValuesBuf;
+    TBuf<TPosition::VECCALC> transitionInvalidBuf;
+    bool identityBufferReady = false;
+    bool transitionCleanupBufferReady = false;
+    // Every owner participates in every standard row.  The previous
+    // batch-strided assignment left all but one owner idle for BS=1, making a
+    // large identity row a single-AIV GM write.  Standard LI does not consume
+    // cacheSlots, so owners can publish disjoint chunks before the outer
+    // SyncAll without introducing a data dependency.  Keep the transition
+    // cleanup on its established one-owner-per-request assignment below.
+    for (uint32_t batch = 0U; batch < batchSize; ++batch) {
+        const int32_t state = states.GetValue(batch);
+        if (state != LIMConfig::REQUEST_STATE_NON_OFFLOAD &&
+
+/* ... */
+
+            // the full-row cleanup.  Avoid scanning the row on every decode.
+            if (static_cast<uint32_t>(cacheCount) >= sourceCapacity) {
+                continue;
+            }
+            if (slots.GetValue(base + static_cast<uint32_t>(cacheCount)) <
+                cacheCount) {
+                continue;
+            }
+            // The scalar probe populated its DCache line with the identity
+            // value.  Invalidate it before DMA overwrites the suffix, or a
+            // later cache writeback could restore slot C and corrupt -1.
+            const uint32_t probeLine = static_cast<uint32_t>(cacheCount) & ~31U;
+            DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE,
+                                     DcciDst::CACHELINE_OUT>(
+                slots[base + probeLine]);
+            if (!transitionCleanupBufferReady) {
+                pipe->InitBuffer(transitionInvalidBuf,
+
+/* ... */
+
+                              cacheSlots, tiling_data->bSize, tiling_data->tSize,                                      \
+                              tiling_data->poolSize, tiling_data->cacheSlotsSize, &tPipe);                             \
+        if ASCEND_IS_AIV { SyncAll(); }                                                                                \
+        __gm__ uint8_t *unionPair0 =                                                                                    \
+            user + MtpWorkspace::Pair0Offset(GetBlockNum(), tiling_data->n1Size);                                      \
+
+/* ... */
+
+        op.Process();                                                                                                   \
+        if ASCEND_IS_AIV {                                                                                              \
+            SyncAll();                                                                                                  \
+            if (GetBlockIdx() % LIMConfig::AIVS_PER_AIC == 0U) {                                                       \
+                tPipe.Reset();                                                                                          \
+                const uint32_t unionOwner = GetBlockIdx() / LIMConfig::AIVS_PER_AIC;                                   \
+```
+
+## ITEM 21
+
+### item 20
+
+https://raw.githubusercontent.com/hicann/catlass/master/include/catlass/arch/cross_core_sync.hpp
+hicann/catlass, last commit 2026-07-16 by yuantao_
+CATLASS's grid barrier layer: reserved FlagIDs (AIV_INTER_BLOCK_BARRIER=8, AIC_INTER_BLOCK_BARRIER=9, AIV_INTER_SUBBLOCK_BARRIER=10, FFTS_MAX_FLAG=7), CrossCoreBarrier<MODE,PIPE>() = set-then-wait on one's own core-type flag, and MAX_REVERSE_DEPTH=15 with CrossCoreSetFlagWithReverse — the documented workaround for the 15-consecutive-set counter overflow freeze.
+```cpp
+namespace Catlass::Arch {
+
+// A certain cross core flag can be continuously set up to 15 times without waiting. In scenarios where there is only
+// one-way synchronization between cores and the synchronization operation is executed multiple times, if the core
+// performing the set operation runs faster, it may result in the flag being set more than 15 times consecutively,
+// leading to a system freeze. To prevent such a freeze, we need to wait for the waiting cores to perform a reverse
+// synchronization operation after executing the set operation MAX_REVERSE_DEPTH times.
+constexpr uint32_t MAX_REVERSE_DEPTH = 15;
+
+using FlagID = uint16_t;
+constexpr FlagID AIV_INTER_BLOCK_BARRIER = 8;
+constexpr FlagID AIC_INTER_BLOCK_BARRIER = 9;
+constexpr FlagID AIV_INTER_SUBBLOCK_BARRIER = 10;
+constexpr FlagID FFTS_MAX_FLAG = 7;
+
+struct CrossCoreFlag {
+    CATLASS_DEVICE
+    CrossCoreFlag() : id(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlag(FlagID id) : id(id)
+    {}
+
+    FlagID id;
+};
+
+template <uint32_t REVERSE_DEPTH_ = MAX_REVERSE_DEPTH>
+struct CrossCoreFlagWithReverse {
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse() : id(0), reverseId(0)
+    {}
+
+    CATLASS_DEVICE
+    CrossCoreFlagWithReverse(FlagID id, FlagID reverseId) : id(id), reverseId(reverseId)
+    {}
+
+    FlagID id;
+    FlagID reverseId;
+    uint32_t count{0};
+};
+
+template <uint8_t MODE, int32_t CORE_TYPE>
+struct BarrierFlag {
+    static_assert(MODE != 255 && MODE == 255, "Unsupported cross core barrier flag, can not find the specialization.");
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x0, AscendC::AIC> {
+    static constexpr FlagID ID = AIC_INTER_BLOCK_BARRIER;
+};
+
+template <>
+struct BarrierFlag<0x1, AscendC::AIV> {
+    static constexpr FlagID ID = AIV_INTER_SUBBLOCK_BARRIER;
+};
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreBarrier()
+{
+    constexpr FlagID flagId = BarrierFlag<MODE, g_coreType>::ID;
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flagId);
+    AscendC::CrossCoreWaitFlag(flagId);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreSetFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+}
+
+CATLASS_DEVICE
+void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE>
+CATLASS_DEVICE void CrossCoreWaitFlag(CrossCoreFlag& flag)
+{
+    AscendC::CrossCoreWaitFlag<MODE, PIPE>(flag.id);
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreSetFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreWaitFlag(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+template <uint8_t MODE, pipe_t PIPE, uint32_t REVERSE_DEPTH>
+CATLASS_DEVICE void CrossCoreWaitFlagWithReverse(CrossCoreFlagWithReverse<REVERSE_DEPTH>& flag)
+{
+    AscendC::CrossCoreWaitFlag(flag.id);
+    if (++flag.count >= REVERSE_DEPTH) {
+        AscendC::CrossCoreSetFlag<MODE, PIPE>(flag.reverseId);
+        flag.count = 0;
+    }
+}
+
+} // namespace Catlass::Arch
+
+#endif // CATLASS_ARCH_CROSS_CORE_SYNC_HPP
+```
+
+## ITEM 22
+
+### item 21
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/matmul/common/cmct/kernel/kernel_matmul_streamk.h
+hicann/ops-nn, last commit 2026-09-18 by szhexin
+Vendor Stream-K form of the grid barrier: AIC publishes its last partial drain with CrossCoreSetFlag<4, PIPE_FIX>(8) and (8+16) for the two AIV slots; every AIV does CrossCoreWaitFlag<4, PIPE_MTE3>(8) and only then SyncAll(). Cores with no work take the SAME path (set/wait + SyncAll) before returning, so nobody is missing from the barrier.
+```cpp
+
+    constexpr static uint16_t NUM_TWO = 2;
+    constexpr static uint16_t AIC_SYNC_AIV_MODE_4 = 4;
+    constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
+    constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
+    constexpr static uint16_t FLAG_ID_MAX = 16;
+    constexpr static uint16_t BLOCK_BASE_M = 256;
+
+/* ... */
+
+        if ASCEND_IS_AIC {
+            // Instantiate mmadOp
+            BlockMmadOp blockMmadOp;
+            int64_t curBlockIdx = AscendC::GetBlockIdx();
+
+            TupleShape tileL0 = bs.GetTileL0Shape();
+            int64_t isHf32 = bs.GetHf32Flag();
+
+            if (curBlockIdx >= bs.GetBlockNum(usedCoreNum_)) {
+                CrossCoreSetFlag<AIC_SYNC_AIV_MODE_4, PIPE_FIX>(AIC_SYNC_AIV_FLAG);
+                CrossCoreSetFlag<AIC_SYNC_AIV_MODE_4, PIPE_FIX>(AIC_SYNC_AIV_FLAG + FLAG_ID_MAX);
+                return;
+            }
+            if (isHf32) {
+
+/* ... */
+
+                        bs.splitSingleKIdx_ == (bs.splitSingleKRound_ - 1));
+                }
+                if (tmpTileIdx + usedCoreNum_ >= tileNum) {
+                    CrossCoreSetFlag<AIC_SYNC_AIV_MODE_4, PIPE_FIX>(AIC_SYNC_AIV_FLAG);
+                    CrossCoreSetFlag<AIC_SYNC_AIV_MODE_4, PIPE_FIX>(AIC_SYNC_AIV_FLAG + FLAG_ID_MAX);
+                }
+            }
+            SetMMLayoutTransform(false);
+            if (isHf32) {
+                AscendC::SetHF32Mode(0);
+                AscendC::SetHF32TransMode(0);
+            }
+        }
+
+        if ASCEND_IS_AIV {
+            uint64_t lastLoopTotalCnt = (mTileNum * nTileNum * batchNum % usedCoreNum_) * skKTileNum;
+            uint64_t curBlockIdxInAiv = AscendC::GetBlockIdx();
+            if (curBlockIdxInAiv >= lastLoopTotalCnt * AscendC::GetTaskRation()) {
+                CrossCoreWaitFlag<AIC_SYNC_AIV_MODE_4, PIPE_MTE3>(AIC_SYNC_AIV_FLAG);
+                SyncAll();
+                return;
+            }
+
+            CrossCoreWaitFlag<AIC_SYNC_AIV_MODE_4, PIPE_MTE3>(AIC_SYNC_AIV_FLAG);
+            SyncAll();
+            BlockEpilogue epilogueOp;
+```
+
+## ITEM 23
+
+### item 22
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/rnn/lstm_block_cell/op_kernel/arch35/sync_helper.h
+hicann/ops-nn, last commit 2026-09-29 by wang-zhiyue2
+In-tree engineering notes on the grid barrier contract: batch scheduling is required or the wait can be posted with nobody to answer (measured 3 hangs / 49 runs without it, 0 / 240 with); mode-4 flags are COUNTERS not one-shot barriers; and WHY an AIV must wait its own AIC on PIPE_MTE3 before SyncAll() — SyncAll's ARRIVE rides the MTE3 queue, so enqueuing the wait on the same queue orders the arrive behind the AIC drain.
+```cpp
+/* sync_helper.h -- ALL synchronization for the raw Ascend 950PR (dav_3510) kernels, in one place.
+ *
+ * WHY THIS IS ITS OWN HEADER, against the "split by who issues it" rule the other headers follow:
+ *
+ *   A HANDSHAKE IS A PROTOCOL, AND A PROTOCOL HAS TWO ENDS. The thing that goes wrong is not one
+ *   side or the other -- it is the PAIRING. A dedicated cross-core measurement pins the pairing rule, because the three
+ * plausible pairings do not all work (1 set : 1 consume deadlocks, 2 : 2 deadlocks, 2 : 1 runs). Putting the two ends
+ * in two different files would separate exactly the thing that must be read together.
+ *
+ * So cube_helper.h and vec_helper.h are pure dataflow, and every ordering question lives here.
+ *
+ * TWO KINDS OF ORDERING, DO NOT CONFUSE THEM
+ *   intra-core   between PIPES of one core (MTE2 / MTE1 / M / FIX / V / MTE3). Set+Wait on a
+ *                typed HardEvent. Cheap, and purely local.
+ *   cross-core   between the AIC and its two AIVs. CrossCoreSetFlag / CrossCoreWaitFlag.
+ *                Semantics differ BY DIRECTION -- see below, this is the part that bites.
+ */
+#ifndef SYNC_HELPER_H
+#define SYNC_HELPER_H
+
+#include "kernel_operator.h"
+
+namespace sh {
+
+/* ---------------------------------------------------------------------------------------------
+ * BATCH SCHEDULING (`__schedmode__` / `SetScheduleMode`) -- WHAT IT IS, AND WHY IT MATTERS
+ *
+ * A cross-core wait only holds if the AIC and its two AIVs are dispatched as a BATCH:
+ * without batch scheduling the wait can be posted with nobody to answer it. A reference
+ * recurrent-operator probe measured 3 hangs in 49 runs (~6%) without it, 0 in 240 with --
+ * concentrated on SMALL shapes, where both AIVs reach the barrier at nearly the same moment.
+ *
+ * TWO SEPARATE LEVERS, AND ONLY ONE OF THEM EXISTS ON EACH PATH:
+ *   op framework   `gert::TilingContext::SetScheduleMode(uint32_t)` -- an OUTPUT SLOT of
+ *                  tiling, so it only exists when tiling runs. This kernel's TilingFunc
+ *                  sets it (batch scheduling: AIC + 2 AIV dispatched together).
+ *   raw <<<>>>     `__schedmode__(N)` -- there is no TilingContext on a raw launch, so
+ *                  this attribute is the only lever there.
+ * ------------------------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------------------------
+ * Intra-core: order one pipe against another, within a single core.
+ *
+ * Each is a Set immediately followed by a Wait on the same event id -- a full stop rather than
+ * true overlap. That is deliberate: correctness first, and the pipe pair stays legible at the
+ * call site. Software-pipelining these (Set early, Wait late, multiple event ids) is a later
+ * optimisation, not a cleanup.
+ * ------------------------------------------------------------------------------------------- */
+template <AscendC::HardEvent E>
+__aicore__ inline void PipeWait(event_t id = EVENT_ID0)
+{
+    AscendC::SetFlag<E>(id);
+    AscendC::WaitFlag<E>(id);
+}
+
+__aicore__ inline void WaitMte2ToMte1() { PipeWait<AscendC::HardEvent::MTE2_MTE1>(); } // GM->L1 before L1->L0
+__aicore__ inline void WaitMte1ToM() { PipeWait<AscendC::HardEvent::MTE1_M>(); }       // L1->L0/BT before Mmad
+__aicore__ inline void WaitMToFix() { PipeWait<AscendC::HardEvent::M_FIX>(); }         // Mmad before the drain
+__aicore__ inline void WaitFixToM() { PipeWait<AscendC::HardEvent::FIX_M>(); }         // drain read before reusing L0C
+
+/* ---------------------------------------------------------------------------------------------
+ * Cross-core. Both ends of each protocol are adjacent ON PURPOSE.
+ *
+ * ⚠⚠ MODE 4 (intra-block) IS USED, NOT MODE 0x2. Mode 0x2 leaks across MIX blocks within
+ * a group at blockDim > 1, and the "barrier, not counting semaphore" pairing (both AIVs
+ * set, cube waits x1) breaks: a flag set by one block's AIV is consumed by another
+ * block's AIC, deadlocking the producer. Mode 4 (`set_intra_block` /
+ * `wait_intra_block`) is strictly intra-MIX-block (1 AIC + 2 AIV) and is what every
+ * vendor MIX-1:2 op uses (quant_batch_matmul_v3, mat_mul_v3 arch35).
+ *
+ * Mode-4 pairing rules (measured by vendor + confirmed by dav_c310 impl):
+ *   set_intra_block from AIC  → flag visible to BOTH AIVs (subBlock-scoped: AIV0 sees
+ *                               flagId, AIV1 sees flagId + INTRA_NUM=16).
+ *   set_intra_block from AIV  → flag visible to AIC only (subBlock-scoped: AIC distinguishes
+ *                               AIV0 by flagId and AIV1 by flagId + INTRA_NUM).
+ *   wait_intra_block from AIC → must wait for BOTH AIVs: flagId AND flagId + INTRA_NUM.
+ *   wait_intra_block from AIV→ waits for its own flagId (hardware routes by subBlockId).
+ *
+ * So the AIC sets/waits TWO flags (one per AIV slot), each AIV sets/waits ONE.
+ *
+ * ⚠ MODE-4 FLAGS ARE COUNTERS, NOT ONE-SHOT BARRIERS. A set landing while an earlier
+ * set on the same id is still unwaited ACCUMULATES -- it is neither lost nor
+ * latched-as-edge (proven on real 3510 by count==0 fast paths pre-firing several
+ * consumed slots ahead of their waits). The counter reading does NOT relax the
+ * cross-launch pairing discipline: a set left unwaited at launch end stays armed
+ * into the NEXT launch and makes its wait return early -- every protocol below
+ * keeps one set + one wait per flag slot per launch.
+ * ------------------------------------------------------------------------------------------- */
+constexpr uint16_t INTRA_NUM = 16; // dav_c310 subBlock flag offset (AIV0: 0..15, AIV1: 16..31)
+
+/* ---------------------------------------------------------------------------------------------
+ * Bias prepass (AIV -> cube): the fp32 padded bias workspace is filled (AIV pre-pass).
+ *
+ * ⚠ ONE id per AIV: the hardware routes AIV1's set to id+16 by subBlockId; an
+ * AIV setting its partner's slot directly corrupts the pairing the AIC's
+ * double wait relies on.
+ * ------------------------------------------------------------------------------------------- */
+constexpr uint16_t V2C_PREPASS = 7;
+
+__aicore__ inline void VecSignalPrepass() { AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(V2C_PREPASS); }
+__aicore__ inline void CubeWaitPrepass()
+{
+    /* ⚠ PIPE_MTE2, NOT PIPE_M. This wait guards the
+     * bias workspace reads, which are MTE2 copies (GM->L1 CopyInFlat /
+     * CopyInNd2Nz inside CubeProjectKS). On PIPE_M it stalled the M pipe and
+     * left the MTE2 reads ungated -- the AIC could read the fp32 bias
+     * workspace before the AIV pre-pass wrote it. Vendor pattern: wait on the
+     * consuming pipe (same rule as every other cross-core wait here). */
+    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(V2C_PREPASS);
+    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(V2C_PREPASS + INTRA_NUM);
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * K-SPLIT PHASE HANDOFF -- the K-split two-phase structure:
+ * the AICs write their partials straight to GM (L0C->GM fixpipe), then every
+ * AIV waits for its OWN AIC and only then joins the grid-wide
+ * AscendC::SyncAll(). The ledger is one set + one wait per flag slot per
+ * launch -- no ring, no reuse.
+ *
+ * ⚠ WHY THE AIV WAITS ON PIPE_MTE3: SyncAll() on 3510 is an AIV-only ffts
+ * barrier whose ARRIVE instruction rides the MTE3 queue (dav_3510
+ * kernel_operator_sync_impl.h: ffts_cross_core_sync(PIPE_MTE3, ...)). Enqueuing
+ * this wait on the SAME queue makes the arrive queue-ordered behind the
+ * own-AIC flag, so the barrier cannot pass while any AIC is still draining
+ * (ops-nn kernel_matmul_streamk.h: CrossCoreWaitFlag<MODE_4, PIPE_MTE3> then
+ * SyncAll -- the exact vendor form). After SyncAll() returns, EVERY cluster's
+ * partials are GM-visible to every AIV.
+ * ------------------------------------------------------------------------------------------- */
+constexpr uint16_t KS_DONE = 8; // distinct from V2C_PREPASS; 16 logical ids total
+
+/* AIC: my LAST partial drain is on the FIX queue -- this set rides PIPE_FIX,
+ * so it is delivered only after every GM write of the phase is complete. */
+__aicore__ inline void CubeSignalKsDone()
+{
+    AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(KS_DONE);
+    AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(KS_DONE + INTRA_NUM);
+}
+/* AIV: my AIC's partials are in GM. Call BEFORE AscendC::SyncAll(). */
+__aicore__ inline void VecWaitKsDone() { AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE3>(KS_DONE); }
+
+} // namespace sh
+```
+
+## ITEM 24
+
+### item 23
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/index/inplace_add/op_kernel/arch35/inplace_add.cpp
+hicann/ops-nn, last commit 2026-08-31 by raoliang_sac
+A two-phase kernel whose phase boundary IS a SyncAll(). Three constraints stated in-source: (a) the published phase-1 traffic must be MTE DataCopy because SyncAll signals on PIPE_MTE3 and vf stores stayed outside the barrier's reach (~0.3-0.5% of destinations read stale values, and neither PipeBarrier<PIPE_ALL> nor DataCacheCleanAndInvalid nor DataSyncBarrier<ALL> closed the window); (b) host tiling must declare batch mode SetScheduleMode(1) or SyncAll returns immediately; (c) every core must take the same branch — cores that skip the work must skip the SyncAll too.
+```cpp
+// Phase one: y = x, over MTE, as one contiguous slice per core.
+//
+// The decomposition is flat rather than by rows on purpose. Splitting by rows
+// ties thread occupancy to the row width and core occupancy to the row count,
+// and both bind in practice: a rank-1 tensor has rowSize == 1, which left 1023
+// of the 1024 threads idle, and an n = 16 tensor left 40 of the 56 cores idle
+// whatever its row width. A flat range has neither property.
+//
+// The transport is DataCopy and not a SIMT vector store, and that is the part
+// that took the longest to find. SyncAll raises its cross-core signal on
+// PIPE_MTE3, so it publishes MTE traffic and only MTE traffic. Writing this
+// phase with vf stores left them outside the barrier's reach, and no
+// combination of PipeBarrier<PIPE_ALL>, DataCacheCleanAndInvalid and
+// DataSyncBarrier<ALL> closed the window: peers kept reading rows this core had
+// already written, at a steady ~0.3-0.5% of scattered destinations, every one
+// of them holding the pristine x value. inplace_index_add_simt.h stages the
+// same handoff through DataCopy for the same reason.
+template <typename T>
+__aicore__ inline void InplaceAddCopy(int64_t total, int64_t coreIdx, int64_t coreNum, __gm__ T* xGm, __gm__ T* yGm,
+
+/* ... */
+
+    }
+}
+
+// Phase two: y[indices[kIdx]] += v[kIdx], as one flat grid-stride pass over the
+// k * rowSize elements of v.
+//
+// This is the split that needs the cross-core barrier: a core writes rows it
+// does not own, so every core must have finished phase one first. Before that
+// barrier worked, each core had to scan the whole index array and keep only the
+// hits landing in its own rows, which made the kernel's cost a function of K
+// alone -- a flat ~1.3ns per index that no amount of intra-block parallelism
+// removed, because the scan itself was the work.
+//
+// No atomics: the operator's contract normalizes indices into [0, n) and
+// requires them to be unique there, so two elements of v never target the same
+// element of y. Duplicate indices are explicitly undefined by the operator
+// contract and are only required to stay memory-safe, which plain stores
+// are. Sibling operators that do allow duplicates pay for asc_atomic_add, which
+// on GM covers only int32/uint32/int64/uint64/float and forces int8/int16 through
+// a widened workspace; staying non-atomic keeps all 13 dtypes on one path.
+template <typename T, typename COMP_T, bool ROW_SIZE_ONE>
+
+/* ... */
+
+    __gm__ T* xGm = reinterpret_cast<__gm__ T*>(x);
+    __gm__ int32_t* indicesGm = reinterpret_cast<__gm__ int32_t*>(indices);
+    __gm__ T* vGm = reinterpret_cast<__gm__ T*>(v);
+    __gm__ T* yGm = reinterpret_cast<__gm__ T*>(y);
+
+    const int64_t coreIdx = static_cast<int64_t>(GetBlockIdx());
+    const int64_t coreNum = static_cast<int64_t>(tilingData->needCoreNum);
+    const int64_t rowSize = tilingData->innerSize * ELEMENTS_PER_VALUE;
+    const int64_t n = static_cast<int64_t>(tilingData->n);
+    const int64_t k = static_cast<int64_t>(tilingData->k);
+    const int64_t copyTotal = n * rowSize;
+    const int64_t accTotal = k * rowSize;
+    const int64_t widest = copyTotal > accTotal ? copyTotal : accTotal;
+
+    TPipe pipe;
+    InplaceAddCopy<T>(copyTotal, coreIdx, coreNum, xGm, yGm, pipe);
+
+    // The cross-core barrier. Two things have to be true for it to hold:
+    // the copy above must be MTE traffic (SyncAll signals on PIPE_MTE3), and the
+    // host tiling must declare batch mode (SetScheduleMode(1)) so the cores are
+    // co-resident -- without it SyncAll returns immediately and every core's
+    // index chunk loses its head element to the peer that copied it.
+    // Every core reaches this, including the ones with no accumulate work.
+    SyncAll();
+
+    if (accTotal <= 0) {
+        return;
+    }
+    const int64_t uint32Max = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+    const int64_t accumulateStride = coreNum * static_cast<int64_t>(THREAD_NUM);
+    const int64_t uint32SafeAccTotal = uint32Max - accumulateStride + 1;
+    if (widest <= uint32Max && accTotal <= uint32SafeAccTotal) {
+        LaunchAccumulate<T, uint32_t>(accTotal, rowSize, tilingData->n, coreIdx, coreNum, indicesGm, vGm, yGm);
+    } else {
+        LaunchAccumulate<T, uint64_t>(accTotal, rowSize, tilingData->n, coreIdx, coreNum, indicesGm, vGm, yGm);
+    }
+}
+
+} // namespace
+
+extern "C" __global__ __aicore__ void inplace_add(GM_ADDR x, GM_ADDR indices, GM_ADDR v, GM_ADDR y, GM_ADDR workspace,
+                                                  GM_ADDR tiling)
+{
+    REGISTER_TILING_DEFAULT(InplaceAddTilingData);
+    GET_TILING_DATA_WITH_STRUCT(InplaceAddTilingData, tilingData, tiling);
+    // Every core must take the same branch here: the cores that skip the work
+    // must also skip the SyncAll inside Process, or the ones that reach it wait
+    // for peers that never arrive.
+    if (tilingData.needCoreNum == 0 || tilingData.n <= 0 || tilingData.innerSize <= 0) {
+        return;
+    }
+#if ORIG_DTYPE_X == DT_COMPLEX32
+    Process<half, INPLACE_ADD_COMPLEX_COMPONENT_COUNT>(x, indices, v, y, &tilingData);
+#elif ORIG_DTYPE_X == DT_COMPLEX64
+    Process<float, INPLACE_ADD_COMPLEX_COMPONENT_COUNT>(x, indices, v, y, &tilingData);
+#else
+    Process<DTYPE_X>(x, indices, v, y, &tilingData);
+#endif
+}
+```
+
+## ITEM 25
+
+### item 24
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/dynamic_quant/op_kernel/dynamic_quant_base.h
+hicann/ops-nn, last commit 2026-07-06 by yang-di52
+DynamicQuant's barrier-free decomposition and its row-max primitive. InitParams: each core owns rowPerHeadCore (head cores) or rowPerTailCore (tail cores) WHOLE rows, so the per-token max never crosses a core. ReduceMaxInplace is the intra-core row reduction: strided Max() repeats to fold the row into one 64-element (fp32) / 128-element (fp16) group, then a single WholeReduceMax. GetScale/GetScaleAndOffset turn that max into the scale.
+```cpp
+
+    __aicore__ inline void InitCommonParams()
+    {
+        lenHead = rowPerHeadCore * tilingData_.rowLen;
+        lenTail = rowPerTailCore * tilingData_.rowLen;
+        if (ORIG_DTYPE_Y == DT_INT4) {
+            outLenHead = lenHead >> 1;
+            outLenTail = lenTail >> 1;
+        } else {
+            outLenHead = lenHead;
+            outLenTail = lenTail;
+        }
+    }
+
+    __aicore__ inline void InitParams(GM_ADDR offset)
+    {
+        blockIdx = GetBlockIdx();
+        if (offset != nullptr) {
+            isAsymmetrical = true;
+        }
+        rowPerHeadCore = tilingData_.rowPerHeadCore;
+        rowPerTailCore = tilingData_.rowPerTailCore;
+
+        if (blockIdx < tilingData_.headCoreNum) {
+            multiRowNum = tilingData_.multiRowNumHeadCore;
+            loopCnt = rowPerHeadCore / multiRowNum;
+            remainRow = rowPerHeadCore % multiRowNum;
+        } else if (blockIdx >= tilingData_.headCoreNum && blockIdx < tilingData_.coreNum) {
+            multiRowNum = tilingData_.multiRowNumTailCore;
+            loopCnt = rowPerTailCore / multiRowNum;
+            remainRow = rowPerTailCore % multiRowNum;
+        }
+        sizeHalfLen = (tilingData_.rowLen + FIFTEEN) / SIXTEEN * SIXTEEN;
+        rightPadding = sizeHalfLen - tilingData_.rowLen;
+        if (rightPadding > 0) {
+            isPad = true;
+        }
+        if (ORIG_DTYPE_Y == DT_INT4) {
+            outAlignLen = (tilingData_.rowLen + SIXTY_THREE) / SIXTY_FOUR * SIXTY_FOUR;
+        } else {
+            outAlignLen = (tilingData_.rowLen + THIRTY_ONE) / THIRTY_TWO * THIRTY_TWO;
+        }
+        sizeFloatLen = (multiRowNum + SEVEN) / EIGHT * EIGHT;
+        lenMultiRow = multiRowNum * sizeHalfLen;
+        lenGMMultiRow = multiRowNum * tilingData_.rowLen;
+        outLen = multiRowNum * outAlignLen;
+        InitCommonParams();
+    }
+
+
+/* ... */
+
+
+    __aicore__ inline void GetScale(float max_value, float& scale)
+    {
+        if (ORIG_DTYPE_Y == DT_INT4) {
+            scale = DYNAMIC_QUANT_INT4_SYM_SCALE / max_value;
+        } else {
+            scale = DYNAMIC_QUANT_INT8_SYM_SCALE / max_value;
+        }
+    }
+
+    __aicore__ inline void GetScaleAndOffset(float max_value, float min_value, float& scale, float& offset)
+    {
+        if (ORIG_DTYPE_Y == DT_INT4) {
+            scale = GetMax((max_value - min_value) / DYNAMIC_QUANT_INT4_SCALE, DYNAMIC_QUANT_EPSINON);
+            offset = DYNAMIC_QUANT_INT4_OFFSET - max_value / scale;
+        } else {
+            scale = GetMax((max_value - min_value) / DYNAMIC_QUANT_INT8_SCALE, DYNAMIC_QUANT_EPSINON);
+            offset = DYNAMIC_QUANT_INT8_OFFSET - max_value / scale;
+        }
+    }
+
+    __aicore__ inline void ReduceMaxInplace(const LocalTensor<float>& src_local, uint32_t count)
+    {
+        uint64_t repsFp32 = count >> 6;       // 6 is cound / ELEM_PER_REP_FP32
+        uint64_t offsetsFp32 = repsFp32 << 6; // 6 is repsFp32 * ELEM_PER_REP_FP32
+        uint64_t remsFp32 = count & 0x3f;     // 0x3f 63, count % ELEM_PER_REP_FP32
+
+        if (likely(repsFp32 > 1)) {
+            // 8 is rep stride
+            if (repsFp32 - 1 > MAX_REPEAT) {
+                Max(src_local, src_local[ELEM_PER_REP_FP32], src_local, ELEM_PER_REP_FP32, MAX_REPEAT,
+                    {1, 1, 1, 0, 8, 0});
+                PipeBarrier<PIPE_V>();
+                Max(src_local, src_local[ELEM_PER_REP_FP32 * MAX_REPEAT], src_local, ELEM_PER_REP_FP32,
+                    repsFp32 - MAX_REPEAT - 1, {1, 1, 1, 0, 8, 0});
+            } else {
+                Max(src_local, src_local[ELEM_PER_REP_FP32], src_local, ELEM_PER_REP_FP32, repsFp32 - 1,
+                    {1, 1, 1, 0, 8, 0});
+            }
+            PipeBarrier<PIPE_V>();
+        }
+        if (unlikely(remsFp32 > 0) && unlikely(offsetsFp32 > 0)) {
+            Max(src_local, src_local[offsetsFp32], src_local, remsFp32, 1, {1, 1, 1, 0, 8, 0});
+            PipeBarrier<PIPE_V>();
+        }
+        uint32_t mask = repsFp32 > 0 ? ELEM_PER_REP_FP32 : count;
+        // 8 is rep stride
+        WholeReduceMax(src_local, src_local, mask, 1, 8, 1, 8);
+    }
+
+    __aicore__ inline void ReduceMaxInplace(const LocalTensor<half>& src_local, uint32_t count)
+    {
+        uint64_t repsHalf = count >> 7;       // 7 is count / ELEM_PER_REP_HALF
+        uint64_t offsetsHalf = repsHalf << 7; // 6 is repsHalf * ELEM_PER_REP_HALF
+        uint64_t remsHalf = count & 0x7f;     // 0x7f 127, count % ELEM_PER_REP_HALF
+
+        if (likely(repsHalf > 1)) {
+            // 8 is rep stride
+            Max(src_local, src_local[ELEM_PER_REP_HALF], src_local, ELEM_PER_REP_HALF, repsHalf - 1,
+                {1, 1, 1, 0, 8, 0});
+            PipeBarrier<PIPE_V>();
+        }
+```
+
+## ITEM 26
+
+### item 25
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/dynamic_quant/op_kernel/dynamic_quant.h
+hicann/ops-nn, last commit 2026-07-06 by yang-di52
+The DynamicQuant compute loop proper: per row -> Cast to fp32 -> optional smooth Mul -> Abs -> ReduceMaxInplace -> Div -> a V_S event pair -> temp.GetValue(0) scalar read -> Muls by the reciprocal -> Cast to int8. No SyncAll anywhere; the asymmetric variant uses ReduceMax/ReduceMin instead.
+```cpp
+    __aicore__ inline void Compute(const LocalTensor<float>& smoothLocal, int32_t multiRow)
+    {
+        uint32_t index = 0;
+        LocalTensor<float> scaleLocal = scaleQueue.AllocTensor<float>();
+        LocalTensor<xDtype> inLocal = inQueue.DeQue<xDtype>();
+        LocalTensor<float> tempFp32 = tempCastUb.Get<float>();
+        LocalTensor<yDtype> outLocal = outQueue.AllocTensor<yDtype>();
+        AscendC::LocalTensor<float> temp = fp32_buf_.Get<float>();
+        LocalTensor<int32_t> tempInt32 = fp32_buf_.Get<int32_t>();
+        auto tempHalf = temp.ReinterpretCast<half>();
+
+        for (int32_t i = 0; i < multiRow; i++) {
+            index = i * sizeHalfLen;
+            // x fp16->fp32
+            Cast(tempFp32, inLocal[index], RoundMode::CAST_NONE, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            if (tilingData_.hasSmooth) {
+                Mul(tempFp32, tempFp32, smoothLocal, tilingData_.rowLen);
+                PipeBarrier<PIPE_V>();
+            }
+            Abs(temp, tempFp32, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            ReduceMaxInplace(temp, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            Div(temp, constScale, temp, 1);
+            event_t event_v_s = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+            SetFlag<HardEvent::V_S>(event_v_s);
+            WaitFlag<HardEvent::V_S>(event_v_s);
+            float scale = temp.GetValue(0);
+            scaleLocal.SetValue(i, 1 / scale);
+            Muls(tempFp32, tempFp32, scale, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            Cast(tempInt32, tempFp32, RoundMode::CAST_RINT, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            SetDeqScale(static_cast<half>(1.0));
+            PipeBarrier<PIPE_V>();
+            Cast(tempHalf, tempInt32, RoundMode::CAST_ROUND, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            Cast(outLocal[i * outAlignLen], tempHalf, RoundMode::CAST_TRUNC, tilingData_.rowLen);
+        }
+        outQueue.EnQue<yDtype>(outLocal);
+        scaleQueue.EnQue<float>(scaleLocal);
+        inQueue.FreeTensor(inLocal);
+    }
+
+    __aicore__ inline void ComputAsymmetric(const LocalTensor<float>& smoothLocal, int32_t multiRow)
+    {
+        uint32_t index = 0;
+        float max_value, min_value;
+        float scale, offset;
+        float back_scale;
+        LocalTensor<float> scaleLocal = scaleQueue.AllocTensor<float>();
+        LocalTensor<float> offsetLocal = offsetQueue.AllocTensor<float>();
+        LocalTensor<xDtype> inLocal = inQueue.DeQue<xDtype>();
+        LocalTensor<float> tempFp32 = tempCastUb.Get<float>();
+        LocalTensor<yDtype> outLocal = outQueue.AllocTensor<yDtype>();
+        AscendC::LocalTensor<float> temp = fp32_buf_.Get<float>();
+        LocalTensor<int32_t> tempInt32 = fp32_buf_.Get<int32_t>();
+        auto tempHalf = temp.ReinterpretCast<half>();
+        for (int32_t i = 0; i < multiRow; i++) {
+            index = i * sizeHalfLen;
+            // x fp16->fp32
+            Cast(tempFp32, inLocal[index], RoundMode::CAST_NONE, tilingData_.rowLen);
+            PipeBarrier<PIPE_V>();
+            if (tilingData_.hasSmooth) {
+                Mul(tempFp32, tempFp32, smoothLocal, tilingData_.rowLen);
+                PipeBarrier<PIPE_V>();
+            }
+            ReduceMax(temp, tempFp32, temp, tilingData_.rowLen, false);
+            PipeBarrier<PIPE_V>();
+            max_value = temp.GetValue(0);
+            ReduceMin(temp, tempFp32, temp, tilingData_.rowLen, false);
+            PipeBarrier<PIPE_V>();
+```
+
+## ITEM 27
+
+### item 26
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/dynamic_quant/op_kernel/dynamic_quant_single_row.h
+hicann/ops-nn, last commit 2026-07-06 by yang-di52
+The batched-rows variant: blkRows is derived from blockIdx_ (head vs tail core) so the ownership is again whole rows; ComputeReduceMax folds each row in place, then ONE WholeReduceMax(..., MASK_NUM_T32, ubRows, 1, 1, rowLen/MASK_NUM_T32*MASK_BLK_STRIDE, ReduceOrder::ORDER_ONLY_VALUE) produces all ubRows maxima at once; Brcb + strided Copy broadcast the reciprocal back across the row so the scaling is a Mul, not a Div.
+```cpp
+        }
+
+        uint32_t blkRows = (blockIdx_ >= tilingD_->headCoreNum) ? tilingD_->rowPerTailCore : tilingD_->rowPerHeadCore;
+        uint32_t loopCnt = (blkRows + tilingD_->multiRowNumHeadCore - 1) / tilingD_->multiRowNumHeadCore;
+        uint32_t tailUbRows = blkRows - (loopCnt - 1) * tilingD_->multiRowNumHeadCore;
+
+        DataCopyExtParams copyInParams{1, 1, 0, 0, 0};
+        DataCopyPadExtParams<xDtype> padParams{false, 0, 0, 0};
+        for (uint32_t idx = 0; idx < loopCnt; idx++) {
+            uint32_t ubRows = (idx == loopCnt - 1) ? tailUbRows : tilingD_->multiRowNumHeadCore;
+            uint32_t ubNums = ubRows * tilingD_->rowLen;
+
+            LocalTensor<xDtype> inLocal = inQueue_.AllocTensor<xDtype>();
+            copyInParams.blockLen = ubNums * sizeof(xDtype);
+            DataCopyPad(inLocal[maxHandleNum_], inGm[idx * maxHandleNum_], copyInParams, padParams);
+
+            inQueue_.EnQue(inLocal);
+            inLocal = inQueue_.DeQue<xDtype>();
+            LocalTensor<float> inLocalFp32 = inLocal.template ReinterpretCast<float>();
+
+            Cast(inLocalFp32, inLocal[maxHandleNum_], RoundMode::CAST_NONE, ubNums);
+            PipeBarrier<PIPE_V>();
+            if (tilingD_->hasSmooth) {
+                // [1, rowLen] -> [ubRows, rowLen]
+                SetMaskCount();
+                SetVectorMask<float, MaskMode::COUNTER>(tilingD_->rowLen);
+                Copy<float, false>(inputCast, smoothLocalFp32, AscendC::MASK_PLACEHOLDER, ubRows,
+                                   {1, 1, static_cast<uint16_t>(tilingD_->rowLen / BLOCK_ELEM_F32), 0});
+                SetMaskNorm();
+                ResetMask();
+                PipeBarrier<PIPE_V>();
+                Mul(inLocalFp32, inLocalFp32, inputCast, ubNums);
+                PipeBarrier<PIPE_V>();
+            }
+            Abs(inputCast, inLocalFp32, ubNums);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t i = 0; i < ubRows; ++i) {
+                ComputeReduceMax(inputCast[i * tilingD_->rowLen], tilingD_->rowLen);
+            }
+            PipeBarrier<PIPE_V>();
+            WholeReduceMax(inputCast, inputCast, MASK_NUM_T32, ubRows, 1, 1,
+                           tilingD_->rowLen / MASK_NUM_T32 * MASK_BLK_STRIDE, ReduceOrder::ORDER_ONLY_VALUE);
+            PipeBarrier<PIPE_V>();
+
+            LocalTensor<yDtype> outLocal = outQueue_.AllocTensor<yDtype>();
+            LocalTensor<float> outScaleLocal = outLocal[maxHandleNum_].template ReinterpretCast<float>();
+
+            // max/127 = max*(1.0/127)
+            Muls(outScaleLocal, inputCast, DYNAMIC_QUANT_FACTOR, ubRows);
+            PipeBarrier<PIPE_V>();
+
+            // 127/max
+            Duplicate<float>(temp1, DYNAMIC_QUANT_MAX, ubRows);
+            PipeBarrier<PIPE_V>();
+            Div(temp1, temp1, inputCast, ubRows);
+            PipeBarrier<PIPE_V>();
+
+            // [ubRows] -> [ubRows, Block]
+            int64_t blockCount = (ubRows + BLOCK_ELEM_F32 - 1) / BLOCK_ELEM_F32;
+            Brcb(temp, temp1, blockCount, {1, MASK_BLK_STRIDE});
+            PipeBarrier<PIPE_V>();
+            // [ubRows, Block] -> [ubRows, tilingD_->rowLen]
+            SetMaskCount();
+            SetVectorMask<float, MaskMode::COUNTER>(tilingD_->rowLen);
+            Copy<float, false>(inputCast, temp, AscendC::MASK_PLACEHOLDER, ubRows,
+                               {1, 0, static_cast<uint16_t>(tilingD_->rowLen / BLOCK_ELEM_F32), 1});
+            SetMaskNorm();
+            ResetMask();
+            PipeBarrier<PIPE_V>();
+            // 改成乘法 Div(inputCast, inLocalFp32, inputCast, ubNums);
+            Mul(inputCast, inLocalFp32, inputCast, ubNums);
+            PipeBarrier<PIPE_V>();
+
+            inQueue_.FreeTensor(inLocal);
+
+            Cast(inputInt32, inputCast, RoundMode::CAST_RINT, ubNums);
+            PipeBarrier<PIPE_V>();
+            SetDeqScale(static_cast<half>(1.0));
+            PipeBarrier<PIPE_V>();
+            Cast(inputCast.ReinterpretCast<half>(), inputInt32, RoundMode::CAST_ROUND, ubNums);
+            PipeBarrier<PIPE_V>();
+            Cast(outLocal, inputCast.ReinterpretCast<half>(), RoundMode::CAST_TRUNC, ubNums);
+            PipeBarrier<PIPE_V>();
+
+            outQueue_.EnQue(outLocal);
+            outLocal = outQueue_.DeQue<yDtype>();
+            outScaleLocal = outLocal[maxHandleNum_].template ReinterpretCast<float>();
+
+            DataCopyParams outScaleParams{1, static_cast<uint16_t>(ubRows * sizeof(float)), 0, 0};
+            DataCopyPad(scaleGm[idx * tilingD_->multiRowNumHeadCore], outScaleLocal, outScaleParams);
+
+            DataCopyParams copyOutParams{1, static_cast<uint16_t>(ubNums * sizeof(yDtype)), 0, 0};
+```
+
+## ITEM 28
+
+### item 27
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/dynamic_quant/op_kernel/arch35/dynamic_quant_regbase_pertoken_large_multicore.h
+hicann/ops-nn, last commit 2026-08-18 by cann-robot
+The ONE DynamicQuant template that cannot avoid the grid barrier, and exactly how it pays for it. coreNumPerToken cores share one token: tokenIdx = blockIdx/coreNumPerToken, coreLocalIdx = blockIdx%coreNumPerToken. ProcessScale() = ProcessScaleRow() (partial max over this core's element slice, CopyUB2Workspace writes ONE float to workspaceTmp1[tokenIdx*coreNumPerToken + coreLocalIdx]) -> SyncAll() -> ProcessScaleCol() (every core re-reads the coreNumPerToken partials for its own token and max-reduces them). Then ProcessY() re-reads x a second time to apply the scale, and only coreLocalIdx==0 writes scaleGm[tokenIdx]. Note Duplicate(..., MIN_FLOAT_VALUE / MAX_FLOAT_VALUE, 64, ...) as the identity for the max/min partials.
+```cpp
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::Init(
+    GM_ADDR x, GM_ADDR smooth_scales, GM_ADDR y, GM_ADDR scale, GM_ADDR offset, GM_ADDR workSpace,
+    const DynamicQuantTilingDataArch35& tilingData)
+{
+    DynamicQuantNDOpt::SetFloatOverflowModeForRegbase<yDtype>();
+    blockIdx = GetBlockIdx();
+
+    ParseTilingData(tilingData);
+    coreNumPerToken = tilingData_.headCoreNum;
+
+    totalTokenNum = tilingData_.coreNum / coreNumPerToken;
+    tokenIdx = blockIdx / coreNumPerToken;
+    coreLocalIdx = blockIdx % coreNumPerToken;
+    headSlices = tilingData_.multiRowNumHeadCore;
+
+    elePerHeadCore = tilingData_.rowPerHeadCore;
+    elePerTailCore = tilingData_.rowPerTailCore;
+    eleCount = (coreLocalIdx < headSlices) ? elePerHeadCore : elePerTailCore;
+
+    if (coreLocalIdx < headSlices) {
+        coreStartOffset = static_cast<int64_t>(coreLocalIdx) * static_cast<int64_t>(elePerHeadCore);
+    } else {
+        coreStartOffset = static_cast<int64_t>(headSlices) * static_cast<int64_t>(elePerHeadCore) +
+                          static_cast<int64_t>(coreLocalIdx - headSlices) * static_cast<int64_t>(elePerTailCore);
+    }
+
+    innerLoopCnt = (eleCount + tilingData_.innerLoopEle - 1) / tilingData_.innerLoopEle;
+    innerLoopRem = (eleCount % tilingData_.innerLoopEle == 0) ? tilingData_.innerLoopEle :
+                                                                eleCount % tilingData_.innerLoopEle;
+    innerLoopFull = (eleCount == innerLoopRem) ? 0 : (eleCount - innerLoopRem) / tilingData_.innerLoopEle;
+
+    uint32_t sizeTailLen = (innerLoopRem + FIFTEEN) / SIXTEEN * SIXTEEN;
+    rightPadding = sizeTailLen - innerLoopRem;
+
+
+/* ... */
+
+    outGm.SetGlobalBuffer((__gm__ yCopyDtype*)y, outLenHead);
+    scaleGm.SetGlobalBuffer((__gm__ float*)scale, totalTokenNum);
+
+    if constexpr (isSymmetrical == false) {
+        workspaceTmp1.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace), tilingData_.coreNum);
+        workspaceTmp2.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace + tilingData_.coreNum * sizeof(float)),
+                                      tilingData_.coreNum);
+    } else {
+        workspaceTmp1.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workSpace), tilingData_.coreNum);
+    }
+
+    if constexpr (hasSmooth == 1) {
+        smoothGm.SetGlobalBuffer((__gm__ T*)smooth_scales);
+
+/* ... */
+
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::Process()
+{
+    if (blockIdx >= tilingData_.coreNum) {
+        return;
+    }
+    ProcessScale();
+    ProcessY();
+}
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::ProcessScale()
+{
+    ProcessScaleRow();
+    SyncAll();
+    ProcessScaleCol();
+}
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::ProcessY()
+{
+    LocalTensor<float> scaleOutLocal = scaleOutQueue.DeQue<float>();
+    __ubuf__ float* scaleOutLocalAddr = (__ubuf__ float*)scaleOutLocal.GetPhyAddr();
+
+    LocalTensor<float> offsetLocal;
+    __ubuf__ float* offsetLocalAddr;
+
+    if constexpr (isSymmetrical == false) {
+        offsetLocal = offsetQueue.DeQue<float>();
+        offsetLocalAddr = (__ubuf__ float*)offsetLocal.GetPhyAddr();
+    }
+
+    ProcessYRow(0, 0, scaleOutLocalAddr, offsetLocalAddr);
+
+    if (coreLocalIdx == 0) {
+        DataCopyParams copyParams{1, (uint16_t)(sizeof(float)), 0, 0};
+        DataCopyPad(scaleGm[tokenIdx], scaleOutLocal, copyParams);
+        if constexpr (isSymmetrical == false) {
+            DataCopyPad(offsetGm[tokenIdx], offsetLocal, copyParams);
+        }
+    }
+    scaleOutQueue.FreeTensor(scaleOutLocal);
+    if constexpr (isSymmetrical == false) {
+        offsetQueue.FreeTensor(offsetLocal);
+    }
+}
+
+
+/* ... */
+
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::ProcessScaleRow()
+{
+    LocalTensor<float> MaxToWorkSpaceLocal;
+    LocalTensor<float> MinToWorkSpaceLocal;
+    LocalTensor<float> scaleToWorkSpaceLocal;
+
+    if constexpr (isSymmetrical == false) {
+        MaxToWorkSpaceLocal = MaxToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(MaxToWorkSpaceLocal, MIN_FLOAT_VALUE, 64, 1, 1, 8);
+        MaxToWorkSpaceQueue.EnQue(MaxToWorkSpaceLocal);
+
+        MinToWorkSpaceLocal = MinToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(MinToWorkSpaceLocal, MAX_FLOAT_VALUE, 64, 1, 1, 8);
+        MinToWorkSpaceQueue.EnQue(MinToWorkSpaceLocal);
+    } else {
+        scaleToWorkSpaceLocal = scaleToWorkSpaceQueue.AllocTensor<float>();
+        AscendC::Duplicate(scaleToWorkSpaceLocal, (float)0.0, 64, 1, 1, 8);
+        scaleToWorkSpaceQueue.EnQue(scaleToWorkSpaceLocal);
+    }
+
+    ProcessScaleRowLoop(0, 0);
+
+    CopyUB2Workspace(1);
+}
+
+/* ... */
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::CopyInScaleByEle(
+    int64_t offset, uint32_t elementNum)
+{
+    DataCopyParams copyParams{1, (uint16_t)(elementNum * sizeof(float)), 0, 0};
+    if constexpr (isSymmetrical == false) {
+        LocalTensor<float> MaxFromWorkSpaceLocal = MaxFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(MaxFromWorkSpaceLocal, workspaceTmp1[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        MaxFromWorkSpaceQueue.EnQue(MaxFromWorkSpaceLocal);
+
+        LocalTensor<float> MinFromWorkSpaceLocal = MinFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(MinFromWorkSpaceLocal, workspaceTmp2[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        MinFromWorkSpaceQueue.EnQue(MinFromWorkSpaceLocal);
+    } else {
+        LocalTensor<float> scaleFromWorkSpaceLocal = scaleFromWorkSpaceQueue.AllocTensor<float>();
+        DataCopyPad(scaleFromWorkSpaceLocal, workspaceTmp1[offset], {1, (uint16_t)(elementNum * sizeof(float)), 0, 0},
+                    {false, 0, 0, 0});
+        scaleFromWorkSpaceQueue.EnQue(scaleFromWorkSpaceLocal);
+    }
+}
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+__aicore__ inline void DynamicQuantPertenLargeMulticore<T, yDtype, hasSmooth, isSymmetrical>::CopyUB2Workspace(
+    int64_t size)
+{
+    if constexpr (isSymmetrical == false) {
+        auto tmp1 = MaxToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp1[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp1, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        MaxToWorkSpaceQueue.FreeTensor(tmp1);
+
+        auto tmp2 = MinToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp2[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp2, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        MinToWorkSpaceQueue.FreeTensor(tmp2);
+    } else {
+        auto tmp = scaleToWorkSpaceQueue.DeQue<float>();
+        DataCopyPad(workspaceTmp1[static_cast<int64_t>(tokenIdx) * static_cast<int64_t>(coreNumPerToken) +
+                                  static_cast<int64_t>(coreLocalIdx)],
+                    tmp, {1, (uint16_t)(size * sizeof(float)), 0, 0});
+        scaleToWorkSpaceQueue.FreeTensor(tmp);
+    }
+}
+
+template <typename T, typename yDtype, int64_t hasSmooth, bool isSymmetrical>
+```
+
+## ITEM 29
+
+### item 28
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/grouped_quant_max/op_kernel/grouped_quant_max.cpp
+hicann/ops-nn, last commit 2026-07-06 by yang-di52
+GroupedQuantMax entry point: the whole grid-wide amax reduction is three statements — op.Process(); SyncAll(); op.MergeAmax(); — under KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0), which is the kernel type the SyncAll hard-sync constraint demands for a pure-Vector operator.
+```cpp
+#include "arch35/grouped_quant_max_regbase.h"
+#include "arch35/grouped_quant_max_tiling_data.h"
+#include "arch35/grouped_quant_max_struct.h"
+
+#define FLOAT_OVERFLOW_MODE_CTRL 60
+
+using namespace AscendC;
+using namespace GroupedQuantMax;
+
+template <uint64_t RoundMode>
+__global__ __aicore__ void grouped_quant_max(GM_ADDR x, GM_ADDR scale, GM_ADDR groupList, GM_ADDR y, GM_ADDR amax,
+                                             GM_ADDR workspace, GM_ADDR tiling)
+{
+    int64_t oriOverflowMode = GetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>();
+    REGISTER_TILING_DEFAULT(GroupedQuantMaxTilingData);
+    GET_TILING_DATA_WITH_STRUCT(GroupedQuantMaxTilingData, tilingData, tiling);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    GroupedQuantMaxRegbase<DTYPE_X, DTYPE_Y, RoundMode> op(&tilingData);
+    GM_ADDR usrWorkspace = GetUserWorkspace(workspace);
+    op.Init(x, scale, groupList, y, amax, usrWorkspace);
+    op.Process();
+    SyncAll();
+    op.MergeAmax();
+    SetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>(oriOverflowMode);
+}
+```
+
+## ITEM 30
+
+### item 29
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/quant/grouped_quant_max/op_kernel/arch35/grouped_quant_max_regbase.h
+hicann/ops-nn, last commit 2026-07-06 by yin-peng
+The matching two-stage reduction body. Stage 1 (inside Process): Reg::Reduce<ReduceType::MAX> folds a tile and StoreAlign<DIST_FIRST_ELEMENT_B32> writes one float per group into the core's own slice of coreGroupMaxGm_. Stage 2 (MergeAmax, after SyncAll): `if (coreIdx_ >= 1) return;` — core 0 alone DataCopyPads the whole [totalCoreNum_, numGroups_] partial matrix in and loops j over actualCoreNum_ with Reg::Max<float, MaskMergeMode::ZEROING> to get the final amax. Partials are seeded with Duplicate(vregFloatMax, 0.0f).
+```cpp
+        }
+
+        AscendC::Reg::Reduce<Reg::ReduceType::MAX>(vregTileMaxFp32, vregTileMaxFp32, maskAll);
+        AscendC::Reg::StoreAlign<float, Reg::StoreDist::DIST_FIRST_ELEMENT_B32>(
+            ((__local_mem__ float*)maxAddr + groupIndex), vregTileMaxFp32, maskOne);
+    }
+
+/* ... */
+
+__aicore__ inline void GroupedQuantMaxRegbase<T, U, RoundMode>::MergeAmax()
+{
+    if (coreIdx_ >= 1) {
+        return;
+    }
+
+    LocalTensor<float> groupMaxLocal = inQueueGroupMax_.AllocTensor<float>();
+    LocalTensor<T> amaxLocal = outQueueAmax_.AllocTensor<T>();
+
+    uint8_t padNum = (numGroups_ % FLOAT_ALIGN_ELEM == 0) ? 0 : FLOAT_ALIGN_ELEM - (numGroups_ % FLOAT_ALIGN_ELEM);
+    DataCopyExtParams copyParams{static_cast<uint16_t>(totalCoreNum_),
+                                 static_cast<uint32_t>(numGroups_ * sizeof(float)), 0, 0, 0};
+    DataCopyPad(groupMaxLocal, coreGroupMaxGm_, copyParams, {true, 0, padNum, 0});
+
+    inQueueGroupMax_.EnQue(groupMaxLocal);
+    groupMaxLocal = inQueueGroupMax_.DeQue<float>();
+
+    __local_mem__ float* groupMaxLocalAddr = (__local_mem__ float*)groupMaxLocal.GetPhyAddr();
+    __local_mem__ T* amaxLocalAddr = (__local_mem__ T*)amaxLocal.GetPhyAddr();
+
+    __VEC_SCOPE__
+    {
+        AscendC::Reg::RegTensor<float> vregFloatMax;
+        AscendC::Reg::RegTensor<float> vregFloatTmp;
+        AscendC::Reg::RegTensor<T> vregFloatOutAmax;
+
+        AscendC::Reg::MaskReg mask = AscendC::Reg::CreateMask<float>();
+        AscendC::Reg::MaskReg maskU8 = AscendC::Reg::CreateMask<uint8_t>();
+
+        uint32_t count = numGroups_;
+        uint16_t vfLoopNum = (numGroups_ + ALIGN_64 - 1) / ALIGN_64;
+        uint32_t numGroupsAlign32_ = (numGroups_ + FLOAT_ALIGN_ELEM - 1) / FLOAT_ALIGN_ELEM * FLOAT_ALIGN_ELEM;
+        uint16_t totalCoreNumLoop_ = static_cast<uint16_t>(actualCoreNum_);
+
+        for (uint16_t i = 0; i < vfLoopNum; ++i) {
+            mask = AscendC::Reg::UpdateMask<float>(count);
+            AscendC::Reg::Duplicate<float>(vregFloatMax, 0.0f, mask);
+            for (uint16_t j = 0; j < totalCoreNumLoop_; ++j) {
+                AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_NORM>(
+                    vregFloatTmp, groupMaxLocalAddr + i * VL_ + j * numGroupsAlign32_);
+                AscendC::Reg::Max<float, AscendC::Reg::MaskMergeMode::ZEROING>(vregFloatMax, vregFloatMax, vregFloatTmp,
+                                                                               mask);
+            }
+
+            if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
+                AscendC::Reg::Cast<T, float, GroupedQuantMaxBase<T, U, RoundMode>::CAST_TRAIT_FP32_TO_X_DETYPE>(
+                    vregFloatOutAmax, vregFloatMax, maskU8);
+                AscendC::Reg::StoreAlign<T, Reg::StoreDist::DIST_PACK_B32>(amaxLocalAddr + i * VL_, vregFloatOutAmax,
+                                                                           mask);
+            } else if constexpr (IsSameType<T, float>::value) {
+                AscendC::Reg::StoreAlign<T>(amaxLocalAddr + i * VL_, vregFloatMax, mask);
+            }
+        }
+    }
+    outQueueAmax_.EnQue(amaxLocal);
+    amaxLocal = outQueueAmax_.DeQue<T>();
+
+    DataCopyExtParams copyParamsOut{1, static_cast<uint32_t>(numGroups_ * sizeof(T)), 0, 0, 0};
+    DataCopyPad(amaxGm_, amaxLocal, copyParamsOut);
+
+    inQueueGroupMax_.FreeTensor(groupMaxLocal);
+    outQueueAmax_.FreeTensor(amaxLocal);
+}
+```
+
+## ITEM 31
+
+### item 30
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/norm/lp_norm_reduce/op_kernel/arch35/lp_norm_reduce_tiling_key.h
+hicann/ops-nn, last commit 2026-10-10 by tangweiwei2
+How the SyncAll kernel-type constraint is expressed in a real tiling key: the group template (tilingKey=1, the A x R 2D-split branch that writes partials to workspace and then SyncAlls) is declared ASCENDC_TPL_MIX_AIV_1_0 'to guarantee the participating cores are co-resident', while the base/empty branches with no cross-core dependency stay ASCENDC_TPL_AIV_ONLY.
+```cpp
+// =============================================================================
+// LpNormReduce_package/op_kernel/arch35/lp_norm_reduce_tiling_key.h
+// =============================================================================
+//
+// ROLE: LpNormReduce TPL（模板化 TilingKey）声明 —— reduction 范式双 bool 轴。
+//   据 docs/LpNormReduce/design/TilingKey.md §1：
+//   - 声明序 isGroup 占 bit0、isEmptyTensor 占 bit1（BOOL 各 1 bit）；
+//   - GET_TPL_TILING_KEY 实际位编码：base=0、group=1、empty=2；
+//   - (isGroup=1, isEmptyTensor=1) 互斥不实例化（tilingKey=3 为设计性空位）；
+//   - dtype 不进 key（框架按输入名 x 以 DTYPE_X 编译期实例化 fp16/fp32/bf16 三档）、
+//     p / axisNum / keepdim / epsilon 等纯参数差异不拆 key。
+//   模板参数与 op_kernel/lp_norm_reduce.cpp 的 kernel 入口签名
+//   template <bool isGroup, bool isEmptyTensor> 一一对应、顺序一致。
+//
+// =============================================================================
+
+#ifndef LP_NORM_REDUCE_TILING_KEY_H_
+#define LP_NORM_REDUCE_TILING_KEY_H_
+
+#include "ascendc/host_api/tiling/template_argument.h" // ASCENDC_TPL macros
+
+// ---------------------------------------------------------------------------
+// ASCENDC_TPL_ARGS_DECL — 声明编译期模板参数（host 侧供 GET_TPL_TILING_KEY 编码，
+// kernel 侧经 ASCENDC_TPL_PRE 预处理导出 @@ 标记供 codegen 实例化）
+// ---------------------------------------------------------------------------
+ASCENDC_TPL_ARGS_DECL(LpNormReduce, ASCENDC_TPL_BOOL_DECL(isGroup, 0, 1), // 0=base/empty, 1=group（A×R 2D 分核）
+                      ASCENDC_TPL_BOOL_DECL(isEmptyTensor, 0, 1) // 0=非空, 1=空 tensor（EMPTY_A/EMPTY_R 共用）
+);
+
+// ---------------------------------------------------------------------------
+// ASCENDC_TPL_SEL — 实例化组合表（3 组合 × 2 档 dtype = 6 份 binary，见 TilingKey.md）
+// SEL 块顺序（base→empty→group）只影响 codegen 实例化遍历顺序，runtime 永远按
+// tilingKey 位编码值直接选符号。
+//
+// 每条 SEL 携带 ASCENDC_TPL_KERNEL_TYPE_SEL（kernel 任务类型，atvoss reduce 框架
+// reduce_tiling_key_decl.h 同款机制）：group（tilingKey=1）为 SyncAll 硬同步分支，
+// 须 MIX_AIV_1_0（纯 AIV 计算、1:0 任务比——保证 SyncAll 参与核同时驻留，
+// bn3d_training_reduce split-reduce / reduce_mean_variance / atvoss reduce
+// *_GROUP SEL 同款）；base / empty 无核间依赖保持 AIV_ONLY。
+// ---------------------------------------------------------------------------
+ASCENDC_TPL_SEL(
+    // tilingKey=0：base（isGroup=0, isEmptyTensor=0）
+    ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_KERNEL_TYPE_SEL(ASCENDC_TPL_AIV_ONLY), ASCENDC_TPL_BOOL_SEL(isGroup, 0),
+                         ASCENDC_TPL_BOOL_SEL(isEmptyTensor, 0)),
+    // tilingKey=2：empty（isGroup=0, isEmptyTensor=1；EMPTY_A/EMPTY_R 共用同一 binary）
+    ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_KERNEL_TYPE_SEL(ASCENDC_TPL_AIV_ONLY), ASCENDC_TPL_BOOL_SEL(isGroup, 0),
+                         ASCENDC_TPL_BOOL_SEL(isEmptyTensor, 1)),
+    // tilingKey=1：group（isGroup=1, isEmptyTensor=0）——SyncAll 硬同步 → MIX_AIV_1_0
+    // （isGroup=1 与 isEmptyTensor=1 互斥：(1,1) 无 SEL 块，tilingKey=3 为设计性空位）
+    ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_KERNEL_TYPE_SEL(ASCENDC_TPL_MIX_AIV_1_0), ASCENDC_TPL_BOOL_SEL(isGroup, 1),
+                         ASCENDC_TPL_BOOL_SEL(isEmptyTensor, 0)));
+
+#endif // LP_NORM_REDUCE_TILING_KEY_H_
+```
+
+## ITEM 32
+
+### item 31
+
+https://raw.githubusercontent.com/hicann/ops-nn/master/norm/l2_normalize/op_kernel/l2_normalize.cpp
+hicann/ops-nn, last commit 2026-09-23 by raoliang_sac
+The same partial-write / SyncAll / second-reduce shape stated as a design contract in the kernel header comment, including the explicit note that phase 3 reuses the phase-2 slot so NO second SyncAll is needed, and that SetScheduleMode(1) is the required companion.
+```cpp
+//
+// ROLE: Ascend C kernel entry point for L2Normalize (Ascend 950 / arch35 only).
+//   核函数签名：
+//     template <bool isGroup, bool isEmptyTensor>
+//     __global__ __aicore__ void l2_normalize(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling);
+//   - 形参顺序 = 算子原型 tensor 定义顺序（x, y）+ 末尾固定 workspace + tiling；
+//     axis / eps 均为 attr，非 tensor 输入，无对应 GM 形参。
+//   - 模板参数为 TilingKey 双 bool 轴（isGroup / isEmptyTensor）；
+//     dtype 走编译期 DTYPE_X 实例化（每 dtype 组合一个 binary），不走 TilingKey 运行时分支。
+//   - base 模板处理通用非空输入；empty 模板对空 tensor 全核早退；group 模板以
+//     A×R 二维分核执行三阶段计算：partial 写 workspace → SyncAll → RA 二次归约
+//     得 denom → keepdims 广播除法。
+// =============================================================================
+
+#include "kernel_operator.h"                   // Ascend C kernel framework (AscendC:: namespace)
+#include "arch35/l2_normalize_tiling_struct.h" // L2NormalizeTilingData / L2NormalizeEmptyTilingData
+#include "arch35/l2_normalize_struct.h"        // TPL 声明（isGroup / isEmptyTensor 双 bool 轴）
+#include "arch35/l2_normalize_base.h"          // Base 模板 kernel 类（TPL_SEL_0）
+#include "arch35/l2_normalize_empty.h"         // Empty 模板 kernel 类（TPL_SEL_1）
+#include "arch35/l2_normalize_group.h"         // Group 模板 kernel 类（TPL_SEL_2）
+
+// ===========================================================================
+// __global__ __aicore__ void l2_normalize(x, y, workspace, tiling)
+//
+// This is the main NPU kernel function. Each AIV core executes this once.
+//
+// Template parameters (TilingKey 双 bool 轴):
+//   isGroup       — group 模板（A 用不满核且 R 有并行度 → A×R 2D 分核 + workspace 二次归约）
+//   isEmptyTensor — 空 tensor 模板（某维为 0 → 全核早退，零计算零 IO）
+//
+// Parameters (all GM_ADDR = global memory pointers on device):
+//   x         — input data tensor
+//   y         — output tensor（shape/dtype 与 x 一致）
+//   workspace — workspace buffer（base R 切分两遍 denom 中转 / group 二次归约用）
+//   tiling    — tiling data buffer（empty → L2NormalizeEmptyTilingData；其余 → L2NormalizeTilingData）
+// ===========================================================================
+template <bool isGroup, bool isEmptyTensor>
+__global__ __aicore__ void l2_normalize(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    // REGISTER_NONE_TILING: Registers the kernel with the AICore runtime.
+    // The tiling data is read manually via GET_TILING_DATA_WITH_STRUCT.
+    REGISTER_NONE_TILING;
+
+    // KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY):
+    //   Sets this kernel to run on AIV (AI Vector) cores only.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+
+    // TPipe 统一在入口申请，经 Init 指针传入各模板。
+    AscendC::TPipe pipe;
+
+    if constexpr (isEmptyTensor) {
+        // 空 tensor 模板（TPL_SEL_1）：EMPTY_A / EMPTY_R 合一全核早退——
+        // 零计算零 IO（不绑 x/y GM）、零 TBuf、零同步。
+        GET_TILING_DATA_WITH_STRUCT(L2NormalizeEmptyTilingData, tilingData, tiling);
+        NsL2Normalize::L2NormalizeEmptyKernel<DTYPE_X> op;
+        op.Init(&tilingData, &pipe); // 仅缓存 TilingData/TPipe（零 IO：不传 GM 形参）
+        op.Process();                // usedCoreNum=0 → 进入即 return（全核早退）
+    } else if constexpr (isGroup) {
+        // group 模板（TPL_SEL_2）：A×R 2D 分核三阶段——
+        // Phase 1 各核 [1 A chunk × 1 段 R 分组] 局部平方和写 ws partial 区
+        // [rGroupCnt, aTotal] → SyncAll 全核同步（SetScheduleMode(1) 配套）→
+        // Phase 2 RA mini-kernel 二次归约 + eps 钳制 + sqrt 得 denom 写 ws
+        // denom 区本核槽位 → Phase 3 keepdims 广播除法（A 切分沿用 Phase 2
+        // 槽位自产自销，无第二次 SyncAll；tail-R / tail-A 运行时子路径）。
+        GET_TILING_DATA_WITH_STRUCT(L2NormalizeTilingData, tilingData, tiling);
+        NsL2Normalize::L2NormalizeGroupKernel<DTYPE_X> op;
+        op.InitGroup(x, y, workspace, &tilingData, &pipe);
+        op.ProcessGroup();
+    } else {
+        // base 模板（TPL_SEL_0）：非空输入兜底分支——A 方向分核、核间零依赖
+        GET_TILING_DATA_WITH_STRUCT(L2NormalizeTilingData, tilingData, tiling);
+        NsL2Normalize::L2NormalizeBaseKernel<DTYPE_X> op;
+        op.Init(x, y, workspace, &tilingData, &pipe);
+        op.Process();
+    }
+}
+```
+
+---
+
+### TOPIC B — additional items (PTO ISA SYNCALL contract, flash-linear-attention-npu, tilelang-ascend)
+
+### item 0
+
+https://pto-isa.gitcode.com/docs/isa/SYNCALL/
+cann/pto-isa (PTO Virtual ISA Architectural Manual), retrieved 2026-10-20; page date not stated. Markdown source: https://gitcode.com/cann/pto-isa/blob/master/docs/isa/SYNCALL.md
+The ISA-level contract for SYNCALL, text-extracted verbatim. States the two orthogonal template axes (SyncCoreType x SyncAllMode), the soft-mode workspace being only ONE int32 counter that must be zeroed, usedCores inference and the rule that non-participating cores MUST NOT call it, and -- critically -- that SYNCALL guarantees arrival ONLY: it takes no WaitEvents, does not wait for a preceding TSTORE to land, and flushes no cache, so cross-core GM traffic around the barrier needs explicit dcci/dsb. Also: Hard AIC-only on A2/A3 cannot be built as pure dav-c220-cube (no FFTS context -> hang); build MIX dav-c220 instead.
+```text
+PTO Virtual ISA Architectural Manual
+SYNCALL
+SYNCALL
+¶
+Instruction Diagram
+¶
+No
+SYNCALL.svg
+is provided.
+SYNCALL
+is a
+cross-core control-plane
+primitive; it does not describe a data transform on a single Tile. Its meaning is "all participants rendezvous at this point before any may proceed".
+flowchart TB
+subgraph hard [Hard Mode / FFTS]
+H1[Each participant reaches the call site] --> H2[ffts_cross_core_sync]
+H2 --> H3[wait_flag_dev]
+H3 --> H4[Barrier complete]
+end
+subgraph soft [Soft Mode / Shared GM Counter]
+S1[Each core arrives: increment the shared counter] --> S2[Derive this round's release condition]
+S2 --> S3[Wait until the counter meets that condition]
+S3 --> S4[Barrier complete]
+end
+Summary
+¶
+SYNCALL
+is a cross-core synchronization barrier. Its two template parameters are independent:
+SyncCoreType
+selects the participant set:
+AIVOnly
+(default),
+AICOnly
+,
+Mix
+(AIC+AIV).
+SyncAllMode
+selects the implementation path:
+Hard
+(FFTS hardware flags, workspace-free overload),
+Soft
+(shared GM atomic counter, workspace-bearing overload).
+Mathematical Semantics
+¶
+Not applicable as an elementwise arithmetic operation.
+SYNCALL
+expresses a
+barrier arrival
+relation: once every core in the current participant set has executed this
+SYNCALL
+, any core may proceed. Hard and Soft have identical semantics and differ only in implementation path.
+C++ Built-in Interface
+¶
+Public header
+<pto/pto-inst.hpp>
+; declarations live in
+include/pto/common/pto_instr.hpp
+:
+// Hardware mode (all CoreType variants)
+template <SyncCoreType CoreType = SyncCoreType::AIVOnly>
+PTO_INST void SYNCALL();
+// Software mode — shared GM atomic counter
+template <SyncAllMode Mode, SyncCoreType CoreType = SyncCoreType::AIVOnly, typename GlobalData,
+std::enable_if_t<is_global_data_v<GlobalData>, int> = 0>
+PTO_INST void SYNCALL(GlobalData &gmWorkspace, int32_t usedCores = 0);
+Parameters
+¶
+gmWorkspace
+: a GM buffer used by Soft mode, of type
+GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>>
+. The instruction uses only its
+first int32
+as the arrival counter shared by all participants, so one cache line is enough to allocate, and it
+must be zeroed before first use
+.
+usedCores
+: the number of cores participating in the barrier.
+When 0, the instruction infers it: AIV-only and AIC-only take the core count of this launch; MIX takes all AIC cores plus their paired AIV cores.
+When specified explicitly it
+may be smaller than the launched core count
+, letting only some cores synchronize; cores that do not participate
+must not
+call
+SYNCALL
+.
+When
+Mode
+is
+Hard
+,
+gmWorkspace
+and
+usedCores
+are ignored and the behavior is identical to the argument-free
+SYNCALL()
+.
+Constraints
+¶
+SYNCALL
+guarantees barrier
+arrival
+and nothing else; ordering and visibility of business data are the caller's responsibility. It does not participate in PTO's automatic Event dependency scheduling (it accepts no
+WaitEvents
+and returns no
+RecordEvent
+), so it does not wait for preceding data instructions on the same core (e.g.
+TSTORE
+) to land. Neither hard nor soft mode
+flushes the cache for business data
+, so cross-core GM accesses around the barrier need explicit
+dcci
+/
+dsb
+.
+Soft mode requires every participating core to enter the same barrier group
+in the same order and the same number of times
+. The instruction derives the current round from the arrival count, so a core that enters one time too many or too few falls out of step with the others and the barrier deadlocks.
+The participant set is determined by how the kernel is compiled and launched, not by
+SYNCALL
+. The template parameters only declare
+which kind of cores
+to synchronize; how many cores actually come up and how AIC and AIV are paired depends on the compile arch and the launch method. If the two disagree, some core waits forever.
+Hard AIC-only on A2/A3 cannot be compiled as a pure cube kernel: plain
+dav-c220-cube
+fails to establish the FFTS context that AIC-only hard sync needs, and hangs in practice. Compile it as MIX (
+dav-c220
+) instead, with the AIC side calling
+SYNCALL<AICOnly>()
+and the AIV side left empty. On A5,
+dav-c310-cube
+works.
+When compiling a kernel by hand (not through chevron auto-split), the kernel meta must be declared explicitly, otherwise the runtime schedules the wrong core type and hard sync hangs for lack of an FFTS context. Declare it with the macros in
+include/pto/common/kernel_meta.hpp
+(
+PTO_SYNCALL_AIV_KERNEL_META
+/
+PTO_SYNCALL_AIC_KERNEL_META
+/
+PTO_SYNCALL_MIX_AIC_KERNEL_META
+); the macro argument must exactly match the
+__global__
+entry symbol. Currently only Hard AIV-only and Soft AIC-only on A2/A3 need a hand-written meta; the compiler generates it for all other cases.
+In the auto build path (
+__PTO_AUTO__
+),
+SYNCALL
+is a no-op; real synchronization happens only in manual kernels.
+In CPU_SIM, every
+SYNCALL
+overload is currently a compatibility no-op, including Soft mode. It does not synchronize
+workers launched by
+LaunchKernelMultiCore
+.
+Examples
+¶
+Hardware Mode
+¶
+#include <pto/pto-inst.hpp>
+using namespace pto;
+void example_hard_aiv() { SYNCALL(); }                        // all AIV cores
+void example_hard_aic() { SYNCALL<SyncCoreType::AICOnly>(); } // all AIC cores
+void example_hard_mix() { SYNCALL<SyncCoreType::Mix>(); }     // AIC + AIV
+For compilation and launch requirements, see "Constraints".
+Software Mode
+¶
+#include <pto/pto-inst.hpp>
+using namespace pto;
+// AIV-only: usedCores=0 falls back to get_block_num()
+void example_soft_aiv(__gm__ int32_t *gmPtr) {
+GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(gmPtr);
+SYNCALL<SyncAllMode::Soft, SyncCoreType::AIVOnly>(gmWs, 0);
+}
+// MIX: AIC and AIV participants arrive on the same counter
+void example_soft_mix(__gm__ int32_t *gmPtr) {
+GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(gmPtr);
+SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, 0);
+}
+// Partial participation: all cores are launched but only the first syncBlocks
+// synchronize; the rest must not call SYNCALL.
+void example_soft_partial(__gm__ int32_t *gmPtr, int32_t syncBlocks) {
+if (static_cast<int32_t>(get_block_idx()) >= syncBlocks) {
+return;
+}
+GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(gmPtr);
+SYNCALL<SyncAllMode::Soft, SyncCoreType::AIVOnly>(gmWs, syncBlocks);
+}
+```
+
+## ITEM 34
+
+### item 1
+
+https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/main/fla/ops/ascendc/kda/chunk_kda_bwd_finalize/op_kernel/chunk_kda_bwd_finalize.cpp
+flashserve/flash-linear-attention-npu, last commit 2026-10-19 by wuyushu
+A hand-written MIX kernel that reduces per-core partials from workspace after a grid barrier, and picks SyncAll<true> over SyncAll<false> *specifically* to avoid the flagId collision documented in key_features.md: AIV-only SyncAll burns flag 14, which no earlier AIC->AIV handoff uses, while MIX SyncAll burns 12/13 and would consume unspent ZB_FREE credits. KERNEL_TYPE_MIX_AIC_1_2 is the declared kernel type.
+```cpp
+
+extern "C" __global__ __aicore__ void chunk_kda_bwd_finalize(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR gk,
+    GM_ADDR rawG, GM_ADDR beta, GM_ADDR aLog, GM_ADDR dtBias,
+    GM_ADDR akk, GM_ADDR vNew, GM_ADDR h, GM_ADDR dh,
+    GM_ADDR dvScan, GM_ADDR dAqk, GM_ADDR dqRaw,
+    GM_ADDR qRstd, GM_ADDR kRstd,
+    GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
+    GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR dBeta,
+    GM_ADDR dG, GM_ADDR dALog, GM_ADDR dDtBias,
+    GM_ADDR workspace, GM_ADDR tiling)
+{
+    REGISTER_TILING_DEFAULT(KDA::ChunkKdaBwdFinalizeTilingData);
+    GET_TILING_DATA_WITH_STRUCT(KDA::ChunkKdaBwdFinalizeTilingData, tilingData, tiling);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if (TILING_KEY_IS(1) || TILING_KEY_IS(2) ||
+        TILING_KEY_IS(3) || TILING_KEY_IS(4)) {
+        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
+        GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
+        KDA::ChunkKdaBwdFinalizeImpl(
+            q, k, v, gk, beta, akk, vNew, h, dh, dvScan,
+            dAqk, dqRaw, qRstd, dq, dv, kRstd, dk, dBeta,
+            rawG, aLog, dtBias, dG,
+            cuSeqlens, chunkIndices, userWorkspace, &tilingData);
+        // Only AIVs produce the partials. AIV-only SyncAll uses flag 14,
+        // which no earlier AIC->AIV handoff uses. MIX SyncAll uses 12/13
+        // and would consume the final, unspent ZB_FREE credits instead.
+        AscendC::SyncAll<true>();
+        if ASCEND_IS_AIV {
+            KDA::FinalizeStage12(userWorkspace, dALog, dDtBias, tilingData);
+        }
+    }
+}
+
+#endif
+```
+
+## ITEM 35
+
+### item 2
+
+https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/main/fla/ops/ascendc/kda/chunk_kda_bwd/op_kernel/chunk_kda_bwd_finalize.h
+flashserve/flash-linear-attention-npu, last commit 2026-09-07 by weinachuan
+Three SyncAll<false>() phase boundaries in one fused MIX kernel, every one of them placed OUTSIDE the `if (active)` guard so inactive cores still arrive. Each barrier carries its reason in-source: WY stores must land before Intra reads them back; Intra's half-row dg writes must finish before Gate remaps the work to whole heads; and the final barrier exists so a queued dg/dA/dbias store cannot leak into the next invocation's reuse of the same output allocation.
+```cpp
+            process.Process();
+        }
+    }
+
+    // WY materializes the base gradients in GM and Intra immediately reads
+    // them back for the local correction.  Complete every WY store before
+    // remapping the same buffers to the Intra owner.
+    AscendC::SyncAll<false>();
+
+
+/* ... */
+
+    }
+
+    // Intra writes dg by half rows on both AIV sub-blocks, whereas Gate
+    // remaps the work to complete heads and updates dg in place.  Finish the
+    // whole Intra phase before any core starts the Gate read/scan/write phase.
+    AscendC::SyncAll<false>();
+
+    if ASCEND_IS_AIV {
+        if (active) {
+            AscendC::TPipe pipe;
+            ChunkKdaBwdCGateProcess<SAFE_GATE, DTYPE_RAW_G> process(
+                dg, rawG, aLog, dtBias, dA, dBias,
+                cuSeqlens, chunkIndices);
+            if (tiling->deferGatePost == 0) {
+                process.Init(*tiling, &pipe);
+                process.Process();
+            }
+        }
+    }
+
+    // Gate is the final phase of the fused MIX kernel.  Do not return while
+    // either AIV sub-block still has a queued dg/dA/dbias store: a following
+    // invocation can reuse the same output allocation and observe that late
+    // write as a stale cross-shape generation.
+    bool needsFinalSync =
+        tiling->seqlen < static_cast<int32_t>(kA5SharedGateMinSeqlen);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    needsFinalSync = needsFinalSync ||
+        (tiling->useGateInKernel != 0 &&
+         !CanUseA5SharedGateAnchor(*tiling));
+#endif
+    if (needsFinalSync) {
+        AscendC::SyncAll<false>();
+    }
+```
+
+## ITEM 36
+
+### item 3
+
+https://raw.githubusercontent.com/tile-ai/tilelang-ascend/ascendc_pto/src/tl_templates/pto/common.h
+tile-ai/tilelang-ascend, branch ascendc_pto, last commit 2026-09-02 by baixinran
+A compiler backend's view: the three grid-barrier wrappers it emits (pto::SYNCALL<SyncCoreType::Mix / AICOnly / AIVOnly>) sitting right next to its atomic GM accumulate helpers (TSTORE with pto::AtomicType::AtomicAdd, from UB and from L0C). The AscendC path of the same backend emits `AscendC::SyncAll<false>` (src/target/codegen_ascend.cc).
+```cpp
+AICORE PTO_INLINE void atomic_add_ub_to_gm_dynamic(
+    __gm__ T1 *handle,
+    const pto::Shape<shape1, shape2, shape3, shape4, shape5> &shape,
+    const pto::Stride<stride1, stride2, stride3, stride4, stride5> &stride,
+    int32_t ub_shape_addr, int32_t ub_offset, int32_t valid_row,
+    int32_t valid_col) {
+  pto::Shape<shape1, shape2, shape3, pto::DYNAMIC, pto::DYNAMIC> dynamic_shape;
+  dynamic_shape.shape[3] = valid_row;
+  dynamic_shape.shape[4] = valid_col;
+  pto::GlobalTensor<
+      T1, pto::Shape<shape1, shape2, shape3, pto::DYNAMIC, pto::DYNAMIC>,
+      pto::Stride<stride1, stride2, stride3, stride4, stride5>>
+      global_tensor(handle, dynamic_shape, stride);
+  constexpr uint8_t len = sizeof(T2);
+  constexpr bool use_nd = (static_cast<uint64_t>(ub_shape2) * len) >= 32;
+
+  if constexpr (use_nd) {
+    TileUbDataND<T2, ub_shape1, ub_shape2, pto::DYNAMIC, pto::DYNAMIC> temp_ub(
+        valid_row, valid_col);
+    pto::TASSIGN(temp_ub, ub_shape_addr + ub_offset * len);
+    pto::TSTORE<decltype(temp_ub), decltype(global_tensor),
+                pto::AtomicType::AtomicAdd>(global_tensor, temp_ub);
+  } else {
+    TileUbDataDN<T2, ub_shape1, ub_shape2, pto::DYNAMIC, pto::DYNAMIC> temp_ub(
+        valid_row, valid_col);
+    pto::TASSIGN(temp_ub, ub_shape_addr + ub_offset * len);
+    pto::TSTORE<decltype(temp_ub), decltype(global_tensor),
+                pto::AtomicType::AtomicAdd>(global_tensor, temp_ub);
+  }
+}
+
+template <typename T1, typename T2, int32_t shape1, int32_t shape2,
+          int32_t shape3, int32_t shape4, int32_t shape5, int32_t stride1,
+          int32_t stride2, int32_t stride3, int32_t stride4, int32_t stride5,
+          uint32_t l0c_shape1, uint32_t l0c_shape2, bool enRelu = false>
+AICORE PTO_INLINE void atomic_add_l0c_to_gm_dynamic(
+    __gm__ T1 *handle,
+    const pto::Shape<shape1, shape2, shape3, shape4, shape5> &shape,
+    const pto::Stride<stride1, stride2, stride3, stride4, stride5> &stride,
+    int32_t l0c_shape_addr, int32_t l0c_offset, int32_t valid_row,
+    int32_t valid_col) {
+  pto::Shape<shape1, shape2, shape3, pto::DYNAMIC, pto::DYNAMIC> dynamic_shape;
+  dynamic_shape.shape[3] = valid_row;
+  dynamic_shape.shape[4] = valid_col;
+  pto::GlobalTensor<
+      T1, pto::Shape<shape1, shape2, shape3, pto::DYNAMIC, pto::DYNAMIC>,
+      pto::Stride<stride1, stride2, stride3, stride4, stride5>>
+      global_tensor(handle, dynamic_shape, stride);
+  constexpr uint8_t len = sizeof(T2);
+
+  pto::TileAcc<T2, l0c_shape1, l0c_shape2, pto::DYNAMIC, pto::DYNAMIC> temp_l0c(
+      valid_row, valid_col);
+  pto::TASSIGN(temp_l0c, l0c_shape_addr + l0c_offset * len);
+
+  constexpr auto reluMode =
+      enRelu ? pto::ReluPreMode::NormalRelu : pto::ReluPreMode::NoRelu;
+  pto::TSTORE<decltype(temp_l0c), decltype(global_tensor),
+              pto::AtomicType::AtomicAdd, reluMode>(global_tensor, temp_l0c);
+}
+
+AICORE PTO_INLINE void sync_all() { pto::SYNCALL<pto::SyncCoreType::Mix>(); }
+
+AICORE PTO_INLINE void sync_all_aic() {
+  pto::SYNCALL<pto::SyncCoreType::AICOnly>();
+}
+
+AICORE PTO_INLINE void sync_all_aiv() {
+  pto::SYNCALL<pto::SyncCoreType::AIVOnly>();
+}
+```
+
+### TOPIC B — negative findings (sources checked that yielded nothing)
+NOTHING: https://github.com/hicann/cann-ops-adv — repo does not exist on GitHub (404); so does github.com/Ascend/cann-ops-adv and github.com/hicann/ascendc-api-adv. The adv-API/ops-adv content now lives under hicann/asc-devkit (docs/zh/api/SIMD-API/adv_api/...) and hicann/ops-nn, both of which are quoted above.
+NOTHING: https://github.com/Ascend/samples — `gh search code "SyncAll" --repo Ascend/samples` returns zero hits and the recursive tree has no sync_all/syncall path; the SyncAll sample moved into hicann/asc-devkit/examples (quoted above).
+NOTHING: https://raw.gitcode.com/cann/ops-nn/raw/master/quant/dynamic_quant/op_kernel/dynamic_quant.h — gitcode raw refuses unregistered traffic with `429 ... Limited account:unregisteredUser`; the same files were taken from the hicann/ops-nn GitHub mirror instead.
+NOTHING: https://github.com/hicann/ops-nn — no kernel in the tree builds a per-token quant row max with SetAtomicMax into GM. Every cross-core max in the repo is done as partials-in-workspace + SyncAll + a second reduce pass (ITEM 28, 30, 31). `gh search code "SetAtomicMax" --limit 30` finds the API only in asc-devkit headers/docs and in sgl-kernel-npu / unified-cache-management / AReno wrappers, never as a row-max reduction.
+NOTHING: https://github.com/hicann/catlass — no dcci polling loop; catlass synchronises purely through CrossCoreSetFlag/CrossCoreWaitFlag (ITEM 21). Its tla_dsl subtree lowers flag barriers in MLIR, not in AscendC kernel source.
+
+
+---
+
+# Provenance / verification log
+
+Items marked "verified first-hand" (A20, A21, B0a-B0d) and all of sections A1-A19 were fetched
+directly, not via the delegated sweeps. In addition I independently re-fetched four claims that
+the sweeps reported and that would change a design decision. All four matched byte-for-byte:
+
+1. `hicann/asc-devkit` `include/basic_api/kernel_operator_block_sync_intf.h` — the arch gate on
+   the `SyncAllConfig` overload. Confirmed: `__NPU_ARCH__` must be one of
+   `3510, 5102, 5162, 9201, 9202`; `2201` is not in that set.
+   (quoted verbatim in B0a)
+
+2. `hicann/asc-devkit` `impl/basic_api/kernel_macros.h` — `2201` is a live arch id in the same
+   tree, in the V200/V210 group. Confirmed. There is no `impl/basic_api/dav_2201/` directory;
+   the directories present are exactly
+   `dav_3510, dav_5161, dav_5162, dav_9201, dav_c100, dav_c220, dav_l300, dav_l311, dav_m200,
+   dav_m300, dav_m310, dav_m510` (plus `reg_compute`, `utils`), so `2201` is served by `dav_c220`.
+   `2201` otherwise appears only under `tests/api/c_api/npu_arch_2201/` and in
+   `docs/.../deprecated_interface/*_arch_2201_deprecated.md`.
+   (quoted verbatim in B0a)
+
+3. `hicann/asc-devkit` `docs/zh/api/SIMD-API/basic_api/atomic_operations/SetAtomicMax_ISASI.md` —
+   A3 支持, data path `UB/L0C Buffer/L1 Buffer->GM`, dtypes
+   `int8_t、int16_t、half、bfloat16_t、int32_t、float`, does not auto-zero GM, and on
+   `NPU架构版本2201` integer and `bfloat16_t` are non-saturating by default with saturation
+   settable only via `npu-smi` at device level. Confirmed.
+   (quoted verbatim in the TOPIC B official-docs section)
+
+4. `Zhangyq-1999/shmem-doc` `_sources/api/atomic_api_sync_async_comparison.md.txt` — the MTE-backend
+   AMO support matrix. Confirmed: on A2/A3 the only MTE-backend atomic is
+   `aclshmemx_mte_atomic_add`; `atomic_fetch`, `atomic_set`, `atomic_swap`,
+   `atomic_compare_swap`, `atomic_inc`, `atomic_fetch_inc`, `atomic_fetch_add` are all marked
+   `950` only.
+   (quoted verbatim in the TOPIC A, continued section)
+
+Also independently fetched and converted to text (HTML→text, so the quoted blocks in the
+visibility section are the agent's extraction; I confirmed the pages exist and carry the same
+content):
+- `https://asc.gitcode.com/guide/programming_guide/advanced_programming/memory_model/cache_coherence.html`
+  (HTTP 200, 86 828 bytes) — names `NPU架构版本2201` in its opening sentence and gives the 2201
+  cache-unit table: `L2 Cache` line 512 B / 192 MB; `AIC ICache` 128 B / 32 KB;
+  `AIV ICache` 128 B / 16 KB; `AIC DCache` 64 B / 16 KB; `AIV DCache` 64 B / 32 KB.
+- `https://asc.gitcode.com/guide/programming_guide/advanced_programming/memory_model/memory_consistency.html`
+  (HTTP 200, 102 805 bytes).
+
+Fetch-access notes for anyone re-running this:
+- `raw.gitcode.com/<owner>/<repo>/raw/<branch>/<path>` works for `cann/shmem` but returns
+  `429 ... Limited account:unregisteredUser` for `cann/ops-nn`, and
+  `{"code":"CH.00402000","title":"Project not found"}` for `cann/ops-hccl` (no such repo) and
+  `Ascend/ascend-transformer-boost`.
+- `gitcode.com/<owner>/<repo>/raw/...` returns the JS shell, not the file.
+- The GitHub mirrors used instead: `immengzi/shmem` and `Zhangyq-1999/shmem-doc` and
+  `mkbk-with-circle/ascend_inc_dispatch_combine` for `cann/shmem`; `hicann/ops-nn`,
+  `hicann/asc-devkit`, `hicann/catlass`, `hicann/cann-recipes-infer`, `hicann/cannbot-skills`
+  are first-party GitHub orgs; `egretwAlker/cpl-ascend-transformer-boost` for ATB/LCCL.
+
+
+---
+
+## 37. The constraint that breaks a multi-block MIX brick: `CrossCoreSetFlag` is intra-core-group only, so the cube's tiling and the vector's tiling must be the *same* partition
+
+### 37.1 The statement, from the team that shipped the first MIX operator into `cann/ops-transformer`
+
+https://zhuanlan.zhihu.com/p/2000250579956540357
+Title 「端到端打通transformer仓experimental路径首个开源MIX算子」. Authorship stated in the article itself,
+verbatim: 「本文原创作者为**华为2012实验室中央媒体技术院 AI 加速团队**，文中的RoPE_Matrix算子由该团队自主开发，且作为
+ops-transformer开源算子仓experimental路径首个贡献的融合算子成功落地。」 Contributors named via the issue tracker,
+verbatim: 「我们专门以issue(`https://gitcode.com/cann/ops-transformer/issues`搜索作者xuyun15和jimmy_lin)的方式记录了
+对应问题」. Retrieved 2026-10-20 (the page is 403 to a plain fetcher; read through a reader proxy).
+
+The constraint, verbatim, embedded in their performance-optimisation section:
+
+```
+由于 `CrossCoreSetFlag`仅支持核内同步（比如说20个Cube和40个Vector，Cube0仅能和Vector0和Vector1同步），所以我们需要同步的将matmul的tiling修改为切S轴的方式。
+```
+
+Translated for the record: *because `CrossCoreSetFlag` only supports intra-core synchronisation (say 20 Cube and 40
+Vector cores — Cube0 can only synchronise with Vector0 and Vector1), we had to correspondingly change the matmul's
+tiling to split along the S axis.*
+
+The worked example they give, verbatim — note how the cube's per-core work is deliberately made the union of exactly
+the two AIVs it can signal:
+
+```
+以[B,N,S,D]=[1,24,28799,128]， Cube20核，Vector40核为例： 则我们可以将S=28799切分为40份： 720*39 + 719； 如此非尾块的Cube执行720*2， Vector执行720，尾块的Vector执行719， 尾块的Cube执行(720+719)。
+```
+
+The surrounding reasoning, verbatim — including the explicit statement of the 910-series CV data path:
+
+```
+实现流程设计：由于910系列 CV分离(Cube上的数据传入Vector必须经过L2或高带宽内存)的特性，我们分析发现matmul计算和Vector计算理论上都是memory bound， 所以我们决策采用先计算matmul后再计算Vector的方式完成编程。
+
+参考样例的实现，我们使用`ASCEND_IS_AIC, ASCEND_IS_AIV`去区分Cube和Vector部分，按照官网说法，这个好处是Cube和Vector解耦，无需关心Cube和Vector数量问题(C/V=1/2)，再通过`CrossCoreSetFlag， CrossCoreWaitFlag`去控制C和V之间的通信关系。
+```
+
+and their kernel skeleton, verbatim — `flagId` 0x8, mode 0x2, bare wait, `KERNEL_TASK_TYPE_DEFAULT` declared at the
+top of the kernel body:
+
+```cpp
+KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);  // dry kernel type: KERNEL_TYPE_MIX_xxx
+TPipe tpipe;
+TCubeTiling tilingLocal;
+RopeMatrix::CopyTiling(&tilingLocal, tiling);
+if ASCEND_IS_AIC {
+    ...
+    AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0x8); // set flag after matmul
+}
+if ASCEND_IS_AIV {
+    AscendC::CrossCoreWaitFlag(0x8); // wait matmul outputs
+    ...
+}
+```
+
+The article also records the tiling bug that motivated the change, verbatim — useful as a worked example of reading
+a MIX profile:
+
+```
+通过注释掉matmul组件代码，仅执行Vector的profiling，可发现 `Vector memory copy in`的开销比预期的要高1倍有余，通过对比我们的实现和原版的RoPE融合算子（`https://gitcode.com/cann/ops-transformer/blob/master/posembedding/rotary_position_embedding/rotate_half_bf16.h`），我们发现tiling的差异：由于x的维度`[B,N,S,D]`, sin/cos维度`[1,1,S,D]`，本方案第一个版本切核方式是BNS方向均分，导致sin和cos需重复拷贝，实际拷贝量不是`S*D`而是约等于x的`B*N*S*D`，因此Vector部分的`memory copy in`开销翻倍。
+```
+
+### 37.2 The shipped operator's own README
+
+https://gitcode.com/cann/ops-transformer/blob/master/experimental/posembedding/rope_matrix/README.md
+raw: https://raw.gitcode.com/cann/ops-transformer/raw/master/experimental/posembedding/rope_matrix/README.md
+Repo `cann/ops-transformer`, branch `master`. Retrieved 2026-10-20. Verbatim:
+
+```
+Designing detail：
+By profiling, we find memory bound for both C and V on 910B. Thus, no need CV pipeline, we just simplify run V after C.
+Using ```AscendC::CrossCoreSetFlag``` and ```AscendC::CrossCoreWaitFlag``` to control pipeline.
+```
+```
+we simplify the code from origin rope-fused operator to fit our cases.
+Then use ```ASCEND_IS_AIC, ASCEND_IS_AIV``` to isolation cube/vector process and ```CrossCoreSetFlag, CrossCoreWaitFlag``` to control communication between cube and vector.
+```
+```bash
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);  // dry kernel type: KERNEL_TYPE_MIX_xxx
+    TPipe tpipe;
+    TCubeTiling tilingLocal;
+    RopeMatrix::CopyTiling(&tilingLocal, tiling);
+    if ASCEND_IS_AIC {
+        ...
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(0x8); // set flag after matmul
+    }
+    if ASCEND_IS_AIV {
+        AscendC::CrossCoreWaitFlag(0x8); // wait matmul outputs
+        ...
+    }
+```
+
+Its directory layout, verbatim — the cube half is a separate header, which is the shape a per-layer kernel wants:
+
+```bash
+  ${op_class}                                          # class
+  ├── ${op_name}                                       # name
+  │   ├── inc                                          # define aRopeMatrixTiling like TCubeTiling, which can be call by both op_device and op_host
+  │   │   └── ${op_name}_extern.h
+  │   ├── op_host                                      # Tiling、InferShape(If needed, custom operator may not need)...
+  │   │   └── ${op_name}_tiling.h                      # Tiling
+  │   ├── op_kernel                                    # kernel
+  │   │   ├── ${op_name}.h                             # fused vector part
+  │   │   └── ${op_name}_cube.h                        # matrix part
+  │   ├── tests                                        # tests
+  │   │   └── test_rope.py                             # test file: contain how to gen the [d, d] rope-matrix,
+  │   ├── CMakeLists.txt                               # makefile
+  │   ├── torch_interface.cpp                          # for torch calling
+  │   └── README.md                                    # readme
+```
+
+and its build flags, verbatim from the same article — the exact flag set for a MIX kernel on `dav-2201`:
+
+```
+8. **CMakeLists文件重写：** 请参考库上代码，COMPILE_FLAGS "--npu-arch=dav-2201 -xasc -ltiling_api -lplatform -lregister" 是为了MIX融合算子编译通过，如果Vector算子可参考ops-math仓的编译工程；
+```
+
+plus two engineering traps the same article records, verbatim:
+
+```
+4. **目录结构调整：** tiling和kernel实现都调整到h文件中，当前官网编译工程如果声明在h文件，实现在cpp文件中可以编译通过但是无法执行的；
+```
+```
+7. **namespace显式调用:**由于kernel和host不同的namespace内有重名的结构，而新的编译方式不区分kernel和host侧，所以using namespace matmul_tiling; using namespace matmul; using namespace AscendC; 不能同时使用，否则会编译工程报错。 为此代码需要调整为显示的调用命名空间中类和结构，如：TPosition修改为matmul_tiling::TPosition；
+```
+
+## Relevance
+This is the most likely cause of `mix_expert_kernel.cpp`'s non-determinism, and it is a design constraint rather
+than a missing barrier. Stated as a rule: **under mode 2, AIC[i] can raise the flag only for AIV[2i] and AIV[2i+1].
+A flag therefore says nothing about any tile produced by a different block's AIC.**
+- Our brick launches `<<<blocks>>>` with blocks > 1 and the AIV half `DataCopy`s "slices of `partial`". If any AIV
+  reads a slice its own AIC did not produce, no amount of `DataSyncBarrier` or `DataCacheCleanAndInvalid` will help:
+  the flag it waited on was raised by the wrong producer. The signature of that failure is exactly what we measured —
+  the slices your own AIC wrote are correct, the rest hold whatever has landed so far, and the count varies with
+  scheduling: 0, 0, 416, 672, 896, 896 of 1024 across six runs of one binary, wrong values being 0 or 0x8000. It also
+  explains why the full `partial` buffer downloaded after the kernel is always bit-correct: every AIC does finish, it
+  just finishes after some AIV already read.
+- The fix is structural and is the one the vendor team used: make the cube's per-core output tile the exact union of
+  the two AIVs' input tiles, so the only data an AIV ever reads is data its own AIC wrote. Their arithmetic for
+  `[B,N,S,D] = [1,24,28799,128]` on 20 Cube / 40 Vector cores is the template — split the consumer axis into
+  `2 × cubeCores` parts, give each AIV one part and each AIC the two parts belonging to its pair, and absorb the
+  ragged tail on both sides (tail AIV does 719, tail AIC does 720 + 719). For our W4A8 routed experts with
+  `moe_intermediate` 128 per rank, the consumer axis is the N direction of the expert GEMM, and the partition must be
+  `2 × blocks` wide, not `blocks` wide.
+- Diagnostic, cheap and decisive: rerun the brick with `<<<1>>>`. If the error count goes to 0 of 1024 every time,
+  this is the cause and §31's cache protocol is not needed. That also reconciles §32 — the vendor's
+  `matmul_fused_manual` sample is correct with no cache maintenance at all precisely because it launches
+  `numBlocks = 1`, so the intra-core-group constraint is trivially satisfied.
+- 「由于910系列 CV分离(Cube上的数据传入Vector必须经过L2或高带宽内存)」 is independent third-party confirmation of
+  README finding 3b and §35.4: on 910-series, cube→vector must pass through L2 or HBM. Their design conclusion —
+  「matmul计算和Vector计算理论上都是memory bound， 所以我们决策采用先计算matmul后再计算Vector」 — is that at
+  memory-bound shapes a CV *pipeline* is not worth building and plain sequencing is enough. Our decode families are
+  memory-bound by the same test (GroupedMatmulSwigluQuantV2 6.793 ms spent against 2.272 ms of bytes;
+  GroupedMatmul 5.596 against 1.212), which argues the per-layer kernel should sequence cube and vector rather than
+  overlap them, and spend its effort on deleting the 505 MIX_AIC launches instead.
+- `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);` declared as the first statement of the kernel body is the
+  form a shipping operator uses, and the build flags are
+  `--npu-arch=dav-2201 -xasc -ltiling_api -lplatform -lregister`.
+- The two engineering traps are worth encoding before the brick grows: a kernel declared in a `.h` with its
+  implementation in a `.cpp` 「可以编译通过但是无法执行」, and `using namespace matmul_tiling;` together with
+  `using namespace matmul;` and `using namespace AscendC;` collides, so names like `TPosition` must be qualified.
+
+
 ## Gaps
 
 What was looked for and not found, or found only partially.
@@ -7151,3 +12095,10 @@ What was looked for and not found, or found only partially.
   `CacheLine::{SINGLE_CACHE_LINE, ENTIRE_DATA_CACHE}` × `DcciDst::{CACHELINE_ALL, CACHELINE_OUT}` and
   `MemDsbT::{ALL, DDR, UB}`. No cost figure was found for any of them; PPFM's own accounting is only
   「AIC 每 chunk 10 次整缓存 DCCI + AIV 6 次 + 4 次 DSB」 with no per-instruction time.
+
+### Section 36 (grid-wide reduction) negative findings, reported as found
+- https://github.com/hicann/cann-ops-adv — repo does not exist on GitHub (404); so does github.com/Ascend/cann-ops-adv and github.com/hicann/ascendc-api-adv. The adv-API/ops-adv content now lives under hicann/asc-devkit (docs/zh/api/SIMD-API/adv_api/...) and hicann/ops-nn, both of which are quoted above.
+- https://github.com/Ascend/samples — `gh search code "SyncAll" --repo Ascend/samples` returns zero hits and the recursive tree has no sync_all/syncall path; the SyncAll sample moved into hicann/asc-devkit/examples (quoted above).
+- https://raw.gitcode.com/cann/ops-nn/raw/master/quant/dynamic_quant/op_kernel/dynamic_quant.h — gitcode raw refuses unregistered traffic with `429 ... Limited account:unregisteredUser`; the same files were taken from the hicann/ops-nn GitHub mirror instead.
+- https://github.com/hicann/ops-nn — no kernel in the tree builds a per-token quant row max with SetAtomicMax into GM. Every cross-core max in the repo is done as partials-in-workspace + SyncAll + a second reduce pass (ITEM 28, 30, 31). `gh search code "SetAtomicMax" --limit 30` finds the API only in asc-devkit headers/docs and in sgl-kernel-npu / unified-cache-management / AReno wrappers, never as a row-max reduction.
+- https://github.com/hicann/catlass — no dcci polling loop; catlass synchronises purely through CrossCoreSetFlag/CrossCoreWaitFlag (ITEM 21). Its tla_dsl subtree lowers flag barriers in MLIR, not in AscendC kernel source.

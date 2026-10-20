@@ -176,6 +176,21 @@ handshake is correct — `ENTIRE_DATA_CACHE` is 「耗时较大」 and a per-lay
 kernel would pay it per stage.
 [reference](../../reference/ascend-fusion-mechanics.md)
 
+The 2201 cache model closes the coherence question and does not fix this. L2
+is shared across cores, the DCache is per-core but used only by the Scalar
+unit, and the ICache is read-only; a cube-to-vector handoff runs L0C, Fixpipe,
+GM, MTE2, UB — entirely through the shared L2. So there was never a coherence
+problem on this path and the DCache flushes were aimed at the wrong cache.
+The documented need is completion ordering, one
+`DataSyncBarrier<MemDsbT::DDR>()` on the producer, and with exactly that
+protocol the arm is still clean in only 3 of 6 runs at four blocks.
+
+Two hypotheses are now closed by measurement. Two `Matmul` objects sharing one
+`TPipe` is not the cause: one projection over the whole 256-wide axis
+alternates 896, 0 identically to two projections over halves. And the
+per-row scalar scale is not the cause: making every row's scale identical
+leaves the failure unchanged.
+
 ## What it is not yet
 
 `BLOCK_DIM` is 1, so one cube core pulls the whole 1.57 MB of gate-and-up
