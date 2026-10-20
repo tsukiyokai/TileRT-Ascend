@@ -1079,3 +1079,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      merges. What stands is that warm absolutes cannot be summed into a round --
      the engine's 57.27 ms of device time is the denominator -- and every lever
      needs its cold figure.
+
+112. A profiler's wait column is queueing, not a share of the kernel. Cast
+     shows 21.47 ms of wait against 1.40 ms of duration -- 1532 percent -- so
+     the column is time spent queued before the kernel starts and cannot split
+     a collective into transfer and synchronisation. It still answers a
+     question: the collectives wait 13 and 18 percent of their own length
+     against Cast's 1532, so their 17.56 ms a round is largely execution, and
+     the one-sided push is worth 8.8 to 14.7 ms depending on whether its 6.2x
+     advantage survives the engine's message size -- a range only sixteen ranks
+     can narrow.

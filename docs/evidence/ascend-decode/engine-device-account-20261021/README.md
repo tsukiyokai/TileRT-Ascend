@@ -41,3 +41,38 @@ projections rested on -- the router's 3 MB running at 158 GB/s where q_a's
 The first two are 87 percent. Fewer, larger kernels is what the five boundary
 merges do -- 21.04 ms measured on one die -- and the collectives are what the
 one-sided push replaces. Both are built; neither has run end to end.
+
+## Wait time, and what it is not
+
+The capture carries a `Wait Time(us)` column per kernel:
+
+    SuperKernel                32.21 ms   wait  1.02 ms     3%
+    hcom_allGather              9.59 ms   wait  1.73 ms    18%
+    hcom_allReduce              7.97 ms   wait  1.00 ms    13%
+    FusedInferAttentionScore    2.92 ms   wait  1.21 ms    41%
+    Cast                        1.40 ms   wait 21.47 ms  1532%
+    MatMulV3                    0.47 ms   wait  1.50 ms   319%
+
+Cast at 1532 percent settles what the column means: it is not a part of the
+kernel's own duration but the time spent queued before it starts, which can
+exceed the kernel's length many times over. So it cannot be used to split a
+collective into transfer and synchronisation.
+
+What it does say is that the collectives are not where the round waits -- 18
+and 13 percent of their own length, against the Cast family's 1532 -- so their
+17.56 ms is largely execution.
+
+## Sizing the one-sided push, honestly
+
+The push was measured at 32.488 us against HCCL's 201.995 at sixteen ranks, a
+factor of 6.2, on a single hidden-state reduction. The engine's collectives
+cost 858 us each, 4.2 times that HCCL figure, so they carry more or synchronise
+more than the microbenchmark did.
+
+    if the 6.2x factor holds at the engine's size   17.56 -> 2.8 ms, saves 14.7
+    if it decays to 2x                              17.56 -> 8.8 ms, saves 8.8
+
+So the lever is worth 8.8 to 14.7 ms a round, and its upper end exceeds every
+other lever measured today combined. Which is why its arm leads the queue; the
+range cannot be narrowed from a single die, because the quantity is a
+sixteen-rank collective.
