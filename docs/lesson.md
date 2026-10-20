@@ -890,3 +890,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     scattered selection at 115, so a fifth of the bytes costs three quarters of
     the time, and adding the gather's own 16.332 us makes pre-gathering 35
     percent slower. The operator is right and the lever is closed.
+
+95. The grouped matmul does not read by its group list. Eight busy experts cost
+    112.850 us and 256 cost 111.524, a 32-fold range in bytes for a 33 percent
+    spread with no ordering, so a narrower draft saves nothing in the MoE --
+    removing a saving the adaptive width was assumed to carry. Compacting the
+    70 touched experts into a contiguous bank makes the operator 32 us faster
+    and costs 3688 us to build, 115 times the saving. With attention's cache
+    this makes two operators today whose apparent waste is the cheaper choice,
+    both of which this project had recorded as opportunities.
