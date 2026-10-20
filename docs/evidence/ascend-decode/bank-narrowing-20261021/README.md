@@ -321,3 +321,38 @@ The first pass divided MB per microsecond by a thousand once too often and read
 every point as 0.00 TB/s, then concluded from the pattern that small banks were
 cached. MB per microsecond is GB per millisecond; the correction is one factor
 of a thousand and it changes the mechanism, not the lever's price.
+
+## At the checkpoint's real widths, the lever is three times larger
+
+The probe used `(experts, 6144, 1536)` int8, 9.4 MB an expert. The checkpoint
+holds `gate_proj` and `up_proj` at `[1024, 6144]` and `down_proj` at
+`[3072, 2048]`, all int8 with the output axis nibble-packed -- so
+`moe_intermediate` is 2048, not 1536, and an expert is 18.9 MB rather than 9.4.
+
+Profiled at six rows and the real widths:
+
+| experts | inner | MB | us | GB/s | ms a round |
+|---|---|---|---|---|---|
+| 2 | 1024 | 12.6 | 16.65 | 756 | 1.30 |
+| 2 | 2048 | 25.2 | 17.69 | 1423 | 1.38 |
+| 16 | 1024 | 100.7 | 80.21 | 1255 | 6.26 |
+| 16 | 2048 | 201.3 | 160.53 | 1254 | 12.52 |
+
+Sixteen experts hold 1254 to 1255 GB/s at both widths, which confirms the
+bandwidth bound, and two experts cost 16.65 to 17.69 us regardless -- a floor
+of about 17 us independent of the bank.
+
+## Which reprices the round
+
+A layer runs the grouped matmul twice: once for the gate and up projections
+together and once for the down projection. At sixteen experts that is roughly
+160 us each, so about 320 us a layer; at the two a round touches it is about 35.
+
+    narrowing saves about 285 us a layer, 22.2 ms a round
+
+Three times the 7.57 ms this page carried, and the reason is the probe's inner
+width: 1536 where the checkpoint has 1024 and 2048, and one call where a layer
+makes two.
+
+So the bank is the round's largest device item by a wide margin, and the
+narrowing is the session's largest lever -- on a 50.710 ms round, 22.2 ms.
