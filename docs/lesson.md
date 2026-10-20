@@ -1289,3 +1289,19 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      configuration and cannot be compared against anything -- which turned the
      attention row-scaling candidate from weakly measured into unmeasured. Name
      the run.
+
+131. Attention is flat in the query rows, which exhausts the single-die
+     candidates for the row cost. Through this project's own `shared_kv_fia` --
+     which runs where six attempts at the engine's sparse operator were
+     rejected -- 123.229 us at one query row against 123.203 at twenty-four,
+     marginal between -0.39 and +0.19 us a row, about ±0.015 ms a row over 78
+     layers against the fitted 0.66. With the projections flat warm and cold,
+     the grouped matmul flat in rows, and capture worth 0.05, five sixths of
+     the slope is unattributed and nothing left to try on one die. It is
+     sixteen-rank behaviour or nothing.
+
+132. The per-row attention mask was already in use. `shared_kv_fia` passes
+     `atten_mask` of shape (1, 1, width, capacity) and is known to run, which
+     is exactly what tree verification needs -- while today's `tree_mask` and
+     `tree_attention` were built to feed `sparse_indices` to an operator that
+     rejected every probe. The shorter path was in the codebase.
