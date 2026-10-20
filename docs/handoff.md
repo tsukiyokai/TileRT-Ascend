@@ -49,12 +49,18 @@ tenant-occupied since 00:17 with 54.5 GiB held on the busiest die against a
    `aclnnSparseFlashAttention` rejects five argument sets with a tiling
    failure. The width arms answer it.
 2. **The 20.30 ms end to end.** None of it has run in the engine.
-3. **The tree mask from the decode loop.** `tree_mask.ancestor_rows` and
-   `tree_attention.install` exist and are checked; nothing calls `write(...)`
-   each round yet.
+3. ~~The tree mask from the decode loop.~~ Done: `--tree` selects the
+   drafter, `MtpRoundExecutor` dispatches on `propose_tree`, the mask writer
+   is injected by the attention installer, and the accepted path commits
+   through the existing `resolve` -- the path is itself a chain, so the linear
+   match, the EOS check, the output budget and the cache commit all apply.
+   Four checks on CPU.
 4. **Width 8 and above disagree between serial and speculative decoding.**
    Recorded in `fia-mask-20261020`, never isolated, and every acceptance
-   figure here is from width 12.
+   figure here is from width 12. Now has a discriminator: a chain draft's
+   tree mask is exactly the causal prefix, so if the cause is future leakage
+   the tree path agrees at width 16 where the chain path does not, and the
+   gate can go. Queued as `causal-20261021`.
 5. The routed kernel's residual five percent against the vendor, parked.
 6. Deregistering one operator from the custom package; deleting its files
    leaves it at 116.376 us instead of CANN's 66.813.
