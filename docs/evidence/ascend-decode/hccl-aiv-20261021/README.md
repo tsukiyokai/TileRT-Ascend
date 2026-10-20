@@ -48,3 +48,30 @@ wraps most of them -- the standalone count is 0.26 calls a layer -- and whether
 a wrapped collective honours `HCCL_OP_EXPANSION_MODE` is unmeasured. The
 variable is read at communicator init, so it should apply to every collective
 on that communicator, but "should" is what this page does not get to say.
+
+## The mode is per process, which answers the open question
+
+Setting the variable after the communicator exists, and then building a second
+communicator over the same ranks:
+
+    started with AIV, flipped to AI_CPU
+      before the flip            183.73 us
+      after, same communicator   181.88
+      a new communicator         181.89
+
+    started unset, flipped to AIV
+      before the flip            317.52 us
+      after, same communicator   298.58
+      a new communicator         319.77
+
+Neither direction moves, and a **freshly built communicator keeps the mode the
+process started with**. So the variable is read once when HCCL loads, not at
+communicator init and not per call.
+
+Which settles what the previous section could not say. The mode is a property
+of the process, so every collective in it takes the same path -- including the
+ones the SuperKernel wraps, which is most of them. The 11 to 13.6 ms a round
+applies to the whole round rather than to the 0.26 standalone calls a layer.
+
+And it makes the application trivial: set `HCCL_OP_EXPANSION_MODE=AIV` in the
+engine's environment. No code.

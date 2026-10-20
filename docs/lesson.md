@@ -1667,5 +1667,10 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      moves is the 48-row all_gather, 1.11x, the only item actually moving a
      large payload, which confirms AIV takes the fixed cost rather than
      transport: the same 193 us floor that two ranks pay where the bytes
-     themselves cost 37. Collectives are 374 us a layer, so this is 11 to 13.6
-     ms a round, an order of magnitude above the bank narrowing.
+     themselves cost 37. And the mode is per process -- flipping the variable
+     after the communicator exists changes nothing, and a freshly built
+     communicator keeps the mode the process started with -- so every
+     collective takes the same path including the ones the SuperKernel wraps.
+     Collectives are 374 us a layer, so this is 11 to 13.6 ms a round for the
+     whole round, an order of magnitude above the bank narrowing, and it
+     applies with an environment variable and no code.
