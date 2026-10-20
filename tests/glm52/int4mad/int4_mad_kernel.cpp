@@ -19,7 +19,21 @@
  * with ones and every element of the product should be K whatever order the
  * fractals are in. A second filling, bytes of 0x21, makes the nibbles of a
  * byte differ: the sum over K becomes 96 if both halves are read, 64 or 128
- * if only one is.
+ * if only one is. A prefix filling then reads out the fractal's own order.
+ *
+ * One mad covers at most 128 of K -- a K of 256 answered 128 -- so a real K
+ * accumulates over several, the first initialising L0C and the rest adding.
+ * Each step also loads its own 128 of K into the same L0 slot, which keeps
+ * L0A and L0B at a kilobyte each and avoids a repeat count large enough to
+ * misbehave: eight fractals in one `LoadData` lost one of four mads' worth
+ * and corrupted a cell.
+ *
+ * Reusing one L0 slot needs the two queues ordered both ways, and
+ * `PipeBarrier<PIPE_ALL>` does not do it -- with it the same code answered
+ * 128 exactly, 256 as 192, 512 as noise, 1024 as half and 6144 exactly,
+ * which is the signature of a hazard rather than of arithmetic. `MTE1_M`
+ * makes the mad wait for its operands; `M_MTE1` stops the next load
+ * overwriting operands the mad is still reading.
  */
 #include "int4_mad_kernel.h"
 #include "kernel_operator.h"
@@ -29,10 +43,21 @@ using namespace AscendC;
 namespace {
 
 constexpr int64_t ROWS = 16;
-constexpr int64_t INNER = 64;
+#ifndef INNER_K
+#define INNER_K 64
+#endif
+constexpr int64_t INNER = INNER_K;
 constexpr int64_t COLUMNS = 16;
-// An INT4 fractal covers 64 of K, so one tile is one repeat.
-constexpr int64_t INT4_FRACTAL_K = 64;
+// How much of K one repeat of `LoadData` covers. An INT4 fractal holds 64,
+// but the parameter may count in INT8 fractals of 32, which would load half
+// the tile and leave the rest of L0 at zero -- and a sum of 64 real terms and
+// 64 zeros is indistinguishable from a K of 64.
+#ifndef REPEAT_K
+#define REPEAT_K 64
+#endif
+constexpr int64_t INT4_FRACTAL_K = REPEAT_K;
+// The most of K one mad covers.
+constexpr int64_t MAD_K = 128;
 
 }  // namespace
 
@@ -56,8 +81,9 @@ extern "C" __global__ __mix__(1, 2) __aicore__ void int4_mad(
     TBuf<TPosition::CO1> product_tile;
     pipe.InitBuffer(left_stage, ROWS * INNER / 2);
     pipe.InitBuffer(right_stage, COLUMNS * INNER / 2);
-    pipe.InitBuffer(left_tile, ROWS * INNER / 2);
-    pipe.InitBuffer(right_tile, COLUMNS * INNER / 2);
+    // L0 holds one step of K, not the whole of it.
+    pipe.InitBuffer(left_tile, ROWS * MAD_K / 2);
+    pipe.InitBuffer(right_tile, COLUMNS * MAD_K / 2);
     pipe.InitBuffer(product_tile, ROWS * COLUMNS * sizeof(int32_t));
 
     LocalTensor<int4b_t> left_l1 = left_stage.Get<int4b_t>();
@@ -77,18 +103,28 @@ extern "C" __global__ __mix__(1, 2) __aicore__ void int4_mad(
     DataCopy(right_l1, right_global, COLUMNS * INNER);
     PipeBarrier<PIPE_ALL>();
 
-    // One fractal a repeat, contiguous, no transposition.
-    LoadData(left_l0, left_l1,
-             LoadData2DParams(0, (uint8_t)(INNER / INT4_FRACTAL_K), 1, 0, 0,
-                              false, 0));
-    LoadData(right_l0, right_l1, LoadData2DParams(0, 1, 1, 0, 0, false, 0));
-    PipeBarrier<PIPE_ALL>();
+    const uint8_t fractals = (uint8_t)(MAD_K / INT4_FRACTAL_K);
+    for (int64_t done = 0; done < INNER; done += MAD_K) {
+        const int64_t span = (INNER - done < MAD_K) ? INNER - done : MAD_K;
+        // The fractals along K come first in the layout, so a step of K
+        // starts whole fractals in.
+        LoadData(left_l0, left_l1[done * ROWS],
+                 LoadData2DParams(0, fractals, 1, 0, 0, false, 0));
+        LoadData(right_l0, right_l1[done * COLUMNS],
+                 LoadData2DParams(0, fractals, 1, 0, 0, false, 0));
+        SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE1_M>(EVENT_ID0);
+        MmadParams step((uint16_t)ROWS, (uint16_t)COLUMNS, (uint16_t)span,
+                        false, 0, false, false, false);
+        step.cmatrixInitVal = (done == 0);
+        step.cmatrixSource = false;
+        Mmad(product, left_l0, right_l0, step);
+        SetFlag<HardEvent::M_MTE1>(EVENT_ID0);
+        WaitFlag<HardEvent::M_MTE1>(EVENT_ID0);
+    }
 
-    Mmad(product, left_l0, right_l0,
-         MmadParams((uint16_t)ROWS, (uint16_t)COLUMNS, (uint16_t)INNER, false,
-                    0, false, false, false));
-    PipeBarrier<PIPE_ALL>();
-
+    SetFlag<HardEvent::M_FIX>(EVENT_ID0);
+    WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
     Fixpipe(out_global, product,
             FixpipeParamsV220((uint16_t)COLUMNS, (uint16_t)ROWS,
                               (uint16_t)0, (uint32_t)COLUMNS, false));

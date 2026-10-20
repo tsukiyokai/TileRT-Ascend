@@ -278,3 +278,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     halves and recombine 16 × high + low, two `mad_s4` a weight tile. Before
     concluding a quantisation scheme is impossible on a part, read the
     vendor's kernels for the op that already does it.
+
+42. Hand-rolling past a library's refusal is the second-best answer. The
+    `Matmul` library rejects INT4 because it plans to widen it to INT8
+    entering L1; driving L1 and L0 directly proved the primitive and then
+    sank into the micro-synchronisation of a reused L0 slot, where
+    `PipeBarrier<PIPE_ALL>` gave right answers at K of 128 and 6144 and wrong
+    ones between. The answer was to remove the reason for the refusal
+    instead: a homogeneous INT4 pair needs no widening and compiles in every
+    combination, and the activation's two INT4 halves stack along M so the
+    weight is still read once. Ask what the library objects to before
+    replacing the library.

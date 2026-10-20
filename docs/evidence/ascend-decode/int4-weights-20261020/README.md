@@ -134,3 +134,38 @@ So every link is proven: INT4 from global memory to L1, L1 to L0, the mad
 itself, and the product out through the fixpipe. What remains is tiling
 K = 6144 and N = 256 by hand, and the activation split the vendor's `a8w4_msd`
 stages describe.
+
+## The way through: a homogeneous INT4 pair, stacked along M
+
+Hand-driving L1 and L0 got the primitive right and then stalled on the
+micro-synchronisation of a reused L0 slot. With `PipeBarrier<PIPE_ALL>` the
+same code answered a K of 128 exactly, 256 as 192, 512 as noise, 1024 as half
+and 6144 exactly -- a hazard's signature, not arithmetic's. Replacing it with
+`SetFlag`/`WaitFlag` on `MTE1_M` and `M_MTE1` made K of 512 and above fail at
+launch instead. Along the way the layout did come out: the INT4 fractal is
+`[k-fractal][16 columns][64 of K]`, a prefix of 64 nibbles lands entirely in
+column zero and a prefix of 1024 spreads 64 across all sixteen; one mad covers
+at most 128 of K; and eight fractals in one `LoadData` lose a mad's worth.
+
+The way through is not to hand-roll at all. The library rejects INT4 because
+it plans to widen it to INT8 on the way into L1 -- so give it a pair that
+needs no widening. `MatmulType<..., int4b_t, ...>` for *both* operands
+compiles in all four combinations tried: B as ND and as NZ, transposed and
+not.
+
+Two INT4 matmuls would read the weight twice and give back the saving, so the
+two halves of the activation stack along M instead. With
+`A' = [A_high ; A_low]` of 2 × ROWS by 6144 and one `Matmul`, the weight is
+read once and
+
+    C[r][n] = 16 × C'[r][n] + C'[ROWS + r][n]
+
+M doubling from two rows to four costs almost nothing in a weight-bound
+matmul, and the library's tiling -- the thing already reaching 66% of
+bandwidth on INT8 -- is kept rather than reimplemented.
+
+So the routed kernel's INT4 form is: the vector half splits the INT8
+activation into two INT4 halves and stacks them, the cube runs one INT4
+matmul an expert, and the vector half recombines with the shift before the
+dequantisation it already does. The down projection takes the same treatment,
+its activation being the intermediate the vector has just quantised.
