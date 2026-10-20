@@ -95,3 +95,25 @@ the term that actually binds. The cost is accuracy, since selection becomes
 block-pooled, and GLM-5.3-Flash's own `index_kpool: 4` shows the model family
 treats that as acceptable. One constant, one arm, and the answer is a
 measurement rather than an argument.
+
+## 2026-10-21: reading everything is the faster choice, not a missed one
+
+The conclusion above -- that the selection is applied as a mask after the read,
+so the sparsity "buys nothing" -- is right about the mechanism and wrong about
+the opportunity. Gathering the selection first, measured on one die at this
+shape:
+
+    cache 10.3 MB, selection 2.2 MB (2048 of 9344)
+    gather the selection          16.332 us    135 GB/s
+    score against the whole       26.352 us    380 GB/s
+    score against the selection   19.166 us    115 GB/s
+    gather plus selection         35.498 us    -9.146 us, -0.71 ms a round
+
+A fifth of the bytes takes three quarters of the time, because the selected
+positions are small and scattered: 115 GB/s against 380 for the contiguous
+read. Add the gather's own 16.332 us and pre-gathering is 35 percent slower
+than letting the operator read everything.
+
+So the operator's choice is the right one at this shape, and the 78 percent of
+bytes it "wastes" are cheaper than the gather that would avoid them. This
+closes attention sparsity as a lever.

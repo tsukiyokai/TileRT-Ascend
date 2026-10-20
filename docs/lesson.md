@@ -882,3 +882,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     order of magnitude behind it, because it predicts in general where the
     automaton recalls on a distribution that largely copies its input. The 15
     was mine and nothing published approaches it.
+
+94. Wasted bandwidth can be the cheaper option. This project's own evidence
+    showed the sparse attention operator reading the whole 10.3 MB cache and
+    applying its 2048-position selection as a mask afterwards, and read that as
+    a missed gather. Measured: the contiguous read runs at 380 GB/s and the
+    scattered selection at 115, so a fifth of the bytes costs three quarters of
+    the time, and adding the gather's own 16.332 us makes pre-gathering 35
+    percent slower. The operator is right and the lever is closed.
