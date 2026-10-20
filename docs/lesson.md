@@ -1645,3 +1645,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      costs 7.53 us an expert, so sixteen more experts cost 120 against 58
      saved. TP16 is right for this workload by measurement, and the 193 us
      floor is what no rank count avoids.
+
+161. HCCL's 193 us per-call floor is synchronisation, not transport, and a
+     hand-rolled peer copy is worse than the collective it would replace. One
+     process, two devices, 144 KB out of die 0: a die-to-die copy is 218 to 244
+     us to every destination -- flat, 0.66 GB/s, above HCCL's own floor -- while
+     the same payload reaches pinned host memory in 37.09 us. So moving the
+     bytes costs 37 and the call costs 193, five times that, independent of
+     rank count, payload and destination. Five exits from the collective cost
+     are now closed by measurement: smaller messages, explicit overlap, fewer
+     calls, fewer ranks, and a hand-rolled primitive. What remains is a cost
+     inside HCCL that is neither bandwidth nor participants nor host dispatch.

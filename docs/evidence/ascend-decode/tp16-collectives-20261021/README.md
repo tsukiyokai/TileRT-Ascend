@@ -115,3 +115,37 @@ TP8 a rank would hold thirty-two.
 So the trade is 58 us of collective against roughly 120 us of bank, and it
 loses. TP16 is the right rank count for this workload, which is now measured
 rather than assumed -- and the 193 us floor is what no rank count avoids.
+
+## The 193 us is synchronisation, not transport
+
+144 KB out of die 0, one process, two devices, no HCCL:
+
+| destination | us | GB/s |
+|---|---|---|
+| die 1 | 219.64 | 0.66 |
+| die 2 | 217.98 | 0.66 |
+| die 4 | 244.03 | 0.59 |
+| die 8 | 218.50 | 0.66 |
+| die 15 | 218.51 | 0.66 |
+| pinned host memory | **37.09** | |
+
+Two readings, both useful. A die-to-die copy through torch is 218 us -- worse
+than HCCL's 193 us floor, and flat across every destination, so building a
+reduction from peer copies is not the way out. And the same payload reaches
+pinned host memory in 37.09 us.
+
+So moving 144 KB off a die costs 37 us. HCCL's 193 us per call is therefore
+**synchronisation and setup, not transport**: five times the cost of the data
+movement it performs, and independent of the rank count, the payload and the
+destination.
+
+## Which is the honest end of this thread
+
+Four exits closed by measurement -- smaller messages, explicit overlap, fewer
+calls, fewer ranks -- and now the fifth, a hand-rolled primitive, closed too:
+the peer copy is more expensive than the collective it would replace.
+
+What remains is the gap between 37 us of transport and 193 us of call: a cost
+that is neither bandwidth nor participants nor host dispatch. Whatever it is
+lives inside HCCL, and 78 layers of it is the largest single item in this
+project's round.
