@@ -1401,3 +1401,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      per-round numbers. What survives is the compute floor: 24.76 ms a round on
      one die at 6.872 accepted is 3.60 ms, before a collective or a row is
      counted, and the target is below it.
+
+142. Acceptance saturates, so the budget optimum was never the binding
+     constraint. With the row cost set to zero and the budget taken to 256, the
+     tree converges to 4.289 accepted and the chain to 3.400 -- 128 to 256
+     buys 1.3 percent and nothing. Every budget optimum this project measured
+     was read as a trade-off against 0.66 ms a row, which implied acceptance
+     would keep rising if rows were free; it does not. At the one-die compute
+     floor of 24.76 ms a round that caps the best drafter at 5.77 ms, and 2.9
+     ms would need 8.54 accepted. So the target has one axis left: per-layer
+     compute at 159 us, against 317 measured warm, 214 replayed in a graph and
+     203 profiled busy. Not a boundary to merge -- a different amount of
+     arithmetic.
