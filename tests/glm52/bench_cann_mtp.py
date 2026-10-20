@@ -488,7 +488,13 @@ def run(args, report):
             if args.target_graph or args.draft_graph:
                 counters_before = asdict(compilation_counter)
                 engine.inject(prefix)
-                engine.start_mtp(first, args.max_tokens,
+                # Under dummy weights the capture case's first token is not
+                # what this model produces, and there is no reference to check
+                # against -- so the arm uses the token the injection itself
+                # computed. The guarantee is untouched: start_mtp still
+                # compares against what inject produced.
+                opening = (engine.first_token_id if args.layers else first)
+                engine.start_mtp(opening, args.max_tokens,
                                  args.width, ())
                 engine.advance_mtp()
                 if args.dump_indices and rank == 0:
