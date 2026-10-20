@@ -446,9 +446,20 @@ def run(args, report):
                        hoist_forward_context=args.hoist_forward_context)
     draft = None
     try:
-        draft = CannMtp(target, shard_projections=args.draft_projection_tp)
-        if not draft.model.do_not_compile:
-            raise ValueError("MTP backbone compilation must be disabled")
+        if args.layers:
+            # A truncated backbone has no MTP head: the checkpoint's is layer
+            # 78 and a shortened model has nowhere to put it. The drafted
+            # round never touches the draft engine -- `_advance_drafted` reads
+            # only the target, the state and the host drafter -- so the
+            # truncated arm runs without one, and requires a host drafter.
+            if not (args.automaton or args.tree or args.lookup):
+                raise ValueError("--layers needs a host drafter: "
+                                 "--automaton, --tree or --lookup")
+        else:
+            draft = CannMtp(target,
+                            shard_projections=args.draft_projection_tp)
+            if not draft.model.do_not_compile:
+                raise ValueError("MTP backbone compilation must be disabled")
         if "float32" not in target.tp_reduction:
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
