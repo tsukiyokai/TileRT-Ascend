@@ -59,3 +59,28 @@ claimed: the warm figures understate the boundary merges rather than
 overstating them. What stands is that warm absolutes cannot be summed into a
 round -- the engine's own 57.27 ms of device time is the denominator -- and that
 every lever needs its cold figure before the total means anything.
+
+## The cache's effect is per lever, not uniform
+
+    routed experts, four launches into one   cold 8.54 ms   warm 8.48 ms
+    four projections off the hidden states   cold 3.59 ms   warm 2.46 ms
+
+The routed-expert merge is unmoved because both sides read the same expert
+weights exactly once; what it saves is the intermediates' round trips through
+HBM, which has nothing to do with whether a weight is resident. The projection
+merge gains by half because what it saves *is* the weights' access pattern --
+four separate pulls become one contiguous pull.
+
+So "every lever needs its cold figure" is right, and the implied "every lever
+will move" is not. The question to ask of a merge is what it saves: a merge
+that removes intermediate traffic is cache-neutral, and one that changes how
+weights are fetched is not.
+
+## The lever table, cold where it has been remeasured
+
+    routed experts, four into one      8.54 ms   cold
+    four projections off the hidden    3.59 ms   cold
+    withholding the custom aclnn lib   2.14 ms   warm, reads one weight bank
+    residual add with the norm         1.46 ms   warm, no weights involved
+    one-sided reduce                   unknown   capture puts the traffic it
+                                                 replaces at 17.56 ms a round
