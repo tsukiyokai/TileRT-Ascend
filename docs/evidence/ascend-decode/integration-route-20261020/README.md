@@ -80,3 +80,40 @@ construction and the rounding does not, and the size of that divergence is
 unmeasured. It matters more here than elsewhere because this engine's TPOT is
 acceptance-coupled, so a kernel that moves tokens produces a TPOT that
 measures acceptance rather than the kernel.
+
+
+## The three artifacts, written
+
+`tests/glm52/routed/routed_expert_binding.cpp` registers
+`tilert::routed_experts` on `PrivateUse1` and calls `routed_expert_launch`.
+Three things in it are not obvious and each has a reason. The cross-core sync
+base from `rtGetC2cCtrlAddr` and the two 256-byte tilings are built once in a
+function-local static, because both belong outside capture. The scratch --
+`partial`, `middle`, `middle_scale`, `wide` -- is shaped by the layer rather
+than by the call, so it is allocated once too. And the stream comes from the
+accessor that does not drain: the draining one costs about a millisecond a
+call on a busy worker against two microseconds, and a cached global pointer
+has been seen to send kernels onto another thread's stream.
+
+`tests/glm52/routed/build_so.sh` differs from the standalone build by `-fPIC`
+and the torch link line. ABI 1, because that is what this box's torch reports
+-- and an operator project would force ABI 0 through its own cmake, so the two
+worlds cannot share an object.
+
+`tilert/models/glm_5_2_ascend/routed_expert.py` replaces
+`apply_gmm1_act_quant` and `apply_gmm2` on the quant-method object of the
+layers it is given, per object rather than per class, so the layers left out
+keep the vendor path and the comparison is within one run. The first method
+does the whole chain and the second returns what it produced. Weights are
+unpacked low-nibble-first into INT8 and need no transpose and no format cast.
+
+## What is not yet known
+
+Three things, and the first run answers all three. Whether those two method
+names are what this tree's `w4a8.py` actually exposes. Whether the numerics
+agree with the *vendor* operator rather than with this project's own host
+reference -- the integer products agree by construction and the rounding does
+not, since the vendor dequantises through the fixpipe's 1+8+10-bit scale with
+separate FP32 additions. And whether a per-layer conversion at eight or
+sixteen layers shows a per-layer in-graph cost that scales to a TPOT delta
+worth having, given that the whole model cannot be converted at all.
