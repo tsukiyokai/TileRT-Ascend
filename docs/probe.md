@@ -68,6 +68,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 
 
+| 10-20 | [Routed split](evidence/ascend-decode/routed-split-20261020/README.md) | Cube gate/up only: 10.742／10.709／10.717／10.852／11.416µs at2／4／8／16／32 rows — flat. By blocks at8 rows:20.610／13.120／10.795µs at1／2／4, i.e.76／120／145 GB/s on a fixed 1.57MB of weights. | Per-expert matmuls are closed: ~10µs each × 44 experts = 440µs a layer against the vendor's165. The cube is short of cores, not efficiency — our earlier "31x off the bytes" divided per-core traffic by the die's aggregate rate; four cores at145 GB/s are near what four can have. Split the expert axis instead: a permuted row belongs to one expert and so to one core, so the dynamic-quant row max is core-local and the routed chain needs no grid barrier at all. Byte floor is45µs a layer. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
