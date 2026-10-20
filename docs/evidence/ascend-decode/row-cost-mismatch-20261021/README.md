@@ -116,3 +116,38 @@ construction, the payload is scalars and fixed tuples -- `token`,
 carrying a dict, once a request. The draft tokens are not broadcast at all;
 each rank already computes them. Which is also why the Gloo measurement came
 out flat in the width.
+
+## Settled from the records: it is the width's fixed cost, not the row's marginal cost
+
+Each arm's own rounds, grouped by how many drafted tokens matched that round:
+
+    auto12   0 matched  76 rounds  median 50.49 ms
+             6 matched   7 rounds  median 50.65 ms
+    auto16   0 matched  79 rounds  median 53.30 ms
+             6 matched   5 rounds  median 53.90 ms
+
+Within one arm, six more matched drafts cost 0.16 to 0.60 ms -- 0.03 to 0.10 ms
+a row, which agrees with the 0.026 measured on one die. Across arms the
+medians are 48.2, 50.5 and 53.5 ms at widths 8, 12 and 16: 0.66 ms per unit of
+width.
+
+So the slope is real and it is the **width's** cost, paid every round whatever
+the draft achieves, not the row's marginal cost. The engine captures one graph
+at `graph_width`, so a wider graph is more expensive to replay even when most
+of its rows carry nothing.
+
+## What that does to the tree
+
+It reverses the earlier reading. A tree's budget is expensive -- but because the
+graph must be captured at that width, not because its nodes cost anything to
+verify. A fixed-budget tree of 64 nodes pays width-64 replay every round.
+
+Which points somewhere specific: match the captured width to the tree's typical
+node count rather than to its ceiling. The adaptive tree's mean is 13.1 nodes
+against a 64 ceiling, so a graph captured at 16 and a tree capped at 16 pays
+53.5 ms a round and accepts what a 13-node tree accepts -- while a 64-wide
+graph would pay about 85 ms for the same work.
+
+That is also why width 12 won the original sweep, and it means the drafting
+work should be measured at a fixed captured width, with the tree shaped to fill
+it rather than to exceed it.

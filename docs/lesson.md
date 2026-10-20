@@ -931,3 +931,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     span is not noise, so something real is being measured and it has not been
     named. Record that as the state rather than picking the least-disproven
     story.
+
+99. The round model's slope is the width's fixed cost, not the row's marginal
+    cost, and the records already said so. Grouping each arm's own rounds by
+    matched drafts: within auto12, zero matches cost 50.49 ms and six cost
+    50.65; within auto16, 53.30 against 53.90. That is 0.03 to 0.10 ms a row,
+    agreeing with the 0.026 measured on one die. Across arms the medians are
+    48.2, 50.5 and 53.5 ms at widths 8, 12 and 16 -- 0.66 ms per unit of width,
+    paid every round whatever the draft achieves, because the engine captures
+    one graph at `graph_width` and a wider graph costs more to replay even with
+    empty rows. Nine mechanisms were hypothesised and excluded before the
+    grouping that settles it, and the data for that grouping was in the records
+    the whole time.
