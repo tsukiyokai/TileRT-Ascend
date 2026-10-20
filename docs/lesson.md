@@ -987,8 +987,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      flat. Ten mechanisms were hypothesised for this before a graph was
      captured at two widths, which was always the direct test.
 
-104. Varying two parameters at once produced both of today's drafting wins, and
-     both withdraw. The tree's 14.510 accepted came from budget 64 with a width
+104. [Half of this is re-corrected by 122.] Varying two parameters at once
+     produced both of today's drafting wins, and both withdraw. The tree's 14.510 accepted came from budget 64 with a width
      ceiling of 32; at equal budget the tree matches the automaton to within
      half a percent -- 9.178 against 9.221 at 16 -- because a suffix match is
      usually right and branching buys nothing on this corpus. The adaptive
@@ -1193,3 +1193,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      skips absent layers, which is inside vLLM. Fifteen constraints were cleared
      on the way, eleven of them our own, and the attempt found the two
      corrections that mattered more than the route.
+
+122. The corpus was the proxy, not the finding. Drafters compared on this
+     repository's source files put the tree within half a percent of the
+     automaton at equal budget, so the tree's branching was recorded as worth
+     nothing here. On the engine's own stream -- the capture case's 8192-token
+     prompt and the 1024 tokens a real run produced -- the tree leads the
+     automaton by 9 percent at width 12 and 20 at width 32, and the automaton
+     leads lookup by 13 to 21. Source files repeat themselves differently from
+     a model rewriting its input. The real stream was available all along, in
+     the records of the run that set the project's best result.
