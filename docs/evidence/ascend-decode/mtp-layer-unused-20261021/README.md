@@ -39,3 +39,24 @@ model rather than against the checkpoint's own head -- the message says "draft
 model", and vLLM's MTP path is a different mechanism from an external drafter.
 And that the engine's speculative config can address layer 78 without
 disturbing the 0 to 77 graph capture the round depends on.
+
+## Upstream支持已确认，架构映射在列
+
+`SpeculativeConfig.hf_config_override`:
+
+    if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+        hf_config.model_type = "deepseek_mtp"
+    if hf_config.model_type == "deepseek_mtp":
+        n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        hf_config.update({"n_predict": n_predict, "architectures": [
+            "DeepseekV32MTPModel" if use_v32_mtp else "DeepSeekMTPModel"]})
+
+with `use_v32_mtp = hf_config.model_type in ("deepseek_v32", "glm_moe_dsa")`.
+
+So this checkpoint's `glm_moe_dsa` becomes `deepseek_mtp` and loads
+`DeepseekV32MTPModel`, with `n_predict` taken from the config's
+`num_nextn_predict_layers` of 1. The path is complete upstream.
+
+A first reading of the same function found a `glm5_next` branch and concluded
+`glm_moe_dsa` had no architecture mapping. That was reading one branch of a
+chain of them -- the mapping is two `if`s earlier.

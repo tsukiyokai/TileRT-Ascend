@@ -854,3 +854,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     to 0.20. A trained head predicts instead of recalling. One extra layer a
     round is 1.3 percent, and acceptance of 15 against today's 9.288 is the
     difference between 4.9 ms and 2.4.
+
+91. Read the whole chain of branches, not the one that mentions your name.
+    Searching `hf_config_override` for `glm_moe_dsa` found it only in a boolean
+    and a `glm5_next` branch that does not apply, which read as "no MTP
+    architecture for this model". Two `if`s earlier the same function maps
+    `glm_moe_dsa` to `deepseek_mtp` and then to `DeepseekV32MTPModel`. The
+    checkpoint's draft head is fully supported upstream; what was missing was
+    only the engine passing a speculative config.
