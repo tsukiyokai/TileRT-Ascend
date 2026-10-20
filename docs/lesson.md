@@ -1961,3 +1961,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      ms a round, not 309 us and 24 ms. Every absolute figure this session took
      around a synchronise carries the same tax; the ratios survive because both
      arms paid it.
+
+187. A layer's device time is 228.67 us and the grouped matmul is 56 percent of
+     it, which inverts the compute ordering this session worked from. Profiled
+     on one die at the engine's shapes: GroupedMatmul 127.17 us, FIA 50.28, four
+     Matmuls 44.63, RmsNorm 3.33, DynamicQuant 3.27 -- 17.84 ms over 78 layers,
+     within 8 percent of the census's 16.4 ms of super kernel time from an
+     unrelated measurement. The host-timed probe had put attention and its
+     projections at 308.97 against the MoE's 198.88, and that was the host tax:
+     the FIA call's seventeen parameters cost about 120 us of argument handling
+     a graph removes. So the bank narrowing aims at the largest item after all
+     -- 127.17 to about 71 us, 4.4 ms a round out of 17.84 -- and attention,
+     which took three experiments to attack, is 3.9 ms a round. The profiler was
+     available all along.
