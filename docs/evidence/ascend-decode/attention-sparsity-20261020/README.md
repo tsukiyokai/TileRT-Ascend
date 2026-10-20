@@ -54,3 +54,44 @@ exists, and nothing to build either way.
 step is not moving data, it is waiting for the slowest rank. The project's
 round budget has carried `hcom_allReduce_` at 5.35 ms a round with no overlap
 and has never accounted for this one.
+
+
+## Corrected: the denominator is wrong in kind, not only in magnitude
+
+Three things overturn the reading above.
+
+The operator is already at or below the public state of the art. A reference
+AscendC `npu_sparse_flash_attention` at batch 1, 128 query heads, topk 2048
+and head dim 512 + 64 costs 98 to 100 µs a call on A3; this one costs 89.4 at
+four query heads. And the published times are flat across KV lengths from
+2560 to 48000, so the cost tracks the sparse window rather than the sequence
+-- which is the behaviour of an operator that already honours its selection.
+
+The binding limit is not bandwidth. A vector core has sixteen outstanding
+MTE2 requests, and a scattered gather on this part necessarily becomes one
+descriptor per block because there is no gather DMA: `Gather` takes `__ubuf__`
+sources on the vector pipe, and the multi-dimensional `DataCopy` is
+unsupported on A3. So the family is latency bound in the number of
+descriptors, and a bytes roofline is the wrong denominator in kind. The
+vendor's own controlled A/B on this part separates the terms: holding bytes
+identical and raising `blockCount` from 1 to 64 takes MTE2 from 548.161 to
+220.772 µs, 2.48 times, while raising `blockLen` from 128 B to 2048 B buys
+only 1.09.
+
+And the byte estimate itself was too small. `KV_N` supports only 1, so the
+MQA latent is not tensor-parallel shardable and all sixteen ranks read the
+same bytes. At `index_topk = 2048`, a 656-byte C8 row and 78 layers that is
+104.8 MB a decode step, which against 1.382 ms implies 75.8 GB/s rather than
+the comfortable figure the page assumed.
+
+What survives is the lever, and it is cheaper than a kernel.
+`sparse_block_size` is an existing attribute of the operator this engine
+already calls, hardcoded to 1 at five sites in
+`vllm_ascend/device/device_op.py`. Above 4 it selects the C template, which
+drops the `kvMergeGm_` staging round trip entirely -- `MergeKv` has exactly
+one call site and it is guarded by `if constexpr (TEMPLATE_MODE ==
+V_TEMPLATE)` -- and cuts the descriptor count by the block factor, which is
+the term that actually binds. The cost is accuracy, since selection becomes
+block-pooled, and GLM-5.3-Flash's own `index_kpool: 4` shows the model family
+treats that as acceptable. One constant, one arm, and the answer is a
+measurement rather than an argument.

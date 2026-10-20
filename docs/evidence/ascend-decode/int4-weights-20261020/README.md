@@ -123,12 +123,20 @@ the answer would be 64 or 128; 96 is 32 ones and 32 twos, so both halves of
 every byte are separate INT4 elements. `mad_s4` consumes packed INT4
 correctly.
 
-One negative worth keeping: `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)`
-is rejected at submission, not at run -- the queue reports `sqe_type=3(place
-holder), errType=0x20(sq sw status error), sqSwStatus=0x23` and the launch
-returns 507015 with no aicore exception anywhere in the log. The `__mix__(1, 2)`
-shape this project already runs cube code through works, with the vector half
-returning immediately.
+One negative, now withdrawn as an explanation though the observation stands:
+`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)` did fail here, with the queue
+reporting `sqe_type=3(place holder), errType=0x20(sq sw status error),
+sqSwStatus=0x23` and a 507015 return. But that is not the scheduler refusing
+the type. The open-source runtime decodes `RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3`
+and `RT_STARS_CQE_ERR_TYPE_SW_STATUS = 1 << 5`, so the line is a placeholder
+SQE carrying a software-status error -- and `KERNEL_TYPE_AIC_ONLY` is live on
+A3 three independent ways, including being the global default in Huawei's own
+`swiglu_gated_mlp` kernel, whose parameters are this very expert chain. The
+documented requirement that fits is that a forced type needs a non-zero
+workspace, and the cube-only type that comes with hard sync is
+`KERNEL_TYPE_MIX_AIC_1_0` rather than `AIC_ONLY`. The `__mix__(1, 2)` shape
+this project runs works, so nothing is blocked -- but "AIC-only is
+unsubmittable" was the wrong conclusion and is retired.
 
 So every link is proven: INT4 from global memory to L1, L1 to L0, the mad
 itself, and the product out through the fixpipe. What remains is tiling

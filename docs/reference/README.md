@@ -23,13 +23,15 @@ ForeachAddList 1.622 / 0.018.
 | File | Covers |
 | --- | --- |
 | `megakernel-persistent-decode.md` | Hazy Research Llama-1B megakernel (full text), MPK / Mirage Persistent Kernel, FlashMoE/FlashDMoE, **CANN SuperKernel device-side source**, ThunderMLA, Event Tensor / ETC, plus a cross-system comparison table. **§9-§72 are the in-kernel cross-rank collective**: `cann/shmem`'s `aclshmem_ptr` and `aclshmemx_mte_atomic_add`, MegaMoE's epoch-tagged `SynchronizeRanks()`, the `sqe_type`/`errType` decode from `cann/runtime`, and the A3 `SyncAll` flagId budget |
-| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence). **§42-§45 are the `int4b_t` and intra-core-sync block**: §42 sub-byte addressing from the shipped headers (and the hard negative on `SetGlobalBuffer`'s length), §43 the authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule with the per-core-half `HardEvent` split, §44 the two shipped vendor int4 kernels and the 950PR unzip tax, §45 the public found-and-fixed W4A4 erratum |
+| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence). **§42-§48 are the `int4b_t` and intra-core-sync block**: §42 sub-byte addressing from the shipped headers (and the hard negative on `SetGlobalBuffer`'s length), §43 the authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule with the per-core-half `HardEvent` split, §44 the two shipped vendor int4 kernels and the 950PR unzip tax, §45 the public found-and-fixed W4A4 erratum, §46 `GetQueEvt` as the barrier→event conversion table, §47 the `Cast`/`DataCopy` guard asymmetry and `REGIST_CUBE_OBJ`'s half-partition, §48 the ISASI constraint list and API allowlist. **§49-§57 are the performance block** — Fixpipe dtypes, kernel types, the 512-byte same-address rule, split-K, IBShare, constant tiling, the 256-byte inner-axis rule, the GM-traffic formula, and working `AIC_ONLY`/`MIX_AIC_1_0` code |
 | `ascend-launch-overhead-and-sync.md` | **Internal Wiki only — do not publish.** Measured MIX head-overhead decomposition, the CrossCoreSetFlag counter limit and MlaPrologV3's real CV pipeline, the 0–7 event-id budget, A3 buffer capacities, `blade/runtime` (an existing Ascend megakernel runtime with `aclrtLaunchMega`), an internal plan for an Ascend MPK, heterogeneous workers, Async-MoE scoreboard sync |
 | `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming. **Part 8 is grouped matmul over 256 experts inside a hand-written kernel** — `group_list_type`'s three modes, per-expert weight addressing, the 128-group TensorList cap. **§B7 is arXiv 2605.13915 "Multi-Scale Dequant"** — one of four things CANN calls MSD, with the M-stacked single-GEMM form as its equation (16); read §B7.-1 first for the four-family taxonomy and the authoritative A8W4 expansion |
 | `w4a8-msd-int4-mmad.md` | The A8W4 MSD decomposition as CANN actually ships it: the four MSD families and which kernels hold each, the documented nibble split and `weightAssistMatrix` / `bias` / `yOffset` correction term, and the `Mmad` both-operands-int4 wall |
-| `mla-decode-fusion.md` | MlaPrologV3, SparseFlashAttention / DSA, FusedInferAttentionScore, FlashMLA, weight absorption |
-| `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem. **Part 7 is the in-kernel collective without a host barrier** — `aclshmem_quiet`'s implementation, epoch/magic tagging, and the A3 AMO limits |
+| `mla-decode-fusion.md` | MlaPrologV3, SparseFlashAttention / DSA, FusedInferAttentionScore, FlashMLA, weight absorption. **§8-§21 are the SparseFlashAttention roofline gap** — `sparse_block_size` flipping `perfMode_` from `V_TEMPLATE` to `C_TEMPLATE` and deleting the `kvMergeGm_` round trip; the reference operator's 98-100 us/call against our 89.4; the A3 controlled A/B showing the gather penalty is **2.48x instruction count, 1.09x burst length**; no gather DMA on 2201; and the 16-outstanding-MTE2-request limit that makes this latency-bound |
+| `ascend-decode-latency-baselines.md` | What batch-1 decode TPOT anyone has actually published on Ascend, so our 10.8528 ms has a reference frame — and the ten-commit host-side lever catalogue behind the best of them (vllm-ascend PR #19033, 910_93, c=1 TPOT 8.2→7.6 ms plain and 7.0→5.1 ms with MTP) |
+| `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem. **Part 7 is the in-kernel collective without a host barrier** — `aclshmem_quiet`'s implementation, epoch/magic tagging, and the A3 AMO limits. **Part 8 is the vendor's MC2 tuning case** — 32.7% measured on MatmulAllReduce, and the three numeric reasons none of it reaches batch=1, plus the AllReduce cost fit with its 14.769 us constant term |
 | `speculative-acceptance.md` | prompt lookup, SuffixDecoding, EAGLE/Medusa/tree drafts, MTP, acceptance-length measurements |
+| `tilert-rocm-glm52-structure.md` | The TileRT ROCm GLM-5.2 binary, disassembled — kernel inventory and structure, for comparison against what we generate |
 | `tilelang-ascend.md` | **Deprioritized** (hand-written AscendC was chosen instead). Kept for the AscendC primitives it documents: pipe flag protocol, real L1/UB address maps, Cube↔Vector handoff, and the tile-ai repo inventory |
 
 ## The findings that change the plan
@@ -161,6 +163,23 @@ ForeachAddList 1.622 / 0.018.
    chapter lists `S322S4` and `FP322S4` as hardware Fixpipe conversions. Hardware capability and API surface
    disagree; until a probe says otherwise, W4 output quant stays a Vector `Cast`.
 
+12. **There are three kernel-type designs, not two, and the launch floor is 4.5x cheaper outside MIX.**
+   `ascend-fusion-mechanics.md` §55: `KERNEL_TYPE_AIC_ONLY` is the **global default in Huawei's own
+   `swiglu_gated_mlp` kernel** (whose parameters are `x`, `gate_up_weight`, `down_weight`, `y` — our expert
+   chain), with twelve per-tiling-key overrides, nine `AIC_ONLY` and three `AIV_ONLY`, and **no MIX branch
+   anywhere**. It also ships in `inclusionAI/AReno`'s fused-experts matmul, `xLLM-AI/xllm-ops`'s
+   `index_group_matmul`, `sgl-project/sgl-kernel-npu`, five `huawei-csl/pto-kernels` files and `tilesim/vTriton`.
+   The copyable cube-only-with-hard-sync template, from `XPU-Forces/mojo_opset`'s grouped GEMM, is four lines
+   and does **not** use `__mix__`: `__global__ __aicore__`, then
+   `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);` as the first statement, then
+   `if ASCEND_IS_AIV { return; }`, then the `TPipe`. At our floors, one MIX_AIC call (13.58 us) replaced by one
+   AIC_ONLY (2.30) plus one AIV_ONLY (0.70) is 3.00 against 13.58 — **4.5x on launch cost for the pair**. The
+   price: `KERNEL_TASK_TYPE(key, value)` is 「仅支持在自定义算子工程中使用」, so a `<<<>>>` project gets only
+   `KERNEL_TASK_TYPE_DEFAULT` — one type per binary, i.e. separate kernels rather than branches of one. Three
+   designs: one MIX megakernel (single launch, 13.58 us each); a tiling-key-switched binary (single launch,
+   cheap — needs a custom-operator project); split AIC/AIV kernels (works with `<<<>>>` today, more launches,
+   each 4.5x cheaper).
+
 ## Corrections to earlier findings in this file
 
 Each of these overturns something stated above, with the newer source winning. Read them before acting on
@@ -190,6 +209,14 @@ finding 3.
   both go through L2 (§35.1). What is needed is `DataSyncBarrier<MemDsbT::DDR>()` before raising the flag, not
   `DataCacheCleanAndInvalid`. Finding 3b's "no L0C→UB path" is confirmed, and the L1 escape is closed too:
   `Fixpipe(L0C→UB)`, `DataCopy(L0C→UB)` and `DataCopyL1ToUB` are all 不支持 on A3 (§35.4).
+- **§47's two-writer hazard has a precondition: `REGIST_CUBE_OBJ` *is* the half-partition, and it works by
+  `return`.** `ascend-fusion-mechanics.md` §47.4, found by checking the claim against the vendor's own `__mix__`
+  examples (one of three ships an unguarded UB→GM `DataCopy` and is nonetheless correct). In MIX mode the
+  **cube** half runs the KFC server loop and `return`s inside the macro; under `ASCENDC_CUBE_ONLY` the **vector**
+  half's `REGIST_CUBE_OBJ` expands to a bare `return`. So an unguarded UB→GM copy after `REGIST_MATMUL_OBJ` is
+  safe, and §47.3 applies only to a hand-partitioned kernel. The flip side is a second, simpler silent failure:
+  in an `ASCENDC_CUBE_ONLY` kernel that calls `REGIST_*_OBJ`, **every vector stage after that line never runs on
+  any core.**
 - **`sqe_type=3, errType=0x20` is not a kernel-type rejection.** Decoded from the open-source runtime
   (`gitcode.com/cann/runtime`): `RT_DAVID_SQE_TYPE_PLACE_HOLDER = 3` while an AIC kernel SQE is 0, AIV 1,
   FUSION/MIX 2; and `RT_STARS_CQE_ERR_TYPE_SW_STATUS = (1ULL << 5U)` = 0x20, rendered by `stars_engine.cc` as
@@ -275,7 +302,92 @@ foreign-core `WaitFlag` (§43.5); a `DataCopy` whose source `TPosition` is neith
 on the cube half (§47.1); `ndNum = 0` on a Fixpipe (§49.5); an odd `operator[]` index on a sub-byte type
 (§42.2); a misaligned `DataCopy` count, 「In NPU mode, no error is reported. The value is rounded down by 32B」
 (§42.5); `load_cbuf_to_cb_s4` dropping `ifTranspose` (§45.6); an out-of-range `HardEvent` indexing one past
-`eventPool_` (§43.6); and an out-of-range `flagId` truncated to its low 4 bits (see the corrections above).
+`eventPool_` (§43.6); an out-of-range `flagId` truncated to its low 4 bits (see the corrections above); a
+`Mutex::Lock`/`Unlock` call, whose bodies are `#if`-gated to 3510/5102 and **empty on 2201** while
+`AllocMutexID()` returns 0 — so an `ENABLE_LOCK`-style arm is completely unsynchronized on A3 while looking
+synchronized in the source, and `vllm-ascend`'s `csrc/attention/common/op_kernel/init_output.h` is that shape
+(§56); and, under `ASCENDC_CUBE_ONLY`, `REGIST_CUBE_OBJ` expanding to a bare `return` on the vector half, after
+which no vector stage runs on any core (§47.4).
+
+`Mutex`/`Lock`/`Unlock` would otherwise be the right tool for a reused staging buffer — 28 ids against the 6
+hand-allocatable event ids, and the vendor's own stated advantage is 「简化反向同步」 — but all five of its API
+pages say `不支持` on A3. **`SetFlag`/`WaitFlag` is the only intra-core mechanism on this part**, which is
+settled rather than a preference (§56.2).
+
+## If you are closing a roofline gap — the lever table
+
+`ascend-fusion-mechanics.md` §49-§54 and `fused-moe-expert.md` §B8 are the devkit's own
+`operator_practice/best_practices` tree, mined for everything bearing on our profile. Every row is a vendor
+measurement with code, not advice.
+
+**First, the result that frames the rest** (§54.1): with K not L1-resident, Matmul GM traffic is
+`M*N*K*(1/baseM + 1/baseN)` — `baseK` does not appear. At M=1, `M/baseM` is 1, so the weight is loaded exactly
+once: **traffic volume is already at its floor and no base-block choice can reduce it.** A batch=1 roofline gap
+is therefore traffic *efficiency* or *Scalar*, by arithmetic rather than by profiling.
+
+| lever | measured | where | gate |
+| --- | --- | --- | --- |
+| AIV ND2NZ instead of on-the-fly, for a non-256B-aligned inner axis | **−39.0%** (149.04 → 90.95 us) | §53.2 | inner axis not 256B aligned **and** data volume large. **`moe_intermediate=1792` is 896 B = 3.5×256, misaligned in int4** |
+| pure-Cube mode (`ASCENDC_CUBE_ONLY`) | −37.2% `aic_time`, **−65.6% Scalar** | §B8.6 | no vector logic in the operator; core split changes 48 AIV → 24 AIC blocks |
+| split-K when M and N are small | −30.1% (19.60 → 13.70 us) | §51.1 | C to **GM only**, output **zeroed + AtomicAdd**, **no Bias** |
+| AIC:AIV 1:2 on a Vector-bound grouped matmul | −29.3% (218.1 → 154.2 us) | §B8.3 | inner loop count **must not be 1** |
+| constant tiling (`MatmulApiStaticTiling`) | −25.9% `aic_time`, **−46.5% Scalar** | §53.1 | const `singleCore*` + const `base*` (full) or const `base*` only (partial) |
+| AB IBShare + cube-view core split | −17.2% (27.11 → 22.44 us) | §52.2 | all Matmul objects in the operator must match; `IterateAll` to GM only |
+| workspace 2 → 4 (credit window depth 4) | −14.5% (154.2 → 131.8 us) | §B8.4 | 4 × baseM × baseN of workspace |
+| K-axis staggered access | **−13.2% with tiling unchanged** | §51.2 | MDL template, K **not** L1-resident, multi-core, A or B in GM, K > 4096 |
+| large-packet transfer (`depthA1`/`depthB1`) | MTE2 −27%, 2491 → **3406 GB/s** | §54.3 | — |
+| L2 split + small tail + 错位分核 | −7.1%, MTE2 −10.7% | §51.3 | from a 99%-MTE2 starting point |
+| MTE2 Preload (`doMTE2Preload`) | −7.7% (30.88 → 28.50 us) | §B8.7 | MDL/SpecialMDL, `singleK <= baseK*stepK`, DB on M or N |
+| B-only IBShare | −3.55%, **MTE2 −15.46%** | §52.1 | shared operand **fully L1-resident**: `singleCoreN = baseN*stepN`, `singleCoreK = baseK*stepKb` |
+| NBuffer33 | −4.0% (34.01 → 32.66 us) | §53.3 | MDL, GM only, **pure-Cube only**, `IterateAll` only, `step* <= 3` |
+| `SetL2CacheHint(CACHE_MODE_DISABLE)` on a read-once weight | unquantified | §B8.4, §50.6 | the vendor does it at `numBlocksM == 1`, i.e. our decode condition |
+| `REQ8`/`VREQ8` int32→int8 requant on the Fixpipe drain | removes a Vector `Cast` | §49.1-§49.3 | **no int4 destination exists** on any product |
+
+**The Scalar pattern.** Four independent cases say the Cube's *Scalar* pipeline binds at our shapes, not Cube
+and not MTE2: 26.27 of 27.11 us (§52.2), 15.02 of 17.85 (§B8.6), 6.32 of 10.62 (§53.1), plus our own 13.58 us
+MIX_AIC floor. The one ratio to read is `aic_scalar_time` against `aic_time` — msOpProf column G against
+column C.
+
+**Two levers point opposite ways, deliberately.** §54 fills all cores (4 → 20 took 12045 → 2532 us, 4.75x);
+§50.3 says launch *fewer* at microsecond scale because head overhead grows with core count
+(「对于整体耗时在微秒级别且单核计算量耗时较少的算子，可以通过减少启动核数并增加单核计算量的方式来获得性能提升」).
+Both hold in their own regime. Measure per call, not per family.
+
+**Ruled out, with numbers**: MC2 / fused MatmulAllReduce at batch=1 — `low-latency-tp-reduce.md` Part 8. Only
+the M axis may be split (HCCL needs contiguity), the vendor's own short-block floor is `c >= 3*128` = 384 rows,
+and the 32.7% in their worked case comes from hiding an 803 us matmul behind a 1071 us AllReduce. At M=1 there
+is no axis and nothing to hide. Keep two numbers from it anyway: the AllReduce cost fit has a **14.769 us
+constant term** below 8 MB (a fixed per-call floor — ~1.15 ms across 78 layers), and **1.15** is the vendor's
+empirical allowance for compute/comm memory-bandwidth contention.
+
+## Provenance of the header-derived findings (§42-§56), and how they were version-checked
+
+Everything in `ascend-fusion-mechanics.md` §42-§56, `fused-moe-expert.md` §B7-§B8 and
+`low-latency-tp-reduce.md` Part 8 that is attributed to "the shipped AscendC implementation" or "the shipped
+devkit" comes from the local clone at **`/home/shanshan/repo/cann/asc-devkit/`**, HEAD
+`6a51d0b167dd8f5555456a0ebb783ef0427e366e`, dated **2026-08-21**. The devkit's tags map 1:1 to CANN releases
+(its own `CHANGELOG_en.md` carries a 「CANN Version | Version Source Tag」 table: `v9.1.0-beta.2` ↔ CANN
+9.1.0-beta.2, and so on), and the clone's HEAD is a master commit **three weeks newer than the local
+`v9.2.0-beta.1` tag** (2026-08-03). Upstream `gitcode.com/cann/asc-devkit` also carries `v9.2.0`,
+`v9.2.0-beta.2` and `v9.2.0.pre`, which are not in the local clone.
+
+Because we run **CANN 9.2.0**, every load-bearing structural claim was re-checked against the local
+`v9.2.0-beta.1` tag with `git show`. All of them hold unchanged:
+
+| claim | file | status at `v9.2.0-beta.1` |
+| --- | --- | --- |
+| §43 Set/Wait asymmetry, `HardEvent` enums, `EventToIndex`, `QUE_MAX_EVENT`, §46 `GetQueEvt` | `impl/basic_api/kernel_event.h` | **file byte-identical to HEAD** |
+| §47.1 every `CastImpl` wrapped in `if ASCEND_IS_AIV` | `impl/basic_api/dav_c220/kernel_operator_vec_vconv_impl.h` | **file byte-identical to HEAD** |
+| §47.2 `ASCEND_IS_AIC` guard in the `DataCopyPad` family only, never in plain `DataCopy` | `impl/basic_api/kernel_operator_data_copy_intf_impl.h` | 8 occurrences, all at line 1412+, i.e. all in the Pad region — same structure |
+| §42.3 `bufferSize_` read nowhere on the `DataCopy` path | `impl/basic_api/kernel_tensor_impl.h` | the same 4 sites: write, CPU-debug zero, `GetSize`, `ReinterpretCast` rescale |
+| §56.2 `Mutex::Lock`/`Unlock` bodies `#if`-gated to 3510/5102 | `include/basic_api/kernel_common.h` | gate identical |
+| §43.5 `SPLIT_CORE_CUBE` / `SPLIT_CORE_VEC` definitions | `impl/utils/sys_macros.h` | identical (the file's only diff is five unrelated CPU-debug type aliases) |
+| §47.4 `REGIST_CUBE_OBJ` → bare `return` on the vector half under `ASCENDC_CUBE_ONLY` | `impl/adv_api/detail/kfc/kfc_register_obj.h` | identical |
+
+So these are not findings from a stale tree: they are verified on the CANN 9.2.0 line we run. What remains
+unverified is the gap between `v9.2.0-beta.1` and the `v9.2.0` release tag, which is not in the local clone —
+if any of §42-§56 is ever contradicted on hardware, fetching `v9.2.0` and re-diffing those seven files is the
+first thing to do.
 
 ## Provenance rule
 

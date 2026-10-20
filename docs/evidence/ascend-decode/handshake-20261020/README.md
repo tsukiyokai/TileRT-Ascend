@@ -45,3 +45,30 @@ a mode that never blocks would be live in every pattern. The routed experts'
 correctness check settles it: with mode 3 and subblock zero answering alone,
 the chain is right at 0 of 540672 values. A handshake that did not order would
 have the down projection read an intermediate still being written.
+
+
+## Corrected: the mode is not what this table measured
+
+`dav_c220/kernel_operator_sync_impl.h` uses mode 2 in BOTH directions inside
+one function: `SyncAllImpl<false>`'s vector branch issues
+`ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG))` and its
+cube branch `GetffstMsg(0x02, SYNC_AIC_AIV_FLAG)`. Direction is carried by
+which core sets and disambiguated by flagId, never by the mode -- and
+`wait_flag_dev(flagId)` takes one argument and is mode-blind. Mode 3 is not
+in the A3 mode set at all.
+
+So the table above cannot be read as being about modes. What it measured is
+real -- those twelve variants did deadlock and those four did not -- but the
+variable it isolated was not the one named. The likely actual constraint is
+pairing cardinality: both AIVs of an AI Core must set before the AIC's wait
+clears, which is why the pattern where only subblock zero sets failed and the
+pattern where both set did not.
+
+The routed kernel works with what the table called "mode 3", so the written
+constant stays until a controlled retest; what changes is the explanation,
+and nothing should be built on the mode numbering.
+
+Also corrected from the same source: `SyncAll` reserves flagIds 11 to 13 only
+in its non-default `<false>` form. The default `<true>` takes 14 alone, and
+`SoftSyncAllImpl(gmWorkspace, ubWorkspace, usedCores)` costs no flagIds at
+all and can barrier a subset of cores.

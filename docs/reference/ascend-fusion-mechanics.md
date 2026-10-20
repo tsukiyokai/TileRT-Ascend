@@ -19342,10 +19342,78 @@ This also explains why an isolated probe can pass where the real kernel fails ev
 writer, and the whole effect disappears. The discriminating observation is not the offset and not the
 allocation — it is **whether the enclosing function is reachable from the cube half**.
 
+### 47.4 ★★★ REFINEMENT, added after an adversarial check: `REGIST_CUBE_OBJ` *is* the half-partition, and it works by `return`
+
+§47.3's hazard has a precondition that the first draft did not state, and finding it took checking the claim
+against the vendor's own `__mix__` examples. Of the three shipped `__mix__` examples that perform a UB→GM
+`DataCopy`, two guard with `ASCEND_IS_AIV`/`ASCEND_IS_AIC` (`matmul_s4.asc`, `matmul_fused_manual.asc`) and one
+does not — `examples/01_simd_cpp_api/04_advanced_api/00_matmul/batch_matmul_iterate_n_batch/batch_matmul_iterate_n_batch.asc`
+has a bare `DataCopy(cGlobal, bufferC, sizeC / sizeof(cType));` at line 179 inside
+`__mix__(1, 2)` with zero guards. That looked like a counter-example. It is not; it is the precondition.
+
+`impl/adv_api/detail/kfc/kfc_register_obj.h:274-332`, verbatim — the four arms that matter:
+
+```cpp
+#ifdef SPLIT_CORE_CUBE
+#ifdef ASCENDC_CUBE_ONLY
+#define REGIST_CUBE_OBJ(tpipe, workspace, ...) AscendC::InitCurObj(tpipe, __VA_ARGS__)
+
+#define REGIST_CUBE_OBJ_REMOTE(tpipe, workspace, ...)
+#else
+...
+#define REGIST_CUBE_OBJ(tpipe, workspace, ...)                                                     \
+    using ASCubeObjConfig = AscendC::GetCubeObjConfig<decltype(AscendC::GetObjType(__VA_ARGS__))>; \
+    static_assert(                                                                                 \
+        ASCubeObjConfig::enableABShareValue != AscendC::CUBEOBJ_MIX_MODE,                          \
+        "If both aType ibshare and bType ibshare are set to true, the values must "                \
+        "be the same for all cube objects.");                                                      \
+    constexpr int8_t asEnableMixDualMaster = ASCubeObjConfig::enableMixDualMasterValue;            \
+    ...                                                                                            \
+    AscendC::KfcServer server;                                                                     \
+    server.Init(workspace);                                                                        \
+    server.InitObj(tpipe, __VA_ARGS__);                                                            \
+    if constexpr (!asEnableMixDualMaster) {                                                        \
+        while (server.isRun()) {                                                                   \
+            server.Run(__VA_ARGS__);                                                               \
+        };                                                                                         \
+        server.Quit();                                                                             \
+        return;                                                                                    \
+    }
+#endif
+#endif
+
+#elif defined(SPLIT_CORE_VEC)
+#ifdef ASCENDC_CUBE_ONLY
+#define REGIST_CUBE_OBJ(tpipe, workspace, ...) return
+#elif ...
+```
+
+So the macro partitions the halves by **returning out of the kernel**, and which half it kills depends on
+`ASCENDC_CUBE_ONLY`:
+
+| build | cube half (`SPLIT_CORE_CUBE`) | vector half (`SPLIT_CORE_VEC`) |
+| --- | --- | --- |
+| MIX (no `ASCENDC_CUBE_ONLY`) | runs the KFC server loop, then **`return`** — never reaches the user body | falls through as a KFC *client*; runs the user body |
+| `ASCENDC_CUBE_ONLY` | `InitCurObj`, falls through — **runs the user body** | **`return`** — never reaches the user body |
+
+Two consequences, and the second is the one that matters to us.
+
+**(a) An unguarded UB→GM `DataCopy` after `REGIST_MATMUL_OBJ` in MIX mode is safe**, because the cube half has
+already returned out of the kernel inside the macro. That is why `batch_matmul_iterate_n_batch.asc` needs no
+guard. §47.3's two-writer hazard therefore applies to a **hand-written** `__mix__` kernel that partitions the
+halves itself (or not at all) — not to one whose halves are partitioned by `REGIST_*_OBJ`.
+
+**(b) ★ Under `ASCENDC_CUBE_ONLY`, `REGIST_CUBE_OBJ` expands to a bare `return` on the vector half.** So in a
+`#define ASCENDC_CUBE_ONLY` kernel that calls `REGIST_MATMUL_OBJ`/`REGIST_CUBE_OBJ`, **the AIV exits at that
+line and every vector stage after it never executes at all** — no `Cast`, no vector `DataCopy`, nothing. The
+AIC alone continues through the whole body. That is not a race; it is the vector half being switched off, and
+it is silent.
+
 ## Relevance
 
 This is the sharpest remaining candidate for the live int4 defect, and it needs no new measurement to check —
-only a reading of which half can reach the function. Our failing function is exactly
+only a reading of which half can reach the function. **Read §47.4 first: it states the precondition and adds a
+second, simpler failure mode that may fit even better.** Our failing function is exactly
 `Cast(half, float)` → `Cast(int4b_t, half)` → `DataCopy(GM, int4b_t)` inside a `__mix__(1,2)`
 `ASCENDC_CUBE_ONLY` kernel. On the cube half the two `Cast`es compile to nothing because every `CastImpl` on
 dav_c220 opens with `if ASCEND_IS_AIV`, while the plain `DataCopy` to GM has no matching guard and issues its
@@ -19357,7 +19425,13 @@ that both halves can reach, because `DataCopyPad` is AIC-safe by construction (`
 and it is also the form that handles a non-32B-aligned tail. Second, the correct fix is the §43 rule applied one
 level up: a function containing vector work must be reachable only from `if ASCEND_IS_AIV`, and the vendor's own
 int4 sample does exactly that — `if ASCEND_IS_AIV { Unzip(...); }` / `if ASCEND_IS_AIC { RunMatmul(); }`
-(§44.2). Third, this is a general audit item for the megakernel, not a one-off: every stage that writes GM from
+(§44.2). Third, §47.4's refinement is the thing to check before any of that, because it is a yes/no question about one
+line: **does this kernel call `REGIST_MATMUL_OBJ` / `REGIST_CUBE_OBJ`, and is `ASCENDC_CUBE_ONLY` defined?** If
+both, the vector half executes `return` at that macro and every vector stage after it — both `Cast`es included
+— never runs at all, on any core, with the AIC alone continuing through the body. That is a simpler and more
+complete failure than the two-writer race, and it predicts garbage rather than a race. If the kernel does *not*
+call those macros, the halves are partitioned by hand and §47.3's two-writer hazard is live. Fourth, this is a
+general audit item for the megakernel, not a one-off: every stage that writes GM from
 UB should be checked for cube-half reachability, because the failure is silent on both sides — the `Cast` that
 should have run produces nothing and says nothing, and the `DataCopy` that should not have run executes and says
 nothing.
@@ -19858,6 +19932,18 @@ and the measurement recipe, verbatim: 「你可以通过执行如下命令行，
 
 > 【描述】搬运不同大小的数据块时，对带宽的利用率（有效带宽/理论带宽）不一样。**根据实测经验，单次搬运数据长度16KB以上时，通常能较好地发挥出带宽的最佳性能。** 因此对于单次搬运，应考虑尽可能的搬运较大的数据块。
 
+★ **CORRECTION, from a controlled A/B that post-dates this subsection** — see `mla-decode-fusion.md` §8-§21,
+sourced from the devkit's own A3-labelled
+`examples/01_simd_cpp_api/05_best_practices/04_memory_access/data_copy/README.md`. That README separates burst
+length from instruction count, which the guidance above conflates. Holding `blockLen = 128B` and the total byte
+count **identical** and changing only `blockCount` from 1 to 64, `aiv_mte2_time` falls **548.161 → 220.772 us,
+2.48x**. Then raising `blockLen` from 128B to 2048B buys only **220.772 → 202.657 us, 1.09x**. So on A3 the
+penalty for many small moves is overwhelmingly **per-`DataCopy`-instruction issue overhead, not burst length**,
+and the 16 KB figure is worth about 9% once the descriptors are already batched into one instruction. Cite the
+instruction count, not the burst length, when explaining a scattered gather that is off its byte roofline. The
+same README gives A3 **L2 = 192 MB** and the hit-rate formula
+`(r0_hit + r1_hit) / (r0_hit + r1_hit + r0_miss_allocate + r1_miss_allocate)`.
+
 `gm_address_512b_alignment.md`, 【优先级】高, verbatim — note the product restriction, which is **A2 only**:
 
 > 【描述】由于AI处理器内部设计约束，从GM向Local Memory搬运数据时，保证GM地址512B对齐可以最有效的发挥出带宽的效率。如下图示例，展示了在512B对齐以及32B对齐情况下单核的带宽效率：**搬运同等数据量，带宽差距最大的情况，32B对齐场景只能达到512B对齐场景的70%。**
@@ -19920,9 +20006,15 @@ to blame. The fix is free and is given as code: rotate each core's access order 
 `blockGroupStart + (mBlockIdx + blockIdx) % numBlocks`. This belongs on the list of things to try before any
 redesign, and `msopprof ./demo` with 「op_summary_*.csv中的MTE2搬运相关指标」 is the vendor's own way to see it.
 
-50.5 and 50.6 are the two remaining cheap rules. **≥16 KB per single transfer** is where bandwidth saturates,
-which is a hard constraint on how finely a fused kernel may tile its GM traffic — and a direct warning for any
-sparse-attention gather that reads many small KV blocks. The 512-byte GM alignment rule with its 70% penalty is
+50.5 and 50.6 are the two remaining cheap rules, and 50.5 needs its own correction read first: on A3 the
+**instruction count**, not the burst length, is what costs. The controlled A/B in 50.5's correction gives
+**2.48x for batching descriptors into one `DataCopy` against only 1.09x for lengthening the burst**, at
+identical total bytes. The 16 KB figure is real but second-order; the first-order rule for any sparse-attention
+gather reading many small KV blocks is to **minimise the number of `DataCopy` instructions** — and
+`mla-decode-fusion.md` records that A3 has no gather DMA at all (`Gather` / `asc_gather_datablock` take
+`__ubuf__` sources and run on `PIPE_V`, not MTE2; the multi-dimensional `NdDmaParams` `DataCopy` is
+`Atlas A3系列产品：不支持`; and the 950 generation added a SIMT unit whose listed use cases are scatter/gather),
+so a scattered GM gather on 2201 necessarily becomes N descriptors and the only lever is N. The 512-byte GM alignment rule with its 70% penalty is
 **A2 only** and does not apply to us, which is worth knowing because it is easy to assume otherwise; the
 same-address rule in 50.4 is the one that does. And `SetL2CacheHint` matters more than it looks: when the
 working set exceeds L2, eviction must write the old line back to GM *before* the new line can enter, so a
@@ -20275,3 +20367,499 @@ coexist with an in-kernel vector stage), and **`IterateAll` only** (so no per-`I
 exclusion IBShare-AB carries in §52.1). Its tiling gate is exact and checkable:
 `stepM, stepKa, stepKb <= 3` with `stepKa = stepKb = Ceil(singleCoreK / baseK)`, and A's fully-loaded blocks
 plus B's loaded blocks must fit L1.
+
+## 54. ★★★ The Matmul GM-traffic formula, the base-block selection criteria, large-packet transfer — and what they prove about a batch=1 roofline gap
+
+Source: `docs/zh/guide/operator_practice/best_practices/matmul_tuning_cases/matmul_tiling_strategy.md`,
+「Matmul算子优化Tiling策略」, in the shipped devkit. Read 2026-10-20. Case: M=4096, N=5120, K=4096, half in,
+float out, ND output, on A2, 20 cores each with 1 Cube and 2 Vector.
+
+### 54.1 ★★★ The traffic formula
+
+分析主要瓶颈点, verbatim — this is the analytical core and it is worth reading twice:
+
+> - Profiling数据的Block Dim可见分核未分满，考虑分核逻辑的优化。设CurrentCore是未优化前分核的Cube核数，MaxCore为最大Cube核数，当开启全部核并行做当前shape数据量的计算时，**预估性能收益为MaxCore / CurrentCore的倍数**。
+> - 优化基本块切分，将影响搬运数据的效率，算子搬运的总数据量为搬运的左矩阵和右矩阵数据量之和。**在Matmul计算K方向不能全载的场景下，根据矩阵乘法的算法，搬运左矩阵的次数为 N / baseN，搬运右矩阵的次数为 M / baseM，即搬运总数据量 totalCnt = (N / baseN) * M * K + (M / baseM) * K * N。** 预估性能收益为搬运数据量的比值，优化前搬运数据量totalCnt0/优化后搬运数据量totalCnt1，**化简后结果为 (1 / baseM0 + 1 / baseN0) / (1 / baseM1 + 1 / baseN1)**，其中，baseM0, baseN0为优化前基本块参数，baseM1, baseN1为优化后基本块参数。
+> - 开启大包搬运后，指令条数变化、地址对齐等因素会影响性能，按照经验预估，**对于MTE2为性能瓶颈的场景，会有20%以上的MTE2性能收益**。
+
+So, with K not fully resident:
+
+```
+totalCnt = (N / baseN) * M * K  +  (M / baseM) * K * N
+         = M * N * K * (1/baseN + 1/baseM)
+```
+
+**Matmul GM traffic is proportional to `(1/baseM + 1/baseN)`** — the harmonic sum of the two output-tile
+dimensions, and nothing else. `baseK` does not appear.
+
+### 54.2 ★ Base-block selection: maximize compute-per-byte, subject to a 512-byte output-offset constraint
+
+优化点二, verbatim and complete — note that the *rejected* block was rejected partly on an alignment ground:
+
+> 当前Tiling中设置的base块为 [baseM, baseN, baseK] = [64, 64, 256]，这种基本块Cube计算cycle少，计算访存比（即计算量与需要数据量的比值）低；**搬出一次Matmul结果到GM的base块是64 * 64，由于输出格式是ND，数据类型是float，搬出下一次Matmul结果的起始地址需要偏移一个baseN的大小，即 64 * 4 = 256字节，导致fixpipe搬出时GM地址非512byte对齐**，那么需要设置更优的基本块。
+>
+> 针对当前shape较大的场景，**基本块的选择原则为计算访存比最大，即在Cube计算量最大的情况下，访存的数据量最小。在输入为fp16类型的情况下，Cube执行单元1 cycle能算 16 * 16 * 16 个数。** 根据经验，[baseM, baseN, baseK] = [128, 256, 64] 和 [128, 128, 128] 两种切分方案均满足搬出时GM地址512Byte对齐（每搬出一次Matmul结果时，地址分别偏移 256 * 4byte 和 128 * 4byte），Cube计算cycle数一致，为 (128 * 64 * 256) / (16 * 16 * 16) = (128 * 128 * 128) / (16 * 16 * 16) = 512cycle。针对 [128, 256, 64]，计算访存比为 512cycle / (128 * 64 * 2 + 256 * 64 * 2) = 512cycle / 48KB；针对 [128, 128, 128]，计算访存比为 512cycle / (128 * 128 * 2 + 128 * 128 * 2) = 512cycle / 64KB；**可见 [128, 256, 64] 基本块方案的计算访存比更高，计算密度更大**，同样的计算量，需要的数据量最小，最大限度提高Cube单元的计算量。
+>
+> 修改Tiling代码，通过 **SetFixSplit()** 接口设置baseM和baseN，tiling函数会自动计算出最优baseK，这里得到64。
+
+```cpp
+    tilingApi.SetShape(M, N, K);
+    tilingApi.SetFixSplit(baseM, baseN, -1);
+```
+
+Two criteria, then:
+
+1. **Compute-to-memory ratio.** Cube does `16*16*16` elements per cycle for fp16, so a block costs
+   `baseM*baseN*baseK / 4096` cycles and loads `(baseM*baseK + baseN*baseK) * sizeof(dtype)` bytes. Maximize
+   the ratio. `[128,256,64]` wins over `[128,128,128]` at equal cycles: 48 KB against 64 KB.
+2. **The Fixpipe output offset must be 512-byte aligned.** The next result tile starts one `baseN` later, so
+   the constraint is on `baseN * sizeof(outputDtype)`: `64*4 = 256` bytes fails, `256*4 = 1024` and
+   `128*4 = 512` pass. **For an int32 output that means `baseN` must be a multiple of 128; for a half output,
+   a multiple of 256.**
+
+### 54.3 Large-packet transfer: `depthA1` / `depthB1`, and a measured bandwidth number
+
+案例介绍 and 优化点三, verbatim:
+
+> - 开启大包搬运：从GM搬运数据到L1时，**对于A矩阵，一次搬入depthA1个基本块，基本块大小为baseM * baseK，对于B矩阵，一次搬入depthB1个基本块，基本块大小为baseN * baseK。开启大包搬运后，一次搬入的数据量变大，从而提升MTE2搬运效率。**
+>
+> - 当前带宽利用率为：totalSize / mte2Time = totalCnt * dtype / mte2Time，代入数据计算为 **2491GB/s**。未开启大包搬运的情况下，矩阵从GM搬运到L1一次只搬运1个基本块。通过模板参数开启大包搬运，一次搬运多个基本块，提高MTE2带宽利用率。
+> - 从下图可以看到，开启大包搬运后，**MTE2耗时从808us下降到591us，带宽利用率代入数据计算为3406GB/s，利用率提升36%+，Cube利用率达到80%+**。
+
+### 54.4 The measured ladder, each step against its prediction
+
+验证优化方案性能收益, verbatim:
+
+> - 优化分核逻辑，**实际收益4.75倍**，约等于 (20核 / 4核) = 5倍收益，并且考虑到核的启动开销，可以认为收益一致。
+> - 优化基本块，**实际收益约3倍**，理论评估代入上述分析公式，收益为 (1/64 + 1/64) / (1/128 + 1/256)，**约等于2.7倍**，考虑到cache缓存的影响，认为收益一致。
+> - 大包搬运，**实际收益25%+**，与经验值一致。
+
+with the absolute numbers from 优化点一 and 优化点二: 「修改代码后，算子执行时间从 **12045us** 下降到 **2532us**」
+and 「使用这组基本块后，MTE2耗时（对应aic_mte2_time）从 **2452us** 降低到 **808us**，MTE2性能提升3倍」.
+
+And the scope caveat, 总结, verbatim:
+
+> **优化点一和优化点二的适用场景，需要shape足够大，数据量足够多，才能分满核和开启最优的基本块。** 大shape场景下，MTE2 Bound算子可参考此案例的优化手段。
+
+## Relevance
+
+54.1's formula settles what a batch=1 roofline gap can and cannot be, by arithmetic rather than by profiling.
+With `totalCnt = M*N*K*(1/baseM + 1/baseN)` and **M = 1** (or 8 under the MSD stack), `M / baseM` is 1 — you
+cannot tile below one row — so the right-matrix term collapses to `1 * K * N`: **the weight is loaded exactly
+once, which is the theoretical floor.** The left-matrix term `(N/baseN) * M * K` is negligible at M=1. So at
+decode our matmuls are *already* at minimum GM traffic volume, and no base-block choice can reduce it, because
+the only lever the formula offers is `1/baseM`, which is pinned.
+
+**Therefore the measured gap between time spent and bytes moved cannot be traffic volume. It must be traffic
+efficiency, or Scalar.** Everything else in §49-§53 then reads as a list of the available mechanisms, each with
+a vendor measurement behind it:
+
+- *efficiency of the same bytes* — the 512-byte same-address serialization when every core reads one weight
+  (§50.4, fixed by rotation; measured −13.2% as K-staggering in §51.2 and −7.1% as 错位分核 in §51.3);
+  transfers below 16 KB not saturating bandwidth (§50.5); a 256-byte-misaligned inner axis crippling the
+  on-the-fly ND2NZ (§53.2, −39.0%); duplicate fetches of a shared operand (§52, MTE2 −15.46%); a
+  non-512-byte-aligned Fixpipe output offset (§54.2); one base block per MTE2 instead of `depthA1`/`depthB1`
+  of them (§54.3, 2491 → 3406 GB/s, +36%); and L2 thrash from an unhinted read-once weight (§50.6, §B8.4).
+- *Scalar* — the KFC message framework in MIX-mode `Matmul` (§B8.6, `aic_scalar_time` 15.02 → 5.17 us);
+  runtime rather than compile-time tiling (§53.1, −46.5%); and a cube-view core split with IBShare (§52.2,
+  26.27 of 27.11 us was Scalar).
+
+54.4's honesty about its own scope is the caution to keep: 「需要shape足够大，数据量足够多，才能分满核和开启最优
+的基本块」. Optimization points one and two of *this* case are for large shapes and do not transfer to us —
+indeed 54.1's core-count lever points the opposite way from §50.3's advice to launch *fewer* cores at
+microsecond scale, and the reconciliation is simply which regime you are in: under-split a millisecond operator
+and you lose a factor of `MaxCore/CurrentCore`; over-split a microsecond one and you pay head overhead that
+grows with core count. At 12.389 ms across two GroupedMatmul families and ~6.5 MIX_AIC calls per layer, we are
+plausibly in *both* regimes at different points in the round, which is an argument for measuring per-call
+rather than per-family.
+
+54.2's two criteria are directly usable despite the scope caveat, because they are constraints rather than
+sizing advice: maximize `baseM*baseN*baseK / ((baseM+baseN)*baseK*sizeof(dtype))`, and keep
+`baseN * sizeof(outputDtype)` a multiple of 512 so the Fixpipe drain address stays aligned — a multiple of 128
+for `baseN` with an int32 output, 256 with a half output. `tilingApi.SetFixSplit(baseM, baseN, -1)` lets the
+tiling function derive the best `baseK` from a chosen `baseM`/`baseN`.
+
+## 55. ★★★ Working public code for both kernel types — the `MIX_AIC_1_0` cube-only idiom, and the vendor's own FFN kernel using `AIC_ONLY` as its default with per-tiling-key overrides
+
+Sources, read 2026-10-20 via `gh`:
+
+- https://github.com/XPU-Forces/mojo_opset — `native/src/npu_a2/group_gemm_fwd/kernel.cpp` and
+  `native/src/npu_a2/group_gemm_bwd/kernel.cpp`
+- https://github.com/hicann/ops-transformer — `experimental/ffn/swiglu_gated_mlp/op_kernel/swiglu_gated_mlp.cpp`
+
+§50.1 established from the official page that `KERNEL_TYPE_AIC_ONLY` is listed as supported on A3, contradicting
+our measured submission failure, and §50.2 identified `KERNEL_TYPE_MIX_AIC_1_0` as the cube-only type that
+carries the hard sync. This section is the working code for both, which settles the question by existence rather
+than by documentation.
+
+### 55.1 ★ The `MIX_AIC_1_0` idiom, complete, from a grouped-GEMM kernel
+
+`XPU-Forces/mojo_opset`, `native/src/npu_a2/group_gemm_fwd/kernel.cpp`, verbatim and complete — the `bwd`
+sibling is byte-identical in its first thirteen lines:
+
+```cpp
+#include "../common/group_tiling.h"
+#include "../common/group_gemm_training.h"
+#include "../common/group_gemm_training_epilogue.h"
+#include "../common/group_gemm_training_main_loop.h"
+extern "C" __global__ __aicore__ void MOJO_GROUP_KERNEL(GM_ADDR input, GM_ADDR weight, GM_ADDR counts,
+                                                        GM_ADDR output, GroupTiling tiling) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);
+  if ASCEND_IS_AIV {
+    return;
+  }
+  static_assert(sizeof(TCubeTiling) <= sizeof(tiling.matmul), "increase native TCubeTiling payload");
+  TCubeTiling matrix = *reinterpret_cast<TCubeTiling *>(tiling.matmul);
+  AscendC::TPipe pipe;
+  using Config = mojo::native::a2::kernels::GroupGemmKernelConfig<false, MOJO_GROUP_TRANS_A,
+                                                                  MOJO_GROUP_TRANS_B, false, false>;
+  using Gemm = mojo::native::a2::kernels::GroupGemm<DTYPE_INPUT, DTYPE_INPUT, Config>;
+  using Epi = mojo::native::a2::kernels::GroupGemmEpilogueNone;
+  mojo::native::a2::kernels::GroupGemmMainLoop<Gemm, Config, Epi> op;
+  op.init(input, weight, nullptr, counts, output, nullptr, &tiling.base, matrix, nullptr, pipe);
+  op.process();
+}
+```
+
+Four things to read off it:
+
+1. **`__global__ __aicore__`, not `__mix__`.** The cube-only-with-hard-sync shape does not use the `__mix__`
+   attribute at all; the kernel type is declared with `KERNEL_TASK_TYPE_DEFAULT`.
+2. **`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);` is the first statement in the kernel body**, before
+   anything else.
+3. **It is immediately followed by `if ASCEND_IS_AIV { return; }`** — an explicit, hand-written vector-half
+   exit, exactly the shape `REGIST_CUBE_OBJ` generates for us under `ASCENDC_CUBE_ONLY` (§47.4). So even with
+   `MIX_AIC_1_0` the author still writes the guard rather than relying on the type alone.
+4. `AscendC::TPipe pipe;` is declared after the guard, so only the cube half constructs it — which also
+   satisfies §48.1's `InitSocState` requirement on the half that runs (「在TPipe框架编程中，初始化过程由TPipe
+   完成」) and leaves the vector half having returned before any state is touched.
+
+### 55.2 ★★ `AIC_ONLY` in the vendor's own SwiGLU gated MLP, as the default, with per-tiling-key overrides
+
+`hicann/ops-transformer`, `experimental/ffn/swiglu_gated_mlp/op_kernel/swiglu_gated_mlp.cpp`, verbatim — note
+the parameter list, which is our expert chain: `x`, `gate_up_weight`, `down_weight`, `y`:
+
+```cpp
+    GM_ADDR x_gm,
+    GM_ADDR gate_up_weight_gm,
+    GM_ADDR down_weight_gm,
+    GM_ADDR y_gm,
+    GM_ADDR workspace,
+    GM_ADDR tiling)
+{
+    REGISTER_TILING_DEFAULT(SwigluGatedMlpTilingData);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(100, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(1101, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(1102, KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE(1103, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(2101, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(2102, KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE(2103, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(2104, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(3101, KERNEL_TYPE_AIC_ONLY);
+    KERNEL_TASK_TYPE(3102, KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE(3103, KERNEL_TYPE_AIC_ONLY);
+
+    if (TILING_KEY_IS(WG_MLP_EMPTY_TILING_KEY)) {
+        return;
+    }
+
+    GET_TILING_DATA(tilingData, tiling);
+```
+
+**`KERNEL_TYPE_AIC_ONLY` is the global default here, in a shipped vendor FFN kernel**, and the per-tiling-key
+overrides switch three branches (`1102`, `2102`, `3102`) to `KERNEL_TYPE_AIV_ONLY` while nine stay `AIC_ONLY`.
+Note the numbering: the `x101`/`x103`/`x104` branches are cube work and the `x102` branches are vector work, so
+the operator is **decomposed into pure-AIC and pure-AIV stages selected by tiling key, with no MIX branch at
+all.**
+
+### 55.3 Who else ships `AIC_ONLY`
+
+`gh search code "KERNEL_TYPE_AIC_ONLY"`, 2026-10-20, first page:
+
+```
+inclusionAI/AReno              areno/accel/csrc/npu/fused_experts_matmul_kernel.cpp
+huawei-csl/pto-kernels         csrc/kernel/kernel_simple_matmul.cpp
+huawei-csl/pto-kernels         csrc/kernel/kernel_batch_matrix_square.cpp
+huawei-csl/pto-kernels         csrc/kernel/kernel_scan_ul1.cpp
+huawei-csl/pto-kernels         csrc/kernel/kernel_tri_inv_trick.cpp
+huawei-csl/pto-kernels         csrc/kernel/kernel_tri_inv_ns.cpp
+huawei-csl/pytorch-tcuscan     src/row_scan.cpp
+huawei-csl/pytorch-tcuscan     src/block_scan.cpp
+hw-native-sys/pto-isa          docs/isa/tile/ops/sync-and-config/syncall.md
+sgl-project/sgl-kernel-npu     csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+xLLM-AI/xllm-ops               xllm_ops/index_group_matmul/op_kernel/index_group_matmul.cpp
+hicann/ops-transformer         experimental/ffn/swiglu_gated_mlp/op_kernel/swiglu_gated_mlp.cpp
+tilesim/vTriton                perfbound/calibration/microbench/mte_gm_to_l1.cce
+tilesim/vTriton                perfbound/calibration/microbench/mte_l0c_to_gm.cce
+UsernameFull/kda-ascendc       aclab/k2_min.cpp
+```
+
+Of particular note: `inclusionAI/AReno`'s `fused_experts_matmul_kernel.cpp` and `xLLM-AI/xllm-ops`'s
+`index_group_matmul.cpp` are both fused MoE expert matmuls — our operator — declared `AIC_ONLY`.
+
+## Relevance
+
+This closes §50.1's contradiction by existence. `KERNEL_TYPE_AIC_ONLY` is not merely listed as supported on A3;
+it is the **global default in Huawei's own SwiGLU gated MLP kernel** and appears in at least four other
+production repos including two fused MoE expert matmuls. Our `sqe_type=3, errType=0x20` is therefore not the
+scheduler refusing the type — consistent with the independent decode of that error from the open-source runtime
+as a `RT_DAVID_SQE_TYPE_PLACE_HOLDER` SQE carrying `RT_STARS_CQE_ERR_TYPE_SW_STATUS`, rendered 「sq sw status
+error」 (README corrections).
+
+§55.1 is a copyable template for the cube-only megakernel, and it is four lines:
+`__global__ __aicore__` (not `__mix__`), then `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_0);` as the first
+statement, then `if ASCEND_IS_AIV { return; }`, then the `TPipe`. The author writes the vector-half exit by hand
+even though the type already says AIC:AIV 1:0 — which is the right instinct given §47.4, and which means the
+guard and the type are complementary rather than redundant. That this appears in a *grouped GEMM* makes it the
+closest public precedent to what we want.
+
+§55.2 is a different architecture from the one we have been assuming, and it is worth considering on its merits.
+Instead of one MIX kernel, the vendor decomposes the FFN into pure-AIC and pure-AIV stages selected by tiling
+key — twelve `KERNEL_TASK_TYPE` lines, nine `AIC_ONLY` and three `AIV_ONLY`, no MIX branch anywhere. The payoff
+is that no branch pays for cores it does not use, which is §50.3's point
+(「Cube核并没有实际的计算指令，但仍会产生核启动和核初始化的头开销」) applied structurally: an AIV-only launch costs
+0.70 us against MIX_AIV's 12.04, and an AIC-only launch 2.30 us against MIX_AIC's 13.58. Against an 11.5 ms
+launch floor with 82% on MIX, that is the largest lever on the floor itself.
+
+The catch for us is the project type. `KERNEL_TASK_TYPE(key, value)` is 「仅支持在自定义算子工程中使用」 (§50.2),
+so a `<<<>>>` direct-launch project gets only `KERNEL_TASK_TYPE_DEFAULT` — one type per kernel binary. The
+same decomposition is still available, but as **separate kernels** rather than tiling-key branches of one, which
+trades the MIX overhead for additional launches and loses the single-launch property a megakernel wants. That
+trade is worth computing: at our measured floors, replacing one MIX_AIC call (13.58 us) with one AIC_ONLY
+(2.30 us) plus one AIV_ONLY (0.70 us) is 3.00 us against 13.58 — a 4.5x reduction in launch cost for the pair,
+before counting whatever the handoff through GM costs.
+
+## 56. ★★ `Mutex` / `Lock` / `Unlock` — the sanctioned alternative to `SetFlag`/`WaitFlag`, which compiles to NOTHING on 2201, and the production kernel that has a dead arm because of it
+
+Sources, read 2026-10-20:
+`/home/shanshan/repo/cann/asc-devkit/docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/Mutex_ISASI.md`
+and its siblings `Lock.md`, `Unlock.md`, `AllocMutexID_ISASI.md`, `ReleaseMutexID_ISASI.md`;
+`include/basic_api/kernel_common.h:136-180`; and
+https://github.com/vllm-project/vllm-ascend — `csrc/attention/common/op_kernel/init_output.h`.
+
+This surfaced from an adversarial check on §43.5: searching public code for `WaitFlag<HardEvent::MTE3_V>` to see
+whether anyone uses it on a cube half. Nobody does — every hit in `vllm-project/vllm-ascend` is in a
+vector-side file (`sparse_flash_mla_csa_block_vector.h`, `sparse_flash_attention_service_vector_mla.h`,
+`sparse_flash_mla_swa_block_vector.h`, `msa_index_score_epilogue.h`, `msa_seg_row_max_epilogue.h`,
+`msa_cast_int8_to_fp16.hpp`), which corroborates §43.5's rule by convention. But one of those files turned out
+to carry a second synchronization mechanism we had no record of.
+
+### 56.1 What it is, and the vendor's own case for preferring it
+
+`Mutex_ISASI.md`, verbatim:
+
+> Mutex用于核内异步流水指令之间的同步控制，其功能类似于传统CPU中的锁机制。通过先锁定再释放指定流水来完成流水间的同步依赖，锁定/解锁指定流水对应Lock/Unlock接口。
+>
+> - **Lock**：根据MutexID获取Mutex，若Mutex已被锁定，将阻塞后续指定流水指令队列，直到当前流水的前序指令中对应MutexID的Mutex被Unlock。
+> - **Unlock**：直到当前流水的前序指令执行完成后，根据MutexID释放对应Mutex。
+>
+> 每个锁有固定的一个MutexID，在不同编程范式中，该ID的获取以及释放方式不同：
+> - 采用TPipe-TQue框架编程范式时，MutexID需要通过AllocMutexID/ReleaseMutexID进行申请释放。
+> - 采用静态Tensor编程范式时，MutexID由开发者自行管理，**建议使用0-27，28-31为系统内部规划预留，不建议使用**。
+>
+> 相对于SetFlag/WaitFlag同步机制，使用Lock/Unlock接口有以下优势：
+> - **内聚性更强，使用时与其它流水线解耦，可以简化反向同步**，如图2所示，以PIPE_MTE2与PIPE_V之间同步为例。
+> - **可以使用更多的同步信号量。**
+
+```cpp
+class Mutex {
+template <pipe_t pipe>
+static __aicore__ inline void Lock(MutexID id);
+template <pipe_t pipe>
+static __aicore__ inline void Unlock(MutexID id);
+};
+```
+
+So it is a per-pipe lock with **28 usable ids (0-27)** against `SetFlag`/`WaitFlag`'s 6 hand-allocatable event
+ids per `HardEvent` (§48.1: 0-5, since 6 and 7 are reserved), and its stated advantage is exactly the pain
+point §43 documents — 「简化反向同步」, simplifying the reverse direction, which is the half of a reused-buffer
+protocol that §46.3 says is easy to get wrong.
+
+### 56.2 ★★ It does not exist on 2201 — `不支持`, and the bodies compile to nothing
+
+产品支持情况, verbatim and identical on `Lock.md`, `Unlock.md`, `AllocMutexID_ISASI.md` and
+`ReleaseMutexID_ISASI.md`:
+
+```
+- Ascend 950PR/Ascend 950DT：支持
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+- Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+- Atlas 200I/500 A2 推理产品：不支持
+```
+
+And the headers do not merely omit it — they define it as an empty function.
+`include/basic_api/kernel_common.h:136-178`, verbatim:
+
+```cpp
+using MutexID = uint8_t;
+
+class Mutex {
+public:
+    template <pipe_t pipe>
+    static __aicore__ inline void Lock(MutexID id)
+    {
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102))
+        ASCENDC_ASSERT((id <= MAX_MUTEXID), {
+            KERNEL_LOG(KERNEL_ERROR, "For Mutex::Lock current id is %u, max MutexID is %u", id, MAX_MUTEXID);
+        });
+        GetBufInternal<pipe, 0>(id);
+#endif
+    }
+
+    template <pipe_t pipe>
+    static __aicore__ inline void Unlock(MutexID id)
+    {
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102))
+        ASCENDC_ASSERT((id <= MAX_MUTEXID), {
+            KERNEL_LOG(KERNEL_ERROR, "For Mutex::Unlock current id is %u, max MutexID is %u", id, MAX_MUTEXID);
+        });
+        RlsBufInternal<pipe, 0>(id);
+#endif
+    }
+};
+
+__aicore__ inline MutexID AllocMutexID()
+{
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102))
+    MutexID id = static_cast<uint8_t>(sff0(Internal::g_bufId));
+    Internal::g_bufId = sbitset1(Internal::g_bufId, id);
+    ASCENDC_ASSERT((id <= MAX_MUTEXID), { ... });
+    return id;
+#else
+    return 0;
+#endif
+}
+```
+
+**On 2201 both `Lock` and `Unlock` have empty bodies and `AllocMutexID()` returns 0.** No `static_assert`, no
+`#error`, no runtime log — the calls compile and do nothing.
+
+### 56.3 ★ A production kernel with a dead arm
+
+`vllm-project/vllm-ascend`, `csrc/attention/common/op_kernel/init_output.h`, verbatim:
+
+```cpp
+            LocalTensor<T> popBuffer =
+                AscendC::LocalTensor<uint8_t>(TPosition::VECIN, POP_BUF_START_ADDR, POP_BUF_ELE_SIZE * sizeof(T))
+                    .template ReinterpretCast<T>();
+
+            if constexpr (ENABLE_LOCK) {
+                Mutex::Lock<PIPE_V>(SYNC_ID);
+            } else {
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_ID);
+
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_ID);
+            }
+            ...
+                dataCopyParams.blockLen = tailSize * sizeof(T);
+                dataCopyParams.srcStride = 0;
+                dataCopyParams.dstStride = 0;
+                AscendC::DataCopyPad(outGm[gmOffset], popBuffer, dataCopyParams);
+            }
+            if constexpr (ENABLE_LOCK) {
+                Mutex::Unlock<PIPE_MTE3>(SYNC_ID);
+            } else {
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_ID);
+
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_ID);
+            }
+```
+
+Two things worth lifting even apart from the trap. The `else` arm is the canonical drain idiom with **nothing
+between the Set and the Wait** — `SetFlag<MTE3_V>(id); WaitFlag<MTE3_V>(id);` back to back, which is simply
+"stall the vector until MTE3 has drained", and it is used in *both* positions: before the vector touches the
+buffer and again after the store. And the store itself is **`DataCopyPad`, not `DataCopy`** — the AIC-safe form
+of §47.2.
+
+The trap: on A3, `ENABLE_LOCK = true` selects an arm in which **both** synchronization points vanish, because
+`Mutex::Lock` and `Mutex::Unlock` have empty bodies on 2201 (§56.2). The `else` arm is correct; the `if` arm is
+unsynchronized.
+
+## Relevance
+
+Two results. First, a negative one that saves time: `Mutex`/`Lock`/`Unlock` would be the better tool for our
+reused-staging-buffer problem — 28 ids against 6, and the vendor's own stated advantage is
+「简化反向同步」, which is precisely the reverse-direction row of §46.2 that a reused UB buffer needs — but it is
+`不支持` on A3 on all five of its API pages, its bodies are `#if`-gated to 3510/5102 and empty on 2201, and
+`AllocMutexID()` returns 0. **On this part `SetFlag`/`WaitFlag` is the only intra-core mechanism, and that is
+settled rather than a preference.** Worth knowing before anyone proposes it, and worth knowing for forward
+planning: on 950PR the lock route exists and is the vendor's recommended one.
+
+Second, a tenth entry for the silent-failure list, and one that is live in code we may well be reading or
+borrowing from: a `Mutex::Lock`/`Unlock` call on 2201 compiles to nothing with no diagnostic, so any kernel with
+an `ENABLE_LOCK`-style switch has an arm that is **completely unsynchronized on A3 while looking synchronized in
+the source.** `vllm-project/vllm-ascend`'s `csrc/attention/common/op_kernel/init_output.h` is exactly that
+shape. If we lift code from the attention kernels — and §56's search shows the `MTE3_V` idiom we want lives in
+precisely those files — check which arm the template flag selects before trusting it.
+
+The corroboration that started this is worth recording too: every public use of `WaitFlag<HardEvent::MTE3_V>`
+found by `gh search code` is in a vector-side file, by naming convention (`*_vector*.h`, `*_epilogue.h`,
+`msa_cast_*.hpp`). Nobody puts an `MTE3_V` wait on a cube half, which is what §43.5 predicts must be true for
+the code to work.
+
+## 57. ★ `GetTaskRatio()`'s return table — a third independent statement of which halves each kernel type launches, and the licence to alternate AIVs over any loop
+
+Source: `/home/shanshan/repo/cann/asc-devkit/docs/zh/api/SIMD-API/basic_api/tool_interface/system_resources_and_variables/GetTaskRatio.md`.
+Read 2026-10-20.
+
+产品支持情况, verbatim — note A3:
+
+```
+- Ascend 950PR/Ascend 950DT：支持
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：支持
+- Atlas A2 训练系列产品/Atlas A2 推理系列产品：支持
+- Atlas 200I/500 A2 推理产品：不支持
+- Atlas 推理系列产品AI Core：支持
+- Atlas 推理系列产品Vector Core：不支持
+- Atlas 训练系列产品：不支持
+- Kirin X90：支持
+- Kirin 9030：支持
+```
+
+功能说明 and 函数原型, verbatim:
+
+> 头文件路径为：`"basic_api/kernel_operator_sys_var_intf.h"`。
+>
+> **分离模式**下，获取任务启动的Cube Core（AIC）或者Vector Core（AIV）的数量与逻辑AI Core数量的比例。
+> - 在AIC上调用时返回AIC数量与逻辑AI Core数量的比例。
+> - 在AIV上调用时返回AIV数量与逻辑AI Core数量的比例。
+>
+> **耦合模式**下，固定返回1。
+
+```cpp
+__aicore__ inline int64_t GetTaskRatio()
+```
+
+返回值说明, 表1, verbatim and complete:
+
+> 针对分离模式，不同核函数（Kernel）类型下（通过设置核函数（Kernel）类型接口设置），在AIC和AIV上调用该接口的返回值如下：
+>
+> | 核函数（Kernel）类型 | KERNEL_TYPE_AIV_ONLY | KERNEL_TYPE_AIC_ONLY | KERNEL_TYPE_MIX_AIC_1_2 | KERNEL_TYPE_MIX_AIC_1_1 | KERNEL_TYPE_MIX_AIC_1_0 | KERNEL_TYPE_MIX_AIV_1_0 |
+> | --- | --- | --- | --- | --- | --- | --- |
+> | AIV | 1 | - | 2 | 1 | - | 1 |
+> | AIC | - | 1 | 1 | 1 | 1 | - |
+
+## Relevance
+
+The `-` entries are the halves that do not run, so this table is an *official, independent* statement of each
+kernel type's launch set, from a page that has nothing to do with §50.2's: **`AIC_ONLY` and `MIX_AIC_1_0` both
+launch the AIC alone** (AIV row `-`), **`AIV_ONLY` and `MIX_AIV_1_0` both launch the AIV alone** (AIC row `-`),
+and only `MIX_AIC_1_1` and `MIX_AIC_1_2` launch both, at ratios 1 and 2. That is now a **third** confirmation
+that `KERNEL_TYPE_AIC_ONLY` is live on A3 — the type page (§50.1), working code in six repos (§55.3), and this
+page's own 产品支持情况 listing A3 as 支持 — against our single measured `sqe_type=3, errType=0x20`, which the
+runtime source decodes as a PLACE_HOLDER SQE with a software-status error rather than a type rejection.
+
+It also licenses the fix for §B8.3's batch=1 problem. The vendor's two-AIV alternation is
+`if (vecCount % taskRation != subBlockIdx) continue;` with `taskRation = GetTaskRatio()`, and this page says
+`GetTaskRatio()` on an AIV under `MIX_AIC_1_2` returns **2** — i.e. it is the AIV-per-AIC count and nothing
+more. The alternation is therefore over *whatever loop the author increments `vecCount` in*, not over M
+specifically. So the §B8.3 precondition 「前提条件，循环次数不为1」 is a property of the chosen loop, not of the
+mechanism: at batch=1, where the M loop may have a single iteration, moving `vecCount++` to the N loop
+(`for (offsetN = 0; offsetN < curCubeSingleN; offsetN += baseN)`, which the same shipped code already has) keeps
+both AIVs busy. That turns the −29.3% step from inapplicable into applicable.
+
+One more thing worth noting from the 功能说明: 「耦合模式下，固定返回1」. On a coupled-architecture part
+`GetTaskRatio()` is a constant 1, so any alternation written on it silently degenerates to "AIV 0 does
+everything" there — a portability trap for code written against a separated part like ours.

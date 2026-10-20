@@ -3952,3 +3952,1931 @@ attention computation **in parallel**" — the gather/compute overlap that secti
 `SetFlag`/`WaitFlag` pair on `MTE2_MTE3` demonstrably does *not* achieve in the public `arch22`
 code. Either the shipped `ops-transformer` kernel is not the one they measured, or the overlap
 they claim is the one we are not getting.
+
+---
+
+## 14. `FusedSparseAttentionOverlap` — the shipped A3 fix, whose only compiled template IS the GLM-5.2 decode combination
+
+https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/fused_sparse_attention_overlap/README.md
+vLLM-Ascend project, CANN custom op. Fetched 2026-10-20 via
+`gh api repos/vllm-project/vllm-ascend/contents/csrc/attention/fused_sparse_attention_overlap/README.md`,
+228 lines.
+
+### 14.1 Product support and function
+
+> # FusedSparseAttentionOverlap
+>
+> ## 产品支持情况
+>
+> |产品      | 是否支持 |
+> |:----------------------------|:-----------:|
+> |<term>Ascend 950PR&950DT 系列产品</term>|√|
+> |<term>Atlas A3 系列产品</term>|√|
+> |<term>Atlas A2 系列产品</term>|√|
+> |<term>Atlas 200I/500 A2 推理产品</term>|×|
+> |<term>Atlas 推理系列产品</term>|×|
+> |<term>Atlas 训练系列产品</term>|×|
+>
+> ## 功能说明
+>
+> - API功能：`fused_sparse_attention_overlap`面向大序列稀疏注意力推理场景，在一个算子中完成Selection KV Cache h2d更新和Sparse Flash Attention计算。算子根据TopK索引及缓存元数据判断KV是否命中Selection KV Cache；未命中的KV从Full KV Cache加载并写入Selection KV Cache，同时通过流水调度将KV搬运与注意力计算重叠，减少独立Gather和Sparse Flash Attention串行执行的开销。
+>
+> - 计算公式：
+>
+>     $$
+>     \text{softmax}(\text{scaleValue} \cdot (Q_{NoPE}@\tilde{K}_{NoPE}^{T} + Q_{RoPE}@\tilde{K}_{RoPE}^{T}))@\tilde{V}
+>     $$
+>
+>     其中，$\tilde{K}$和$\tilde{V}$由`selectionTopkIndices`指定。命中项从Selection KV Cache读取，未命中项从Full KV Cache读取。算子执行后会原地更新`selectionKRoPE`、`selectionKvCache`、`selectionKvBlockStatus`和`selectionMembershipMap`，供后续Token复用。
+
+### 14.2 THE constraint list — the vendor states the GLM-5.2 decode template
+
+> ## 约束说明
+>
+> - 该接口仅支持推理场景，并支持图模式。
+> - 当前编译的模板仅支持GLM5.2 Decode使用的组合：`FLASH_DECODE=0`、`layoutQuery="TND"`、`layoutKv="PA_BSND"`、`TEMPLATE_MODE=V_TEMPLATE`、`IS_SPLIT_G=0`。
+> - 当前支持FLOAT16和BFLOAT16，`query`、Full KV Cache及Selection KV Cache的数据类型必须保持一致。
+> - 当前仅支持MLA-absorb形态，NoPE维度D为512，RoPE维度Dr为64；`query`最后一维为576，`attentionOut`最后一维为512。
+> - 当前验证的分组头配置为N1=4、N2=1，PageAttention的`block_size`为128。
+> - `selectionKvBlockStatus`最后一维至少容纳TopK个Token ID和一个有效数量字段，并按8个INT32元素对齐。
+> - 当前`selectionMembershipMap`每行包含16376个Token映射位置、8个控制字段及对齐空间，`membership_stride`为16400。
+> - `selectionTopkIndices`中的有效Token ID必须在对应Batch的`fullKvActualSeq`范围内。
+> - Selection KV Cache容量不得小于TopK，Full KV Cache和Selection KV Cache的Block Table必须覆盖所有被访问的逻辑块。
+
+### 14.3 The Selection KV Cache state
+
+> | selectionKvCache | 输入/输出（原地更新） | NPU侧Selection KV Cache，采用PageAttention排布，shape为(selection_block_num,selection_block_size,D)。未命中的KV数据会从fullKvCache加载并写入该tensor。 | FLOAT16、BFLOAT16 | ND |
+
+> | selectionKvBlockStatus | 输入/输出（原地更新） | Selection KV Cache的驻留Token状态，shape为(B,N2,status_stride)。前TopK个位置记录驻留Token ID，并使用附加位置记录有效数量。status_stride需要满足算子对齐要求。 | INT32 | ND |
+
+> | selectionMembershipMap | 输入/输出（原地更新） | Selection KV Cache的Token到Slot映射及紧凑搬运计划，shape为(B,N2,membership_stride)。既可由算子内部Planner维护，也可承载框架生成的External Plan。 | INT16 | ND |
+
+> | selectionTopkIndices | 输入 | Indexer输出的TopK Token索引，不支持空tensor。支持三维(T1,N2,TopK)或可展平为该排布的四维输入。 | INT32 | ND |
+
+> | fullKvCache | 输入 | 完整KV Cache，采用PageAttention排布，shape为(full_block_num,block_size,D)。作为Selection KV Cache未命中时的数据源。 | FLOAT16、BFLOAT16 | ND |
+
+> | fullKRoPE | 输入 | 完整K RoPE缓存，采用PageAttention排布，shape为(full_block_num,block_size,Dr)。 | FLOAT16、BFLOAT16 | ND |
+
+> | fullKvBlockTable | 输入 | Full KV Cache的逻辑块到物理块映射表，shape为(B,full_block_count)。 | INT32 | ND |
+
+> | fullKvActualSeq | 输入 | 各Batch的Full KV有效序列长度，shape为(B)。 | INT32 | ND |
+
+> | fullQActualSeq | 输入 | TND排布下Query的有效序列信息，元素个数需要与query第一维对应。Decode场景中每个Query Token的长度为1。 | INT32 | ND |
+
+> | scaleValue | 属性 | Query与Key乘积的缩放系数，通常设置为1/sqrt(D+Dr)。 | FLOAT | - |
+
+> | sparseBlockSize | 属性 | 稀疏选择粒度。当前融合路径仅支持Token-wise稀疏化，取值为1。 | INT64 | - |
+
+> | selectionTopkBlockSize | 属性 | TopK索引的选择粒度，当前仅支持1。 | INT64 | - |
+
+> | layoutQuery | 属性 | query的数据排布格式，当前仅支持"TND"。 | STRING | - |
+
+> | layoutKv | 属性 | Full KV Cache的数据排布格式，当前仅支持PageAttention排布"PA_BSND"。 | STRING | - |
+
+> | sparseMode | 属性 | 稀疏模式。当前Decode融合路径使用3，表示rightDownCausal模式。 | INT64 | - |
+
+> | attentionOut | 输出 | Attention计算结果，shape为(T1,N1,D)。输出不包含Query的RoPE维度。 | FLOAT16、BFLOAT16 | ND |
+
+### 14.4 What vLLM-Ascend actually ships today, for contrast
+
+https://github.com/vllm-project/vllm-ascend `vllm_ascend/attention/sfa_v1.py` (2213 lines):
+
+```python
+        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query.contiguous(),
+            key=cache,
+            value=cache,
+            sparse_indices=indices,
+            scale_value=scale,
+            sparse_block_size=1,
+            block_table=metadata.block_table,
+            actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
+            actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
+            query_rope=None,
+            key_rope=None,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+```
+
+`sparse_block_size=1`, `layout_query="TND"`, `layout_kv="PA_BSND"`, `attention_mode=2`,
+`sparse_mode=3`, `return_softmax_lse=False`. This is the plain `SparseFlashAttention` of
+sections 8-12, with no Selection KV Cache and no overlap.
+
+And the documented single-node A3 GLM-5.2-W4A8C8 recipe —
+https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/GLM5.2.html
+(source `docs/source/tutorials/models/GLM5.2.md` in vllm-project/vllm-ascend), fetched 2026-10-20:
+
+> 5.1.1 Single-node Deployment
+>
+> Quantized model GLM-5.2-w4a8c8 can be deployed on 1 Atlas 800 A3 (64GB × 16) .
+
+> export HCCL_BUFFSIZE=200
+> export HCCL_OP_EXPANSION_MODE="AIV"
+> export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+> vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.2-w4a8c8 \
+> --host 0.0.0.0 \
+> --port 8000 \
+> --api-server-count 1 \
+> --data-parallel-size 2 \
+> --enable-expert-parallel \
+> --tensor-parallel-size 8 \
+> --seed 1024 \
+> --served-model-name glm-5 \
+> --tool-call-parser glm47 \
+> --reasoning-parser glm45 \
+> --enable-auto-tool-choice \
+> --max-num-seqs 12 \
+> --max-model-len 135000 \
+> --max-num-batched-tokens 8192 \
+> --trust-remote-code \
+> --gpu-memory-utilization 0.92 \
+> --quantization ascend \
+> --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+> --attention_config.indexer_kv_dtype int8 \
+> --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"multistream_overlap_shared_expert":true, "enable_flashcomm1": true, "enable_fused_mc2": 0}' \
+> --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
+
+> Notice:
+> The parameters are explained as follows:
+>
+> For single-node deployment, we recommend using dp1tp16 and turn off expert parallel in low-latency scenarios.
+
+> Sparse SFA C8 | A3 (w8a8c8); long-context prefill | --kv-cache-dtype int8 | Sparse Flash Attention skips unnecessary attention computation of the C8 quantized model, accelerating long-context prefill | Experimental in v0.23.0. On the w8a8c8 weights it can be combined with DCP/context parallelism (as in the reference configs in this document); on the w4a8c8 weights enabling both together has known issues and is not recommended
+
+> Sparse LI C8 | A3 (w8a8c8) | --attention_config.indexer_kv_dtype int8 | Sparse attention optimization reduces computation of the C8 quantized model, improving throughput | Independent of --kv-cache-dtype int8
+
+> --kv-cache-dtype turboquant_4bit_nc: Enables 4-bit TurboQuant quantization for the SFA packed main KV cache, as an alternative to --kv-cache-dtype int8. It requires an A2/A3 device, does not support context parallelism (DCP/PCP), cannot be combined with the C8 cache, and in Prefill-Decode disaggregation the Mooncake option "use_ascend_direct" must be false.
+
+Only the 1M-context configs add context parallelism:
+
+> --prefill-context-parallel-size 1 \
+> --decode-context-parallel-size 16 \
+> --cp-kv-cache-interleave-size 128 \
+
+### 14.5 Sibling kernels in the same tree
+
+`gh api repos/vllm-project/vllm-ascend/contents/csrc/attention --jq '.[].name'`, 2026-10-20:
+
+```
+attn_res_fwd
+chunk_kda_fwd
+common
+compressor
+compressor_metadata
+fused_lightning_indexer_manage
+fused_quant_lightning_indexer_manage
+fused_scatter_copy_sparse_flash_attention
+fused_sparse_attention_overlap
+indexer_compress_epilog_v2
+inplace_partial_rotary_mul
+k2q_csr
+kda_gate_cumsum_vllm
+kda_layout_swap12
+kv_compress_epilog_v2
+kv_quant_sparse_attn_sharedkv
+kv_quant_sparse_attn_sharedkv_metadata
+kv_quant_sparse_flash_attention_vllm
+lightning_indexer_v2
+msa_index_score
+quant_lightning_indexer_v2
+quant_lightning_indexer_v2_metadata
+recurrent_gated_delta_rule_v310
+rms_norm_dynamic_quant
+sparse_attention_score
+sparse_attn_sharedkv
+sparse_attn_sharedkv_metadata
+sparse_flash_attention
+sparse_flash_mla
+sparse_flash_mla_metadata
+```
+
+Note `fused_scatter_copy_sparse_flash_attention`, `sparse_attn_sharedkv` +
+`sparse_attn_sharedkv_metadata`, and `kv_quant_sparse_attn_sharedkv` + its metadata — four more
+gather/attention fusion variants, two of them metadata-driven in the section-11 style.
+
+## Relevance
+
+This section confirms, from the vendor, every inference sections 8-13 drew from source — and then
+hands us the fix.
+
+**The confirmation is line-for-line.** `当前编译的模板仅支持GLM5.2 Decode使用的组合：
+FLASH_DECODE=0、layoutQuery="TND"、layoutKv="PA_BSND"、TEMPLATE_MODE=V_TEMPLATE、IS_SPLIT_G=0`
+plus `当前验证的分组头配置为N1=4、N2=1，PageAttention的block_size为128`. Every one of these was
+predicted above and is now stated as *the* GLM-5.2 decode configuration:
+
+| predicted in | prediction | vendor statement |
+|---|---|---|
+| 8.1 | `FLASH_DECODE` never 1 | `FLASH_DECODE=0` |
+| 8.1, 13 | `IS_SPLIT_G = 0` because `Q_N <= 64` | `IS_SPLIT_G=0`, `N1=4` |
+| 8.6, 9.1 | `sparse_block_size = 1` → `V_TEMPLATE` → `kvMergeGm_` round trip | `TEMPLATE_MODE=V_TEMPLATE`, `sparseBlockSize ... 取值为1` |
+| 10.5, 13 | 64 heads / TP16 = 4 per rank | `N1=4、N2=1` |
+| 13 | 576 = 512 nope + 64 rope | `NoPE维度D为512，RoPE维度Dr为64；query最后一维为576` |
+
+**And it resolves the 5.0x arithmetic.** `layoutQuery="TND"` is the answer to section 10's open
+question. In TND, `InitCalcParamsEach` reads `actBatchS1 = GetBalanceActualSeqLengths(...)` as the
+Q token count, so `totalBaseNum = T1`, not 1. The shipped recipe runs
+`--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'`, so a decode step
+carries **4 query tokens** (1 + 3 MTP) and `usedCoreNum = 4`. Not 1, and not 24 — **4 of 24 cube
+cores**, with 20 taking the early `return`.
+
+The two factors are of different kinds and must not simply be multiplied. Section 9.1's 3-HBM-transit
+staging is a *bytes* claim: it raises the op's own floor to ~3x the algorithmic byte roofline, and
+it composes with the roofline additively-in-bytes. Section 8.3's 4-of-24 is a *bandwidth-ceiling*
+claim, and 4 cores do not pull 4/24 of HBM — a handful of AI cores can already saturate a large
+fraction of a die's bandwidth, so the penalty is well below 6x and is not separable from the
+transit count without a measurement. The honest statement is: the op's floor is ~3x roofline from
+staging alone, our measured 6.973 ms is ~1.7x that floor, and the residual 1.7x is where the
+4-of-24 core limit, the per-Mmad `PipeBarrier<PIPE_M>` of section 9.7, the `MTE2_MTE3`
+serialization of section 9.5, and the 13.58 us MIX_AIC launch floor all live. Per call that is
+6.973 ms / 78 layers = 89.4 us, of which 13.58 us is launch floor — 15% of the op's cost is
+launch before a single byte moves.
+
+The TND read is verified in source —
+`attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h`:
+
+```cpp
+__aicore__ inline uint64_t SparseFlashAttentionMla<SFAT>::GetBalanceActualSeqLengths(
+    GlobalTensor<int32_t>& actualSeqLengths, uint32_t bIdx)
+{
+    if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
+        if (bIdx > 0) {
+            return actualSeqLengths.GetValue(bIdx) - actualSeqLengths.GetValue(bIdx - 1);
+        } else if (bIdx == 0) {
+            return actualSeqLengths.GetValue(0);
+        } else {
+            return 0;
+        }
+    } else {
+        if (sfaKernelConstInfo.actualLenDimsQ == 0) {
+            return sfaKernelConstInfo.qSeqSize;
+        } else if (sfaKernelConstInfo.actualLenDimsQ == 1) {
+            return actualSeqLengths.GetValue(0);
+        } else {
+            return actualSeqLengths.GetValue(bIdx);
+        }
+    }
+}
+```
+
+At `bIdx == 0` in TND this returns `actualSeqLengths.GetValue(0)`, the prefix sum at batch 0 —
+i.e. the Q token count. `sfa_v1.py` passes exactly that:
+`actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32)`.
+
+**The actionable fact.** `FusedSparseAttentionOverlap` is A3-supported, graph-mode capable, and
+its only compiled template is exactly our configuration. It attacks the gather cost from a
+direction none of sections 8-12 suggested: a persistent **Selection KV Cache** keyed by resident
+token ID (`selectionKvBlockStatus`: `前TopK个位置记录驻留Token ID，并使用附加位置记录有效数量`)
+plus a token→slot map and compaction plan (`selectionMembershipMap`, 16376 mapping slots,
+`membership_stride = 16400`). Because consecutive decode steps' top-2048 sets overlap heavily —
+the IndexCache paper measures 70-100% overlap between *adjacent layers*, and temporal overlap
+between adjacent *tokens* at fixed layer is the same phenomenon — most of the 2048 rows are
+already resident and only the misses are fetched from `fullKvCache`. On top of that it pipelines
+the miss gather against the attention compute: `通过流水调度将KV搬运与注意力计算重叠，减少独立
+Gather和Sparse Flash Attention串行执行的开销`.
+
+That is the mechanism that removes section 9.1's extra HBM transits *and* section 9.5's
+`SetFlag`/`WaitFlag` serialization, in a shipped A3 kernel, without us writing one. It does not
+fix the 4-of-24 core problem — `FLASH_DECODE=0` and `IS_SPLIT_G=0` are still in its template
+list, so the parallelism gap survives and remains ours to close in the megakernel.
+
+Two caveats worth stating. First, `Selection KV Cache容量不得小于TopK` — at least 2048 token
+slots of 576 halves = 2.25 MiB per (batch, n2) of extra HBM, plus the `selectionMembershipMap` at
+16400 INT16 = 32 KiB per row. Second, the published recipe uses `--tensor-parallel-size 8
+--data-parallel-size 2` rather than TP16, while the prose says `For single-node deployment, we
+recommend using dp1tp16 and turn off expert parallel in low-latency scenarios` — so the TP16
+low-latency path is recommended but not the one in the reference script, and `N1=4` in the
+constraint list corresponds to TP16, not to the TP8 script (which would give `N1=8`).
+
+**One number that bounds what sparsity is buying us at 8K.** `index_topk = 2048` against seq 8192
+is 25% of the KV. A dense `FusedInferAttentionScore` decode over all 8192 tokens would read 4x
+the bytes but, per section 12, would run `SplitCore` and use up to 16 cores instead of 4, with no
+`kvMergeGm_` round trip and no scattered gather. 4x the bytes at 4x the cores and 1/3 the transits
+is roughly break-even on paper. At seq 8K the sparsity may be costing us. That A/B is one
+experiment and it is the one to run first.
+
+---
+
+## 15. The A3 decode-attention alternatives, side by side: every one is MIX_AIC, so the launch floor is unavoidable outside a megakernel
+
+Same clone and commit (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20).
+
+### 15.1 Kernel task type, per operator
+
+```
+$ for d in <ops>; do grep -rhn 'KERNEL_TASK_TYPE' $d/op_kernel/*.cpp; done
+=== fused_infer_attention_score ===
+78:        KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+=== sparse_flash_mla ===
+101:    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+103:    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+=== sparse_flash_attention ===
+83:    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+=== kv_quant_sparse_flash_attention ===
+132:    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+```
+
+`sparse_flash_mla`'s two entries are arch-gated, and the gate names the A3 arch macro directly:
+
+```cpp
+#if (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+#else
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#endif
+```
+
+`IncreFlashAttention` is the only one that varies the CV ratio *per tiling key* rather than with a
+single default — `attention/incre_flash_attention/op_kernel/incre_flash_attention_arch22.h`:
+
+```cpp
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+...
+    KERNEL_TASK_TYPE(QF16_KVF16_OUTF16_ANTIPERCHANNEL_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVF16_OUTF16_ANTIPERCHANNEL_PAGEDCACHE_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVF16_OUTF16_ANTIPERCHANNEL_BSH_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVF16_OUTF16_ANTIPERCHANNEL_BSH_PAGEDCACHE_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERCHANNEL_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERCHANNEL_PAGEDCACHE_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERCHANNEL_BSH_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERCHANNEL_BSH_PAGEDCACHE_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERTOKEN_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+    KERNEL_TASK_TYPE(QF16_KVINT8_OUTF16_ANTIPERTOKEN_PAGEDCACHE_C1V1_TILING, KERNEL_TYPE_MIX_AIC_1_1);
+```
+
+`NsaSelectedAttentionInfer` has no `KERNEL_TASK_TYPE` directive in its `op_kernel/` at all.
+
+### 15.2 The comparison
+
+All on `Atlas A3系列产品 √`, for a batch=1 single-query (or MTP-4) MLA decode with a sparse
+block list:
+
+| op | sparse index input | S2 split across cores | combine | task type | A3 decode viability |
+|---|---|---|---|---|---|
+| `SparseFlashAttention` | `sparse_indices` `[T1,KV_N,K]`, `sparse_block_size` 1..128 | **no** (`FLASH_DECODE=0`, `actBatchS2=1`) | dead code | `MIX_AIC_1_2` | this is what we run; 4 of 24 cores at `T1=4` |
+| `KvQuantSparseFlashAttention` | same + C8/TQ4 packed slot | **no** (0 `splitKVFlag_` sites) | dead code | `MIX_AIC_1_2` | folds dequant in; same core limit |
+| `NsaSelectedAttentionInfer` | NSA selected blocks | **no** (0 sites, logs `PA FlashDecode is not enabled`) | dead code | none declared | same core limit |
+| `SparseFlashMla` + `...Metadata` | `ori_sparse_indices` + `ori_topk_length`; A3 SWA template only | **yes** (`FA_S2_START/END_INDEX` per core, AI-CPU balanced) | `SplitFD` + `fdMetadata` per AIV | `MIX_AIC_1_2` on A3 | real split; A3 restricted to `仅支持SWA模板` |
+| `FusedInferAttentionScore` | none (dense) | **yes** (`SplitCore` + `IsFlashDecode`) | `numOfFdHead` + `usedVecNumOfFd` | `MIX_AIC_1_2` | dense baseline; 4x the bytes, up to 16 cores |
+| `IncreFlashAttention` | none (dense) | **yes** (`IsFlashDecode` + `SplitBNS`) | `service_vector_flashdecode_mla.h` | `MIX_AIC_1_2`, `1_1` for C1V1 keys | dense decode reference |
+| `FusedSparseAttentionOverlap` (vllm-ascend) | `selectionTopkIndices` + Selection KV Cache | **no** (`FLASH_DECODE=0` in its template list) | n/a | n/a (vllm-ascend tree) | removes the gather round trip; keeps the core limit |
+
+### 15.3 `SparseAttnSharedkv` — A3-exclusive, metadata-driven, but not our shape
+
+`experimental/attention/sparse_attn_sharedkv/README.md`:
+
+> | 产品                                                         | 是否支持 |
+> |<term>Ascend 950PR&950DT系列产品</term>                        | ×  |
+> |<term>Atlas A3系列产品</term>        | √  |
+> |<term>Atlas A2系列产品</term>        | ×  |
+
+> - API功能：`SparseAttnSharedKV`算子旨在完成以下公式描述的Attention计算，支持Sliding Window Attention、Compressed Attention以及Sparse Compressed Attention。
+
+> - 该接口当前支持三种计算场景：场景一，仅传入`ori_kv`时为Sliding Window Attention计算；场景二，传入`ori_kv`及`cmp_kv`时为Sliding Window Attention + Compressed Attention计算；场景三，传入`ori_kv`、`cmp_kv`及`cmp_sparse_indices`时为Sliding Window Attention + Sparse Compressed Attention计算。
+
+> - 当`layout_q`为TND时，功能使用限制如下：
+>   - `q`的shape需要为[T1,N1,D]，其中N1仅支持64。
+>   - `ori_sparse_indices`的shape需要为[Q\_T, KV\_N, K1]，其中K1为对`ori_kv`一次离散选取的token数，K1仅支持512。
+>   - `cmp_sparse_indices`的shape需要为[Q\_T, KV\_N, K2]，其中K2为对`cmp_kv`一次离散选取的token数，K2仅支持512。
+
+It takes a `metadata` input in the section-11 style (`op_host/sparse_attn_sharedkv_def.cpp:88`
+`this->Input("metadata")`, validated against a fixed `METADATA_LIMIT`), and it is the only
+attention op in the repo marked A3-only. But `N1仅支持64` means 64 Q heads per rank — TP1, not
+TP16 — and `K1仅支持512` means top-512, not top-2048. Wrong shape for us on both axes.
+
+### 15.4 `SparseFlashAttention`'s own test matrix has no single-query decode case
+
+`attention/sparse_flash_attention/tests/pytest/sparse_flash_attention_paramset.py`. Five cases:
+`bsnd_basic`, `bsnd_multi_batch`, `pa_bsnd`, `tnd_basic`, `tnd_pa_multi_batch`. Their shapes:
+
+| case | B | S1 | S2 | N1 | K (top-k) | `sparse_block_size` |
+|---|---|---|---|---|---|---|
+| `bsnd_basic` | 1 | **5** | 262144 | 8 | 16 | 1 |
+| `bsnd_multi_batch` | 32 | **6** | 512 | 64 | 32 | 1 |
+| `pa_bsnd` | 2 | **8192** | 1024 | 16 | 2048 | 1 |
+| `tnd_basic` | 2 | **4** | 3072 | 8 | 32 | 1 |
+| `tnd_pa_multi_batch` | 4 | **5** | 3072 | 64 | 64 | 1 |
+
+with e.g. `bsnd_basic` verbatim:
+
+```python
+    "bsnd_basic": {
+        "Testcase_Prefix": ["sfa_bsnd_basic"],
+        "layout_query": ["BSND"],
+        "layout_kv": ["BSND"],
+        "q_type": [torch.float16],
+        "kv_type": [torch.float16],
+        "B": [1],
+        "S1": [5],
+        "S2": [262144],
+        "N1": [8],
+        "N2": [1],
+        "D": [512],
+        "K": [16],
+        "scale_value": [1.0 / math.sqrt(576)],
+        "sparse_block_size": [1],
+        "rope_head_dim": [64],
+        "sparse_mode": [0],
+        "attention_mode": [2],
+        "return_softmax_lse": [True],
+        "use_sinks": [False],
+        "actual_seq_q": [[4]],
+        "actual_seq_kv": [[4]],
+        "range_query": [[-10.0, 100.0]],
+        "range_key": [[5.0, 100.0]],
+    },
+```
+
+**The minimum `S1` in the entire matrix is 4.** Not one case has `S1 = 1`. The only case with
+`K = 2048` is `pa_bsnd`, whose `S1` is 8192 — a prefill. The op has no public test for a pure
+single-query decode step.
+
+## Relevance
+
+Two conclusions for our 10.8528 ms.
+
+**The 13.58 us MIX_AIC launch floor is not avoidable by picking a different operator.** Every
+shipped A3 decode-attention kernel declares `KERNEL_TYPE_MIX_AIC_1_*`. There is no AIV-only
+attention decode path, so our 505 MIX_AIC calls per round and the 11.5 ms launch floor they imply
+cannot be reduced by operator substitution — only by reducing the *number* of MIX launches. At
+6.5 MIX_AIC calls per layer, SFA is one of them; the launch floor alone is 13.58 us of the
+89.4 us we pay per SFA call, i.e. **15% of the op's cost before any byte moves**. This is the
+clearest argument in this whole document for the megakernel over per-op optimization: the
+launch floor is a property of the dispatch, and the only way past it is fewer dispatches.
+
+**The missing decode tiling is explained, not just observed.** Section 12 showed the splitter was
+dropped when SFA was forked from FIA. Section 15.4 shows why nobody noticed: the op's test matrix
+has no `S1 = 1` case, so the `totalBaseNum = 1` collapse in `InitCalcParamsEach` is never
+exercised. The nearest case, `tnd_basic` with `S1 = 4`, happens to produce `usedCoreNum = 4` —
+non-degenerate enough to pass, degenerate enough to hide the bug. And it is exactly the shape
+vLLM-Ascend ships, because MTP-3 makes `T1 = 4`. Our configuration sits precisely on the only
+decode-ish shape the op was validated against, and that shape uses 4 of 24 cores.
+
+The practical consequence: do not expect an upstream fix to arrive on its own, and do not expect
+`KvQuantSparseFlashAttention` or `NsaSelectedAttentionInfer` to behave differently — both have
+zero `splitKVFlag_ = true` sites. The two routes that change the parallelism are
+`SparseFlashMla` + `SparseFlashMlaMetadata` (if the A3 `仅支持SWA模板` restriction can be made to
+express a pure top-k pattern) and our own megakernel using the `split_core.h` cost model
+`6*ceil(M/16) + 10*ceil(S2/64)` and the `SparseFlashMlaMetadata` task-list schema.
+
+---
+
+## 16. DMA instruction accounting for a token-wise sparse gather on A3: `DataCopyPA` can only cross one page per instruction
+
+Same clone and commit (`gitcode.com/cann/ops-transformer`,
+`3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20).
+`attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_service_cube_mla.h`.
+
+### 16.1 `DataCopyPA` — the block-table gather, verbatim
+
+```cpp
+/*
+    适用PA数据从GM拷贝到L1，支持ND、NZ数据；
+    PA的layout分 BNBD（blockNum,N,blockSize,D） BBH（blockNum,blockSize,N*D
+    BSH\BSND\TND 为BBH
+    shape.copyRowNumAlign 需要16字节对齐，如拷贝k矩阵，一次拷贝128*512，遇到尾块 10*512 需对齐到16*512
+*/
+template <typename T, SFA_LAYOUT SRC_LAYOUT>
+__aicore__ inline void DataCopyPA(LocalTensor<T>& dstTensor,  // l1
+                                  GlobalTensor<T>& srcTensor, // gm
+                                  GlobalTensor<int32_t>& blockTableGm,
+                                  const PAShape& shape,     // blockSize, headNum, headDim
+                                  const Position& startPos) // bacthIdx nIdx curSeqIdx
+{
+    uint64_t blockTableBaseOffset = startPos.bIdx * shape.maxblockNumPerBatch;
+    uint32_t curS2Idx = startPos.s2Idx;
+    uint32_t copyFinishRowCnt = 0;
+    uint32_t blockElementCnt = 32 / sizeof(T);
+    while (copyFinishRowCnt < shape.copyRowNum) {
+        uint64_t reaminRowCnt = curS2Idx % shape.blockSize;  // 获取在单个块上超出的行数
+        uint64_t blockIdOffset = curS2Idx / shape.blockSize; // 获取block table上的索引
+        uint64_t idInBlockTable =
+            blockTableGm.GetValue(blockTableBaseOffset + blockIdOffset); // 从block table上的获取编号
+        // 计算可以拷贝行数
+        uint32_t copyRowCnt = shape.blockSize - reaminRowCnt; // 一次只能处理一个Block
+        if (copyFinishRowCnt + copyRowCnt > shape.copyRowNum) {
+            copyRowCnt = shape.copyRowNum - copyFinishRowCnt; // 一个block未拷满
+        }
+        uint64_t dStride = shape.headDim;
+        uint64_t offset = idInBlockTable * shape.blockSize * shape.headNum * shape.headDim; // PA的偏移
+
+        if constexpr (SRC_LAYOUT == SFA_LAYOUT::BSND || SRC_LAYOUT == SFA_LAYOUT::TND) {
+            offset += (uint64_t)(startPos.n2Idx * shape.headDim) + reaminRowCnt * shape.headDim * shape.headNum +
+                      startPos.dIdx;
+            dStride = shape.headDim * shape.headNum;
+        } else {
+            offset += (uint64_t)(startPos.n2Idx * shape.headDim * shape.blockSize) + reaminRowCnt * shape.headDim +
+                      startPos.dIdx;
+        }
+
+        uint32_t dValue = shape.actHeadDim;
+        uint32_t srcDValue = dStride;
+        LocalTensor<T> tmpDstTensor = dstTensor[copyFinishRowCnt * blockElementCnt];
+        GlobalTensor<T> tmpSrcTensor = srcTensor[offset];
+
+        DataCopyGmNDToL1<T>(tmpDstTensor, tmpSrcTensor, copyRowCnt, shape.copyRowNumAlign, dValue, srcDValue);
+        copyFinishRowCnt += copyRowCnt;
+        curS2Idx += copyRowCnt;
+    }
+}
+```
+
+`uint32_t copyRowCnt = shape.blockSize - reaminRowCnt; // 一次只能处理一个Block` — "one
+instruction can only handle one Block". Each loop iteration is one `blockTableGm.GetValue()`
+scalar GM read plus one `DataCopy` (Nd2Nz).
+
+The underlying move, also verbatim:
+
+```cpp
+// 场景：query、queryRope、key、value GM to L1
+// GM按ND格式存储
+// L1按NZ格式存储
+// GM的行、列、列的stride
+template <typename T>
+__aicore__ inline void DataCopyGmNDToL1(LocalTensor<T>& l1Tensor, GlobalTensor<T>& gmTensor, uint32_t rowAct,
+                                        uint32_t rowAlign,
+                                        uint32_t col,       // D
+                                        uint32_t colStride) // D or N*D
+{
+    Nd2NzParams sfaCubeCopyParams;
+    sfaCubeCopyParams.ndNum = 1;
+    sfaCubeCopyParams.nValue = rowAct; // nd矩阵的行数
+    // T为int4场景下，dValue = col / 2，srcDValue = colStride / 2
+    sfaCubeCopyParams.dValue = col;          // nd矩阵的列数
+    sfaCubeCopyParams.srcDValue = colStride; // 同一nd矩阵相邻行起始地址间的偏移
+    sfaCubeCopyParams.dstNzC0Stride = rowAlign;
+    sfaCubeCopyParams.dstNzNStride = 1;
+    sfaCubeCopyParams.srcNdMatrixStride = 0;
+    sfaCubeCopyParams.dstNzMatrixStride = 0;
+    DataCopy(l1Tensor, gmTensor, sfaCubeCopyParams);
+}
+```
+
+and the non-PA variant the `C_TEMPLATE` path uses:
+
+```cpp
+__aicore__ inline void SFAMatmulService<SFAT>::CopyInMm1BToL1(LocalTensor<KV_T>& bL1Tensor,
+                                                              const uint64_t keyGmBaseOffset,
+                                                              uint32_t copyTotalRowCntAlign, uint32_t copyStartRowCnt,
+                                                              uint32_t nActCopyRowCount, uint32_t headSize)
+{
+    uint64_t dStride = sfaCubeConstInfo.headDim;
+    if constexpr (KV_LAYOUT_T == SFA_LAYOUT::BSND || KV_LAYOUT_T == SFA_LAYOUT::TND) {
+        dStride = sfaCubeConstInfo.headDim * sfaCubeConstInfo.kvHeadNum;
+    }
+
+    uint32_t blockElementCnt = 32 / sizeof(KV_T);
+
+    Nd2NzParams mm1Nd2NzParamsForB;
+    mm1Nd2NzParamsForB.nValue = nActCopyRowCount;
+    mm1Nd2NzParamsForB.dValue = headSize;
+    mm1Nd2NzParamsForB.srcDValue = dStride;
+    mm1Nd2NzParamsForB.ndNum = 1;
+    mm1Nd2NzParamsForB.dstNzC0Stride = copyTotalRowCntAlign;
+    mm1Nd2NzParamsForB.dstNzNStride = 1;
+    mm1Nd2NzParamsForB.srcNdMatrixStride = 0;
+    mm1Nd2NzParamsForB.dstNzMatrixStride = 0;
+    DataCopy(bL1Tensor[copyStartRowCnt * blockElementCnt], keyGm[keyGmBaseOffset], mm1Nd2NzParamsForB);
+}
+```
+
+Note `ndNum = 1` in every one of these: the Nd2Nz path moves a single ND matrix per instruction,
+so there is no multi-descriptor batching available to the cube's gather.
+
+### 16.2 The instruction count, per (layer, head-group), at our configuration
+
+GLM-5.2 at TP16 seq 8K: `top_k = 2048`, `sparse_block_size = 1`, PA `block_size = 128`,
+`headDim = 512`, `headDimRope = 64`, bf16.
+
+`V_TEMPLATE` (what we run — `TEMPLATE_MODE=V_TEMPLATE` per section 14.2):
+
+| stage | instruction | count | bytes per instruction |
+|---|---|---|---|
+| index read | `topkGm_.GetValue` (scalar GM) | 2048 | 4 |
+| block table read | `blkTableGm_.GetValue` (scalar GM) | 2048 | 4 |
+| nope gather (MTE2) | `DataCopyPad`, `blockCount=2` | 1024 | 2 x 1024 = 2 KiB |
+| rope gather (MTE2) | `DataCopyPad`, `blockCount=2` | 1024 | 2 x 128 = 256 B |
+| nope flush (MTE3) | `DataCopyPad`, `blockCount<=32` | 64 | <=32 x 1024 = 32 KiB |
+| rope flush (MTE3) | `DataCopyPad`, `blockCount<=32` | 64 | <=32 x 128 = 4 KiB |
+| cube reload (MTE2) | `DataCopy` Nd2Nz from `kvMergeGm_` | ~8 | contiguous 128 x 256 |
+
+`>= 4096` scalar GM reads and `>= 2176` DMA instructions per layer per head-group, of which 1024
+are 256-byte rope bursts. The rope stream alone is half the instruction count for 1/8 of the
+bytes.
+
+`C_TEMPLATE` (`sparse_block_size > 4`), for comparison — the cube gathers directly and
+`DataCopyPA`'s `一次只能处理一个Block` bound applies. With `sparse_block_size = B` and PA
+`block_size = 128`, a selected run of `B` consecutive tokens lies inside one page whenever
+`B | 128` and the run is page-aligned, which the op guarantees via
+`blockSize_ % sparseBlockSize_ > 0` being rejected (section 8.6). So the count is
+`top_k_blocks = 2048 / B` block-table reads and the same number of `DataCopy` instructions,
+with `B x 1024` bytes each — and **no** GM staging, no flush, no reload:
+
+| `sparse_block_size` | selected blocks | MTE2 instructions | bytes/instruction (nope) | GM staging |
+|---|---|---|---|---|
+| 1 (`V_TEMPLATE`) | 2048 | 1024 pairs + 1024 rope + flush + reload | 2 KiB / 256 B | **yes, 3 transits** |
+| 16 (`C_TEMPLATE`) | 128 | 128 | 16 KiB | no |
+| 32 (`C_TEMPLATE`) | 64 | 64 | 32 KiB | no |
+| 128 (`C_TEMPLATE`) | 16 | 16 | 128 KiB | no |
+
+### 16.3 The block-wise lever is documented and currently unused
+
+`attention/sparse_flash_attention/README.md`:
+
+> | sparse_block_size | 可选属性 | 代表sparse阶段的block大小。sparse_block_size为1时，为Token-wise稀疏化场景；sparse_block_size大于1且小于等于128时，为Block-wise稀疏化场景，块内token共享相同的稀疏化决策。默认值为1。 | INT64 | - |
+
+> - <term>Atlas A3系列产品</term>、<term>Atlas A2系列产品</term>：
+>   - 参数sparse_block_size支持[1,128]，且要求是2的幂次方，在PageAttention场景下要求sparse_block_size整除block_size。
+
+A3 and A2 accept any power of two in [1,128]; the 950 series accepts only 1
+(`sparse_block_size仅支持1`, and the tiling rejects anything else on `DAV_3510`, section 8.6).
+vLLM-Ascend ships `sparse_block_size=1` (section 14.4), and
+`FusedSparseAttentionOverlap` is explicit that it cannot do otherwise:
+
+> | sparseBlockSize | 属性 | 稀疏选择粒度。当前融合路径仅支持Token-wise稀疏化，取值为1。 | INT64 | - |
+> | selectionTopkBlockSize | 属性 | TopK索引的选择粒度，当前仅支持1。 | INT64 | - |
+
+The direction of travel in the model family is toward block granularity. `zai-org/GLM-5.3-Flash`
+(https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json, fetched 2026-10-20, 29464
+bytes, nested `text_config`) adds indexer-side pooling: `"index_kpool": 4`,
+`"index_kpool_compress": true`, `"index_kpool_always_select_tail": true`, with
+`"qk_rope_head_dim": 0` and `"mla_use_nope": true` — which by the Ascend kernel's own formula
+`KV_D = 512 + rope_head_dim*2 + 4*4` makes the C8 row **528 bytes** instead of 656. Its
+`layer_types` is 45 entries = 34 `linear_attention` + 11 `deepseek_sparse_attention`.
+
+## Relevance
+
+This is the quantitative answer to candidate (b), and it identifies a lever we control.
+
+**The per-instruction burst lengths are tiny and the instruction count is enormous.** At our
+configuration, one `SparseFlashAttention` call per layer issues `>= 4096` scalar GM reads (the
+top-k index plus the block-table entry for each of 2048 tokens, each on the AIV scalar pipe and
+each in the dependency chain ahead of the DMA that consumes it) and `>= 2176` DMA instructions,
+half of which move 256 bytes. Against a measured 89.4 us per call, 2176 DMA instructions is
+41 ns per instruction — which is in the right order for an MTE issue slot, meaning the kernel is
+plausibly **instruction-issue bound rather than bandwidth bound**. That is a different failure
+mode from "scattered reads miss L2", and it predicts a specific profile signature: `aiv_mte2_time`
+high relative to bytes moved, `aic_mte2_time` low, `aic_mac_ratio` low, and the scalar pipe busy.
+If our Level-2 profile shows that pattern, candidate (b) is confirmed in its instruction-count
+form rather than its burst-efficiency form, and the fix is to reduce instruction count, not to
+improve locality.
+
+**Raising `sparse_block_size` is the single cheapest experiment available.** It is an existing
+attribute of the op we already call, accepted on A3 for any power of two up to 128, and it does
+three things at once: it cuts MTE2 instruction count by `B`, it raises burst length to
+`B x 1024` bytes, and — because `sparse_block_size > 4` switches `perfMode_` to `C_TEMPLATE`
+(section 8.6) — **it eliminates the `kvMergeGm_` HBM round trip entirely**, replacing it with
+`DataCopyPA` straight into L1. That is the ~2.8 ms staging cost of section 9 removed by changing
+one integer. At `sparse_block_size = 16`: 128 instructions of 16 KiB instead of 2048 of 1-2 KiB,
+and one HBM transit instead of three.
+
+This is verified, not inferred. `MergeKv` — the whole gather-and-stage routine of section 9 — has
+exactly one call site, and it is guarded:
+`attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h:909-911`:
+
+```cpp
+            if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+                ...
+                sfaKernelVectorService.MergeKv(extraInfo0);
+```
+
+`grep -n 'MergeKv' op_kernel/arch22/` returns the declaration
+(`service_vector_mla.h:66`), the definition (`service_vector_mla.h:1028`) and that single guarded
+call. Under `C_TEMPLATE` the routine is never entered, `kvMergeGm_` is never written, and the
+cube's `else` branch in `ComputeMm1NoRope` (section 9.1) walks the top-k list straight into L1.
+The V_TEMPLATE-only validity bookkeeping goes with it — `ElewiseCompute` reads
+`v0ValidSizeUb_.GetValue(...)` only under the same guard
+(`service_vector_mla.h:442`).
+
+The cost is accuracy, and it is not free: `块内token共享相同的稀疏化决策` means the indexer must
+select whole 16-token blocks. GLM-5.2's indexer emits per-token top-2048, so using
+`sparse_block_size = 16` requires either pooling the index scores over 16-token blocks before the
+top-k (which is exactly `index_kpool` in GLM-5.3-Flash, so the model family considers it
+acceptable) or taking `top_k/16` blocks and accepting a different selected set. The accuracy delta
+is a measurement we can make cheaply, and the performance upside is the largest single item found
+in this investigation that does not require writing a kernel.
+
+And the template is compiled. The sixth `ASCENDC_TPL_ARGS_SEL` entry of section 8.1 is
+`FLASH_DECODE 0, PAGE_ATTENTION 1, LAYOUT_T TND, KV_LAYOUT_T {TND, PA_BSND}, TEMPLATE_MODE
+C_TEMPLATE, IS_SPLIT_G {0,1}, HAS_ROPE {0,1}` — exactly our layout combination with `C_TEMPLATE`
+instead of `V_TEMPLATE`. No rebuild of CANN is required to try it; `sparse_block_size = 8` or
+higher selects it through `perfMode_` at tiling time.
+
+**One caveat that constrains the lever.** `sparse_block_size` must divide the PageAttention
+`block_size`, which vLLM-Ascend fixes at 128 for the SFA path
+(`get_supported_kernel_block_sizes` returns `[128]`, section 13.3), so `B` in {1,2,4,8,16,32,64,128}
+all satisfy the divisibility constraint. But the 950 series rejects everything except 1, so a
+block-wise path is A3/A2-only and would not forward-port to A5.
+
+---
+
+## 17. Why discrete gather is structurally expensive on A3: there is no SIMT unit, and CANN says so
+
+https://gitcode.com/cann/ops-transformer/blob/master/docs/zh/develop/cross_platform_migration_guide.md
+CANN `ops-transformer`, master, commit `3efc65dad2a97a4fea856c3be319da596a42fb8a`, read 2026-10-20.
+
+### 17.1 The SIMT unit is a 950-series addition
+
+> #### SIMT
+>
+> Ascend 950系列新增了SIMT单元。SIMT在处理非规整离散访问方面相比SIMD有较大优势，适合地址不连续、访存跨度变化大、分支路径不一致的场景（如scatter/gather、索引重排、稀疏更新等）。
+>
+> 迁移时建议优先识别"访存主导"且"向量化效率低"的算子子流程：若原有SIMD实现存在大量掩码分支、无效lane占比高、或需要复杂地址拼装，可将该部分改写为SIMT路径，通常可降低控制开销并提升有效访存吞吐。
+>
+> 实践中需重点关注以下事项：一是线程任务切分要与数据稀疏性匹配，避免线程负载极不均衡；二是减少高频随机访存导致的流水空转，尽量在上游完成索引规整与分桶；三是将边界处理与主路径解耦，避免在热点循环中引入过多分支。建议在迁移后同时对比"纯SIMD实现"和"SIMD+SIMT混合实现"，按数据分布选择最优策略，而非固定单一路径。
+
+### 17.2 The documented SIMD-vs-SIMT split, with a measured template threshold
+
+> **以gather_v2算子为例：SIMD与SIMT实现对比**
+>
+> gather_v2算子根据合轴后的尾轴为单位进行gather，因此模板选择的依据是：尾轴 ≤ 2048时走SIMT模板，尾轴 > 2048时走SIMD模板。因为尾轴小时，需要离散访问多个不连续的小块地址，simt效率高。以下对比两种实现的核心差异：
+
+> SIMT采用线程级并行模型，每个线程独立处理元素：
+>
+> ```
+> // SIMT: 使用线程级并行，无需显式buffer管理
+> __simt_vf__ LAUNCH_BOUND(2048) void GatherSimt(...) {
+>     for (INDEX_SIZE_T index = Simt::GetThreadIdx();
+>          index < currentCoreElements;
+>          index += Simt::GetThreadNum()) {  // 线程跳跃式并行
+>         // 每个线程独立计算单点索引并访问
+>         INDEX_SIZE_T gatherI = Simt::UintDiv(yIndex, m0, shift0);
+>         INDICES_T indicesValue = indices[gatherI];  // 根据单点索引gatherI直接访问GM
+>         y[yIndex] = idxOutOfBound ? 0 : x[xIndex];  // 直接写回GM
+>     }
+> }
+> ```
+
+> **2. 访存模式差异**
+>
+> | 特性 | SIMD实现 | SIMT实现 |
+> |------|----------|----------|
+> | 数据访问 | 通过DataCopyPad显式搬运到UB | 线程直接通过`__gm__`指针访问GM |
+> | Buffer管理 | 需AllocTensor/EnQue/DeQue/FreeTensor | 无需显式buffer，硬件自动管理 |
+> | 同步机制 | 显式事件同步（HardEvent::MTE2_V等） | 线程间隐式同步 |
+>
+> **3. 适用场景差异**
+>
+> SIMD适合连续访问大块地址的场景，通过向量化指令高效处理连续数据；
+>
+> SIMT适合离散访存，线程并行处理；
+
+> | SIMT | SIMT引入后可用线程级并行处理分支/不规则计算，但需要适配线程划分、共享内存与同步语义；部分Vector实现可迁移为SIMT版本 |
+
+### 17.3 Regbase, also 950-only
+
+> #### Regbase
+>
+> Ascend 950系列引入了Regbase编程范式，相比传统的Membase（Vector API）编程，Regbase更接近底层硬件的寄存器操作，提供更精细的向量化控制能力。
+>
+> **特点**
+>
+> - 使用`AscendC::Reg`命名空间下的底层API
+> - 直接操作寄存器`RegTensor<T>`而非显式管理UB缓冲队列
+> - 通过`MaskReg`实现灵活的元素级掩码控制
+>
+> > 注：`MicroAPI` 为 `Reg` 的历史别名（CANN 头文件中定义 `namespace MicroAPI = Reg;`，仅在部分新架构生效）。新代码统一使用 `AscendC::Reg` 命名空间，本仓已全量完成 MicroAPI→Reg 整改。
+
+This is consistent with the operator tree: `SparseFlashAttention`'s `arch35` directory contains
+`op_kernel/arch35/common/util_regbase.h` and `arch22` has no Regbase equivalent.
+
+## Relevance
+
+This is the structural reason candidate (b) is real on A3 and cannot be engineered away inside the
+existing programming model, and it reframes the whole investigation's conclusion.
+
+**A3 has no hardware gather.** `Ascend 950系列新增了SIMT单元` — the SIMT unit that is "适合地址
+不连续、访存跨度变化大" (suited to non-contiguous addresses and varying access strides) and whose
+listed use cases are literally `scatter/gather、索引重排、稀疏更新` is a **950-series addition**.
+A3 (`__NPU_ARCH__ == 2201`) is SIMD/Membase only. Therefore on A3 a scattered KV gather *must* be
+expressed as what section 16 counted: many explicit `DataCopyPad` instructions with
+`显式事件同步（HardEvent::MTE2_V等）`, each carrying per-instruction issue cost, with the
+addresses computed by scalar GM reads on the critical path. There is no thread-per-element path.
+
+**The vendor's own template threshold is a calibration point we can use.** `gather_v2` picks SIMT
+when the trailing axis is `<= 2048` elements and SIMD when `> 2048`, because `尾轴小时，需要离散
+访问多个不连续的小块地址，simt效率高`. Our per-token gather moves 512 bf16 elements (1024 bytes)
+per selected token — firmly inside the "small trailing axis, discrete access to many small
+non-contiguous addresses" regime where CANN's own operator library judges SIMD to be the wrong
+tool. On A3 that is the only tool available.
+
+**So the three candidate causes resolve as follows**, and the ranking is not what the brief's
+framing implied:
+
+- (c) **insufficient parallelism** is the largest and the most fixable: 4 of 24 cube cores, caused
+  by a dropped `SplitCore` call (sections 8, 10, 12), with two reference implementations in the
+  same repo to copy.
+- (b) **gather inefficiency** is real and structural, but its mechanism is *instruction count and
+  scalar address generation*, not L2 miss or burst length: `>= 4096` scalar GM reads and
+  `>= 2176` DMA instructions per layer per head-group (section 16), on a chip with no SIMT unit
+  (this section). Its cheapest mitigation is `sparse_block_size > 4`, which both cuts the
+  instruction count by `B` and eliminates the `kvMergeGm_` round trip.
+- (d) **tail effects from prefill tiling** are present and measurable but second-order:
+  `sInnerSize_ = 512` fixed, `M_SPLIT_SIZE = 128` against `M = 4`, zero-padding to 512 rows one
+  `DataCopyPad` at a time, and `PipeBarrier<PIPE_M>()` on every Mmad because
+  `(16/16)*(128/16) = 8 < 10`.
+- (a) **launch/head overhead** is a flat 13.58 us per call = 15% of the op, unavoidable by
+  operator substitution because every A3 decode attention kernel is `MIX_AIC` (section 15), and
+  removable only by issuing fewer kernels.
+
+**The synthesis.** Our 6.973 ms is not one problem. It is a dropped core-splitter (fixable by
+calling a different operator or owning the kernel), an HBM staging round trip (fixable by one
+attribute change), a per-instruction gather cost that is architectural on A3 (mitigable by block
+granularity, properly fixed only on 950), and a launch floor that only a megakernel removes. Of
+these, the two that need no new kernel are: set `sparse_block_size` to 8 or more so
+`perfMode_` picks `C_TEMPLATE`, and evaluate `SparseFlashMla` + `SparseFlashMlaMetadata` for a
+real S2 split. Both are configuration changes against already-compiled templates.
+
+---
+
+## 18. CONTRADICTION: small-batch sparse decode is a named family on A3, and flash-decode splitting was quantitatively rejected there
+
+This section exists because it contradicts the recommendation of sections 8, 10 and 12. Read it
+before acting on them.
+
+### 18.1 The named bottleneck family, and the rejected fix
+
+https://github.com/tile-ai/tilelang-ascend/pull/1741
+Nance-Mike, opened 2026-09-04, merged 2026-09-24 by LLMZhangYC. Test platform A3
+(Ascend910_9362), CANN 9.1.0.
+
+> **仍慢于 baseline 的 case 族及根因**（逐族定量分析见 `bottleneck_analysis.md`）：
+>
+> | 族 | 现状 | 根因 |
+> |----|----|----|
+> | B 族大 shape（cases 1-5、20） | 0.07-0.12x | dense kernel 本身已 4.4× 于 gather 路径，但 bitmap scatter 构建开销（~450ns/写）+ 每 (block,n) ~3.4μs 的 CV 握手串行吞掉大半收益 |
+> | MLA 族（cases 9-13） | 0.23-0.33x | CV relay 全口径流量约为 gather 的 7×（ws 暂存 + acc_gm 往返），聚合带宽 ~1TB/s 饱和；M=32 小 tile staging 次因 |
+> | 小批量 decode（cases 14、16、18） | 0.45-0.71x | 块数 16-32 ≈ 核数 20，单块 relay 即 makespan，flash-decoding 拆分经定量推演为负收益 |
+>
+> R7 四项候选（gather 流水化 GM 直读 / chunk 暂存 + 两项分析）已全部经测量/分析否决，operator 级优化空间已收敛，剩余主要杠杆在框架侧。
+
+Per-case results from the same PR:
+
+> | level4/sparse_flash_attention_9  | ✅ | 448.30 | 0.26x | 0.000122 |
+> | level4/sparse_flash_attention_13 | ✅ | 447.92 | 0.23x | 0.000061 |
+> | level4/sparse_flash_attention_14 | ✅ |  68.04 | 0.71x | 0.000061 |
+> | level4/sparse_flash_attention_16 | ✅ | 128.86 | 0.46x | 0.000122 |
+> | level4/sparse_flash_attention_18 | ✅ | 130.16 | 0.45x | 0.000061 |
+
+> | 指标 | baseline | R6 最终版 | 变化 |
+> | 综合得分 | 53.37 | **66.00** | +12.63 |
+> | 平均加速比 | 0.09x | **0.82x** | 9.1x |
+
+Two statements here cut against sections 8-12:
+
+1. `小批量 decode ... 根因 ... 块数 16-32 ≈ 核数 20，单块 relay 即 makespan，flash-decoding 拆分经定量推演为负收益`
+   — "block count 16-32 ≈ core count 20, a single block's relay is the makespan, **flash-decoding
+   splitting was quantitatively deduced to be net-negative**".
+2. `MLA 族 ... CV relay 全口径流量约为 gather 的 7×（ws 暂存 + acc_gm 往返），聚合带宽 ~1TB/s 饱和`
+   — the CV relay path moves **7x** the bytes of the gather path, and 1 TB/s aggregate bandwidth
+   is already saturated.
+
+### 18.2 The public per-call number for our exact shape
+
+https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/sparse_flash_attention/bench_sfa/README_zh.md
+tile-ai/tilelang-ascend, branch `ascendc_pto`, current as of 2026-10-20. Measured on A3.
+
+> ## 📊测试输入
+> 输入定义在 bench_sfa.py 中，公共参数如下：
+> - T=1
+> - B=1
+> - Q_N=128
+> - KV_N=1
+> - D=512
+> - D_rope=64
+> - sparse_size=2048
+> - block_size=128
+> - act_kv_s=2560
+>
+> 三组 shape 只在 KV_S 上不同：
+> | 编号 | KV_S | 说明 |
+> | shape0 | 2560 | 短序列 |
+> | shape1 | 6400 | 中序列 |
+> | shape2 | 48000 | 长序列 |
+>
+> act_kv_s 固定为 2560，sparse_size 固定为 2048，实际参与计算的有效稀疏窗口规模基本不变。
+>
+> ## 性能结果
+> |  | shape0 | shape1 | shape2 | 平均耗时(us) | AscendC / TileLang |
+> | AscendC  | 98.000 | 99.000 | 100.000 | 99.000 | 1.00x |
+> | TileLang | 109.760 | 109.100 | 108.980 | 109.280 | 0.91x |
+>
+> *注： AscendC 参考实现来源：* https://gitcode.com/cann/cann-recipes-infer/blob/master/ops/ascendc/torch_ops_extension/custom_ops/converter/npu_sparse_flash_attention.py
+
+and the optimization ladder at that same B=1 shape:
+
+> |[sparse_flash_attn_pa_baseline.py]            | √ | 64  | × | × | × | × | × | × | 602us |
+> |[sparse_flash_attn_pa_developer.py]           | √ | 64  | √ | × | × | × | √ | × | 347us |
+> |[sparse_flash_attn_pa.py]                     | √ | 64  | √ | √ | √ | √ | √ | √ | 127us |
+> |[sparse_flash_attn_pa_no_cv_pipeline.py]      | √ | 256 | √ | √ | √ | √ | √ | √ | 109us |
+
+### 18.3 The other published batch-1 sparse decode numbers
+
+https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/deepseek_v4/sparse_flash_mla/bench_mark.md
+tile-ai/tilelang-ascend, branch `ascendc_pto`, retrieved 2026-10-20.
+
+> | B | 1 | Batch size |
+> | N1 | 64 | Query heads |
+> | N2 | 1 | KV heads (so 64 query heads share one KV head) |
+> | D | 512 | Head dimension |
+> | layout | TND | Query layout |
+> | K | 512 | Top-k compressed indices (`csa` / `hca`; `swa` uses none) |
+> | S (decode) | 1 | One query step against a KV cache of 8193 |
+>
+> Measurement: `msprof` **device Task Duration** from `op_summary`, first launch dropped
+> (cold start) and the rest averaged. Both sides run the same shapes and the same dtype.
+>
+> | Scenario | AscendC | tileLang | Performance Ratio (AscendC/tileLang) |
+> | swa prefill | 1850.954u | 1490.930u | 124.1% |
+> | hca prefill | 3005.296u | 3141.853u | 95.7% |
+> | csa prefill | 6882.407u | 6022.700u | 114.3% |
+> | swa decode | 23.916u | 13.824u | 173.0% |
+> | hca decode | 24.007u | 18.644u | 128.8% |
+> | csa decode | 38.759u | 31.659u | 122.4% |
+
+### 18.4 The launch-side component, measured and bounded
+
+https://github.com/vllm-project/vllm-ascend/pull/17863
+LiPu-jpg, 2026-10-01, state OPEN (draft). Physical A2: Ascend 910B3, 20 AIC / 40 AIV, CANN 9.1.0.
+
+> A2/A3 NoPE SFA assigns one query group per task, but launches and reserves scratch for every hardware core. A one-row TND query on the tested A2 launches 20 AIC / 40 AIV despite having one query group. Bound the launch by query tensor rows and allocate scratch for that launch.
+
+> - Actual canonical host hashes and profiler counts were checked: q1 = 1 AIC / 2 AIV; q32 = 20 AIC / 40 AIV.
+> - **Public latency, all 40 frozen-input cases:** B/C/C/B has 18 lower / 22 higher, maximum increase 1.7883%; reverse C/B/B/C has 30 lower / 10 higher, maximum increase 1.2230%. ... Query counts 1/2/4/8 have all 16 cases lower in both orders, reductions 4.6473–7.8103% across those rounds. Count 16 is mixed in forward and lower in reverse
+> - **Memory, all 40 cases in separate original / launch-only / combined processes:** eager and graph peak-increase reductions at q1/2/4/8/16 respectively 57,796,096 / 65,135,104 / 58,818,560 / 44,113,920 / 14,704,640 bytes. At q20/21/24/25/32, peak increase is unchanged. ... Single-query reduction is 55.1187 MiB
+> - **Final expanded performance, all 364 cases:** 234 lower / 130 higher, maximum increase 3.8763% in a RoPE64 control outside the guard. All 112 boundary cases at q2/4/9/10/11/12/13 are lower; q16/19 retain increases up to 1.6975% inside the bound.
+
+### 18.5 The padded-capacity waste, independently reported
+
+https://github.com/vllm-project/vllm-ascend/pull/17653
+ShuZihan, 2026-09-28, state OPEN (draft).
+
+> Sparse attention can iterate over padded capacity even when only a prefix of the selected indices is valid, as in DCP decode. This PR detects that prefix and shortens the computation loop automatically in C8 and non-C8 V-template kernels with `sparse_mode=0` and `sparse_block_size=1`. Empty rows and other paths keep their existing behavior.
+> ...
+> NPU correctness/graph tests and an A/B benchmark are included. A3 compilation, device tests and model/performance validation are pending; keep this PR as draft.
+
+## Relevance
+
+Three things, two of which revise conclusions above.
+
+**CONFIRMED, exactly: the full die is launched for one query row.** PR #17863's
+`A one-row TND query on the tested A2 launches 20 AIC / 40 AIV despite having one query group`
+is section 8.2 and 8.3 observed from outside: `usedCoreNum_ = aicNum_` in `SplitBalanced` sets
+`blockDim` to the whole die, and then `InitCalcParamsEach` gives work to `totalBaseNum` of them
+and early-`return`s the rest. The measured post-fix counts `q1 = 1 AIC / 2 AIV; q32 = 20 AIC /
+40 AIV` are precisely `usedCoreNum = min(T1, coreNum)`.
+
+**REVISED: the launch-side component is only 4.6-7.8%.** PR #17863 removes the idle launches and
+reports `Query counts 1/2/4/8 have all 16 cases lower in both orders, reductions 4.6473–7.8103%`.
+So *not launching* 16-19 dead cores is worth under 8%. That bounds candidate (a) tightly and says
+the idle cores are cheap to leave idle — the expensive thing is that the working cores have all
+the work. It also hands us a free 55.1 MiB: `Single-query reduction is 55.1187 MiB` of scratch
+reserved for cores that do nothing.
+
+**CONTRADICTION, and it is the important one: flash-decode splitting has already been evaluated
+for small-batch sparse decode on A3 and rejected.** `小批量 decode ... flash-decoding 拆分经定量
+推演为负收益`. Sections 8, 10 and 12 all conclude that the fix is to split S2 across cores and
+combine with an lse reduction. PR #1741 says that was quantitatively analysed and found
+net-negative. The reconciliation matters, so state it precisely rather than dismissing it:
+
+- Their regime is `块数 16-32 ≈ 核数 20` — they already had 16-32 parallel blocks against 20
+  cores, so the machine was already full and splitting further only adds reduction cost. Ours is
+  `T1 = 4` blocks against 24 cores (section 14), so we have 20 idle cores and they had none.
+  Their negative result is a statement about a saturated machine, not about splitting per se.
+- But their second row is a direct warning about the *cost* side of the split:
+  `MLA 族 ... CV relay 全口径流量约为 gather 的 7×（ws 暂存 + acc_gm 往返），聚合带宽 ~1TB/s 饱和`.
+  A split-KV combine adds exactly those `ws 暂存 + acc_gm 往返` round trips — the `accumOut` and
+  `logSumExp` workspace of section 8.1. They measured that path at **7x** the gather path's bytes
+  and found 1 TB/s already saturated. Our section 9.1 estimated the existing `kvMergeGm_` staging
+  at 3x; a flash-decode combine on top would add more.
+
+So the honest revision is: splitting S2 across the 20 idle cores is not free, and the published
+analysis of the closest regime says the combine traffic can exceed the parallelism gain. The
+split is only clearly net-positive if the combine stays on-chip — which is possible only inside a
+megakernel, where partial `(out, max, sum)` can live in UB/L1 across core groups instead of
+round-tripping `acc_gm`. That is now the second independent argument for the megakernel as the
+enabling vehicle rather than an optimization, and it arrives from a measurement rather than from
+our reasoning.
+
+**CONTRADICTION with our 6.973 ms: we are already at the public state of the art for this
+operator.** The reference AscendC `npu_sparse_flash_attention` at **B=1, Q_N=128, KV_N=1, D=512,
+D_rope=64, sparse_size=2048, block_size=128** costs **98-100 us per call on A3**. Our measurement
+is 6.973 ms over 78 layers = **89.4 us per call** at `Q_N=4`. Two readings, both significant:
+
+- Our per-call cost is *at or slightly below* the published reference despite running 1/32 of the
+  query heads. So there is no misuse to find in our call site; 89.4 us is what this operator
+  costs for a 2048-token gather, almost independent of head count.
+- The published times are 98.000 / 99.000 / 100.000 us for KV_S = 2560 / 6400 / 48000 — **flat
+  across an 18.75x change in KV length**, with `act_kv_s` and `sparse_size` held fixed. The cost
+  tracks the sparse window, not the sequence. That is the signature of a kernel whose time is set
+  by the 2048-token gather and its fixed overheads, and it means our seq-8K figure would not
+  improve at seq 2K either.
+
+The corollary is uncomfortable and should be stated plainly: the 5.6 ms we hoped to recover by
+"closing `SparseFlashAttention` to roofline" is not recoverable by calling this operator better.
+It is recoverable only by not using this operator — block-wise granularity (section 16),
+`FusedSparseAttentionOverlap`'s Selection KV Cache (section 14), or our own kernel. The ladder in
+18.2 shows what owning the kernel is worth on this exact shape: **602 us → 347 us → 127 us →
+109 us**, i.e. 5.5x from baseline to a fully-optimized hand-written version, with the final step
+coming from dropping the CV pipeline and widening the tile from 64 to 256.
+
+---
+
+## 19. The mechanism, from the team that wrote the kernel: MTE2 issue-queue depth is 16, and the BIU will not coalesce a source-contiguous / destination-strided gather
+
+https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20260930-ascend-prefill-deep-dive-zh.md
+DeepSeek (deepseek-ai/FlashMLA), doc dated 2026-09-30. Target: Ascend 950.
+
+> DeepSeek 于 2026 年 9 月 30 日开源了华为昇腾平台的推理基础设施与核心组件，其中就包括本仓库（deepseek-ai/FlashMLA）中的昇腾平台的稀疏 Attention 的 prefill 与 decoding 算子。在 DeepSeek v4.1 模型的典型工况下，该算子可以在 prefill 时达到 410 TFlops，decoding 时达到 360 TFlops，分别达到了硬件理论性能上限的 95% 与 83%。
+
+### 19.1 Why 1 Cube : 1 Vector is impossible — three named bounds
+
+> 1. **MTE2 Issue Queue Entry bound**。在华为昇腾 950 NPU 上，单个 VECTOR Core 在同一时刻最多只能有 16 个"已发出但还未完成"的 MTE2 拷贝请求。哪怕用上了 gather2 技巧（见下文），一次也只能拷贝 32 个 token，太少了。
+>
+> 2. **Dequantize bound**。在 decoding 的时候，算子需要读取 FP8 或 FP4 格式的 KV Cache，将其反量化为 bfloat16 格式，再送入 CUBE Core 计算。根据微基准测试（micro-benchmark），使用 1C1V 时，反量化的速度赶不上 CUBE Core 计算的速度，导致反量化成为瓶颈。
+>
+> 3. **FixPipe bound**。当只使用一个 CUBE Core 和一个 VECTOR Core 的时候，FixPipe 向外搬运的速度只有 128 Byte/cycle/AI Core。此时每个块的 MMA 计算周期为 `MMA_M * B_TOPK * (512+512) / 4096 = B_TOPK * 16`，FixPipe 搬运所需的周期为 `(MMA_M * 512 + MMA_M * B_TOPK) * sizeof(float) / 128 = 1024 + B_TOPK * 2`。... 需要 `B_TOPK * 16 > 1024 + B_TOPK * 2`，得到 `B_TOPK > 73.14`。为了留出足够的余量，`B_TOPK` 需要选取 96 或 128，这一方面使得 UB 空间更加紧张，另一方面也加重了上面提到的 MTE2 Issue Queue Entry Bound 的问题。
+>
+> 因此，最终我们还是决定为每个 CUBE Core 配备两个 VECTOR Core，以分摊 MTE2 发射、反量化、FixPipe 搬运、softmax 等操作的开销。
+
+### 19.2 The `gather2` trick — identical to what `CopyInKv` does
+
+> 本算子需要从显存中以 token 为粒度读取 KV。倘若我们为每个 KV 都发起一次 MTE2 拷贝请求，那么总拷贝请求数就会过多，超过 MTE2 的 Issue Queue 队列深度（16）。为此，我们使用了一种技巧：设置 MTE2 请求的 `burst_count=2`，`src_stride` 为两个 token 开始地址之差，这样就可以一次性拷贝两个 KV token 了，节约 MTE2 拷贝请求数量并降低发射 overhead。MTE2 拷贝的各个参数使用 SIMD VF 计算得到，避免阻塞 scalar 核心。
+
+### 19.3 Why the in-line ND2NZ shortcut is unavailable, and why the BIU will not coalesce
+
+> KV 在显存中是以 ND 格式存储的，shape 为 `[s_kv, d_qk]`，stride 为 `[d_qk, 1]`。但是，CUBE Core 要求输入的矩阵使用 NZ layout。正常来说，我们会在把数据从显存搬运到 L1 buffer 中时，随路完成 ND2NZ 转换，但我们的 KV 是使用 MTE2 一个一个 token 地"稀疏"的从显存上搬到片上存储上的，无法启用随路的 ND2NZ 转换。
+>
+> 有一个思路是，在发起 GM -> L1 拷贝时，将一个 token（512 个 bfloat16）视为 32 个 32B 的数据块，这 32 个数据块在显存上是连续的，在 L1 buffer 中则以 `B_TOPK * 32B` 为 stride 排布。但后续实验显示，AI Core 内部的 BIU（负责发送访存指令的单元）只会在**源和目标都连续**的时候才会触发访存合并，而像这里这种"只有源连续，而目的不连续"的情况是无法合并访存的，导致 L2 带宽利用率很低，整体瓶颈位于 L2 带宽。
+>
+> 所以，唯一的做法就是将 KV 先从显存拷贝到 UB，使用 SIMD VF 将其从 ND Layout 转为 NZ Layout，然后再拷贝到 L1。
+
+### 19.4 The icache ceiling that bounds specialization
+
+> 华为昇腾 NPU 上的 Instruction Cache (icache) 大小相对有限，只有 32K (CUBE Core)、16K (VECTOR Core) 或 8K (SIMD VF)，因此需要注意控制代码的总体积
+
+### 19.5 The same conclusion, independently, from Tencent on 910B2C
+
+https://arxiv.org/abs/2505.14022 (HTML: https://arxiv.org/html/2505.14022v1), section 3
+Chenghuan Huang, Zhigeng Xu (WeChat HPC, Tencent), Chong Sun, Chen Li (WeChat Vision, Tencent),
+Ziyang Ma (corresponding). arXiv:2505.14022v1 [cs.PF], 20 May 2025. Ascend 910B2C.
+
+> Since the cube core is dedicated to matrix multiplication, we mainly leverage vector cores to accelerate MSDA operations. Specifically, we further explore the capabilities of random memory accesses on vector cores. Results show that only gathering data within UB is natively supported, while gathering or scattering data between UB and GM can only be accomplished by multiple explicit fine-grained data copy operations. However, it is important to note that overlapping memory access latencies through massive thread-level parallelism is infeasible, as the Ascend NPU does not adopt an SIMT (Single Instruction Multiple Thread) design but relies on a limited number of high-performance cube and vector cores. This necessitates top-down random memory access optimizations for compute patterns such as MSDA.
+
+> Table 1: Ascend 910B2C Performance Specifications.
+> #Cube 24  #Vec 48  Peak Performance (Cube@FP16) 353  Peak Performance (Vector@FP16) 20
+> GM Size (GB) 64  UB Size (KB) 192  GM Bandwidth (GB/s) 1800
+
+> Extensive experiments show that our solution achieves up to 5.9× (forward), 8.9× (backward), and 7.3× (end-to-end training) speedup over the grid sample-based baseline, and 1.9×, 2.4×, and 2.0× acceleration over the latest vendor library, respectively.
+
+### 19.6 The CANN-side recipe for a *dense* decode attention, for contrast
+
+https://arxiv.org/abs/2505.21411 (HTML: https://arxiv.org/html/2505.21411v1), section 4.2.3
+Pangu Team, Huawei (pangutech@huawei.com). arXiv:2505.21411v1 [cs.CL], 27 May 2025.
+
+> With increasing concurrency levels and iterative expansion of sequence lengths, the key-value (KV) cache exhibits linear growth in memory footprint, causing the latency of attention operations to rise to 30%-50% of total inference time. Consequently, the attention module emerges as a key bottleneck in MoE inference.
+>
+> Profiling results reveal that KV vector data transfer accounts for approximately 70% of attention computation time, followed by vector operations and matrix multiplications. Therefore, optimizing both memory access bottlenecks and vector computation constraints within operator pipelines has become a critical challenge in improving the efficiency of attention mechanisms.
+>
+> To address this challenge, we propose MulAttention, a fused attention operator optimized for Ascend hardware, specifically designed for the decoding stage in LLM inference. Specifically, MulAttention improves memory bandwidth utilization through a large-packet KV transfer strategy, as illustrated in steps (1) and (5) in Figure 5. Leveraging the MTE2 transfer unit, KV vectors are block-loaded from global memory (GM) into the Unified Buffer (UB) of the vector computation unit, where a NZ layout transpose is performed simultaneously.
+>
+> Furthermore, we propose a dual-loop pipeline with a pingpong scheduler for KV processing. By decoupling operations with distinct compute patterns, specifically Cube and Vector operations, into separate loops, we eliminate pipeline bubbles caused by interleaved execution of Key, softmax, and Value computations... In addition, the use of a ping-pong buffering mechanism allows for the overlapping of KV data prefetching and computation. This overlap effectively hides memory latency and increases the utilization of the MTE2 pipeline to over 89%. Through these optimizations, MulAttention achieves a 4.5× end-to-end attention speedup, and significantly enhances hardware utilization.
+
+> In the decode stage dominated by memory-intensive operations, Pangu Pro MoE maintains low latency within several tens of milliseconds for small batch sizes such as a single batch.
+
+### 19.7 The same recipe, as applied in the public tilelang-ascend SFA kernel
+
+https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/sparse_flash_attention/bench_sfa/sparse_mla_performance_optimization_zh.md
+tile-ai/tilelang-ascend, branch `ascendc_pto`, retrieved 2026-10-20.
+
+> ## Sparse KV: 稀疏访存优化
+> 在稀疏场景下，KV 数据在 Global Memory 中呈离散分布，但后续的 Cube 矩阵运算需要连续的内存输入，这里采取了以下机制设计并优化：
+>
+> - **双vector核访存指令发射**：基于A2/A3芯片Cube核和Vector核数量1：2的特性，利用vector核发射访存指令，将指令下发效率提升一倍。
+> - **离散 KV Gather 与连续搬出**：利用统一的稀疏索引先将离散的 KV 从 GM 收集到 UB，在这里gather为连续块之后，再一次性搬出到 Workspace 给后续cube核使用。
+> - **异步拷贝 (核内手动同步)**：手动设置 `set_flag` / `wait_flag` 进行精确控制，使得离散拷入异步执行，大幅度缩减gather kv整体时间。
+> - **搬入搬出 Ping-Pong (Double Buffer)**：对离散kv gather操作使用双buffer机制，当前数据通过 MTE3 写出到 Workspace 的同时，针对后一块数据的 MTE2 读取指令已经异步发起，使得MTE3与MTE2进行流水掩盖。
+>
+> 本样例最终实际的优化前后流水如下图所示，通过手动设置核内同步，MTE2搬入指令可实现连续下发，大幅提高了MTE2并行度；同时搬入搬出Ping-Pong实现了MTE3和MTE2流水掩盖，进一步减少kv gather耗时。
+
+and on the workspace / L2 coupling:
+
+> 在此模式下，编译器为每个逻辑任务独立执行 `alloc_buffer`、`annotate_address` 等初始化操作，并分配一份独立的 Workspace。当逻辑任务数远大于物理核数时，会产生三个性能问题：**(1)** 初始化操作随任务数冗余执行；**(2)** Workspace 总量随任务数线性膨胀，显存开销巨大；**(3)** 膨胀后的 Workspace 超出 L2 Cache 容量，Cube-Vector 间频繁交互的中间张量被置换到 HBM，遭遇严重的访存瓶颈。
+
+and the tiling arithmetic:
+
+> 以测试输入参数为例（`q_heads=128, kv_heads=1, m_base_size=16`）：
+> - **Head group 维度分块**：GQA group size `g = q_heads / kv_heads = 128`。由于 `g > m_base_size`，将 Q head 维度按 `m_base_size=16` 切分，得到 `g_block_num = g / m_base_size = 8` 个子块。每个计算核处理 16 个连续的 Q head 子块。
+> ...
+> 将 `topk=2048` 按 `n_base_size=256` 切分，得到 `n_block_num = ⌈topk / n_base_size⌉ = 8` 次迭代。
+
+## Relevance
+
+This is the authoritative mechanism for the 5.0x, and it replaces my section 16 inference with a
+hardware number.
+
+**The binding constraint is 16 outstanding MTE2 requests per vector core.** `单个 VECTOR Core 在
+同一时刻最多只能有 16 个"已发出但还未完成"的 MTE2 拷贝请求`. With `burst_count=2` that is 32
+tokens in flight per vector core, and the author's own verdict on that is `太少了` — too few. On
+A3 we have 2 vector cores per cube core, so 64 tokens in flight per cube core. Gathering 2048
+tokens therefore takes at minimum 32 sequential issue-queue refills per (layer, head-group), each
+refill bounded by HBM latency rather than bandwidth. **This is a latency-bound regime, and a
+bandwidth roofline cannot describe it.** Our 1.382 ms "of bytes" is the wrong denominator in kind,
+not just in magnitude.
+
+**`CopyInKv`'s `blockCount = 2` is not a design choice, it is the gather2 trick.** Section 9.4
+observed that `CopyInKv` folds exactly two tokens into one `DataCopyPad` and could not explain why
+the ceiling was 2 rather than higher. It is 2 because `DataCopyExtParams` carries one `srcStride`
+*and* because the point is to halve the number of entries consumed in a 16-deep issue queue:
+`节约 MTE2 拷贝请求数量并降低发射 overhead`. The CANN kernel and DeepSeek's kernel independently
+arrived at the same `burst_count=2`.
+
+**The GM→UB→Workspace→L1 staging of section 9.1 is forced, not lazy.** This is the single most
+important correction to section 9. I characterized the `kvMergeGm_` round trip as an avoidable
+3-transit penalty. DeepSeek's doc says the direct route is *impossible*: a per-token sparse MTE2
+cannot enable in-line ND2NZ (`无法启用随路的 ND2NZ 转换`), and the obvious workaround — treat a
+token as 32 contiguous 32 B chunks and scatter them into L1 with a `B_TOPK * 32B` stride — fails
+because `AI Core 内部的 BIU ... 只会在源和目标都连续的时候才会触发访存合并`, so a
+source-contiguous / destination-strided copy is not coalesced and the bottleneck moves to L2
+bandwidth. Their conclusion: `唯一的做法就是将 KV 先从显存拷贝到 UB，使用 SIMD VF 将其从 ND
+Layout 转为 NZ Layout，然后再拷贝到 L1`. The staging pass is the only correct implementation.
+So the ~2.8 ms I attributed to a removable round trip in section 9 is **not removable** by
+restructuring the copy; it is removable only by making the gather less discrete (block-wise,
+section 16) or less frequent (Selection KV Cache, section 14).
+
+**The realistic ceiling is 83%, not 100%.** `prefill 时达到 410 TFlops，decoding 时达到 360
+TFlops，分别达到了硬件理论性能上限的 95% 与 83%` — from the authors of the reference kernel, on
+950, with full control of the implementation. Decode is structurally 12 points worse than prefill
+and tops out at 83% of peak. A target that assumes 100% of a memory roofline at batch=1 decode is
+not reachable on this architecture by anyone.
+
+**Two levers this section does validate.** First, `双vector核访存指令发射` — use both vector cores
+of each 1C2V group purely to issue MTE2, doubling the effective issue-queue depth to 32 entries
+(`将指令下发效率提升一倍`). Section 9.3 shows the CANN kernel already splits `MergeKv` across
+`GetSubBlockIdx()` 0 and 1, so this is already done. Second, `MTE2 拷贝的各个参数使用 SIMD VF
+计算得到，避免阻塞 scalar 核心` — compute the DMA descriptors with vector instructions instead of
+scalar, so that address generation does not block issue. Section 9.2 shows the CANN kernel does
+the *opposite*: `topkGm_.GetValue()` and `blkTableGm_.GetValue()` are scalar GM reads on the
+critical path, two per token. That is a concrete, named divergence between the shipped CANN kernel
+and DeepSeek's design, and at 2048 tokens it is 4096 scalar GM reads per call that DeepSeek's
+kernel does not pay. **This is the most specific actionable gap in the shipped operator found
+anywhere in this document.**
+
+**And the L2 warning bears on the megakernel design.** `膨胀后的 Workspace 超出 L2 Cache 容量，
+Cube-Vector 间频繁交互的中间张量被置换到 HBM`. A3 has 192 MB L2 per die (section 20). The
+`kvMergeGm_` budget from section 8.4 is 2.25 MB per core x 24 = 54 MB, which fits — but a
+megakernel that also stages MoE and projection intermediates must keep the total under 192 MB or
+the Cube-Vector relay silently falls out of L2, which is exactly the `CV relay 全口径流量约为
+gather 的 7×` failure PR #1741 measured in section 18.1.
+
+---
+
+## 20. The measured decomposition: on A3 the scattered-gather penalty is 2.48x from instruction count and only 1.09x from burst length
+
+This is the answer to the structural question. It is a controlled A/B from Huawei's own A3-labelled
+example, and it separates the two hypotheses cleanly.
+
+### 20.1 The controlled experiment — same bytes, same burst length, only `blockCount` varies
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/05_best_practices/04_memory_access/data_copy/README.md
+Huawei / CANN `asc-devkit`, HEAD `5f50fc4c6adab4bf891de229f4ff69b9d49e1897`, retrieved 2026-10-20.
+"本样例支持的产品及CANN软件版本 | Atlas A3系列产品 | >= CANN 9.0.0".
+优化点1, GM→UB via `DataCopyPad`, Tensor=[12288,12288] half, Block Num=48:
+
+| Scenario | 配置 | Task Duration(μs) | aiv_total_cycles | aiv_mte2_time(μs) | aiv_mte2_ratio | 相对基线MTE2性能提升 | 说明 |
+|---|---|---|---|---|---|---|---|
+| 1 | Tile=[1,64] `DataCopyParams={blockCount=1, blockLen=128B, srcStride=24448B}` | 564.84 | 49222116 | 548.161 | 0.989 | 基线 | 小分块搬运 |
+| 2 | Tile=[64,64] `DataCopyParams={blockCount=64, blockLen=128B, srcStride=24448B}` | 233.54 | 20167322 | 220.772 | 0.972 | +148.3% | 中等分块搬运 |
+| 3 | Tile=[64,1024] `DataCopyParams={blockCount=64, blockLen=2048B, srcStride=22528B}` | 215.82 | 18563430 | 202.657 | 0.969 | +170.5% | 大分块搬运 |
+
+> **MTE2 带宽理论分析**：… Atlas A2/A3 系列按 GM 带宽约 1.8TB/s 估算，理论耗时约 167.77μs。大分块场景下，GM 到 UB 的 `aiv_mte2_time` 为 202.657μs，GM 到 L1 的 `aic_mte2_time` 为 214.519μs，实测相对理论值分别高约 20.8% 和 27.9%。
+>
+> **优化效果分析**：
+> - 增大分块可以显著降低搬运指令发射开销。GM 到 UB 场景中，大分块相对小分块在 Atlas A2/A3 系列上端到端性能提升约 161.7%，在 Ascend 950 系列上提升约 369.0%。
+> - 实际配置时建议在片上空间允许的前提下优先增大单次搬运大小，同时保持分块不超过 UB/L1 可用缓存。单次搬运字节数越大、`mLoopCount/nLoopCount` 越少，DataCopy 指令数量和循环控制开销越低。
+
+**Scenarios 1 and 2 use the identical `blockLen = 128B` and move the identical total bytes.** The
+only change is `blockCount` 1 → 64. `aiv_mte2_time` falls 548.161 → 220.772 us = **2.48x**. Then
+raising `blockLen` 128B → 2048B (2 → 3) buys only a further 220.772 → 202.657 = **1.09x**.
+
+So on A3: the cost of a scattered gather is **2.48x from needing one instruction per block** and
+**1.09x from the burst being short**. Burst length is nearly free; instruction count is not.
+
+### 20.2 The remaining measured penalties, same source
+
+优化点2, non-aligned tail:
+
+> | 3 | Tensor=[12288,12288] Tile=[64,1024] blockLen=2048B | 215.82 | 202.657 | 0.969 | 基线 | 对齐大分块 |
+> | 4 | Tensor=[12288,12287] Tile=[64,1024] full/tail blockLen=2048B,2046B | 275.3 | 259.047 | 0.973 | **-21.6%** | 非对齐数据大分块 |
+>
+> GM 到 L1: | 3 | Tensor=[12288,12287] … dValue=256(full),255(tail) | 438.76 | 422.515 | 0.986 | **-47.5%** | 非对齐数据大分块 |
+>
+> - 非对齐数据会引入额外边界处理，在 Atlas A2/A3 系列上影响更明显，尤其 GM 到 L1 场景端到端性能劣化约 47.5%。
+> - 建议在设计矩阵 shape 和切分策略时尽量采用对齐矩阵。按本样例 half 数据类型计算，**Atlas A2/A3 系列建议主搬运维度对应的连续字节数满足 512B 对齐**；Ascend 950 系列建议满足 128B 对齐。
+
+优化点4, multi-core same-address serialization (Tensor=[6144,512], Tile=[128,64], Block Num=48):
+
+> | 7 | 539.42 | 42823246 | 474.717 | 0.984 | 所有核按相同顺序完整载入 |
+> | 8 | 328.88 | 28054500 | 307.38 | 0.973 | 所有核错开分片顺序完整载入 |
+>
+> - 从端到端性能看，Atlas A2/A3 系列的 UB 场景提升约 64.0%
+
+优化点3, L2 and the A3 hit-rate formula:
+
+> A2/A3 的 L2Cache 大小为 192MB，950PR 的 L2Cache 大小为 128MB。
+>
+> Atlas A2/A3 系列和 Ascend 950 系列的 profiler 输出字段不同，命中率计算方式也不同：Atlas A2/A3 系列使用 `l2cache_hit_ratio = (r0_hit + r1_hit) / (r0_hit + r1_hit + r0_miss_allocate + r1_miss_allocate)`；Ascend 950 系列使用 `l2cache_hit_ratio = hit / (hit + miss + victim)`。
+>
+> | 5 | Atlas A2/A3 … 整块矩阵按相同路径连续搬 4 次 | 828.06 | 816.05 | r0_hit 212 | r0_miss_allocate 4718595 | r1_hit 217 | r1_miss_allocate 4718592 | **L2Cache命中率 0.005%** |
+> | 6 | Atlas A2/A3 … N 方向切 4 份，每份连续搬 4 次 | 365.74 | 354.56 | 3539159 | 1179644 | 3539158 | 1179655 | **75.00%** |
+>
+> 重复搬运场景在同一数据规模下执行多轮 GM 读取，使用 `msopprof --ai-core=on --aic-metrics=L2Cache` 采集 L2Cache 读命中和 miss allocate 数据。
+
+### 20.3 The A3 hardware constraint table — the burst split, stated for arch 2201
+
+https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/hardware_constraints/npu_arch_2201.html
+(source: https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/hardware_constraints/npu_arch_2201.md)
+Huawei / CANN `asc-devkit`, 2026-10-20. Page title 「NPU架构版本2201」, tagged
+`<!-- npu="A3" --> Atlas A3系列产品`. 表1 硬件约束以及解决方案建议:
+
+> | 内存访问（GM） | 数据搬运会被拆成128B/256B/512B不同长度进行搬运，非对齐会向上取整。 | Tiling尽量让搬运的内轴128B、256B、512B对齐。<br> 具体解决方案可参考[GM地址尽量512B对齐](...)章节。 |
+> | 内存访问（GM） | 单次搬运数据长度16KB以上时，可发挥带宽的最佳性能。 | 根据实测经验，单次搬运数据长度16KB以上时，通常能较好地发挥出带宽的最佳性能。因此对于单次搬运，应考虑尽可能的搬运较大的数据块（不同芯片不一样）。 |
+> | 内存访问（GM-->L1） | DataCopy中源操作数相邻连续数据块的间隔（前面一个数据块的尾与后面数据块的头的间隔）不要超出65535，单位为DataBlock（32字节）。 | 前面一个数据块的尾与后面数据块的头的间隔超出65535时，需要拆分成多条指令来实现。 |
+> | 内存访问（GM） | 多核并行同地址访问GM，会被硬件串行化。 | 对相同地址的访问，会被硬件串行化，性能为排队时间，大约下降10%-20%；<br> 多核访问通过错峰访问（调整数据访问顺序和修改切分策略等），使得第一次加载数据到L2 Cache，后续访问性能反而提升。 |
+> | 内存访问（L0 Buffer/L1 Buffer/Unified Buffer（UB）等） | 各存储单元的最小访问粒度/地址对齐要求：<br> UB：32Byte对齐。<br> L1 Buffer：32Byte对齐。<br> L0A Buffer/L0B Buffer：512Byte对齐。<br> L0C Buffer：64Byte对齐。<br> BiasTable Buffer：64Byte对齐。<br> Fixpipe Buffer：128Byte对齐。 |
+> | Cube | MTE1和MMAD指令队列的深度为32。 | 对应指令队列容易满，会阻塞其他指令下发，引起流水断流。 |
+
+The 512 B request granularity and its serialization:
+
+https://asc.gitcode.com/guide/operator_practice/simd_operator_optimization/memory_access/avoid_same_address_access.html
+tagged for `Ascend 950PR&950DT`, `Atlas A3系列产品`, `Atlas A2系列产品`:
+
+> 【描述】MTE2、MTE3、Scalar等单元访问Global Memory数据时，其地址请求会按照512字节粒度对齐后进行处理。当同时访问Global Memory的数据，且地址处于连续的512字节范围内时，由于数据一致性的原因，多个请求会被串行处理，进而影响数据搬运效率。
+>
+> 当前算子执行机制保证用户核函数（Kernel）入参（包括Workspace/Tiling）的地址512字节对齐，因此开发者只需要根据地址的偏移量即可判断两个地址是否会落入连续的512字节范围内。
+>
+> 如下图所示，AI Core内的各个核对Global Memory的数据同时发出读写请求，尽管addr0~addr5是多个不同的地址，但因为落在连续的512字节范围内，被视为同一个地址请求，此时这几个数据请求会被串行处理，数据访问效率会降低。同地址访问的影响受同时访问的核数影响，同地址访问的核数越多时，串行导致的性能劣化越严重。
+
+And the cacheline, same mechanism:
+
+https://asc.gitcode.com/guide/programming_guide/advanced_programming/hardware_implementation/basic_architecture.html
+
+> 所有通过搬运单元读写GM的数据都缺省被缓存在L2Cache，以此加快访问速度，提高访问效率。**核外L2Cache以Cache Line为单位加载数据，根据硬件规格不同，Cache Line大小不同（128/256/512Byte等）。**
+
+https://asc.gitcode.com/guide/operator_practice/simd_operator_optimization/memory_access/l2_cache_split.html
+
+> 【描述】假设，AI处理器的L2 Cache大小为192MB，L2 Cache读写混合带宽约为7TB/s，而GM的带宽约为1.6TB/s，两者之间存在较大差距。…若数据无法命中L2 Cache，即需要访问的数据不在L2 Cache内，导致需要去GM上读写，带宽利用效率较低，最终算子搬入或搬出数据变为算子整个运行过程的性能瓶颈。
+
+### 20.4 The bandwidth-vs-block-size curve
+
+https://www.hiascend.com/developer/techArticles/20240906-1?envFlag=1
+昇腾CANN 官方技术文章, 2024-09-06, 「Ascend C算子性能优化实用技巧03——搬运优化」
+
+> ## 02 尽量一次搬运较大的数据块
+> 搬运不同大小的数据块时，对带宽的利用率（有效带宽/理论带宽）不一样。根据实测经验，单次搬运数据长度16KB以上时，通常能较好地发挥出带宽的最佳性能。因此对于单次搬运，应考虑尽可能的搬运较大的数据块。下图展示了某款AI处理器上实测的不同搬运数据量下带宽的变化图。
+>
+> 说明：测试数据与处理器型号及HBM频率相关，且实际测试时可能会存在略微抖动，具体带宽数值并不一定和下文的测试数据严格一致。
+>
+> ## 03 GM地址尽量512B对齐
+> 由于AI处理器内部设计约束，从GM向Local Memory搬运数据时，保证GM地址512B对齐可以最高效的发挥出带宽的效率。如下图示例，展示了在512B对齐以及32B对齐情况下单核的带宽效率：搬运同等数据量，带宽差距最大的情况，32B对齐场景只能达到512B对齐场景的70%。
+>
+> 说明：本性能优化手段仅针对Atlas A2训练系列产品/Atlas 800I A2推理产品生效。
+>
+> ## 04 高效使用搬运API
+> 使用搬运API时，应该尽可能地使用API的srcStride/dstStride/blockLen/blockCount等参数实现连续搬运或者固定间隔搬运，而不是使用for循环，二者效率差距极大。如不这样，图片的每一行为16KB，需要从每一行中搬运前2KB，针对这种场景，使用srcStride/dstStride/blockLen/blockCount等参数可以达到一次搬完的效果，每次搬运 32 KB；如果使用for循环遍历每行，每次仅能搬运 2 KB。
+
+Chart figure URLs (same article; byte-identical copies in the doc repo as
+`docs/zh/guide/figures/gm_ub_bw.png`, `ub_gm_bw.png`, `gm_ub_align.png`, `ub_gm_align.png`):
+`https://www.hiascend.com/p/resource/202409/103ad6f61a9d4f47b74b2aed38c70f59.png`,
+`.../2a74314eb0ac460384a08a2491b8a613.png`, `.../2bbae8909d534f11b560da0fada6de59.png`,
+`.../38487e7f1a224bcfa6d56c8eefd64d15.png`, `.../769746be1b844ed593cf6eef434779e2.png`,
+`.../d2a0020cc58d449c8c3413183f082609.png`, `.../d79b8ba0e26b4074a2091a47b9b6b459.png`.
+
+Values read off the vendor plot (a reading of the figure, **not** vendor-printed numbers), axes
+带宽(GB/s) vs 单次搬运数据量(KB), single core:
+
+- GM→UB: ~1 KB ≈ 1.7 GB/s · 2 KB ≈ 3 · 4 KB ≈ 6.5 · 8 KB ≈ 12.5 · 12 KB ≈ 17 · 16 KB ≈ 29 ·
+  24 KB ≈ 29 · 32 KB ≈ 27.5 (dip) · 48 KB ≈ 31 · 64 KB ≈ 33 · 96 KB ≈ 34.5 · 128-160 KB ≈ 33.7 ·
+  192 KB ≈ 35.
+- UB→GM: 1 KB ≈ 1.3 · 2 KB ≈ 2.8 · 4 KB ≈ 5.5 · 8 KB ≈ 11 · 12 KB ≈ 15 · 16 KB ≈ 28.5 ·
+  32 KB ≈ 27.5 · 48 KB ≈ 30 · 64 KB ≈ 33 · 160 KB ≈ 35.2.
+- 512B-aligned vs 32B-aligned (GM→UB): at 16 KB, 29 vs 22 GB/s (76%); at 32 KB, 27.5 vs 26;
+  converging above 96 KB.
+
+Single-core saturation ≈ 35 GB/s; a 2 KB transfer gets ≈ 3 GB/s, i.e. ~12x off saturation.
+
+### 20.5 `DataCopyPad` / `DataCopyExtParams` on A3 — exact limits
+
+https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html
+Ascend C API reference (asc.gitcode.com, CANN 9.2.0 tree), 2026-10-20.
+「DataCopyPad（GMToUB非对齐数据搬运）」, 产品支持情况: `Atlas A3系列产品：支持`
+
+> ```cpp
+> template <typename T>
+> __aicore__ inline void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
+>                                    const DataCopyExtParams& dataCopyParams,
+>                                    const DataCopyPadExtParams<T>& padParams)
+> ```
+>
+> 针对如下型号，DataCopyExtParams结构体参数定义请参考表4：Atlas A3系列产品 / Atlas A2系列产品 / Atlas 200I/500 A2推理产品
+>
+> **表4 DataCopyExtParams结构体参数定义**
+> | blockCount | 搬运的数据块个数，数据类型为uint16_t，取值范围：**blockCount∈[0, 4095]**，默认值为1。 |
+> | blockLen | 搬运的每个数据块长度，数据类型为uint32_t，取值范围：blockLen∈[0, …]，单位：1B。注：blockLen必须是sizeof(T)的整数倍，需要注意不要超过UB空间大小。 |
+> | srcStride | 源操作数相邻数据块之间的间隔（即前一个数据块**结束地址**与后一个数据块**起始地址**的差值），数据类型为**uint32_t**，取值范围：srcStride∈[0, …]，单位：1B。 |
+> | dstStride | 目的操作数相邻数据块之间的间隔…数据类型为uint32_t…单位：dataBlock（32B）。 |
+> | rsv | 预留参数，当前需设置为0。 |
+>
+> 针对Ascend 950PR&950DT系列产品，DataCopyExtParams结构体参数定义请参考表3。
+> | blockCount | …取值范围：**blockCount∈[0, 65535]**，默认值为1。 |
+> | srcStride | …数据类型为**int64_t**，取值范围：srcStride∈[**-blockLen**, …]，单位：1B。**当srcStride = -blockLen时，表示每次传输的连续数据块均为同一块，即重复搬运第一个数据块。** |
+>
+> **约束说明**
+> - 当DataCopyExtParams结构体参数blockCount、blockLen任意一个值为0时，该接口将被视为NOP（空操作）。该说明针对如下型号生效：Atlas A3系列产品 / Atlas A2系列产品 / Ascend 950PR&950DT系列产品
+> - 位于Global Memory的源地址必须1字节对齐，位于UB的目的地址必须32字节对齐。
+> - 特别地，针对Ascend 950PR&950DT系列产品，支持Compact模式，该模式支持单个数据块非32字节对齐，将所有数据块合并成一个连续数据块，在该数据块右侧填充数据至32字节对齐。
+>
+> ```cpp
+> enum class PaddingMode : uint8_t {
+>     Normal = 0, // 默认模式，与原有数据搬运格式保持一致，每次数据搬运都会补齐至32字节对齐
+>     Compact,    // 紧凑模式，允许单次搬运不对齐，统一在整块数据末尾补齐至32字节对齐
+> };
+> ```
+
+And the plain `DataCopy` gap limits —
+https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopy_GMAndUB_highdim_split.html,
+「DataCopy（GM与UB高维切分数据搬运）」, `Atlas A3系列产品：支持`:
+
+> **表3 DataCopyParams结构体参数定义**
+> | blockCount | 搬运的数据块个数。数据类型为uint16_t，取值范围：blockCount∈[0, 4095]，默认值为1。 |
+> | blockLen | 搬运的每个数据块长度。数据类型为uint16_t，取值范围：blockLen∈[0, 65535]，单位：DataBlock（32B）。 |
+> | srcGap | 源操作数相邻数据块之间的间隔（即前一个数据块**结束地址**与后一个数据块**起始地址**的差值），数据类型为uint16_t，取值范围：srcGap∈[0, 65535]，单位：DataBlock（32B）。<br>• blockCount = 1时，srcGap无意义，设置为0即可。 |
+> | dstGap | …取值范围：dstGap∈[0, 65535]，单位：DataBlock（32B）。 |
+
+### 20.6 There is no hardware gather-DMA from GM on Ascend
+
+`Gather` and `asc_gather_datablock` are UB-only and run on `PIPE_V`, not MTE2.
+
+https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/scatter_gather/Gather.html
+
+> ```cpp
+> template <typename T>
+> __aicore__ inline void Gather(const LocalTensor<T>& dst, const LocalTensor<T>& src, const LocalTensor<uint32_t>& srcOffset, const uint32_t srcBaseAddr, const uint32_t count)
+> ```
+> Gather接口接受输入张量（src）、地址偏移张量（srcOffset）和基地址（srcBaseAddr），根据基地址和地址偏移量确定输入张量的索引，将输入张量中对应元素收集到结果张量（dst）中。
+
+https://asc.gitcode.com/api/SIMD-API/c_api/vector_compute/vector_gather/asc_gather_datablock.html
+
+> ```cpp
+> __aicore__ inline void asc_gather_datablock(__ubuf__ uint16_t* dst, __ubuf__ uint16_t* src, __ubuf__ uint32_t* src_offset, uint16_t dst_repeat_stride, uint8_t dst_block_stride, uint8_t repeat)
+> ```
+> 给定一个输入的矢量和一个地址偏移矢量，根据偏移地址按照DataBlock的粒度将输入矢量收集到目的矢量中。
+> ## 流水类型
+> PIPE_V
+> ## 约束说明
+> - src加上src_offset偏移后的地址不能超出Unified Buffer（UB）大小数据的范围。
+
+And the multi-dimensional DMA that would describe a strided gather in one descriptor is 950-only:
+
+https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopy_GMToUB_NDDMA.html
+
+> ## 产品支持情况
+> - Ascend 950PR&950DT系列产品：支持
+> - **Atlas A3系列产品：不支持**
+> - Atlas A2系列产品：不支持
+>
+> 多维数据搬运接口，相比于基础数据搬运接口，可更加自由配置搬入的维度信息以及对应的Stride。
+> ```cpp
+> template <typename T, uint8_t dim, const NdDmaConfig& config = kDefaultNdDmaConfig>
+> __aicore__ inline void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, const NdDmaParams<T, dim>& params)
+> ```
+> | loopSrcStride | 表示每个维度内，该源操作数元素与下一个元素间的间隔。单位为元素个数。数据类型为uint64_t，loopSrcStride需在[0, 2^40)。 |
+
+### 20.7 Profiling metric definitions, and the one metric that does NOT exist on A3
+
+https://www.hiascend.com/doc_center/source/zh/mindstudio/70RC1/mscommandtoolug/mscommandug/atlasprofiling_16_0072.html
+Huawei, MindStudio 7.0.RC1 命令行用户指南, 「op_summary（AI Core、AI Vector Core和AI CPU算子数据）」.
+表2 PipeUtilization; 表10 is the `ai*_` variant, 「下列字段仅 Atlas A2训练系列产品/Atlas 800I A2推理产品 支持」:
+
+> mte2_time(us) — mte2类型指令（DDR->AICORE搬运类指令）耗时，单位us。
+> mte2_ratio — mte2类型指令（DDR->AICORE搬运类指令）的cycle数在total cycle数中的占用比。
+> mte1_ratio — mte1类型指令（L1->L0A/L0B搬运类指令）的cycle数在total cycle数中的占用比。
+> mte3_ratio — mte3类型指令（AICORE->DDR搬运类指令）的cycle数在total cycle数中的占用比。
+> mac_time(us) — cube类型指令（矩阵类运算指令）耗时，单位us。
+> mac_ratio — cube类型指令（矩阵类运算指令）的cycle数在total cycle数中的占用比。
+> icache_miss_rate — icache是为instruction预留的L2 Cache，icache_miss_rate数值高代表AI Core读取指令的效率低。
+> **memory_bound** — 用于识别AICore执行算子计算过程是否存在Memory瓶颈，由mte2_ratio/max(mac_ratio, vec_ratio)计算得出。计算结果小于1，表示没有Memory瓶颈；计算结果大于1 则表示AI Core在执行Task过程中大部分时间都在做内存搬运而不是计算，且数值越大Memory瓶颈越严重。
+> **cube_utilization(%)** — cube算子利用率，查看cube算子在单位时间内的运算次数是否达到理论上限，越接近于100%则表示越接近理论上限。计算公式：cube_utilization=total_cycles / (freq * core_num * task_duration)。
+>
+> 表10 字段说明（PipeUtilization）— 下列字段仅 Atlas A2训练系列产品/Atlas 800I A2推理产品 支持
+> **ai\*_mte2_time(us)** — mte2类型指令（**片上内存**->AICORE搬运类指令）耗时，单位us。
+> **ai\*_mte2_ratio** — mte2类型指令（**片上内存**->AICORE搬运类指令）的cycle数在total cycle数中的占用比。
+> ai\*_mac_ratio — cube类型指令（矩阵类运算指令）的cycle数在total cycle数中的占用比。
+>
+> 表15 字段说明（ResourceConflictRatio）
+> **ai\*_vec_bankgroup_cflt_ratio** — vec_bankgroup_stall_cycles类型指令执行cycle数在total cycle数中的占用比。由于vector指令的block stride的值设置不合理，造成bankgroup冲突。
+> ai\*_vec_bank_cflt_ratio — vec_bank_stall_cycles类型指令执行cycle数在total cycle数中的占用比。由于vector指令操作数的读写指针地址不合理，造成bank冲突。
+> ai\*_vec_resc_cflt_ratio — …当某个计算单元正在执行计算，但算子逻辑仍然往该单元下发指令，就会造成整体的算力没有得到充分应用。
+>
+> 表16 字段说明（L2Cache）
+> ai\*_write_cache_hit — 写cache命中的次数。
+> ai\*_r\*_read_cache_hit — 读r*通道cache命中次数。
+> ai\*_r\*_read_cache_miss_allocate — 读r*通道cache缺失后重新分配的次数。
+
+`mte2_iq_full_ratio` exists only on the pre-A2 generation —
+https://www.hiascend.com/doc_center/source/zh/canncommercial/5046/devtools/auxiliarydevtool/atlasprofiling_16_0119.html,
+CANN 商用版 5.0.4.6, 「AI Core性能指标采集项说明」:
+
+> mte1_iq_full_ratio：代表mte1_iq_full_cycles类型指令执行cycle数在所有指令执行cycle数中占比。
+> **mte2_iq_full_ratio：代表mte2_iq_full_cycles类型指令执行cycle数在所有指令执行cycle数中占比。**
+> mte3_iq_full_ratio：代表mte3_iq_full_cycles类型指令执行cycle数在所有指令执行cycle数中占比。
+> cube_iq_full_ratio：代表cube_iq_full_cycles类型指令执行cycle数在所有指令执行cycle数中占比。
+> vec_iq_full_ratio：代表vec_iq_full_ratio类型指令执行cycle数在所有指令执行cycle数中占比。
+> **iq_full_ratio：代表vec_resc_cflt_ratio，mte1_iq_full_ratio，mte2_iq_full_ratio，mte3_iq_full_ratio，cube_iq_full_ratio，vec_iq_full_ratio类型指令执行cycle数之和在所有指令执行cycle数中占比。**
+
+On CANN 8.0.0 (https://www.hiascend.com/doc_center/source/zh/canncommercial/800/devaids/devtools/profiling/atlasprofiling_16_0069.html,
+「ai_core_utilization（AI Core指令占比）」, 表7 ResourceConflictRatio) the table contains only
+`vec_bankgroup_cflt_ratio`, `vec_bank_cflt_ratio`, `vec_resc_cflt_ratio` — no `*_iq_full_ratio`.
+
+The tool that can see per-instruction issue gaps —
+https://asc.gitcode.com/guide/programming_guide/debug_and_tuning/performance_tuning.html:
+
+> ```
+> OPPROF_{timestamp}_XXX
+> ├──ArithmeticUtilization.csv  # cube/vector指令cycle占比，建议优化算子逻辑，减少冗余计算指令
+> ├──L2Cache.csv                # L2 Cache命中率，影响MTE2，建议合理规划数据搬运逻辑，增加命中率
+> ├──Memory.csv                 # Unified Buffer（UB），L1和主存储器读写带宽速率，单位GB/s
+> ├──PipeUtilization.csv        # pipe类指令耗时和占比，建议优化数据搬运逻辑，提高带宽利用率
+> ├──ResourceConflictRatio.csv  # UB上的bank group、bank conflict和资源冲突率在所有指令中的占比
+> ```
+> bisheng add_custom.asc -o add_custom --npu-arch=dav-2201
+> msopprof ./add_custom
+> | msopprof simulator | 适用于仿真性能分析，可协助用户分析算子指令和代码热点问题。 | 指令流水图 / 算子代码热点图 / 内存通路吞吐率波形图 |
+
+### 20.8 The launch floor: our 0.70 us is corroborated exactly; 13.58 us is not
+
+https://hpc101.zjusct.io/lab/Lab3.5-AscendC-Op/
+ZJUSCT (浙江大学超算队), HPC101「Lab 3.5：昇腾算子开发与优化」, retrieved 2026-10-20, platform 910B4:
+
+> **从启动开销的角度思考为什么不一定需要启动全部 AIV**
+>
+> 在 NPU 中，每个核在被启动时都要单独付一次初始化开销（加载配置、建立执行上下文、准备片上资源等），且这部分几乎无法通过流水、搬运或规约优化消除——它只和「启动了多少个核」有关。下面是用一个 body 几乎为空的算子，只改变 `<<<blocks>>>` 下发 AIV 数目，用 `msprof op` 测得的 Task Duration，可以近似认为是启动开销：
+>
+> 它随启动核数近似线性增长（**约 2 核 0.67 µs → 40 核 2.25 µs**），本身处在微秒量级，在大算子里几乎被 profiling 波动淹没；但当算子整体只有几微秒、单核计算量又很小时就占比可观。因此计算量过小的任务要选择「够用就好」的核数，而不是无脑写满全部 AIV。
+>
+> **提高搬运效率**
+> MTE 搬运存在固定启动成本，单次搬运过小时难以充分利用带宽。
+> 若 UB 预算和数据布局允许，可以尝试用一次 `DataCopy` 搬运多行，或用 `blockCount`、`blockLen` 与 stride 参数表达规则的多段搬运，减少逐行发射指令的开销。
+
+The kernel-type cost model —
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0218.html,
+「设置Kernel类型」:
+
+> ## 功能说明
+> 用于用户自定义设置kernel类型，**控制算子执行时只启动该类型的核，避免启动不需要工作的核，缩短核启动开销。**
+>
+> | KERNEL_TYPE_AIV_ONLY | 算子执行时仅启动AI Core上的Vector核：比如用户在host侧设置numBlocks为10，则会启动10个Vector核。 |
+> | KERNEL_TYPE_AIC_ONLY | 算子执行时仅启动AI Core上的Cube核：比如用户在host侧设置numBlocks为10，则会启动10个Cube核。 |
+> | KERNEL_TYPE_MIX_AIC_1_1 | AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:1，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，则会启动10个Cube核和10个Vector核。 |
+> | **KERNEL_TYPE_MIX_AIC_1_2** | AIC、AIV混合场景下，设置核函数的类型为MIX AIC:AIV 1:2，算子执行时会同时启动AI Core上的Cube核和Vector核，比如用户在host侧设置numBlocks为10，**则会启动10个Cube核和20个Vector核**。 |
+
+And the closest public number in magnitude to our MIX floor —
+https://cann.csdn.net/69afcc5554b52172bc603633.html, 昇腾CANN 官方,
+「大模型推理加速利器SuperKernel技术综述」:
+
+> 以DeepSeekV3网络中的一层为例，根据Profiling数据分析发现，网络上肉眼可见的Task等待调度开销较为明显。在BatchSize大小为96、Sequence长度3K的场景下，**平均每层的Task平均等待的开销约为18us左右**。按照61层网络计算，总的调度等待开销在1.1ms左右。这些开销基本是绝对开销，在大的Batch场景下还会进一步扩大。
+>
+> 通过详细评估和调试，SuperKernel技术优化后的基本收益模型可以分为以下三部分：首先是两个Task之间的调度开销降低；其次是每个Task结束后会执行Cache Flush操作，将所有修改的Cache内容刷新出去，其中包含一些不必要的栈空间；**最后是算子调度后的核启动时间，包括同地址访问的排队延迟、Scalar执行初始化等环节。**
+>
+> 在多核处理器系统中，当多个计算核心同时执行同一个内核函数时，它们会访问内存中完全相同的指令地址（Text段）。这种对同一地址的并发访问会在共享的L2缓存层面形成一个串行化的访问队列，导致多个核心的请求发生争用，即使数据已缓存在L2中，也会因队列拥堵产生访问延迟，显著削弱多核并行带来的性能提升。
+>
+> torchair.scope.super_kernel('layers', 'debug-dcci-all=1') # 自动为每个算子结束后插入cache强制刷新，**每算子约2-3us耗时**，仅做排查问题使用
+>
+> 特定执行模式需要适配：对于设计上原本AIC和AIV配比为1:1的算子，需要对其进行适配，使其能够在AIC和AIV配比为1:2的模式下正确执行，以满足SuperKernel的调度要求。
+
+https://www.hiascend.com/developer/techArticles/20240715-1
+昇腾CANN 官方技术文章, 2024-07-15, 「深度解读昇腾CANN模型下沉技术，提升模型调度性能」:
+
+> 比如，大模型场景的增量推理或训练的FineTune阶段，都是计算量较小的场景，此时很容易出现单个算子的Host下发时间比Device上的算子执行时间还长，从而导致Device间歇处于空闲状态。这种现象通常称为Host Bound，这种模型也称为Host Bound模型。
+>
+> 以Host Bound的LLaMA-7B模型的推理场景为例，…通过Profiling结果可以看出该模型是一个Host Bound模型，采用Host调度方式，Device上计算时间和空隙的时间比例接近1:1，采用模型下沉执行方式，Device空隙大幅减少，并且端到端有18ms的收益，吞吐量整体提升37%。
+>
+> 以盘古71B增量推理模型为例（模型输入输出总个数约1600个，模型内节点总数约6300个，…），当前模型下沉的头开销约2ms，关于头开销的性能优化在持续进行中。
+
+### 20.9 PageAttention `block_size` on A3, officially
+
+https://www.hiascend.com/doc_center/source/zh/Pytorch/60RC2/apiref/apilist/ptaoplist_000787.html
+Huawei 昇腾 PyTorch API 参考, 「torch_npu.npu_fused_infer_attention_score」:
+
+> 当Q_S等于1时：… page attention场景：
+> 使能必要条件是blocktable存在且有效，同时key、value是按照blocktable中的索引在一片连续内存中排布，支持key、value dtype为FLOAT16、BFLOAT16、INT8，在该场景下key、value的inputLayout参数无效。
+> **该场景下，blockSize是用户自定义的参数，该参数的取值会影响page attention的性能。key、value输入类型为FLOAT16、BFLOAT16时需要16对齐，key、value 输入类型为INT8时需要32对齐，推荐使用128。通常情况下，page attention可以提高吞吐量，但会带来性能上的下降。**
+
+https://support.huaweicloud.com/bestpractice-modelarts/modelarts_llm_infer_5908032.html
+华为云 ModelArts 最佳实践, 「Ascend-vLLM推理常见问题」:
+
+> 问题3：使用离线推理时，性能较差或精度异常
+> **解决方法：将block_size大小设置为128**
+
+And the counter-pressure, https://github.com/vllm-project/vllm-ascend/issues/12589:
+
+> The root cause is traced to the default `block-size=128` … With `block_size=128`, a 128K prompt generates 1024 blocks. Due to hash granularity, only fully filled blocks (128 tokens) can be cached. In practice, the last block of each chunked prefill segment is often incomplete, causing hash mismatches. The large block size leads to high fragmentation: different requests produce different block boundaries for the same logical prefix, preventing hash matches.
+> … In vLLM-Ascend, the recommended block size for optimal caching is 32 (as noted in internal documentation and recent code changes).
+
+### 20.10 The official bandwidth-utilization method, with worked numbers
+
+https://bbs.huaweicloud.cn/blogs/433080
+昇腾CANN, 华为云社区, 2024-08-16, 「基于Ascend C的Matmul算子性能优化最佳实践」,
+性能验证平台为Atlas A2训练系列产品/Atlas 800I A2推理产品:
+
+> 从上图Profiling数据来看，**aic_mte2_ratio数值是0.973**，这表明MTE2类型指令的cycle数在total cycle数中的占比过大，这意味着当前性能瓶颈点可能在于MTE2流水。
+>
+> **开启大包搬运后，指令条数变化、地址对齐等因素会影响性能，按照经验预估，对于MTE2为性能瓶颈的场景，会有20%以上的MTE2性能收益。**
+>
+> …搬出一次Matmul结果到Global Memory的base块是64 * 64，由于输出格式是ND，数据类型是float，搬出下一次Matmul结果的起始地址需要偏移一个baseN的大小，即64 * 4 = 256字节，导致fixpipe搬出时Global Memory地址非512byte对齐，那么需要设置更优的基本块。
+>
+> 从下图可以看到，使能这组基本块后，**MTE2耗时（对应aic_mte2_time）从2452us降低到808us，MTE2性能提升3倍。**
+>
+> 当前带宽利用率为：totalSize / mte2Time = totalCnt * dtype / mte2Time，代入数据计算为 **2491GB/s**。未使能大包搬运的情况下，矩阵从Global Memory搬运到L1一次只搬运1个基本块。通过模板参数使能大包搬运，一次搬运多个基本块，提高MTE2带宽利用率。
+>
+> 从下图可以看到，使能大包搬运后，**MTE2耗时从808us下降到591us，带宽利用率代入数据计算为3406GB/s，利用率提升36%+，Cube利用率（对应aic_mac_ratio）达到80%+。**
+
+## Relevance
+
+This is the measured decomposition the structural question asked for, and it settles the ranking
+of causes with controlled A/B data rather than reasoning.
+
+**The answer to (b): it is instruction count, not burst length.** From 20.1, holding bytes and
+`blockLen = 128B` fixed and changing only `blockCount` 1 → 64 is worth **2.48x**; then raising
+`blockLen` 128B → 2048B is worth only **1.09x**. Every mechanism in sections 9, 16 and 19 that
+reduces instruction count — the `blockCount=2` pairing, the 32-row UB staging, block-wise
+`sparse_block_size` — attacks the 2.48x term. Nothing attacks the 1.09x term, and nothing needs
+to. This retires the "short DMA burst" hypothesis as a significant contributor and confirms
+"MTE2 descriptor overhead" as the real one.
+
+**The full penalty budget for A3, each measured:**
+
+| cause | measured A2/A3 penalty | source |
+|---|---|---|
+| one instruction per block vs 64 per instruction, same 128 B burst | **2.48x** | 20.1 sc. 1 vs 2 |
+| burst 128 B vs 2048 B, same instruction count | **1.09x** | 20.1 sc. 2 vs 3 |
+| non-aligned tail, GM→UB | 1.22x | 20.2 优化点2 |
+| non-aligned tail, GM→L1 (ND2NZ) | 1.48x | 20.2 优化点2 |
+| multi-core same-512 B-address serialization | 1.64x (constraint table says 10-20%) | 20.2 优化点4, 20.3 |
+| L2 hit 0.005% vs 75% | 2.26x | 20.2 优化点3 |
+| single-core bandwidth at 2 KB vs saturated | ~12x | 20.4 |
+
+Even the *best* case in 20.1 — 64 contiguous 2 KiB blocks per instruction — lands 20.8% (GM→UB)
+and 27.9% (GM→L1) above the 1.8 TB/s theoretical time. So a 1.21-1.28x gap is the floor for a
+perfectly-tiled dense copy on A3. A roofline target of 1.0x is unreachable in principle.
+
+**Three A3 hardware limits that constrain every fix proposed above.** First, `blockCount ∈
+[0, 4095]` on A3 (65535 on 950), so at most 4095 blocks per instruction, and only if one stride
+describes them. Second, **`srcStride` is `uint32_t` on A3** while on 950 it is `int64_t` with the
+`-blockLen` repeat trick — so on A3 a pair must be emitted with the lower address first, which is
+exactly why `CopyInKv`'s `还原成2条搬运指令` fallback fires on an unsorted index list (section
+9.4), and it confirms section 9's recommendation to sort the top-k ascending. Third, A3's
+`PaddingMode` has no `Compact`: `每次数据搬运都会补齐至32字节对齐` — every block pads
+individually, so A3 pays a padding event per gathered row that 950 does not.
+
+**And the hardest limit: there is no gather DMA.** `Gather` and `asc_gather_datablock` take
+`__ubuf__` / `LocalTensor` sources and run on `PIPE_V`, not MTE2; the multi-dimensional
+`NdDmaParams` DMA is marked `Atlas A3系列产品：不支持`. Combined with section 17's
+`Ascend 950系列新增了SIMT单元` and section 19's BIU no-coalesce finding, that is three independent
+confirmations that on A3 a scattered GM gather must become N descriptors. The 2.48x is therefore
+not an implementation defect — it is the price of the only available expression.
+
+**Our 0.70 us AIV launch floor is independently reproduced; our 13.58 us MIX floor is not.**
+ZJUSCT measures `约 2 核 0.67 µs → 40 核 2.25 µs` for an empty kernel on 910B4, against our
+0.70 us — the methodology is sound. But that linear model (~0.04 us/core) predicts a few
+microseconds for MIX_AIC_1_2, not 13.58. Nothing public corroborates a ~13 us MIX floor. The
+documented mechanisms that could produce it, none of them quantified for MIX specifically:
+MIX_AIC_1_2 starts 3x the cores at the same `numBlocks` (20.8); ICache is 32 KiB on the cube core
+and 16 KiB on the vector core (section 19.4) while a MIX kernel carries both code segments; and
+`多核并行同地址访问ICache，会被硬件串行化` with Huawei's own breakdown of 核启动时间 naming
+`同地址访问的排队延迟` and `Scalar执行初始化`. The closest public number in magnitude is
+`平均每层的Task平均等待的开销约为18us左右` on a DeepSeek-V3 decode layer, `按照61层网络计算，总的
+调度等待开销在1.1ms左右` — same order as our 13.58 us, and SuperKernel is the named cure.
+
+**Diagnostically, one metric we wanted does not exist on A3.** `mte2_iq_full_ratio` — the direct
+"MTE2 issue queue is full" signal that would confirm the 2.48x term in our own kernel — is a
+pre-A2 metric; on A2/A3 `ResourceConflictRatio` is vector-only. So the instruction-issue
+bottleneck must be inferred: compare `aic_mte2_time` / `aiv_mte2_time` against
+`bytes / 1.8 TB/s`, collect the `L2Cache` group
+(`aiv_r0/r1_read_cache_hit` + `_miss_allocate`, with
+`l2cache_hit_ratio = (r0_hit + r1_hit) / (r0_hit + r1_hit + r0_miss_allocate + r1_miss_allocate)`
+on A3), and use `msopprof simulator` for the 指令流水图 and 内存通路吞吐率波形图, built with
+`--npu-arch=dav-2201`. Note also that `memory_bound = mte2_ratio / max(mac_ratio, vec_ratio)`
+cannot distinguish "MTE2 busy moving bytes" from "MTE2 busy issuing descriptors" — both read as
+`mte2_ratio ≈ 1`, which is precisely our situation.
+
+**One warning about L2.** A3's L2 is 192 MB and the selected KV working set at seq 8K is
+104.8 MB (section 13), so it nominally fits — but the `kvMergeGm_` staging adds 2.25 MB x 24 cores
+= 54 MB of write traffic through the same cache, and 20.2 優化点3 shows L2 hit rate swinging
+2.26x on access-order alone. Our scattered reads are also exposed to the 512 B same-address
+serialization of 20.3: at TP16 with every rank reading the *same* MQA latent cache
+(`KV_N仅支持1`), cross-core and cross-rank reads landing in one 512 B window are serialized by
+hardware, `同地址访问的核数越多时，串行导致的性能劣化越严重`. That is a TP16-specific penalty
+that does not appear at TP1 and is not in any byte count.
+
+---
+
+## 21. The vendor's FlashAttention tuning case, and two candidate causes ruled out by inspection
+
+### 21.1 The measured before/after, with the five levers and their yields
+
+/home/shanshan/repo/cann/asc-devkit/docs/zh/guide/operator_practice/best_practices/flash_attention_tuning.md
+(CANN `asc-devkit`, local clone, file dated 2026-08-21, 226 lines; published as
+https://www.hiascend.com/developer/techArticles/20240607-1 and
+https://www.cnblogs.com/huaweiyun/p/18243836, 昇腾CANN, 2024-06-12,
+「基于Ascend C的FlashAttention算子性能优化最佳实践」, verified on
+Atlas A2 训练系列产品 / Atlas 800I A2 推理产品)
+
+> ## 分析主要瓶颈点
+>
+> 通过观察分析流水图和Profiling数据，结合优化经验来判断性能瓶颈点。在优化过程中不同阶段可能会出现不同的瓶颈点，需要不断优化以达到最佳性能。
+>
+> -   根据优化经验，循环间会存在一些不必要的性能开销，循环越多性能可能越差；满足Unified Buffer（UB）最大空间限制的情况下，UB切分的基本块越大，循环越少。算子中通过InitBuffer接口分配UB buffer大小。
+>
+>     ```
+>     pipe->InitBuffer(ubBuffer, 120 * 1024);
+>     pipe->InitBuffer(tmpBuffer, 30 * 1024);
+>     pipe->InitBuffer(vecClc3, 8 * 1024);
+>     ```
+>
+>     如上代码所示，InitBuffer接口的第二个参数表示buffer占用的大小，所有buffer大小的和即为占用的总空间。这里120 \* 1024 + 30 \* 1024 + 8 \* 1024 = 158KB < UB Size，没有充分利用UB空间。
+>
+> -   观察如下流水图，绿色为Vector侧的流水，橙色为Cube侧的流水，可以看出两侧的流水都存在大段的空隙，CV之间流水很大程度上未并行，需要考虑CV流水优化。
+>
+> -   对于上述场景一，causal场景下可能存在核间分布不均匀的情况，如下图经过atten\_mask掩码后，红色部分是算子需要计算的部分，绿色无需计算；如果不按照基本块的个数来分核，按照第一根轴的大小8（行）来分核，假设平均分到9个核上，每个核做ceil\(8 / 9\) = 1行，则第1个核只需做1个基本块，但是第8个核需要做8个基本块的计算，出现明显的负载不均衡。因此需要考虑将红色块均匀分到多个核上计算。
+>
+> -   场景一的Profiling数据如下，aic\_fixpipe\_ratio占比极高，可能存在FixPipe bound。
+>
+> -   场景二的Profiling数据如下，mte2\_ratio占比高，可能存在MTE2 bound。
+
+> -   优化点三：每个核负载均衡
+>
+>     尽量实现每个核的计算量均匀，负载均衡。优化前的分核及每个核的计算量如[图11]所示，按照第一根轴的大小8（行）来分核，平均分到9个核上，每个核计算ceil\(8/9\)=1行，第1个核只计算1个基本块，但是第8个核计算8个基本块。优化后如[图12]所示，红色块总共36个基本块，均分到每个核上，每个核的计算量为4个基本块，性能提升一倍。
+>
+> -   优化点四： FIXPIPE优化
+>
+>     从采集的Profiling数据来看，Cube FixPipe占比高达81%，出现了很严重的bound（达到上限）。CAModel工具打印发现存在很多异常的128B搬运，排查代码，发现workspace地址未512B对齐。
+>
+>     代码实现中使用SetGlobalBuffer接口设置workspace的起始地址，如果起始地址不是按照512B对齐，搬运效率会很低，可以强制[GM地址512Byte对齐]来避免这个情况。下面代码中ADDR\_ALIGN\_SIZE即为512。
+>
+>     ```
+>     // init workspace address
+>     syncGlobal.SetGlobalBuffer((__gm__ int32_t*)workspace);
+>     uint64_t workspaceOffsets = SYNC_GLOBAL_WORKSPACE_SIZE;
+>     dqWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + workspaceOffsets / sizeof(T2));
+>     workspaceOffsets = (workspaceOffsets + qPostBlockTotal * sizeof(float) + ADDR_ALIGN_SIZE) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;  dkWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + workspaceOffsets / sizeof(T2));
+>     ...
+>     ```
+>
+>     修改代码，workspace地址经过512B对齐后，FixPipe时间减半。
+>
+> -   优化点五：MTE2优化
+>
+>     结合如下的Profiling数据和流水图，可以看出MTE2 bound，且部分MTE2搬运时间异常。
+>
+>     将输入数据排布格式从BSH更改为BNSD后，数据搬运连续，不需要跳地址读取数据，搬运效率提升一倍，部分异常搬运时长降低了一半。
+
+> ## 验证优化方案性能收益
+>
+> -   调整tiling基本块：理论评估Vector切块越大，计算和搬运循环次数越少，同时能够充分利用搬运带宽和Vector算力。基本块大小从\(64, 128\)增大到\(128, 128\)后，性能提升一倍，实测与理论分析一致。
+> -   CV流水并行：CV流水掩盖的时间即为提升的性能，符合预期的收益。
+> -   核间负载均衡：优化前负载最多的核计算量减少的倍数，即为预期提升的性能；案例中优化前负载最多的核的计算量大小为8块，优化后为4块，实际性能提升一倍，符合预期的收益。
+> -   FixPipe优化：从Profiling数据看出FixPipe占比0.8，优化后占比0.55，实测算子性能提升45%，与理论分析一致。
+> -   MTE2优化：从Profiling数据看出MTE2占比0.52，优化后占比减少一半，实测算子性能提升30%，与理论分析一致。
+>
+> ## 总结
+>
+> 融合算子场景，可参考此优化。
+
+### 21.2 RULED OUT: `SparseFlashAttention`'s workspace offsets are already 512B-aligned
+
+The FixPipe pathology above (`workspace地址未512B对齐` → `很多异常的128B搬运` → FixPipe at 81%)
+is a candidate for our gap, so it was checked. It does not apply.
+`attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h`:
+
+```cpp
+    // workspace 内存排布
+    // |Q--|mm1ResGm(存S)|vec1ResGm(存A1,A2)|mm2ResGm(存O)|vec2ResGm
+    // |Core0_Q1-Core0_Q2-Core1_Q1-Core1_Q2....Core32_Q1-Core32_Q2|Core0_mmRes
+    uint64_t offset = 0;
+    mm1ResGm.SetGlobalBuffer(
+        (__gm__ MM1_OUT_T*)(workspace + offset +
+                            aiCoreIdx * dbWorkspaceRatio * sfaKernelConstInfo.mmResUbSize * sizeof(MM1_OUT_T)));
+    offset += GetBlockNum() * dbWorkspaceRatio * sfaKernelConstInfo.mmResUbSize * sizeof(MM1_OUT_T);
+
+    vec1ResGm.SetGlobalBuffer(
+        (__gm__ KV_T*)(workspace + offset +
+                       aiCoreIdx * dbWorkspaceRatio * sfaKernelConstInfo.mmResUbSize * sizeof(KV_T)));
+    offset += GetBlockNum() * dbWorkspaceRatio * sfaKernelConstInfo.mmResUbSize * sizeof(KV_T);
+
+    mm2ResGm.SetGlobalBuffer(
+        (__gm__ MM2_OUT_T*)(workspace + offset +
+                            aiCoreIdx * dbWorkspaceRatio * sfaKernelConstInfo.bmm2ResUbSize * sizeof(MM2_OUT_T)));
+    offset += GetBlockNum() * dbWorkspaceRatio * sfaKernelConstInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
+    mm2ResInt32Gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(mm2ResGm.GetPhyAddr(0)));
+
+    if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+        // s2  d+rope bufNum
+        kvMergeGm_.SetGlobalBuffer((__gm__ KV_T*)(workspace + offset + aiCoreIdx * 512 * 576 * 4 * sizeof(KV_T)));
+        offset += GetBlockNum() * 512 * 576 * 4 * sizeof(KV_T);
+
+        kvValidSizeGm_.SetGlobalBuffer(
+            (__gm__ int32_t*)(workspace + offset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
+    }
+```
+
+`grep -n 'ADDR_ALIGN\|AlignUp\|512) \* 512' op_kernel/arch22/*.h` returns nothing — there is no
+explicit alignment step. But the alignment holds structurally:
+
+- `mmResUbSize = sInnerSizeAlign_ * Align(sfaCubeMSize, 16U)` where `sInnerSizeAlign_ =
+  Align(sInnerSize_, BYTE_BLOCK=32)` (section 8.1). So `mmResUbSize` is a multiple of
+  `32 * 16 = 512` elements, and every `offset +=` term is `GetBlockNum() * 2 * (512k) *
+  sizeof(T)` — a multiple of 512 bytes for any `sizeof(T) >= 1`.
+- `bmm2ResUbSize = headDimAlign_ * Align(sfaCubeMSize, 16U)`, same argument with
+  `headDimAlign_ = Align(512, 32) = 512`.
+- `kvMergeGm_`'s per-core stride is `512 * 576 * 4 * 2 = 2,359,296` bytes, and its total is
+  `GetBlockNum()` times that. Both 512 B multiples.
+- `kvValidSizeGm_`'s per-core stride is `2 * 128 * 4 * 4 = 4096` bytes.
+
+At our shape (`sInnerSizeAlign_ = 512`, `Align(gSize=4, 16) = 16`): `mmResUbSize = 8192` elements,
+so `mm1ResGm`'s span is `24 * 2 * 8192 * 4 = 1,572,864` B; `vec1ResGm` 786,432 B; `mm2ResGm`
+1,572,864 B; `kvMergeGm_` 56,623,104 B. Every boundary is 512 B-aligned. So the
+`很多异常的128B搬运` / FixPipe-at-81% mechanism is **not** a contributor here, and the 45% that
+fixing it was worth in the vendor case is not available to us.
+
+### 21.3 RULED OUT: the measured family is the attention op, not the indexer
+
+GLM-5.2 runs the lightning indexer on 21 of 78 layers and `SparseFlashAttention` on all 78
+(section 13.1). They are separate operators: `attention/lightning_indexer`,
+`attention/quant_lightning_indexer`, `attention/lightning_indexer_v2` in `ops-transformer`, and
+`csrc/attention/lightning_indexer_v2`, `quant_lightning_indexer_v2`, `msa_index_score` in
+vllm-ascend. A per-operator-family profile attributing 6.973 ms to `SparseFlashAttention`
+therefore excludes the indexer, and the indexer's cost is a separate line item not covered by
+this document.
+
+## Relevance
+
+Two candidate causes eliminated, and one calibration for what the remaining levers are worth.
+
+**The load-balance lever's yield is bounded by the makespan ratio, and the vendor states the
+rule.** `优化前负载最多的核计算量减少的倍数，即为预期提升的性能` — the speedup equals the factor
+by which the most-loaded core's work shrinks. Their case: 8 blocks → 4 blocks = 2x. Ours: with
+`T1 = 4` base blocks on 4 cores (section 14) and 2048 selected tokens split 512-per-S2-block into
+4 sequential `sInnerLoopTimes` iterations on each, the most-loaded core does 4 S2 iterations. A
+perfect S2 split over 24 cores would make that 1 iteration on 16 cores (bounded by the 512-token
+floor of section 10.2, `2048/512 = 4` useful splits per head-group x 4 head-groups = 16). So the
+makespan ratio is **4x**, not 24x — and PR #1741's `flash-decoding 拆分经定量推演为负收益`
+(section 18.1) says the combine traffic may eat it. A 4x makespan gain against a combine that
+PR #1741 measured at 7x the gather bytes is genuinely uncertain, and that uncertainty is the
+honest state of the parallelism lever.
+
+**The two cheap diagnostic candidates are dead.** Workspace misalignment (21.2) and
+indexer-cost-attributed-to-attention (21.3) are both eliminated by inspection, so neither explains
+any part of the 5.0x. That leaves the four causes of section 17 with their measured weights from
+section 20, and the ranking stands.
+
+**The `BSH → BNSD` lever has an analogue we should check.** `将输入数据排布格式从BSH更改为BNSD后，
+数据搬运连续，不需要跳地址读取数据，搬运效率提升一倍` — worth 30% in the vendor case for a 0.52
+`mte2_ratio`. Our KV layout is fixed at `PA_BSND` by the op (`layout_kv ... 当前仅支持
+PageAttention排布"PA_BSND"`, section 14.3), so the layout itself is not ours to change. But the
+same principle — `不需要跳地址读取数据` — is exactly what `sparse_block_size > 1` buys
+(section 16): consecutive selected tokens become one contiguous run instead of a jump per token.
+That is the third independent line of evidence for the block-granularity lever.
+
+---
+
+## Gaps (sections 8-21)
+
+What was looked for and not found, with the exact URLs tried.
+
+**Not found: any public statement framing sparse attention as N× off a memory roofline on
+Ascend.** `gh search issues --repo vllm-project/vllm-ascend "roofline"` returns 0 results.
+`gh search issues "ascend sparse attention performance"` (global) returns 0. The roofline framing
+in our measurement has no public counterpart; the public framing is always 离散访存 /
+instruction-count / 块数≈核数.
+
+**Not found: `aic_mte2_time` / `aiv_mte2_time` / `cube_utilization` numbers for *sparse* attention
+decode.** `gh search issues --repo vllm-project/vllm-ascend "mte2"` returns exactly one result
+(#4167, quoted in section 18 context as a dense-FFN report). The closest numbers for *any*
+small-batch attention are flash-attention-npu #325 (B=1, dense FIA, `aic_time` 47.70 us,
+`aiv_vec` 5.91 us = 11%, `wait_ib` 18.80 us, `icache_miss_rate` 0.138, ~21 us fixed floor, 4 of 20
+cores used) — a different operator on a different code base, so not transferable to
+`SparseFlashAttention`.
+
+**`mte2_iq_full_ratio` is not collectible on A3**, so the instruction-issue bottleneck that
+section 20.1 measures at 2.48x cannot be confirmed directly in our own profile. Confirmed absent
+from CANN 8.0.0's `ai_core_utilization` ResourceConflictRatio table
+(https://www.hiascend.com/doc_center/source/zh/canncommercial/800/devaids/devtools/profiling/atlasprofiling_16_0069.html);
+present only in CANN 5.0.4.6
+(https://www.hiascend.com/doc_center/source/zh/canncommercial/5046/devtools/auxiliarydevtool/atlasprofiling_16_0119.html).
+
+**No corroboration anywhere for a ~13 us MIX launch floor.** Our 0.70 us AI_VECTOR_CORE floor is
+reproduced exactly (0.67 us at 2 AIV, https://hpc101.zjusct.io/lab/Lab3.5-AscendC-Op/), but the
+same linear model predicts single-digit microseconds for MIX_AIC_1_2, not 13.58. The closest
+public figure in magnitude is `平均每层的Task平均等待的开销约为18us左右` on a DeepSeek-V3 decode
+layer (https://cann.csdn.net/69afcc5554b52172bc603633.html), which is scheduling wait rather than
+core-start cost. Treat 13.58 us as a real but unexplained measurement.
+
+**The `bottleneck_analysis.md` and `optimization_log.md` referenced by tilelang-ascend PR #1741 as
+the source of its per-family quantitative analysis are not in the repository on any branch.**
+`gh search code --repo tile-ai/tilelang-ascend "bottleneck_analysis"` returns zero results. So the
+load-bearing claim `flash-decoding 拆分经定量推演为负收益` (section 18.1) is a conclusion whose
+derivation is not public. It is the single most consequential unverifiable statement in sections
+8-21, because it contradicts the recommendation of sections 8, 10 and 12.
+
+**No A/B measurement of `sparse_block_size = 1` versus `> 4` anywhere.** The attribute is
+documented (section 16.3), the `C_TEMPLATE` path that it selects is compiled (section 16), and
+`MergeKv` is verified to be skipped under it (section 16) — but no published run compares them,
+and no accuracy delta for block-wise selection on GLM-5.2 was found. This is the cheapest
+high-value experiment identified and it is entirely unmeasured publicly.
+
+**No measurement of `SparseFlashMla` + `SparseFlashMlaMetadata` against `SparseFlashAttention` on
+the same shape.** Both are A3-supported (sections 11.1, 10.5) and differ on the S2 split, but no
+A/B exists. Whether the A3 `仅支持SWA模板` restriction (section 11.2) can express a pure top-k DSA
+pattern is unresolved.
+
+**`zhuanlan.zhihu.com/p/2074998277100017262`** ("Qwen3.8-27B 在昇腾 950PR 单卡推理测试",
+2026-08-23) returns HTTP 403 to `curl` with desktop and mobile UA and to a fetcher; the tardis
+mirrors `https://www.zhihu.com/tardis/zm/art/2074998277100017262` and `.../tardis/bd/art/...`
+return HTTP 200 with a 1255-byte stub. Search snippets indicate it contains a per-operator msprof
+breakdown including `FusedInferAttentionScore` at 15.3% of kernel time with cube utilization 56.4%
+flagged as having optimization headroom — the closest public analogue of our own table — but it
+could not be read verbatim and is therefore not quoted.
+
+**`hiascend.com/document/detail/...` is unreadable by a fetcher**: returns HTTP 200 with body
+`Please Enable JavaScript and Cookie.` Confirmed for `atlasprofiling_16_0069.html`,
+`atlas_ascendc_best_practices_10_0041.html`, `atlas_ascendc_best_practices_10_0035.html`. The
+`doc_center/source/...` and `developer/techArticles/...` paths do work; the metric definitions in
+section 20.7 came from the MindStudio 7.0.RC1 `doc_center` path.
+
+**`asc.gitcode.com/api/` is HTTP 404**; the index is at `https://asc.gitcode.com/api/README.html`
+(381 KB link list). `asc.gitcode.com/api`, `/api/index.html`, `/sitemap.xml`,
+`/api/sitemap.xml` all 404.
+
+**Other hard blocks:** `https://blog.csdn.net/m0_71340392/article/details/141166456` HTTP 521
+(the same content is at `https://bbs.huaweicloud.cn/blogs/433080`, used instead);
+`https://blog.csdn.net/julia4scientist/article/details/154120883` HTTP 521 / ETIMEDOUT — the only
+source claiming a measured `block_size` 16→128 sweep (~36% throughput, NPU util 91%, Qwen3-8B on
+Atlas 800 A2), **unverified, not cited**; `https://juejin.cn/post/7685816258889023526` and
+`.../7379147394755018792` are JS challenge pages; `https://vllm.ai/blog/2025-09-29-deepseek-v3-2`
+HTTP 302 into a corporate proxy block page at `114.114.114.114:9421` (worked around via the post's
+git source on raw.githubusercontent.com); `https://huggingface.co/THUDM/GLM-4.5/raw/main/config.json`
+HTTP 401 (canonical org is `zai-org`); `https://www.remio.ai/zh/post/glm-5-3-sparse-attention-cuts-compute-but-hbm-demand-persists-zh`
+is a 1.5 MB Wix JS shell with zero extractable prose.
+
+**`bbs.huaweicloud.com` yielded nothing**: no forum thread surfaced in any search on
+稀疏注意力 昇腾 性能, DSA 昇腾, 昇腾 离散访存 性能, or 昇腾 稀疏注意力 decode 小batch. The one
+usable Huawei-forum source was `bbs.huaweicloud.cn/blogs/433080` (Matmul tuning, found by other
+means).
+
+**No MindIE sparse-attention decode material found anywhere** — on gitee, gitcode or hiascend.
+Searched 昇腾 MindIE 稀疏注意力 性能 decode 小batch and the gitee equivalents.
+
+**`gitcode.com/liang_yue/cann-ops-adv-SparseDecodeAttention` renders fully but contains no
+performance numbers at all** — no latency, no speedup, no utilization. Its `op_eval/` directory is
+described as 性能评估 with no published results. Useful only for architectural claims
+(IFA extended to sparse; `减少 CPU 同步`; `降低 kernel launch 开销：单次 aclOpExecutor 调用替代两次独立算子调用`).
+
+**vllm-ascend PRs #12807 ("Sfa topk index cache prefetch") and #15642 ("fused sparse attention
+overlap decode") have entirely empty PR descriptions** — only a bot summary. No measurements for
+the `FusedSparseAttentionOverlap` of section 14, so its Selection-KV-Cache hit rate and its actual
+speedup are unquantified publicly.
+
+**`https://github.com/vllm-project/vllm-ascend/issues/11801` (GLM5系列模型性能基线) was never
+answered** — triage asked for config and the thread ends with a request to follow up. There is no
+public GLM-5 performance baseline on Ascend to compare our 10.8528 ms against.
+
+**Unsourced claim, explicitly flagged:** a search snippet asserted that sparse-attention kernels
+show "vector-compute pipe ratio ~9.5%". Two follow-up searches failed to locate the originating
+document. The 9.5% figure is **not** sourced and is not relied on above.
+
+**Figure-only data:** `https://github.com/vllm-project/vllm-ascend/issues/7562`'s per-stage
+microsecond latencies for the DSA IndexerSelect pipeline are in an attached PNG
+(`user-attachments/assets/e43553ab-...`) and not recoverable as text. The bandwidth-vs-block-size
+values in section 20.4 are a reading of vendor chart images, not vendor-printed numbers, and are
+labelled as such.
+
+**Reproduction note.** Both CANN doc/operator trees are public git and the default clone is
+sparse, omitting `docs/` and `examples/`:
+
+```
+git clone --depth 1 https://gitcode.com/cann/ops-transformer.git && git -C ops-transformer sparse-checkout disable
+git clone --depth 1 https://gitcode.com/cann/asc-devkit.git     && git -C asc-devkit     sparse-checkout disable
+```
+
+Heads used here: `ops-transformer` `3efc65dad2a97a4fea856c3be319da596a42fb8a` (2026-10-20 16:03
++0800) for sections 8-17 and 21.2; `asc-devkit` `5f50fc4c6adab4bf891de229f4ff69b9d49e1897`
+(2026-10-20) for section 20. A second reader independently cloned `ops-transformer` at
+`d7e6a7c6c1450c040049486845336c77f3100406` the same day; the quoted files are identical.
+`raw.gitcode.com` refuses unregistered traffic with `429 Limited account:unregisteredUser` and the
+`gitcode.com/.../raw/master/...` form returns a JavaScript shell, so cloning is the only reliable
+route.
