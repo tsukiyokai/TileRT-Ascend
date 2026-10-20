@@ -1395,5 +1395,9 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      pays 588 us a layer where the same operators replay in 214: 374 us a
      layer, 29.2 ms a round, the same unattributed four fifths of the row cost
      seen per layer. Every earlier estimate priced one half and assumed the
-     other; neither half reaches the target alone and the product of their
-     measured bests does.
+     other. But the lower rows are one die with no collective in them, so that
+     cell is not a product of comparables -- and the sixteen-rank capture that
+     would supply the missing figure was taken at max_tokens 6, which voids its
+     per-round numbers. What survives is the compute floor: 24.76 ms a round on
+     one die at 6.872 accepted is 3.60 ms, before a collective or a row is
+     counted, and the target is below it.

@@ -46,3 +46,41 @@ costed against a fixed acceptance; the drafters against a fixed round. Neither
 reaches 2.9 alone and the product of their measured bests does, which is why
 the single unattributed quantity -- 374 us a layer -- is the whole project
 rather than one lever among several.
+
+## Correction: the lower three rows exclude the sixteen-rank collectives
+
+Rows 317, 214 and 203 are all one die with TP16 shards and a dense attention
+stand-in. None of them contains a collective. So the cell at 2.43 ms is not the
+product of two comparable measurements -- it is a collectives-free compute
+figure times a measured acceptance, and the engine's 588 us a layer includes
+collectives that the 214 does not.
+
+The size of what is missing, from `profile-rope-20261018` rank 1:
+
+    AivKernel, collective    20.4 calls a round   858.4 us each   17.5 ms
+
+Twenty calls a round over 78 layers is **0.26 a layer**, not two. So the
+collectives are already mostly absorbed into the SuperKernel, and the 17.5 ms
+standalone remainder is not a per-layer quantity at all -- which is why
+dividing it by 78 to compare against 214 would be the same error in the other
+direction.
+
+And that capture is `max_tokens: 6, mtp_width: 4`, so its per-round figures are
+void for a steady-state decode, as recorded. Both halves of the attribution
+therefore have a known defect: the one-die account omits collectives, and the
+sixteen-rank capture was taken at the wrong width.
+
+## Which is why the gating experiment is the one that was queued
+
+A steady-state decode capture at the engine's own width gives the per-layer
+cost with collectives in it, on sixteen ranks, at the right width -- the single
+number both halves of this table are missing. Until it exists the table bounds
+the problem rather than solving it: the engine is at 9.3794 ms, the drafting
+side is bounded at 5.394 to 6.872 accepted, and the compute floor on one die is
+24.76 ms a round, which at 6.872 accepted is 3.60 ms before a single collective
+is counted.
+
+That last figure is the one worth carrying: **3.60 ms**, compute-only, best
+measured drafter, zero row cost, zero collectives. The target is below it, so
+2.9 ms needs acceptance above 8.5 at that floor -- which only the copy oracle
+reaches, and the oracle is not a drafter.
