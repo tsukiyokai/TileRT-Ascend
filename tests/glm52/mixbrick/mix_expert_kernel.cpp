@@ -37,6 +37,7 @@ constexpr int64_t GATE_UP = 2 * HALF;
 // example picks for exactly this handoff. A flag's counter also saturates at
 // 15 sets, which a per-layer persistent kernel will have to reckon with.
 constexpr uint16_t GATE_READY = 8;
+constexpr uint16_t VECTOR_ALIVE = 9;
 
 using AQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, false>;
 using BQuant = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, true>;
@@ -124,7 +125,8 @@ __aicore__ inline void SwiGlu(Epilogue& held)
 __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
                                 __gm__ float* gu_scale,
                                 __gm__ float* token_scale,
-                                __gm__ bfloat16_t* out, int64_t rows)
+                                __gm__ bfloat16_t* out, int64_t rows,
+                                int64_t first, int64_t stride)
 {
     Epilogue held;
     held.Init(pipe);
@@ -143,11 +145,11 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     // Two vector subblocks, alternate rows each. At eight rows the work is
     // 1024 elements, so the split is about keeping both subblocks fed rather
     // than about throughput.
-    // Two vector subblocks, alternate rows each. The stride is written out
-    // rather than taken from `GetTaskRation`, which is not 2 on every path and
-    // would make the loop never advance if it returned zero.
-    const int64_t subblocks = 2;
-    for (int64_t row = GetSubBlockIdx(); row < rows; row += subblocks) {
+    // Which rows this core owns. A MIX kernel's two vector subblocks take
+    // alternate rows; a vector-only kernel is one core and takes them all.
+    // Reading `GetSubBlockIdx` here instead would silently write every other
+    // row in the vector-only case, which is half the output.
+    for (int64_t row = first; row < rows; row += stride) {
         DataCopy(held.product, product_global[row * GATE_UP], GATE_UP);
         PipeBarrier<PIPE_ALL>();
         Cast(held.gate, held.product, RoundMode::CAST_NONE, HALF);
@@ -167,10 +169,13 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
 
 }  // namespace
 
-// The AIC:AIV ratio is declared once, by KERNEL_TASK_TYPE_DEFAULT in the
-// body. `[[bisheng::core_ratio]]` says the same thing again and the sanitizer
-// build rejects it outright in this position.
-extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_fused(
+// `__mix__(cube, vec)` is the vendor spelling and it is not interchangeable
+// with `[[bisheng::core_ratio(cube, vec)]]`: the macro has two definitions,
+// one per compilation pass -- `__attribute__((aic))` for the cube half and
+// `core_ratio` for the mix -- while the C++11 attribute applies
+// unconditionally to both, which hung every launch.
+extern "C" __global__ __mix__(1, 2) __schedmode__(1)
+__aicore__ void mix_expert_fused(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ float* gu_scale,
     __gm__ float* token_scale, __gm__ bfloat16_t* out,
@@ -178,23 +183,39 @@ extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_fused(
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     SetSyncBaseAddr(sync_base);
-    TPipe pipe;
-    // `stages` localises a hang: bit 0 the cube half, bit 1 the flag, bit 2
-    // the vector half.
+    // `stages` localises a hang: bit 0 the cube half, bit 1 the cube's set,
+    // bit 2 the vector half, bit 3 the vector's wait. Set and wait are
+    // separate bits so a hang can be attributed to one side: a set with no
+    // waiter that completes proves the set is fine, and a wait with no setter
+    // that hangs proves the vector half is alive at all.
     if ASCEND_IS_AIC {
+        TPipe cube_pipe;
         if (stages & 1) {
-            Project(pipe, x, gate_up, partial, tiling, rows);
+            Project(cube_pipe, x, gate_up, partial, tiling, rows);
         }
         if (stages & 2) {
-            CrossCoreSetFlag<0x0, PIPE_FIX>(GATE_READY);
+            // Mode 2 is the only one that crosses from cube to vector. Mode 0
+            // synchronises cores of the same kind, so a mode-0 set from the
+            // cube raises a flag only another cube would consume and the
+            // waiting vector core never sees it -- which is what hung every
+            // run that included this flag.
+            CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
+        }
+        if (stages & 16) {
+            CrossCoreWaitFlag(VECTOR_ALIVE);
         }
     }
     if ASCEND_IS_AIV {
-        if (stages & 2) {
+        TPipe vector_pipe;
+        if (stages & 8) {
             CrossCoreWaitFlag(GATE_READY);
         }
+        if (stages & 16) {
+            CrossCoreSetFlag<0x02, PIPE_MTE3>(VECTOR_ALIVE);
+        }
         if (stages & 4) {
-            Activate(pipe, partial, gu_scale, token_scale, out, rows);
+            Activate(vector_pipe, partial, gu_scale, token_scale, out, rows,
+                     GetSubBlockIdx(), 2);
         }
     }
 }
@@ -202,7 +223,8 @@ extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_fused(
 // The AIC:AIV ratio is declared once, by KERNEL_TASK_TYPE_DEFAULT in the
 // body. `[[bisheng::core_ratio]]` says the same thing again and the sanitizer
 // build rejects it outright in this position.
-extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_project(
+extern "C" __global__ __mix__(1, 2) __schedmode__(1)
+__aicore__ void mix_expert_project(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ uint8_t* tiling, int64_t rows)
 {
@@ -224,7 +246,7 @@ void mix_expert_activate(__gm__ int32_t* partial, __gm__ float* gu_scale,
                          int64_t rows)
 {
     TPipe pipe;
-    Activate(pipe, partial, gu_scale, token_scale, out, rows);
+    Activate(pipe, partial, gu_scale, token_scale, out, rows, 0, 1);
 }
 
 void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
