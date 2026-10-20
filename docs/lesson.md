@@ -1999,3 +1999,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      is 9.4 ms a round that no lever has touched and that capture removes by
      construction -- larger than the rope refresh's 6.61 ms, and the same
      mechanism.
+
+190. No super kernel contains attention, so its eager call is structural.
+     Grouping the capture's 1911 super kernel calls by the operator each name
+     ends in: GatherV3 234, QuantBatchMatmulV3 234 and 225 and 63, GroupedMatmul
+     225, ForeachAddList 225, DynamicQuant 48 and 48, one aiv_all_reduce 3 --
+     and zero naming attention. Each group is 75 to 78 a round, once a layer, so
+     the super kernel fuses the MoE side and attention sits outside it. Its 120
+     us of argument handling a call is therefore 9.4 ms a round that capture
+     removes, not an artefact of this capture's width. It also explains the 637:
+     eight super kernels a layer grouped by operator type, which is why "78
+     super kernels at 210 us" was wrong in both factors.

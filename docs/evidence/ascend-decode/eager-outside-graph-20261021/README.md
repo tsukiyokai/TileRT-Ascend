@@ -145,3 +145,36 @@ removes by construction.
 
 That is the largest single item left in the host account, and it follows from
 the same mechanism already implemented for the rope refresh.
+
+## Confirmed: no super kernel contains attention
+
+The same capture shows 637 super kernel calls a round and 81 eager attention
+calls, which is only consistent if the super kernel covers part of the model.
+Grouping its 1911 calls by the operator each name ends in:
+
+    GatherV3               234
+    QuantBatchMatmulV3     234
+    GroupedMatmul          225
+    QuantBatchMatmulV3     225
+    ForeachAddList         225
+    QuantBatchMatmulV3      63
+    DynamicQuant            48 + 48
+    aiv_all_reduce           3
+    super kernels naming attention: 0
+
+Each group is 225 to 234 calls over three rounds, so 75 to 78 a round -- once a
+layer. The super kernel fuses the MoE side: the routing gather, the quantised
+matmuls, the grouped matmul, the expert combine, the quantisation. **Attention
+is not in any of them.**
+
+So the eager attention call is structural rather than an artefact of this
+capture's width. Its 120 us of argument handling a call, 78 times a round, is
+9.4 ms that capture would remove -- and it is the largest item in the host
+account that no lever touches.
+
+## And it explains the 637
+
+Eight or so super kernels a layer rather than one, grouped by operator type,
+which is why the earlier reading of "78 super kernels at 210 us" was wrong in
+both factors: there are 637 calls a round at 52.7 us average, and the 210 us
+names were the few heavy ones.
