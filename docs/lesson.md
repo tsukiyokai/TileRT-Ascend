@@ -1181,3 +1181,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      thirty-five arms queued today would have measured the MTP engine under
      names that say drafter. Read the record's own fields, not the directory's
      name.
+
+121. Dummy weights and tensor parallelism are incompatible, which closes the
+     truncated-backbone triangle. Under `load_format="dummy"` each of sixteen
+     ranks initialises its own random weights, so they disagree about the first
+     token and `start_mtp`'s check fires -- correctly, since catching that is
+     what it is for. A shard is not a copy, so seeding identically would not
+     help. The route needed dummy weights because the loader walks every tensor
+     the checkpoint index lists; it needed real weights because TP16 needs one
+     model. Running this engine in a fraction of its memory needs a loader that
+     skips absent layers, which is inside vLLM. Fifteen constraints were cleared
+     on the way, eleven of them our own, and the attempt found the two
+     corrections that mattered more than the route.
