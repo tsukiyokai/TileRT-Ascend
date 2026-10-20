@@ -28,11 +28,13 @@ rather than to its ceiling.
 | TP reduction by one-sided push | 6.50 ms | `--onesided-reduce` |
 | four projections off the hidden states | 2.46 ms | unwired |
 | residual add with the norm | 1.46 ms | unwired |
-| grouped matmul to CANN's own | 1.40 ms | `STOCK_OPP=1`, net 1.4 |
+| withholding the custom aclnn library | 2.14 ms | a trimmed opp path, net 2.14 |
 | adaptive draft width | 9.7 percent | on by default with `--automaton` |
 
-20.30 ms of merges takes the round to about 33 ms at width 16; with the
-adaptive tree's 9.288 accepted that is a TPOT near 3.57 ms.
+21.04 ms of merges takes the round to about 34.4 ms at width 16; with the
+adaptive tree's 9.288 accepted that is a TPOT near 3.70 ms. The width term is
+the graph's, so the capture should match the tree's typical 13.1 nodes rather
+than its ceiling.
 
 ## The queue
 
@@ -44,10 +46,11 @@ tenant-occupied since 00:17 with 54.5 GiB held on the busiest die against a
 
 ## Open, in order of what they decide
 
-1. **What in graph replay scales with width.** Attention is the leading
-   candidate and the only layer operator not measurable from one die --
-   `aclnnSparseFlashAttention` rejects five argument sets with a tiling
-   failure. The width arms answer it.
+1. ~~What in graph replay scales with width.~~ Answered on one die with a
+   synthetic graph: eager is flat across a fourfold row range while replay
+   rises monotonically, 2.3 us a row over eight layers. Capture fixes shapes
+   into the task list and a wider list costs more to replay.
+   [Evidence](evidence/ascend-decode/graph-width-replay-20261021/README.md)
 2. **The 20.30 ms end to end.** None of it has run in the engine.
 3. ~~The tree mask from the decode loop.~~ Done: `--tree` selects the
    drafter, `MtpRoundExecutor` dispatches on `propose_tree`, the mask writer
