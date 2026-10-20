@@ -921,3 +921,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     trajectory -- wider drafts accept more, advance further, grow the KV faster
     and pay more for attention later -- so the fitted slope is mostly context
     length. Compare at constant trajectory length, not constant round count.
+
+98. Five mechanisms excluded and the slope still stands. `round = 45.88 + 0.814
+    a row` survives: graph buckets (one captured size), the TP reduction (flat
+    to negative over an eightfold byte range), per-row operator cost (0.336 us
+    a row a layer against 10.4 claimed), trajectory length (the arms cap tokens
+    not rounds), and the Gloo command broadcast (305 us at width 0, 289.6 at
+    64). A fit with residuals of a few hundred microseconds across a 19.3 ms
+    span is not noise, so something real is being measured and it has not been
+    named. Record that as the state rather than picking the least-disproven
+    story.

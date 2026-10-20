@@ -82,3 +82,32 @@ Not adjacent widths -- buckets are excluded, so that tests nothing. Fix the
 number of tokens generated rather than the number of rounds, and compare
 widths over the same trajectory length. If the round cost is flat in the width
 at constant trajectory, the row term is an artefact of the measurement.
+
+## Five candidates excluded; the slope is sound and what it measures is not identified
+
+Added to the three above:
+
+- **Trajectory length.** The arms cap at `--max-tokens 1024`, so every width
+  generates the same token count over the same growing context. Width changes
+  the round count, not the trajectory.
+- **The Gloo command broadcast.** A round's scope is "Gloo, draft chain,
+  verify, MTP recompute, commit", and the Gloo part is one
+  `broadcast_object_list` a round. Measured over two ranks it is flat in the
+  draft size: 305.0 us at width 0, 289.6 at 64.
+
+So the fitted 0.814 ms a row is real -- four widths, 19.3 ms across the range,
+residuals of a few hundred microseconds -- and none of the five mechanisms that
+could produce it survives measurement. The honest position is that the slope is
+sound and what it measures has not been identified, which is why the queued
+width arms lead the queue: this one number decides whether a tree's budget is
+affordable, and with it whether 2.x ms is reachable.
+
+## A smaller finding on the way past
+
+The Gloo command broadcast costs 305 us an object against 106 us for an
+equivalent integer tensor -- threefold on two ranks, and object broadcast
+pickles, sends a length, then sends bytes, so sixteen ranks will be worse.
+One a round at 55 ms is half a percent, but the fix is to broadcast a
+fixed-size tensor instead of a Python object, and the drafter is deterministic
+so each rank could recompute the draft from the same state at 0.1 us rather
+than receive it at all.
