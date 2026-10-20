@@ -38,3 +38,44 @@ serial-equivalence check that failed at width 8 or above, whose output nobody
 kept. The gate is therefore a recorded observation with no located cause, and
 the cheapest way forward is to re-run the comparison and read the failure rather
 than to keep reading the code -- four readings have now found nothing.
+
+## The comparison, re-run: the boundary is real and the cause is numerical
+
+One die, the gathered path against the same attention computed one query row at
+a time, which is what serial equivalence means. Random selections, 2048 rows a
+query, bf16:
+
+| width | max abs | max rel | verdict |
+|---|---|---|---|
+| 1 | 0 | 0 | exact |
+| 2 | 0 | 0 | exact |
+| 4 | 0 | 0 | exact |
+| 6 | 0 | 0 | exact |
+| 8 | 0.000976562 | 0.194073 | differs |
+| 12 | 0.00195312 | 0.164032 | differs |
+| 16 | 0.000976562 | 0.171661 | differs |
+
+So the boundary is exactly where the constant says, and the failure is one bf16
+least-significant unit -- 0.00098 is 2^-10, the gap between neighbouring bf16
+values near 1. The relative figure of 0.17 comes from dividing by elements near
+zero, not from a large error.
+
+## Which changes what the gate means
+
+Not a logic error. A misindexed gather or a wrong sequence length would
+disagree by order-one amounts, not by one unit in the last place. What changes
+at eight is the operator's internal blocking: `actual_seq_kvlen=[2048] * width`
+batches the queries, and a different width gives a different reduction order
+over the same 2048 keys.
+
+So the gate is correct if the criterion is bit-exactness and unnecessary if the
+criterion is a tolerance. That is a decision rather than a defect, and it is
+now a measured one: four readings of the code found no cause because there is
+no error in the code.
+
+## What this leaves for a width above six
+
+The project's own numerics gate is what decides. If it accepts a bf16 ULP on
+the attention output -- and the W4A8C8 checkpoint's own quantisation is far
+coarser -- then `GATHER_FIA_MAX_WIDTH` can be raised and the gathered path
+becomes available at the widths the drafters actually want, 12 to 24.

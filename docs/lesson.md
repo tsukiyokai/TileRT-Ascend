@@ -1869,5 +1869,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the caller's tensor, not a slice of that buffer. So the gate is a recorded
      observation -- "widths above six failed serial-equivalence checks" --
      whose failing output nobody kept, and four readings have now found
-     nothing. Re-running the comparison and reading the failure is cheaper than
-     a fifth reading.
+     nothing -- because there is no error in the code. Re-run on one die, the
+     gathered path against one query row at a time: exact at widths 1, 2, 4 and
+     6, differing at 8, 12 and 16 by 0.00098, which is 2^-10, one bf16 unit in
+     the last place. The 0.17 relative figure is division by elements near
+     zero. So the boundary is real, the cause is the operator's internal
+     blocking under `actual_seq_kvlen=[2048] * width`, and the gate is correct
+     under a bit-exact criterion and unnecessary under a tolerance -- a
+     decision, not a defect.
