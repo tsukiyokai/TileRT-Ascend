@@ -1694,3 +1694,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      buffer, the algorithm and determinism -- it is the handshake intrinsic to
      a collective, and the only way past is fewer calls, which is an execution
      structure rather than a setting.
+
+165. Computing every attention head on every rank beats sharding plus a reduce,
+     at batch one. One die, 12 rows, 8192 cache rows: 4 heads cost 87.17 us and
+     64 cost 161.03 -- sixteen times the heads for 1.85 times the cost, because
+     at twelve rows the attention is dominated by reading the 9.4 MB cache and
+     that read does not scale with heads. So sharded is 87.17 plus a 120 us
+     reduce, 207 a layer; redundant is 161.03 and no reduce, 161 a layer. That
+     is 46 us a layer, 3.6 ms a round against the better expansion mode and 9.8
+     against the default. The cost is a replicated KV cache: 734 MB a rank, 1.5
+     percent of what it already holds. Not yet established: that the engine's
+     MLA path can be asked for every head, since q_b and o_proj are sharded
+     with them, which is sixteen times the attention weights rather than the
+     cache.
