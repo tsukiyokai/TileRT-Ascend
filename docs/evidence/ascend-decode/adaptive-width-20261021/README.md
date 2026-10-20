@@ -38,3 +38,26 @@ a per-row attention mask the kernel does not take; this lowers the width's cost
 and needs nothing. Both are needed: engine work reaches about 40 ms a round,
 and 2.9 ms at 40 ms needs 13.8 accepted, which the tree reaches at a low edit
 rate while this makes each round cheaper.
+
+## The factor, and a baseline the change had quietly rewritten
+
+Sweeping the multiplier at an edit rate of 0.05:
+
+    factor 1.5   acceptance 4.031   mean width  6.1   TPOT 12.62
+    factor 2     acceptance 4.369   mean width  8.1   TPOT 12.01
+    factor 3     acceptance 4.369   mean width 10.9   TPOT 12.54
+    factor 4     acceptance 4.369   mean width 13.2   TPOT 12.97
+
+Two is best, and the shape is right: past three the acceptance is capped at
+4.369 while the width keeps growing, and at 1.5 the proposal is too short to
+hold what the stream offers.
+
+The sweep also exposed a regression of its own making. The adaptive ceiling
+was hardcoded inside `propose`, so the fixed-width column that was supposed to
+be the baseline fell from 5.393 to 2.896 -- the comparison was against a
+contaminated control. It is now a constructor argument, on by default and off
+for a caller that needs a fixed row count, such as a graph with static token
+buckets.
+
+Final figures at 0.05: fixed width 32 accepts 5.393 for a TPOT of 13.34, and
+adaptive accepts 4.351 at a mean width of 8.0 for 12.05 -- 9.7 percent.

@@ -99,7 +99,8 @@ def run(stream, prompt_length, width, budget, branches, longest):
     long_chain = LookupDrafter(prompt, longest=longest, shortest=2)
     # The same contract as the chain drafters, so this column is what an
     # engine would see from a module swap alone, with no tree verification.
-    automaton = AutomatonDrafter(prompt, longest=longest, shortest=2)
+    automaton = AutomatonDrafter(prompt, longest=longest, shortest=2,
+                                 adaptive=False)
     tree = TreeDrafter(prompt, longest=longest, budget=budget,
                        branches=branches)
     chain_accepted = []
@@ -132,12 +133,16 @@ def run(stream, prompt_length, width, budget, branches, longest):
         automaton.commit(stream[at:at + step])
         tree.commit(stream[at:at + step])
         at += step
+    import os
+
+    factor = float(os.environ.get("FACTOR", "2"))
+    floor = int(os.environ.get("FLOOR", "2"))
     walker = AutomatonDrafter(prompt, longest=longest, shortest=2)
     at = prompt_length
     taken_last = 1
     while at < len(stream):
         truth = stream[at:at + max(width, budget)]
-        here = min(width, max(2, 2 * taken_last))
+        here = min(width, max(floor, int(round(factor * taken_last))))
         taken = accepted_by_chain(walker.propose(here), truth) + 1
         taken = min(taken, len(stream) - at)
         walker.commit(stream[at:at + taken])

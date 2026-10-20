@@ -789,3 +789,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     continuation of a short match rather than from a long match. Scoring any of
     this inside a loop whose columns share one advance locks the feedback at the
     narrowest width; an adaptive column needs its own trajectory.
+
+85. A change that alters shared code rewrites its own baseline. The adaptive
+    ceiling went straight into `propose`, so the fixed-width column it was
+    being compared against fell from 5.393 to 2.896 and the comparison was
+    against a contaminated control -- the third time today a measurement was
+    taken against something the change had already moved. Behaviour that
+    changes a default belongs behind a constructor argument, with the control
+    pinned explicitly. The factor sweep that found this also settled it: two is
+    best, 12.01 against 12.62, 12.54 and 12.97 at 1.5, 3 and 4.

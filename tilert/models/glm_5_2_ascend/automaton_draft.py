@@ -25,13 +25,16 @@ from .tree_draft import SuffixAutomaton
 class AutomatonDrafter:
     """Hold the context and propose what most often followed its tail."""
 
-    def __init__(self, prompt, longest=32, shortest=2):
+    def __init__(self, prompt, longest=32, shortest=2, adaptive=True):
         # Kept for report parity with the drafter this replaces; the walk
         # needs no length bounds of its own.
         self.longest = longest
         self.shortest = shortest
         self.automaton = SuffixAutomaton()
         self.context = []
+        # A caller that needs a fixed row count -- a graph with static token
+        # buckets, or a measurement of the ceiling itself -- turns this off.
+        self.adaptive = adaptive
         self.accepted_last = 1
         self.rounds = 0
         self.hits = 0
@@ -58,7 +61,8 @@ class AutomatonDrafter:
         7.18 at an edit rate of 0.02 and 12.02 against 13.24 at 0.05.
         """
         self.rounds += 1
-        count = min(count, max(2, 2 * self.accepted_last))
+        if self.adaptive:
+            count = min(count, max(2, 2 * self.accepted_last))
         counts = self.automaton.occurrences()
         state = self._deepest_with_continuation(counts)
         if state is None:
