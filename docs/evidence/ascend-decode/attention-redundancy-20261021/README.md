@@ -46,3 +46,34 @@ with it, is the next question.
 And the 120 us saved assumes one collective a layer attributable to attention.
 The round's measured collective cost is 374 us a layer, which is about two
 calls, so the other one belongs to the MoE and is untouched by this.
+
+## The weight cost, read from the checkpoint: 13.91 GB a rank
+
+The shapes, not guessed:
+
+    q_a_proj.weight      (2048, 6144)    I8
+    q_b_proj.weight      (16384, 2048)   I8
+    kv_b_proj.weight     (28672, 512)    BF16
+    o_proj.weight        (6144, 16384)   I8
+
+16384 is 64 heads of 256, not of 128 -- which is where an estimate of 2.4 GB
+came from and why it was wrong by six times.
+
+    one layer, as stored          190.2 MB
+    78 layers                      14.83 GB
+    a rank's share at TP16          0.93 GB
+    replicated, the added cost     13.91 GB
+
+So the trade is **30 percent of a rank's 47 GiB budget for 3.6 ms a round**,
+not the 1.5 percent the cache-only reading suggested. Memory is tight in this
+configuration -- the precheck wants 47 of 64 GiB -- so this is a real cost
+rather than a rounding error.
+
+## Which makes it a dial rather than a switch
+
+The saving and the cost are both linear in the number of layers made redundant:
+46 us and 178 MB a layer. Twenty layers is 3.6 GB for 0.92 ms a round; forty is
+7.1 GB for 1.84 ms.
+
+So the lever survives, at a worse exchange rate than first priced, and it is
+tunable against whatever memory the KV cache and the expert bank leave.
