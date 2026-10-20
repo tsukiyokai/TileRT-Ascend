@@ -194,3 +194,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     side through global memory, which is cheap only because it lands in L2.
     `rtGetC2cCtrlAddr` returns the sync base address but only once a device is
     bound. [Reference](reference/ascend-fusion-mechanics.md).
+
+35. Learn the kernel debugger before the kernel needs it. Four blind
+    bisections cost more than the whole toolchain survey did, and two of the
+    three real defects came out of tools rather than reasoning. The
+    instrumented compile rejects an attribute list the plain one accepts,
+    which is how `[[bisheng::core_ratio(1, 2)]]` was found to be a second
+    declaration of the ratio `KERNEL_TASK_TYPE_DEFAULT` already sets -- it
+    hung every run. And `--cce-aicore-arch=dav-c220` drops `__schedmode__`
+    with no warning while `--npu-arch=dav-2201` keeps it, which only the
+    runtime log's `schemMode` field shows. `synccheck` reports at kernel exit,
+    so it is silent on a hang; a stage bitmask on the kernel argument
+    localises one in four runs. [debug.md](debug.md).

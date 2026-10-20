@@ -244,3 +244,11 @@ design the first bricks to need the cube-to-vector direction only.
 `Muls` takes half, float, int16 or int32 and rejects BF16. Compute in FP32 and
 `Cast` the roundings back where the unfused stages have them, or the result is
 more accurate and no longer comparable.
+
+Kernel debugging has its own page now: [debug.md](debug.md) maps the CUDA and
+ROCm tools onto `msdebug`, `mssanitizer`, `msprof`, `msobjdump` and the CPU
+simulation library, and records what each one did on a real hang. Two results
+from it belong in any build script: `--npu-arch=dav-2201` rather than
+`--cce-aicore-arch=dav-c220`, because the latter silently drops
+`__schedmode__`; and never grep a compiler log for `error` alone, because the
+warnings carry the answers.

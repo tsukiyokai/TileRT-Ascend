@@ -20,12 +20,23 @@ for d in asc/impl/adv_api asc/impl/basic_api asc/impl/c_api \
   device_incs="$device_incs -I $H/$d"
 done
 device_incs="$device_incs -I /opt/ascend/cann-9.2.0/include -I $here"
+# `mssanitizer` refuses a kernel built without this, with "No active sanitizer
+# tool on kernel". Opt in with SANITIZE=1; it changes the binary, so never
+# time an instrumented build.
+sanitize=${SANITIZE:+--cce-enable-sanitizer}
+# DEBUG=1 adds device debug info so `msdebug` can break inside the kernel.
+# ARCH overrides the architecture flag: `--cce-aicore-arch=dav-c220` silently
+# drops `__schedmode__`, while `--npu-arch=dav-2201` makes it reach the
+# kernel metadata, which the runtime log reports as schemMode.
+debug=${DEBUG:+-g}
+arch=${ARCH:---npu-arch=dav-2201}
 host_incs="-I $H/tikcpp/tikcfw -I $H/tikcpp/tikcfw/lib -I $H/tikcpp/tikcfw/impl"
 host_incs="$host_incs -I $H/tikcpp/tikcfw/interface"
 host_incs="$host_incs -I /opt/ascend/cann-9.2.0/include -I $here"
 
-/opt/ascend/cann-9.2.0/bin/bisheng -xcce --cce-aicore-arch=dav-c220 \
-  -std=c++17 -O2 $device_incs -c "$here/mix_expert_kernel.cpp" \
+/opt/ascend/cann-9.2.0/bin/bisheng -xcce "$arch" \
+  -std=c++17 -O2 ${sanitize:-} ${debug:-} $device_incs \
+  -c "$here/mix_expert_kernel.cpp" \
   -o "$out/kernel.o" > "$out/kernel_build.log" 2>&1
 g++ -std=c++17 -O2 $host_incs -c "$here/mix_tiling.cpp" \
   -o "$out/tiling.o" > "$out/tiling_build.log" 2>&1

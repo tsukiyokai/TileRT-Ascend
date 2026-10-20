@@ -14,6 +14,15 @@
  * parallel decomposition -- the multi-core N split needs the gate and up rows
  * interleaved so a core owns whole pairs, which is a separate change.
  */
+// MIX-mode Matmul is driven from the AIV: `Iterate` on the vector side only
+// notifies the cube side, which answers when the matrix work is done. That is
+// the KFC channel, and it is why a vendor MIX entry carries a
+// `__kfc_workspace__`. Calling the API from inside `if ASCEND_IS_AIC` is the
+// server half running the client's code with no client, and it deadlocks.
+// This macro selects the other route -- Matmul on the cube side only -- and
+// `matmul_intf.h` reads it, so it has to precede the include.
+#define ASCENDC_CUBE_ONLY
+
 #include "mix_expert_kernel.h"
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
@@ -158,8 +167,10 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
 
 }  // namespace
 
-extern "C" __schedmode__(1) __global__ [[bisheng::core_ratio(1, 2)]]
-__aicore__ void mix_expert_fused(
+// The AIC:AIV ratio is declared once, by KERNEL_TASK_TYPE_DEFAULT in the
+// body. `[[bisheng::core_ratio]]` says the same thing again and the sanitizer
+// build rejects it outright in this position.
+extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_fused(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ float* gu_scale,
     __gm__ float* token_scale, __gm__ bfloat16_t* out,
@@ -188,8 +199,10 @@ __aicore__ void mix_expert_fused(
     }
 }
 
-extern "C" __schedmode__(1) __global__ [[bisheng::core_ratio(1, 2)]]
-__aicore__ void mix_expert_project(
+// The AIC:AIV ratio is declared once, by KERNEL_TASK_TYPE_DEFAULT in the
+// body. `[[bisheng::core_ratio]]` says the same thing again and the sanitizer
+// build rejects it outright in this position.
+extern "C" __global__ __schedmode__(1) __aicore__ void mix_expert_project(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ uint8_t* tiling, int64_t rows)
 {

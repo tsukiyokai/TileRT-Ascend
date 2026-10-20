@@ -220,7 +220,7 @@ int main(int argc, char** argv)
         for (int step = 0; step < repeats; ++step) {
             mix_expert_fused_launch(BLOCK_DIM, stream, sync_base, x, weight,
                                     partial, (float*)scale, (float*)token,
-                                    fused_out, tiling, rows);
+                                    fused_out, tiling, rows, stages);
         }
         Check(aclrtSynchronizeStream(stream), "fused timing");
         clock_gettime(CLOCK_MONOTONIC, &end);

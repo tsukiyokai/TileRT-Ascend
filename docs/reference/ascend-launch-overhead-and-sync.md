@@ -1849,3 +1849,358 @@ garbled output on every request and crashes the prefill ranks with AI-vector-cor
 507035; disabling it on the same build is correct. That is our hardware, our quantization and
 our parallelism. Treat MegaMoE as a design to learn from and a code base to read, not as a
 component to depend on, until that defect is understood.
+
+---
+
+## MIX kernel hangs with a populated AIV half — diagnosis
+
+Target: `tests/glm52/mixbrick/mix_expert_kernel.cpp`, A3, CANN 9.2.0,
+`bisheng -xcce --cce-aicore-arch=dav-c220`, raw `<<<1, nullptr, stream>>>`.
+Symptom: `mix_expert_project` (cube half only) returns; `mix_expert_fused` (same cube half plus
+an AIV half) hangs in `aclrtSynchronizeStream`, and hangs even at `stages=1` where the AIV half
+is runtime-skipped.
+
+Sources below are the CANN 9.0 API reference and `cann/asc-devkit` best-practice samples,
+already transcribed in `ascend-fusion-mechanics.md` §5, §11, §14, §15, §16, §25; URLs repeated
+here so this section stands alone. Read 2026-10-20.
+
+### D.1 The cause: MIX-mode `Matmul` is driven from the AIV, and you took the AIV away
+
+This is the mechanism, and it is documented. Verbatim, CANN 9.0 「Matmul使用说明」
+https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0614.html
+
+> 分离模式：Matmul API都是从AIV侧发起的，调用Iterate计算时在AIV侧只会起到通知的作用，通知AIC去做矩阵计算，计算完成后AIC告知AIV计算完成。
+
+In the default (separated) mode the Matmul high-level API **is issued from the AIV side**;
+`Iterate` on the AIV is a notification to the AIC, and the AIC replies on completion. The AIC
+is the compute server, not the caller. This is the "kfc" (kernel function call) channel, which
+is why the vendor's own entry point carries a `__kfc_workspace__` parameter (§D.3).
+
+`mix_expert_kernel.cpp` calls `mm.Init / SetTensorA / SetTensorB / IterateAll / End` inside
+`if ASCEND_IS_AIC`, and gives the AIV unrelated work. That is the client half on the server
+core, with no client.
+
+The same page states the mode selection and the one hard sequencing rule:
+
+> 默认为MIX模式（包含矩阵计算和矢量计算），该场景下通常不定义ASCENDC_CUBE_ONLY宏，如果在程序中使用了ASCENDC_CUBE_ONLY宏，则必须使用ASCEND_IS_AIC宏和ASCEND_IS_AIV宏将Cube计算和Vector计算隔离开。
+>
+> 纯Cube模式（只有矩阵计算）场景下，建议在代码中定义ASCENDC_CUBE_ONLY宏，避免额外的性能开销。
+
+```cpp
+// 纯cube模式（只有矩阵计算）场景下，需要设置该代码宏，并且必须在#include "lib/matmul_intf.h"之前设置
+// #define ASCENDC_CUBE_ONLY
+#include "lib/matmul_intf.h"
+```
+
+Note 「**必须在#include "lib/matmul_intf.h"之前设置**」 — before the include, not after.
+
+`mix_expert_kernel.cpp` line 19 includes `lib/matmul_intf.h` with no such define anywhere in
+the file. So `Matmul` is instantiated in MIX mode, while the kernel body is written in the
+cube-only *structure*. The vendor page names that structure and says it requires the macro —
+this is the 底层编码 route, verbatim, same page:
+
+> 上文介绍的实现方法，AIC侧和AIV侧的代码隔离和核间同步由框架来完成，开发者无需关心。除该方法外，开发者也可以选择底层编码的方式在分离模式下实现融合算子，这种方式将更加灵活。采用底层编码方式时，需要注意以下几点：
+>
+> 通过ASCEND_IS_AIV和ASCEND_IS_AIC实现AIV和AIC代码之间的隔离。
+>
+> 自行实现AIC核和AIV核之间的同步：比如Matmul + LeakyRelu算子样例中，需要确保在AIC完成矩阵计算后，AIV再进行LeakyRelu的计算。
+>
+> **使用高阶API Matmul时需要设置ASCENDC_CUBE_ONLY，表示仅在AIC侧调用Matmul API。**
+>
+> 使用设置Kernel类型接口设置Kernel类型为KERNEL_TYPE_MIX_xxx，同时启用AIV核和AIC核。
+
+```cpp
+#define ASCENDC_CUBE_ONLY // 指定Matmul运行在AIC上
+KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);  // 设置Kernel类型为KERNEL_TYPE_MIX_xxx
+if ASCEND_IS_AIC {
+    ...
+    // AIC核进行Matmul计算
+    // AIC核完成计算后，通过AscendC::CrossCoreSetFlag<modeId, pipe>(flagId)发送同步flag
+}
+if ASCEND_IS_AIV {
+    ...
+    // AIV核通过AscendC::CrossCoreWaitFlag(flagId)接收同步flag
+    // AIV核进行LeakyRelu计算
+}
+```
+
+That code block is `mix_expert_fused` line for line — `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)`,
+`if ASCEND_IS_AIC { Matmul; CrossCoreSetFlag }`, `if ASCEND_IS_AIV { CrossCoreWaitFlag; vector }` —
+minus its first line.
+
+### D.2 The second, independent defect: no system workspace, and no null guard
+
+Same page, verbatim:
+
+> Matmul高阶API内部实现时需要使用系统workspace，开发者需要：
+>
+> 在host侧Tiling实现时，设置总的workspace的数值大小（包含用户workspace和系统workspace），workspace空间由框架来申请并管理。系统workspace的空间大小通过GetLibApiWorkSpaceSize获取。
+
+```cpp
+size_t userWorkspaceSize = 0;
+size_t systemWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+currentWorkspace[0] = userWorkspaceSize + systemWorkspaceSize;
+```
+
+> 若算子工程不是自定义算子工程，也不是带有HAVE_WORKSPACE编译宏的Kernel直调算子工程，kernel侧需要在Matmul初始化前，通过SetSysWorkSpace设置系统workspace。
+
+```cpp
+// 使用Matmul时必须设置workspace空间
+SetSysWorkspace(workspace);
+if (GetSysWorkSpacePtr() == nullptr) {
+    return;
+}
+```
+
+`mixbrick` is a kernel-direct-launch project, does not define `HAVE_WORKSPACE`, never calls
+`SetSysWorkspace`, has no `__kfc_workspace__` parameter, and never checks
+`GetSysWorkSpacePtr()`. So the system workspace is null. The vendor's own guard *returns early*
+on exactly this condition, which tells you the library does not tolerate it. The KFC
+request/reply queue between AIV and AIC lives in that workspace; a handshake against a null base
+address is a wait that is never answered.
+
+Either D.1 or D.2 alone is sufficient to deadlock. Both are present.
+
+### D.3 Known-good raw-launch MIX declarations — item 3, four of them
+
+**None of them uses `[[bisheng::core_ratio(1, 2)]]`. All use `__global__ __mix__(aic, aiv)`.**
+
+**(a) The closest analogue to the mixbrick workload** — per-token-quantized int8 grouped matmul
+with dequant + activation + cast in one `__mix__` kernel, `<<<>>>`-invoked, A3 at CANN >= 9.2.0:
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
+
+> | 产品 | CANN软件版本 |
+> |------|-------------|
+> | Ascend 950PR&950DT系列产品 | >= CANN 9.2.0 |
+> | Atlas A3系列产品 | >= CANN 9.2.0 |
+> | Atlas A2系列产品 | >= CANN 9.2.0 |
+
+```cpp
+constexpr uint32_t scenarioNum = SCENARIO_NUM;
+// ...
+constexpr uint32_t PIPELINE_DEPTH = (scenarioNum >= 2) ? 4 : 1;
+
+template <...>
+#if SCENARIO_NUM == 0
+__global__ __mix__(1, 1)
+#else
+__global__ __mix__(1, 2)
+#endif
+void quant_group_matmul_custom(...)
+```
+
+**(b) Matmul on AIC + GELU on AIV, hand-split, with `CrossCoreSetFlag`** — the structure
+mixbrick is reaching for:
+
+https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/matmul_gelu_high_performance/README.md
+
+> 本样例使用 `__global__ __mix__(1, 2)` 声明核函数，表示每个逻辑核由1个AIC和2个AIV组成。AIC侧负责Matmul计算，AIV侧负责GELU向量计算，两者在同一AI Core内按(baseM × baseN)块粒度流水并行。
+
+```cpp
+__global__ __mix__(1, 2) void mmad_vector_custom(__gm__ uint8_t* xMatrix, __gm__ uint8_t* yMatrix, __gm__ uint8_t* zMatrix)
+{
+    AscendC::InitSocState();
+    KernelMmadVector<...> op;
+    op.Init(xMatrix, yMatrix, zMatrix);
+    op.Process();
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+```
+
+```cpp
+if ASCEND_IS_AIC {
+    // AIC侧：Buffer分配 + 计算循环 + Fixpipe搬出
+    ProcessLoopAic(...);
+}
+if ASCEND_IS_AIV {
+    // AIV侧：GELU向量计算 + 搬出至GM
+    ProcessLoopAiv();
+}
+```
+
+> AIC侧每完成一个 (baseM × baseN)大小子块的Fixpipe输出后，通过 `CrossCoreSetFlag` 通知AIV侧数据已就绪；AIV侧通过 `CrossCoreWaitFlag` 等待该信号，然后开始GELU计算
+
+Note `AscendC::InitSocState();` as the first statement and `PipeBarrier<PIPE_ALL>()` as the
+last. `mix_expert_fused` has neither.
+
+**(c) The framework-managed form, showing what the workspace plumbing looks like** — CANN 9.0
+Matmul+LeakyRelu sample, same API-reference page as D.1:
+
+```cpp
+// kernel入口函数，mix场景，AIC:AIV=1:2
+__global__ __mix__(1, 2) void matmul_leakyrelu_custom(GM_ADDR a, GM_ADDR b, GM_ADDR bias, GM_ADDR c,
+                                                      __kfc_workspace__ GM_ADDR workspace, AscendC::tiling::TCubeTiling tiling)
+{
+    AscendC::TPipe pipe;
+    MatmulLeakyKernel<half, half, float, float> matmulLeakyKernel;
+    matmulLeakyKernel.Init(a, b, bias, c, workspace, tiling, &pipe);
+    // Matmul对象初始化
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulLeakyKernel.matmulObj, &matmulLeakyKernel.tiling);
+    matmulLeakyKernel.Process(&pipe);
+}
+```
+
+Two things to copy: the `__kfc_workspace__ GM_ADDR workspace` parameter, and
+`REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), obj, &tiling)` rather than a bare
+`mm.Init(&cube, &pipe)`. Note this kernel body is **not** wrapped in `ASCEND_IS_AIC` at all —
+in MIX mode the framework performs the split, which is the counterpart of D.1.
+
+**(d) A working hand-written A2/A3 megakernel that avoids the question entirely** —
+`huawei-csl/megagdn-pto`, `kernels/pto/mega_kernel.cpp`, fetched 2026-10-20:
+
+```cpp
+extern "C" __global__ AICORE void launch_mega_kernel(
+    __gm__ uint8_t* q_ptr, __gm__ uint8_t* k_ptr, __gm__ uint8_t* v_ptr,
+    ...
+    uint64_t ffts_addr) {
+  ...
+  mega_kernel_impl(...);
+}
+
+extern "C" void call_kernel(
+    uint32_t block_dim, void* stream, ...) {
+  uint32_t fftsLen{0};
+  uint64_t fftsAddr{0};
+  rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
+  launch_mega_kernel<<<block_dim, nullptr, stream>>>(..., fftsAddr);
+}
+```
+
+It has **no** `KERNEL_TASK_TYPE_DEFAULT`, **no** `core_ratio`, **no** `__schedmode__`, and it
+uses PTO-ISA rather than the `Matmul` high-level API — so there is no KFC channel to deadlock.
+Its A2/A3 build line, from `scripts/compile_kernel.sh`:
+
+```bash
+    "${BISHENG}" -fPIC -shared -xcce -DMEMORY_BASE -O2 -std=c++17 \
+        -I"${KERNEL_DIR}" \
+        -I"${KERNEL_DIR}/include" \
+        -I"${PTO_LIB_PATH}/include" \
+        -I"${ASCEND_TOOLKIT_HOME}/pkg_inc" \
+        -I"${ASCEND_TOOLKIT_HOME}/pkg_inc/runtime" \
+        -I"${ASCEND_TOOLKIT_HOME}/pkg_inc/profiling" \
+        --npu-arch=dav-2201 \
+        -Wno-ignored-attributes \
+        "${src}" \
+        -o "${out}"
+```
+
+Two details to lift: `--npu-arch=dav-2201`, not `--cce-aicore-arch=dav-c220`; and
+`-Wno-ignored-attributes`, which is direct evidence that bisheng silently drops attributes it
+does not recognise on this path — see D.4.
+
+### D.4 `__schedmode__` — item 2
+
+The value `1` is correct. `SetScheduleMode`'s parameter table, verbatim
+(https://www.hiascend.com/doc_center/source/zh/canncommercial/81RC1/apiref/basicdataapi/atlasopapi_07_00248.html):
+
+> | 参数 | 输入/输出 | 说明 |
+> |---|---|---|
+> | schedule_mode | 输入 | 0：普通模式，默认情况下为普通模式。<br>1：batchmode模式，**核间同步算子需要设置该模式**。 |
+
+And the attribute is the documented lever for exactly this project type — CANN 9.0, verbatim:
+
+> Kernel直调场景下通过__schedmode__(mode)限定符来设置batchmode模式；工程化算子开发场景下，通过TilingContext的SetScheduleMode接口来设置batchmode模式，具体请参考《基础数据结构和接口》。
+
+So the answer to "does the attribute genuinely work on a raw launch" is **yes, it is the
+documented and only lever there** — there is no architectural fork, and hand-written MIX
+kernels do *not* have to become registered operators. `schemMode=0` is a toolchain symptom,
+not a design limit.
+
+Why it is being dropped: `-Wno-ignored-attributes` in the vendor's own A2/A3 build line (D.3d)
+says bisheng drops unrecognised attributes with a warning rather than an error. `build.sh`
+redirects the compile to `$out/kernel_build.log` and then greps only for `error`, so any such
+warning is captured but never shown. The one-line check, on the A3 box:
+
+```bash
+grep -i -E "ignor|attribute|warn" /tmp/mixbrick-build/kernel_build.log
+```
+
+If `cce_schedule_mode` appears there, that is the whole of item 2. The two things to vary are
+the arch flag (`--npu-arch=dav-2201` instead of `--cce-aicore-arch=dav-c220`, since the vendor
+uses the former for this chip and the `dav-2201` spelling matches `__NPU_ARCH__ == 2201`) and
+the attribute spelling against the toolchain's own headers:
+
+```bash
+grep -rn "cce_schedule_mode\|__schedmode__" /opt/ascend/cann-9.2.0/aarch64-linux/tikcpp/ | head
+```
+
+Whether `schemMode=0` is *causing* this particular hang is a separate question, and the
+evidence says probably not on its own: the measured failure rate without batchmode is ~6%
+(3 hangs in 49 runs, `hicann/ops-nn` `rnn/lstm_block_cell/op_kernel/arch35/sync_helper.h`,
+quoted in `ascend-fusion-mechanics.md` §25), whereas this hang is deterministic. Batchmode is
+necessary for a cross-core kernel and must be fixed, but it does not explain a 100% hang —
+D.1/D.2 do.
+
+### D.5 Item 4, answered: yes, `IterateAll` on the AIC expects an AIV counterpart
+
+The doc note the question quotes — 「如果调用高阶API，无需开发者处理AIC和AIV的同步」 — means the
+library issues that synchronization itself, and D.1 says which direction it runs in: the AIV
+issues, the AIC serves, the AIC replies. So a MIX-mode `Matmul` is not a cube-local object that
+happens to be callable from the AIC; it is one half of a two-core protocol. Calling `IterateAll`
+from the AIC with no AIV participant is the protocol with one end missing.
+
+`ASCENDC_CUBE_ONLY` is precisely the switch that collapses it to a one-core object — that is
+what 「表示仅在AIC侧调用Matmul API」 means, and why the same page pairs it with
+「避免额外的性能开销」: the overhead avoided is the KFC round trip.
+
+There is also a documented flagId hazard in the hand-written route, already recorded in
+`ascend-fusion-mechanics.md` §4 and §20: `Matmul` with N objects reserves flagIds `[0, 2N-1]`
+on 2201, plus flagId 15 under SuperKernel at 1:2. `mix_expert_kernel.cpp` picks
+`GATE_READY = 8`, which is outside `[0,1]` for its single object and therefore safe — the file's
+own comment on this is correct.
+
+### D.6 What to change, smallest first
+
+1. `#define ASCENDC_CUBE_ONLY` **above** `#include "lib/matmul_intf.h"` (line 19). This is the
+   one-line change that matches the kernel's existing structure to the vendor's 底层编码 recipe.
+2. Add the system workspace: a `__kfc_workspace__ GM_ADDR workspace` parameter or an explicit
+   `SetSysWorkspace(workspace)` before Matmul init, sized host-side from
+   `GetLibApiWorkSpaceSize()`, and keep the vendor's `if (GetSysWorkSpacePtr() == nullptr) return;`
+   guard so this fails loudly instead of hanging. Worth doing even under `ASCENDC_CUBE_ONLY`.
+3. Switch the entry declaration to `__global__ __mix__(1, 2)` and drop
+   `[[bisheng::core_ratio(1, 2)]]`; add `AscendC::InitSocState()` first and
+   `PipeBarrier<PIPE_ALL>()` last, per D.3b.
+4. Build with `--npu-arch=dav-2201`, and surface compiler warnings in `build.sh` instead of
+   grepping only for `error`.
+
+Ordering for the bisect, since 1 and 2 are independently sufficient: apply 1 alone first. If
+`stages=1` then returns, D.1 was the cause and D.2 is latent; if it still hangs, D.2 is live.
+
+### D.7 What this does not explain, and the experiment that would settle it
+
+Why `mix_expert_project` — same MIX declaration, same MIX-mode `Matmul`, same missing
+workspace, same `if ASCEND_IS_AIC` wrapper — returns correctly. Both defects above are present
+in it too. The difference is only that its AIV half is empty, which matches the reported
+`stages=1` behaviour (presence of compiled AIV code is sufficient) but is not something the
+vendor documentation addresses. The plausible reading is that with no AIV-side code the AIV
+image is trivial and no KFC client half is instantiated, so nothing waits; once the AIV image is
+real, the framework's MIX-mode machinery has a second participant and the handshake becomes
+observable. That is inference, not a sourced claim.
+
+Two cheap experiments that would distinguish it:
+- Add a single trivial AIV statement to `mix_expert_project` (e.g. `if ASCEND_IS_AIV { AscendC::PipeBarrier<PIPE_ALL>(); }`).
+  If it then hangs, the trigger is the AIV image being non-empty, independent of `Matmul`.
+- Apply fix 1 only to `mix_expert_fused` and keep everything else. If `stages=7` runs, D.1 is
+  confirmed as the sole cause and the asymmetry is explained by compilation, not by semantics.
+
+Also undetermined: whether `--cce-aicore-arch=dav-c220` and `--npu-arch=dav-2201` select
+different frontends for attribute handling. No document comparing the two spellings was found;
+the only evidence is that the vendor uses the latter for this chip.
+
+### Gaps for this section
+
+- The `BareMix样例` named by the API reference (「完整样例请参考BareMix样例」) as *the* complete
+  worked example of the `ASCENDC_CUBE_ONLY` + hand-written-sync route was not located. Searched
+  GitCode `cann/*` (search API returns 401 unauthenticated), `cann/cann-samples`, and
+  `cann/asc-devkit` examples. It is the single most useful missing artifact for this problem;
+  a direct filesystem search on the A3 box would likely settle it:
+  `grep -rl "BareMix\|ASCENDC_CUBE_ONLY" /opt/ascend/cann-9.2.0/ 2>/dev/null | head`
+- No document was found stating what the AIV half of a MIX kernel must do at minimum for the
+  task to retire — i.e. whether an empty AIV half is legal, and whether a terminating
+  handshake is required on both halves. §D.7 is inference in that gap.
+- No published decomposition of the KFC request/reply cost, which is what would say whether
+  `ASCENDC_CUBE_ONLY` is also the right *performance* choice for our persistent kernel, beyond
+  the doc's qualitative 「避免额外的性能开销」.
