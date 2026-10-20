@@ -351,6 +351,751 @@ Code-editing is named as a first-class target. Our workload — an agentic codin
 
 ---
 
+### Single-chain n-gram / prompt-lookup match policies — the exact code and defaults in Saxena's original, HF transformers, vLLM, TRT-LLM and llama.cpp
+
+Sources, all retrieved 2026-10-20 and pinned (a `git clone --filter=blob:none` of each repo; line numbers below refer to that commit):
+- https://github.com/apoorvumang/prompt-lookup-decoding @ cada4fe6ec7368d41c386ec3fb94fa11268971eb (Apoorv Saxena, "Prompt Lookup Decoding", November 2023; last commit 2024-08-23)
+- https://github.com/huggingface/transformers @ 9f5750c67ad4c2e077dd3883d20503f3d77b2fe5 (2026-10-20)
+- https://github.com/vllm-project/vllm @ fce64bc5c2c939a4521bfb9b462c8c74c1c13893 (2026-10-20)
+- https://github.com/NVIDIA/TensorRT-LLM @ 083447cd22b228a36cf30d21385c624be905cddd (2026-10-20)
+- https://github.com/ggml-org/llama.cpp @ 84663953535d4323e92b4bc90971aa022c305d06 (2026-10-19)
+
+#### 1. Saxena's original (the algorithm every other implementation descends from)
+
+> **TLDR**: We modify speculative decoding where we replace the draft model with simple string matching in the prompt to generate candidate token sequences. This results in significant speedups (2x-4x) in input-grounded tasks, with no effect on output quality. This method can be used with any decoder model without model changes or external datastore, and with both greedy and sampling techniques.
+
+> **Intuition**: In several LLM use cases where you're doing _input grounded generation_ (summarization, document QA, multi-turn chat, code editing), there is high n-gram overlap between LLM input (prompt) and LLM output. This could be entity names, phrases, or code chunks that the LLM directly copies from the input while generating the output. Prompt lookup exploits this pattern to speed up autoregressive decoding in LLMs.
+
+`README.md` lines 28-56:
+
+````python
+def find_candidate_pred_tokens(input_ids, max_ngram_size=3, num_pred_tokens=10):
+    input_length = input_ids.size(1)
+
+    for ngram_size in range(max_ngram_size, 0, -1):
+        # Extract the last n tokens as our search ngram
+        ngram = input_ids[0, -ngram_size:].tolist()
+
+        # Create sliding windows of size ngram_size
+        windows = input_ids.unfold(dimension=1, size=ngram_size, step=1)
+
+        # Convert ngram to a tensor for comparison
+        ngram_tensor = torch.tensor(ngram, device=input_ids.device).unsqueeze(0)
+
+        # Find where the windows match the ngram
+        matches = (windows == ngram_tensor).all(dim=2)
+
+        # Get the indices of matches
+        match_indices = matches.nonzero(as_tuple=True)[1]
+
+        # Iterate through match indices to find a valid continuation
+        for idx in match_indices:
+            start_idx = idx + ngram_size
+            end_idx = start_idx + num_pred_tokens
+            # Ensure we don't go beyond the length of input_ids and avoid self-match
+            if end_idx <= input_length and start_idx < input_length - ngram_size:
+                return input_ids[0, start_idx:end_idx]
+
+    # If no match is found, return an empty tensor
+    return torch.tensor([], dtype=torch.long, device=input_ids.device)
+````
+
+> Input to this function is the same as to the draft model - all the tokens till the current generation step (`input_ids`). It then tries to match last few tokens to somewhere earlier in the prompt. If found, it returns the next-k token continuation as `candidate_input_ids` or candidate sequence. The 2 parameters are `max_ngram_size`, which is the maximum ngram to use when looking for matches in the prompt. `num_pred_tokens` is the candidate sequence length to return after match is found.
+
+> - **GPU**: Single A100 40GB
+> - **Model**: Mistral-7B-Instruct-v0.1
+> - **Decoding Type**: Greedy decoding
+> - **Hyperparams**: Matching max n-gram size = 3, Continuation length = 10
+
+The only coding datum in the README, and the author's own list of open policy questions:
+
+> - roleplay has the worst gain. This is probably because there isn't many ngrams to copy, since each generation is sort of unique.
+> - coding has very high gain in 2nd turn, because there is lots of code copying
+> - in first turn, extraction has highest gain. This agrees with our hypothesis - in extraction there is definitely n-gram copying, and PLD should help
+
+> - There's probably better ways to do string matching than the current one, and there are several obvious things to improve eg. what to do when there are multiple matches? Whats the ideal length of continuation?
+> - We haven't yet tried sampling, although there's no reason it shouldn't work.
+>     - Here, one additional thing to test would be whether prompt lookup while sampling can affect hallucination rates, since this artifically increases probability of sampling exact sequences from input (this was suggest by my colleague Shwetha S)
+> - Testing actual FLOPs impact and tradeoffs is needed
+> - Also need to figure out best hyperparams - 3 and 10 were chosen on very little testing
+
+#### 2. HF transformers `PromptLookupCandidateGenerator` (the reference many engines copy)
+
+`src/transformers/generation/candidate_generator.py` lines 1017-1060:
+
+````python
+class PromptLookupCandidateGenerator(CandidateGenerator):
+    """
+    `CandidateGenerator` class to be used for prompt lookup generation. This class generates candidates by looking up
+    likely continuations in the provided prompt (input_ids) itself.
+    Read the following blog post for more information: https://github.com/apoorvumang/prompt-lookup-decoding
+
+    Args:
+        eos_token_id (`torch.Tensor`, *optional*):
+            The token id of the end of sequence token.
+        num_output_tokens (`int`, *optional*, defaults to 10):
+            The number of tokens to be output as candidate tokens.
+        max_matching_ngram_size (`int`, *optional*, defaults to 2):
+            The maximum ngram size to be considered for matching in the prompt
+        max_length (`int`, *optional*, defaults to 20):
+            The number of total maximum tokens that can be generated. For decoder-only models that includes the
+            prompt length. Defaults to 20, which is the max length used as default in generation config.
+        logits_processor (`LogitsProcessorList`, *optional*):
+            An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+            used to modify the prediction scores of the language modeling head applied at each generation step. In
+            prompt lookup assisted generation, they are not used to manipulate probabilities, but rather to find
+            forbidden tokens (p = -inf) and block them from being valid candidates.
+        vocab_size (`int`, *optional*):
+            The size of the vocabulary. Required if `logits_processor` is provided.
+    """
+
+    def __init__(
+        self,
+        eos_token_id: torch.Tensor | None = None,
+        num_output_tokens: int = 10,
+        max_matching_ngram_size: int = 2,
+        max_length: int = 20,
+        logits_processor: Optional["LogitsProcessorList"] = None,
+        vocab_size: int | None = None,
+    ):
+        self.num_output_tokens = num_output_tokens
+        self.max_matching_ngram_size = max_matching_ngram_size
+        self.max_length = max_length
+        self.eos_token_id = eos_token_id
+        self.logits_processor = logits_processor
+        self.vocab_size = vocab_size
+
+        if self.max_matching_ngram_size <= 0 or self.num_output_tokens <= 0:
+            raise ValueError("Invalid max_matching_ngram_size or num_output_tokens")
+
+````
+
+`src/transformers/generation/candidate_generator.py` lines 1076-1112:
+
+````python
+            return input_ids, None
+
+        chosen_ids = None
+        match_found = False
+        for ngram_size in range(min(self.max_matching_ngram_size, input_length - 1), 0, -1):
+            # Create sliding windows of size ngram_size
+            windows = input_ids.unfold(dimension=1, size=ngram_size, step=1)
+
+            # Convert ngram to a tensor for comparison
+            ngram_tensor = input_ids[0, -ngram_size:]
+
+            # Find where the windows match the ngram
+            matches = (windows == ngram_tensor).all(dim=2)
+
+            # Get the indices of matches
+            match_indices = matches.nonzero(as_tuple=True)[1]
+
+            # Iterate through match indices to find a valid continuation
+            # TODO (joao): this finds the first valid candidates (left to right), but perhaps we should find the
+            # longest valid candidates?
+            for idx in match_indices:
+                start_idx = idx + ngram_size
+                end_idx = start_idx + self.num_output_tokens
+                end_idx = min(end_idx, input_length, self.max_length)
+
+                if start_idx < end_idx:
+                    chosen_ids = input_ids[0, start_idx:end_idx]
+
+                    # Check if the each new candidate token is forbidden according to the logits processor. If all
+                    # tokens are allowed, we keep `chosen_ids` as is.
+                    # 1. create random logits.
+                    # 2. apply the logits processor to get output logits for the next token, using the arbitrary
+                    #    logits as input.
+                    # 3. compare the output logits with the next candidate token. If they are -inf, then the next
+                    #    candidate token is forbidden and we don't want to generate it.
+                    if self.logits_processor is not None:
+                        sequence_with_candidate = input_ids
+````
+
+`src/transformers/generation/candidate_generator.py` lines 1130-1154:
+
+````python
+
+                    match_found = True
+
+                    # remove remaining candidate ids if an "eos" token is found, otherwise the target model may
+                    # accept eos and the rest as valid, thus not stopping generation after "eos"
+                    # NOTE: below code is written based on the fact that assisted decoding supports only bs=1
+                    if self.eos_token_id is not None:
+                        mask = torch.isin(chosen_ids, self.eos_token_id)
+                        match_indices_eos = torch.nonzero(mask)
+                        if match_indices_eos.numel() > 0:
+                            first_eos_index = match_indices_eos[0].item()
+                            chosen_ids = chosen_ids[:first_eos_index]
+                    break
+            if match_found:
+                break
+
+        # In case we didn't find a match return the input sequence unchanged, reverts back to autoregressive decoding
+        if not match_found or chosen_ids is None or len(chosen_ids) == 0:
+            return input_ids, None
+
+        # Now need extend input_ids with chosen_ids
+        chosen_ids = chosen_ids.unsqueeze(0)
+        candidate_input_ids = torch.cat((input_ids, chosen_ids), dim=1)
+        # assisted_generation expects logits as well, but we don't have those here, so returning None
+        return candidate_input_ids, None
+````
+
+Config-level documentation of the same two knobs:
+
+`src/transformers/generation/configuration_utils.py` lines 339-342:
+
+````text
+        prompt_lookup_num_tokens (`int`, *optional*):
+            The number of tokens to be output as candidate tokens.
+        max_matching_ngram_size (`int`, *optional*):
+            The maximum ngram size to be considered for matching in the prompt. Default to 2 if not provided.
+````
+
+#### 3. vLLM `ngram` — config defaults and the match routine
+
+`vllm/config/speculative.py` lines 476-481:
+
+````python
+    prompt_lookup_max: int | None = Field(default=None, ge=1)
+    """Maximum size of ngram token window when using Ngram proposer, required
+    when method is set to ngram."""
+    prompt_lookup_min: int | None = Field(default=None, ge=1)
+    """Minimum size of ngram token window when using Ngram proposer, if
+    provided. Defaults to 1."""
+````
+
+`vllm/config/speculative.py` lines 1235-1263:
+
+````python
+        if self.method in ("ngram", "[ngram]"):
+            self.method = "ngram"
+
+        if self.method in ("ngram", "ngram_gpu"):
+            # Set default values if not provided
+            if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
+                # TODO(woosuk): Tune these values. They are arbitrarily chosen.
+                self.prompt_lookup_min = 5
+                self.prompt_lookup_max = 5
+            elif self.prompt_lookup_min is None:
+                if self.prompt_lookup_max is None:
+                    raise ValueError(
+                        "Either prompt_lookup_max or prompt_lookup_min must be "
+                        "provided when using the ngram method."
+                    )
+                self.prompt_lookup_min = self.prompt_lookup_max
+            elif self.prompt_lookup_max is None:
+                if self.prompt_lookup_min is None:
+                    raise ValueError(
+                        "Either prompt_lookup_max or prompt_lookup_min must be "
+                        "provided when using the ngram method."
+                    )
+                self.prompt_lookup_max = self.prompt_lookup_min
+
+            # Validate values
+            if self.prompt_lookup_min > self.prompt_lookup_max:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must "
+                    f"be <= prompt_lookup_max={self.prompt_lookup_max}"
+````
+
+`vllm/v1/spec_decode/ngram_proposer.py` lines 12-36:
+
+````python
+class NgramProposer:
+    def __init__(self, vllm_config: VllmConfig):
+        assert vllm_config.speculative_config is not None
+        assert vllm_config.speculative_config.prompt_lookup_min is not None
+        assert vllm_config.speculative_config.prompt_lookup_max is not None
+
+        # Minimum length of the n-gram to match.
+        self.min_n = vllm_config.speculative_config.prompt_lookup_min
+        # Maximum length of the n-gram to match.
+        self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        # Number of tokens follow the match. If there are less than k
+        # tokens follow the match, we will return the maximum amount of
+        # tokens until the end.
+        self.k = vllm_config.speculative_config.num_speculative_tokens
+        # Maximum length of the model.
+        self.max_model_len = vllm_config.model_config.max_model_len
+
+        # Pre-allocate buffers for numba batch propose.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.valid_ngram_draft = np.zeros((max_num_seqs, self.k), dtype=np.int32)
+        self.valid_ngram_num_drafts = np.zeros((max_num_seqs), dtype=np.int32)
+
+        # Threshold of total number of tokens in the batch to enable
+        # multi-threading in numba batch propose.
+        self.num_tokens_threshold = 8192
+````
+
+`vllm/v1/spec_decode/ngram_proposer.py` lines 209-295:
+
+````python
+@jit(nopython=True)
+def _find_longest_matched_ngram_and_propose_tokens(
+    origin_tokens: np.ndarray,
+    min_ngram: int,
+    max_ngram: int,
+    max_model_len: int,
+    k: int,
+) -> np.ndarray:
+    """Find the longest n-gram which matches the suffix of the given tokens
+    whose length is within [min_ngram, max_ngram] (inclusive).
+
+    If found, we will extract k right after the matched ngram.
+    """
+    # Do not generate draft tokens is context is shorter than minimum n-gram
+    total_token = origin_tokens.shape[0]
+    if total_token < min_ngram:
+        return np.empty((0,), dtype=origin_tokens.dtype)
+
+    # Do not generate draft tokens beyond the max model length.
+    k = min(k, max_model_len - total_token)
+    if k <= 0:
+        return np.empty((0,), dtype=origin_tokens.dtype)
+
+    # Flip tokens, and the goal become to find longest ngram
+    # on the rightmost position which matches the prefix with
+    # length [min_n, max_n] (inclusive).
+    tokens = origin_tokens[::-1]
+
+    # Longest prefix (not including itself) which is a suffix of
+    # the current position.
+    #   lps[i] = max{v, where tokens[0:v] == tokens[i+1-v:i+1]}
+    #
+    # As ngram is capped by max_ngram to save memory, we only need to
+    # store lps for the first max_ngram prefix.
+    lps = np.zeros(max_ngram, dtype=np.int32)
+
+    longest_ngram = 0
+    position = 0
+
+    # lps[0] always equal to 0, we start with index 1
+    prev_lps = 0
+    i = 1
+    while i < total_token:
+        # tokens[:prev_lps] is the longest prefix as a suffix of tokens[:i]
+        if tokens[prev_lps] == tokens[i]:
+            # Token match: tokens[:prev_lps+1] is the longest prefix as
+            # a suffix of tokens[:i+1]
+            prev_lps += 1
+            # Check if we found a longer valid ngram.
+            #
+            # Update position when longest_ngram matched prev_lps,
+            # as we want to get the target n-gram of the earliest position
+            # in the original tokens (i.e.
+            # latest position in the reversed tokens)
+            if prev_lps >= longest_ngram:
+                longest_ngram = prev_lps
+                position = i
+            if i < max_ngram:
+                # Store LPS for the first max_ngram prefix
+                lps[i] = prev_lps
+            if prev_lps == max_ngram:
+                # When prev_lps reached max_ngram, update prev_lps
+                # to lps[max_ngram-1] to avoid matching ngram
+                # longer than max_ngram
+                prev_lps = lps[max_ngram - 1]
+            i += 1
+        elif prev_lps != 0:
+            # Token mismatch: try the second-longest prefix
+            # among all suffix of tokens[:i],
+            # which is the longest prefix of tokens[:prev_lps]
+            prev_lps = lps[prev_lps - 1]
+        else:
+            # Token mismatch, and no more prefix (except empty string)
+            # as a suffix of tokens[:i]
+            i += 1
+
+    if longest_ngram < min_ngram:
+        # No valid ngram is found
+        return np.empty((0,), dtype=origin_tokens.dtype)
+
+    # Flip the position back, so in origin_tokens,
+    # origin_tokens[total_token-1-position:total_token-1-position+longest_ngram]
+    # is the matched ngram, so we should start drafting tokens from
+    # total_token-1-position+longest_ngram
+    start_position = total_token - 1 - position + longest_ngram
+    k = min(k, total_token - start_position)
+    return origin_tokens[start_position : start_position + k]
+````
+
+vLLM's own documentation example (`docs/features/speculative_decoding/n_gram.md`):
+
+`docs/features/speculative_decoding/n_gram.md` lines 7-21:
+
+````python
+from vllm import LLM, SamplingParams
+
+prompts = ["The future of AI is"]
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+llm = LLM(
+    model="Qwen/Qwen3-8B",
+    tensor_parallel_size=1,
+    speculative_config={
+        "method": "ngram",
+        "num_speculative_tokens": 5,
+        "prompt_lookup_max": 4,
+    },
+)
+outputs = llm.generate(prompts, sampling_params)
+````
+
+#### 4. TensorRT-LLM `NGram` — the pool keeps several matches per pattern, then emits exactly one
+
+`tensorrt_llm/_torch/speculative/ngram.py` lines 14-49:
+
+````python
+class NGramPoolManager(BaseResourceManager):
+    """
+    Drafter for NGram. This class maintains the pattern-matches pairs for NGram drafter.
+
+    For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
+
+    Here we call ["I","love"] as `pattern`, and [["apple", "because", "it", "is"], ["banana", "and"]] as `matches`.
+
+    `pattern` is a list of token ids. The pool emits corresponding draft tokens from the matches if the pattern appears at the tail of the generated sentence.
+
+    `matches` is a list of candidate draft token ids attaching to a pattern.
+
+    Arguments:
+        max_total_draft_tokens: int
+            The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+
+        max_matching_ngram_size: int
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+
+        is_use_oldest: bool = True
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+
+        is_public_pool: bool = True
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
+
+    Members:
+        pool: dict[tuple[int], OrderedSet[int]] or dict[int, dict[tuple[int], OrderedSet[int]]]
+            If is_public_pool == True, it maps from patterns to matches
+            If is_public_pool == False, it maps from request ID to the request-specific pool
+
+        start_index: dict[int, int]
+            It maps from request ID to the index of the prompt to update the pool in the next step.
+    """
+````
+
+`tensorrt_llm/_torch/speculative/ngram.py` lines 84-141:
+
+````python
+    def get_draft_tokens(
+        self,
+        prefix: list[int],
+        request_id: int,
+        max_sequence_length: int,
+    ):
+        prefix_len = len(prefix)
+        max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
+        if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
+            return []
+
+        if request_id not in self.start_index:  # Extend start_index and pool for a new request
+            self.start_index[request_id] = 0
+            if not self.is_public_pool:
+                self.pool[request_id] = {}
+
+        pool = (self.pool if self.is_public_pool else self.pool[request_id])
+
+        # Update pool
+        sequence = prefix[self.start_index[request_id]:]
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            # Find each possible pattern-match combination, and use tuple for hash
+            for l in range(len(sequence) - size):
+                r = min(l + size + self.max_total_draft_tokens, len(sequence))
+                pattern = tuple(sequence[l:l + size])
+                new_match = tuple(sequence[l + size:r])
+                if pattern not in pool or \
+                    (not self.is_keep_all and len(new_match) > len(pool[pattern][0])):
+                    # Replace the match if
+                    # 1. the pattern does not exist in the pool
+                    # 2. only one match is kept, and the new match is longer (MRU)
+                    pool[pattern] = OrderedSet((new_match, ))
+                elif new_match not in pool[pattern]:
+                    # Update the matches if the pattern is already existed:
+                    # TODO: need a strategy to maintain the short candidates, now we just remove them
+                    # Drop all existed matches with small length
+                    for match in pool[pattern]:
+                        if len(match) < len(new_match):
+                            pool[pattern].remove(match)
+                    pool[pattern].add(new_match)
+
+        draft_tokens = []
+        for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
+                          -1):
+            pattern = tuple(prefix[-size:])
+            if pattern not in pool:
+                continue
+            draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
+            draft_tokens = list(draft_tokens)[:max_draft_token_length_this_step]
+            break
+
+        # Update start_index
+        self.start_index[request_id] = max(
+            0, prefix_len -
+            (self.max_total_draft_tokens + self.max_matching_ngram_size - 1))
+
+        return draft_tokens
+````
+
+`tensorrt_llm/_torch/speculative/ngram.py` lines 161-181:
+
+````python
+class NGramDrafter(Drafter):
+
+    _needs_padding_kv_extension = True
+
+    def __init__(
+        self,
+        spec_config: NGramDecodingConfig,
+        ngram_pool_manager: NGramPoolManager = None,
+    ):
+        super().__init__(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            max_concurrency=spec_config.max_concurrency,
+            draft_len_schedule=spec_config.draft_len_schedule)
+        assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
+        self.spec_resource_manager = ngram_pool_manager
+        self.spec_config = spec_config
+        self.max_draft_len = spec_config.max_draft_len
+        self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
+        assert self.max_draft_len == self.max_total_draft_tokens, "NGram only supports linear tree."
+
+````
+
+`tensorrt_llm/llmapi/llm_args.py` lines 3021-3048:
+
+````python
+class NGramDecodingConfig(DecodingBaseConfig):
+    """Configuration for NGram drafter speculative decoding."""
+    decoding_type: Literal["NGram"] = Field(default="NGram")
+    max_matching_ngram_size: PositiveInt = Field(
+        default=2,
+        description=
+        "The length maximum of searching tokens (can be understood as length maximum of input tokens "
+        "to search).")
+    is_keep_all: bool = Field(
+        default=True,
+        description=
+        "Whether to keep all candidate pattern-matches pairs, only one "
+        "match is kept for each pattern if False.")
+    is_use_oldest: bool = Field(
+        default=True,
+        description="Whether to provide the oldest match when pattern is hit, "
+        "the newest one is provided if False.")
+    is_public_pool: bool = Field(
+        default=True,
+        description="Whether to use a common pool for all requests, or the pool "
+        "is private for each request if False.")
+
+    @model_validator(mode="after")
+    def validate_ngram_config(self):
+        if self.max_draft_len is None or self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for NGram")
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only supports linear tree
+        return self
+````
+
+`docs/source/features/speculative-decoding.md` lines 83-100:
+
+````markdown
+### NGram
+
+The NGram method is an implementation of [this Prompt Lookup Decoding algorithm](https://github.com/apoorvumang/prompt-lookup-decoding).
+
+When the NGram algorithm is used, TRT-LLM will maintain a map from token prefixes to candidate draft sequences. For example, the 3-gram ["The ", " future ", " is"] could map to the draft sequence [" bright", " because"]. The prefixes are token sequences that are extracted from the prompt and the tokens generated by the target model. The NGram pool and matching procedure can be tuned with the following options:
+
+* `max_draft_len`: Maximum draft candidate length.
+* `max_matching_ngram_size`: Maximum prompt suffix length to match with keys in the pool.
+* `is_public_pool`: If true, a single ngram pool is shared for all requests. Otherwise, each request has its own ngram pool.
+* `is_keep_all`: If true, draft candidates will be retained in the pool forever. Otherwise, only the largest draft candidate is retained.
+* `is_use_oldest`: If true, the oldest draft candidate is always proposed for a given match. Otherwise, the newest draft candidate is used. Only applicable if `is_keep_all == True` because `is_keep_all == False` means we'll only ever have a single value for each key.
+
+```python
+from tensorrt_llm.llmapi import NGramDecodingConfig
+
+speculative_config = NGramDecodingConfig(
+    max_draft_len=3, max_matching_ngram_size=4, is_public_pool=True)
+
+````
+
+#### 5. llama.cpp `ngram-simple` / `ngram-map-k` / `ngram-map-k4v` / `ngram-mod`
+
+`docs/speculative.md` lines 126-203:
+
+````markdown
+### n-gram Map (`ngram-simple`, `ngram-map-*`)
+
+These implementations search the token history for patterns and use matching sequences as draft candidates.
+They require no additional model but rely on patterns that have already appeared in the generated text.
+An example to use this approach can be the rewriting of source code by a LLM.
+
+#### n-gram Map (`ngram-simple`)
+
+This implementation looks for the last n-gram in history that matches the current n-gram and creates a draft using the m tokens following the matched n-gram. It is the simplest self-speculative approach with minimal overhead.
+
+```
+llama-server [...] --spec-type ngram-simple --spec-draft-n-max 64
+```
+
+#### n-gram Map Key (`ngram-map-k`)
+
+This implementation looks for the current n-gram of size n (called the _key_) in the token history. If the key n-gram is followed by the same m tokens (called the _mgram_) multiple times, it creates a draft using these m tokens. This approach requires a minimum number of occurrences (argument `--spec-ngram-map-k-min-hits`, default is 1) before generating drafts.
+
+The number of accepted tokens is stored for each used n-gram.
+
+**Example:**
+```
+llama-server [...] --spec-type ngram-map-k --spec-draft-n-max 64
+```
+
+#### n-gram Map Key-4-Values (`ngram-map-k4v`)
+
+This experimental implementation looks for the current n-gram of size n (called the _key_) in the token history. For each key, up to four _values_ (n-grams of size m, called _mgrams_) are tracked. An internal statistic counts the occurrences of each mgram after the key n-gram. If one mgram is significantly more frequent than the others, it is used as the draft.
+
+The number of accepted tokens is stored for each used n-gram.
+
+**Example:** Server options to be used if there are a lot of longer repetitions.
+```
+llama-server [...] --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 8 --spec-ngram-map-k4v-size-m 8 --spec-ngram-map-k4v-min-hits 2 --spec-draft-n-max 64
+```
+
+### n-gram Mod (`ngram-mod`)
+
+Add basic ngram hasher for speculative decoding:
+
+- For each ngram, compute a hash using LCG
+- For each computed hash, store the next token
+- During speculation, iteratively compute the rolling hash of the last n tokens and pick the next token from the storage
+
+Some characteristics:
+
+- Lightweight (~16 MB)
+- Constant memory and complexity
+- Can generate variable draft lengths (i.e. m is not fixed)
+
+Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other.
+
+**Sample usage:**
+
+```
+# notes:
+# - small `n` are not recommended
+# - MoEs require long drafts
+# - dense models: can reduce `--spec-ngram-mod-n-min` and `--spec-ngram-mod-n-max`
+
+llama-server ... --spec-type ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
+```
+
+Applications:
+
+- Iterating over a block of text/code (e.g. in llama.vim)
+- Reasoning models (when they have to repeat their thinking in the final answer)
+- Summarization
+
+Example Video:
+
+- See #19164
+
+### Differences between ngram-simple, ngram-map and ngram-mod
+
+- ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
+- ngram-map-k looks for a previous matching n-gram and inserts the following m-gram but uses an internal hash-map of n-grams in the current context window.
+- ngram-mod uses a hash pool which is shared across all server slots. The hash pool is a map from n-gram hash to the next token (not the next m-gram as in ngram-map).
+````
+
+`docs/speculative.md` lines 317-358:
+
+````text
+### n-gram Mod Parameters
+
+```
+--spec-ngram-mod-n-match                N
+                                        ngram-mod lookup length (default: 24)
+--spec-ngram-mod-n-min                  N
+                                        minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48)
+--spec-ngram-mod-n-max                  N
+                                        maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64)
+```
+
+### n-gram Simple Parameters
+
+```
+--spec-ngram-simple-size-n              N
+                                        ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-simple-size-m              N
+                                        ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-simple-min-hits            N
+                                        minimum hits for ngram-simple speculative decoding (default: 1)
+```
+
+### n-gram Map Key Parameters
+
+```
+--spec-ngram-map-k-size-n               N
+                                        ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-map-k-size-m               N
+                                        ngram size M for ngram-map-k speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-map-k-min-hits             N
+                                        minimum hits for ngram-map-k speculative decoding (default: 1)
+```
+
+### n-gram Map Key-4-Values Parameters
+
+```
+--spec-ngram-map-k4v-size-n             N
+                                        ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-map-k4v-size-m             N
+                                        ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-map-k4v-min-hits           N
+                                        minimum hits for ngram-map-k4v speculative decoding (default: 1)
+````
+
+`docs/speculative.md` lines 424-445:
+
+````text
+Each speculative decoding implementation prints statistics.
+
+```
+draft acceptance rate = 0.57576 (  171 accepted /   297 generated)
+statistics ngram_simple: #calls = 15, #gen drafts = 5, #acc drafts = 5, #gen tokens = 187, #acc tokens = 73
+statistics draft: #calls = 10, #gen drafts = 10, #acc drafts = 10, #gen tokens = 110, #acc tokens = 98
+```
+
+```
+draft acceptance rate = 0.70312 (   90 accepted /   128 generated)
+statistics ngram_mod: #calls = 810, #gen drafts = 15, #acc drafts = 15, #gen tokens = 960, #acc tokens = 730, dur(b,g,a) = 0.149, 0.347, 0.005 ms
+```
+
+```
+statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts = 26, #gen tokens = 1248, #acc tokens = 968, dur(b,g,a) = 2.234, 1.427, 0.016 ms
+```
+
+
+- `#calls(b,g,a)`: number of calls of begin (new prompt), generation and accumulation of this implementations
+- `#gen drafts`: number of drafts generated by this implementation
+- `#acc drafts`: number of drafts accepted (partially) by the main model
+- `#gen tokens`: number of tokens generated by this implementation (including rejected tokens)
+````
+
+## Relevance
+Four independent codebases agree on the single-chain policy: try the longest suffix first (Saxena `max_ngram_size=3`, HF `max_matching_ngram_size=2`, vLLM `prompt_lookup_min/max` which both default to 5 when neither is given although the field docstring still says "Defaults to 1", TRT-LLM `max_matching_ngram_size=2`), and then take exactly ONE occurrence. Which occurrence differs: HF takes the first hit scanning left to right (its own TODO asks "perhaps we should find the longest valid candidates?"), vLLM takes the longest matched n-gram and, among equal lengths, "the earliest position in the original tokens", TRT-LLM stores every distinct continuation for a pattern in an `OrderedSet` and then emits `pool[pattern][0 if self.is_use_oldest else -1]` (`is_use_oldest=True` by default), llama.cpp `ngram-simple` uses "the last n-gram in history that matches". Nobody in this list verifies two occurrences at once: TRT-LLM states it outright in code (`assert self.max_draft_len == self.max_total_draft_tokens, "NGram only supports linear tree."`) and in `NGramDecodingConfig` ("Current NGram only supports linear tree"). That is the unexploited headroom for our shape: when the same suffix occurs k times earlier in the context with different continuations, a linear drafter pays the whole-round loss every time its single guess is the wrong occurrence, while the other k-1 continuations were already sitting in the pool. The draft-length defaults span a wide range (Saxena 10, HF 10, vLLM docs 5, TRT-LLM docs 3, llama.cpp `ngram-simple` m=48 and `ngram-mod` n_max=64) and llama.cpp's own sample comment says "MoEs require long drafts", which is consistent with our MoE target needing wide drafts to amortise an expensive verify.
+
+---
+
 ## Gaps
 
 Looked for and could not find:

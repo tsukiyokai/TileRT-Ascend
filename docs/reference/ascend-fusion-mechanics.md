@@ -17335,3 +17335,498 @@ What was looked for and not found, or found only partially.
 - https://raw.gitcode.com/cann/ops-nn/raw/master/quant/dynamic_quant/op_kernel/dynamic_quant.h — gitcode raw refuses unregistered traffic with `429 ... Limited account:unregisteredUser`; the same files were taken from the hicann/ops-nn GitHub mirror instead.
 - https://github.com/hicann/ops-nn — no kernel in the tree builds a per-token quant row max with SetAtomicMax into GM. Every cross-core max in the repo is done as partials-in-workspace + SyncAll + a second reduce pass (ITEM 28, 30, 31). `gh search code "SetAtomicMax" --limit 30` finds the API only in asc-devkit headers/docs and in sgl-kernel-npu / unified-cache-management / AReno wrappers, never as a row-max reduction.
 - https://github.com/hicann/catlass — no dcci polling loop; catlass synchronises purely through CrossCoreSetFlag/CrossCoreWaitFlag (ITEM 21). Its tla_dsl subtree lowers flag barriers in MLIR, not in AscendC kernel source.
+
+## 42. ★ Sub-byte (`int4b_t`) tensor addressing on dav-2201, read off the shipped AscendC headers — and the hard negative on `SetGlobalBuffer`'s length argument
+
+Source: the AscendC devkit source tree present on this machine,
+`/home/shanshan/repo/cann/asc-devkit/` (the `hicann/asc-devkit` tree — the same one quoted in §35 and §A11).
+This is the implementation, not a doc page, so it settles the question rather than describing it.
+Read 2026-10-20.
+
+This section exists because of a live defect: a `DataCopy` from `LocalTensor<int4b_t>` (UB) to
+`GlobalTensor<int4b_t>` (GM) lands at element offset 0 every time and never at element offset 12288, same
+function, same staging buffers, same 2048-element span, same run — while the identical copy at offset 12288
+*does* land in an isolated probe whose `GlobalTensor` was declared 14336 elements long instead of 98304. The
+question asked was whether the declared length in `SetGlobalBuffer` is the remaining variable. It is not, and
+the code below is why.
+
+### 42.1 `int4b_t` is a one-byte C++ struct holding one nibble — `sizeof(int4b_t) == 1`
+
+`impl/utils/common_types.h:41,49-71,102` (identical copy at `impl/basic_api/utils/kernel_utils_constants.h:81,606`):
+
+```cpp
+constexpr uint32_t INT4_BIT_NUM = 4;
+
+template <int bit_num, bool sign = true>
+struct integer_sub_type {
+    static int const k_bits = bit_num;
+    static bool const k_signed = sign;
+
+    using T = typename conditional<k_signed, int8_t, uint8_t>::type;
+    using Storage = uint8_t;
+
+    static Storage const mask = Storage(((static_cast<uint64_t>(1)) << static_cast<uint32_t>(k_bits)) - 1);
+    Storage storage;
+    __aicore__ inline integer_sub_type() = default;
+
+    __aicore__ inline integer_sub_type(uint32_t value) : storage(reinterpret_cast<Storage const&>(value) & mask) {}
+
+    __aicore__ inline integer_sub_type(int32_t value) : storage(reinterpret_cast<Storage const&>(value) & mask) {}
+
+    __aicore__ inline operator T() const
+    {
+        if (k_signed && ((storage & Storage(static_cast<uint64_t>(1) << static_cast<uint32_t>(k_bits - 1))) != 0)) {
+            // Sign extend
+            return T(storage) | ~T(mask);
+        }
+        return T(storage);
+    }
+    ...
+};
+
+using int4b_t = integer_sub_type<INT4_BIT_NUM, true>;
+```
+
+So the C++ object is **one byte with one `uint8_t storage` member**: `sizeof(int4b_t) == 1`, and
+`alignof(int4b_t) == 1`. The *logical* width is carried separately, by an explicit specialization at
+`impl/basic_api/utils/kernel_utils_constants.h:663-670`:
+
+```cpp
+template <typename T>
+struct SizeOfBits {
+    static constexpr uint32_t value = sizeof(T) * ONE_BYTE_BIT_SIZE;
+};
+
+template <>
+struct SizeOfBits<int4b_t> {
+    static int const value = INT4_BIT_NUM;
+};
+```
+
+**This is the whole trap.** `sizeof(int4b_t)` is 1 (one nibble per byte, as a scalar), but `SizeOfBits<int4b_t>`
+is 4 (two nibbles per byte, as packed tensor storage). Every tensor-level API uses the second convention and
+every raw-pointer expression uses the first. Mixing them gives a factor of two in the address.
+
+### 42.2 `GlobalTensor<int4b_t>::operator[]` counts NIBBLES, and truncates an odd index silently
+
+`impl/basic_api/kernel_tensor_impl.h:1651-1675`, verbatim and complete:
+
+```cpp
+template <typename T>
+__aicore__ inline GlobalTensor<T> GlobalTensor<T>::operator[](const uint64_t offset) const
+{
+    GlobalTensor result = *this;
+    if constexpr (IsHalfByteDataType<PrimType>()) {
+        result.address_ = result.address_ + offset / INT4_TWO;
+        result.oriAddress_ = result.oriAddress_ + offset / INT4_TWO;
+#if (__NPU_ARCH__ == 5102)
+    } else if constexpr (SupportType<PrimType, int2b_t>()) {
+        result.address_ = result.address_ + offset / INT2_FOUR;
+        result.oriAddress_ = result.oriAddress_ + offset / INT2_FOUR;
+    } else if constexpr (SupportType<PrimType, uint1b_t>()) {
+        result.address_ = result.address_ + offset / INT1_EIGHT;
+        result.oriAddress_ = result.oriAddress_ + offset / INT1_EIGHT;
+#endif
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113))
+    } else if constexpr (IsSameType<PrimType, uint2b_t>::value) {
+        result.address_ = result.address_ + offset / INT2_FOUR;
+        result.oriAddress_ = result.oriAddress_ + offset / INT2_FOUR;
+#endif
+    } else {
+        result.address_ = result.address_ + offset;
+        result.oriAddress_ = result.oriAddress_ + offset;
+    }
+    return result;
+}
+```
+
+with `constexpr uint32_t INT4_TWO = 2;` at `impl/basic_api/utils/kernel_utils_constants.h:80`.
+
+Three consequences, all exact:
+
+1. **`operator[](offset)` counts elements (nibbles), not bytes.** `address_` has type `__gm__ PrimType*` =
+   `__gm__ int4b_t*` with `sizeof == 1`, so `address_ + offset / 2` advances exactly `offset/2` bytes =
+   `offset` nibbles. `gm[12288]` is byte 6144. Correct.
+2. **An odd index is silently truncated down.** `offset / INT4_TWO` is integer division with no assert on this
+   path. `gm[12289]` and `gm[12288]` are the same address. There is no diagnostic even in CPU debug.
+3. **`operator[]` does NOT adjust `bufferSize_`.** `GlobalTensor result = *this;` copies it unchanged, so
+   after `auto sub = gm[12288]`, `sub.GetSize()` still reports the *original* 98304. Any logic of yours that
+   derives a remaining span from `GetSize()` after a subscript is wrong by the offset.
+
+`GetPhyAddr(offset)` applies the same halving but *does* assert evenness —
+`impl/basic_api/kernel_tensor_impl.h:1337-1341` (the non-3510 branch, i.e. ours):
+
+```cpp
+    if constexpr (IsHalfByteDataType<PrimType>()) {
+        ASCENDC_DEBUG_ASSERT(
+            (offset % 2 == 0),
+            KERNEL_LOG_INTERNAL(KERNEL_ERROR, "The offset for int4b_t GetPhyAddr should be an even num."));
+        return this->address_ + offset / INT4_TWO;
+```
+
+`ASCENDC_DEBUG_ASSERT` is compiled out on NPU. So the evenness rule is real but unenforced on device.
+
+### 42.3 ★ The hard negative: `SetGlobalBuffer`'s `bufferSize` argument has NO device-side effect whatsoever
+
+Declaration, `include/basic_api/kernel_tensor.h` (class `GlobalTensor`), with the field's own comment at line 291:
+
+```cpp
+    __aicore__ inline void SetGlobalBuffer(__gm__ PrimType* buffer, uint64_t bufferSize);
+    __aicore__ inline void SetGlobalBuffer(__gm__ PrimType* buffer);
+...
+public:
+    // element number of Tensor
+    uint64_t bufferSize_;
+```
+
+Definition, `impl/basic_api/kernel_tensor_impl.h:1251-1300`, verbatim (2201 takes the `#else` arm):
+
+```cpp
+template <typename T>
+__aicore__ inline void GlobalTensor<T>::SetGlobalBuffer(
+    __gm__ typename GlobalTensor<T>::PrimType* buffer, uint64_t bufferSize)
+{
+#if (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102)
+    ...
+#else
+    if (this->cacheMode_ == CacheMode::CACHE_MODE_NORMAL) {
+        this->address_ = buffer;
+    } else {
+        this->address_ = L2CacheAlter<PrimType, CacheRwMode::RW>(buffer, cacheMode_);
+    }
+    this->oriAddress_ = buffer;
+#endif
+    bufferSize_ = bufferSize;
+}
+
+template <typename T>
+__aicore__ inline void GlobalTensor<T>::SetGlobalBuffer(__gm__ typename GlobalTensor<T>::PrimType* buffer)
+{
+...
+#if ASCENDC_CPU_DEBUG
+    bufferSize_ = 0;
+#endif
+}
+```
+
+An exhaustive grep for every reference to `bufferSize_` in the whole devkit (`impl/` + `include/`, excluding
+the unrelated HCCL `comm_config_pub.h` / `hccl_comm_pub.h` / `aicpu_communicator.h` fields of the same name)
+returns exactly four sites:
+
+```
+impl/basic_api/kernel_tensor_impl.h:1273:    bufferSize_ = bufferSize;                 // the 2-arg SetGlobalBuffer, above
+impl/basic_api/kernel_tensor_impl.h:1298:    bufferSize_ = 0;                          // the 1-arg SetGlobalBuffer, ASCENDC_CPU_DEBUG only
+impl/basic_api/kernel_tensor_impl.h:1647:    return bufferSize_;                       // GetSize()
+impl/basic_api/kernel_tensor_impl.h:1725:    output.bufferSize_ = this->GetSize() * SizeOfBits<T>::value / SizeOfBits<U>::value;   // ReinterpretCast, 3510/5102 only
+include/basic_api/kernel_tensor.h:291:    uint64_t bufferSize_;                     // the declaration
+```
+
+It is stored, it is returned by `GetSize()`, and on 3510/5102 it is rescaled by `ReinterpretCast`. **Nothing
+on the `DataCopy` path reads it.** The only consumer that could ever have stopped a copy is the overflow
+reporter, and that macro is empty off CPU debug — `impl/basic_api/kernel_log.h:76-84` and `:299`:
+
+```cpp
+#define ASCENDC_REPORT_OVERFLOW_MEM(cond) \
+    do {                                  \
+        if (!(cond)) {                    \
+            raise(SIGABRT);               \
+        }                                 \
+    } while (0)
+#else
+#define ASCENDC_REPORT_OVERFLOW_MEM(cond)
+#endif
+```
+
+```cpp
+#define ASCENDC_REPORT_OVERFLOW_MEM(cond)
+```
+
+The Level-2 (count-based) `DataCopy` to GM is the only place it is invoked for this direction —
+`impl/basic_api/kernel_operator_data_copy_intf_impl.h:844-851`:
+
+```cpp
+template <typename T>
+__aicore__ inline __inout_pipe__(MTE3) void DataCopy(
+    const GlobalTensor<T>& dst, const LocalTensor<T>& src, const uint32_t count)
+{
+    ASCENDC_REPORT_OVERFLOW_MEM((CheckDataCopyTensorSizeOverflow(dst, src, count)));
+    struct DataCopyParams repeatParams;
+    DataCopyCheck<T>(count, repeatParams);
+    DataCopy(dst, src, repeatParams);
+}
+```
+
+**Therefore: for a sub-byte type, the `bufferSize` argument is in ELEMENTS (nibbles) — the field's own comment
+says `element number of Tensor`, and `ReinterpretCast`'s rescale by `SizeOfBits` confirms it — but passing a
+length larger than the real allocation is inert on NPU. It does not clamp, truncate, reroute or drop a
+`DataCopy`. It only disables a CPU-debug `SIGABRT`.** 98304 vs 14336 cannot be the cause of the
+offset-12288 failure. That hypothesis is closed.
+
+### 42.4 ★ What CAN silently drop a UB→GM `DataCopy`: the unguarded `else` in the Level-0 overload
+
+`impl/basic_api/kernel_operator_data_copy_intf_impl.h:271-329`, the overload every other form funnels into:
+
+```cpp
+template <typename T>
+__aicore__ inline __inout_pipe__(MTE3) void DataCopy(
+    const GlobalTensor<T>& dst, const LocalTensor<T>& src, const DataCopyParams& repeatParams)
+{
+    ...
+    using PrimType = PrimT<T>;
+    const Hardware srcHWPos = GetPhyType((TPosition)src.GetPosition());
+#if defined(ASCENDC_DEBUG) || defined(ASCENDC_CPU_DEBUG)
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+    CheckBasicDataCopyTypeSupport<T>("DataCopy from LocalTensor to GlobalTensor with DataCopyParams");
+    CheckDataCopyTensor(dst, src, repeatParams, "DataCopy from LocalTensor to GlobalTensor with DataCopyParams");
+#endif
+#endif
+#ifdef ASCENDC_CPU_DEBUG
+    if (!CheckFuncDataCopy(dst, src, repeatParams, "DataCopy from LocalTensor to GlobalTensor")) {
+        ASCENDC_REPORT_CHECK_ERROR("DataCopy from LocalTensor to GlobalTensor", KernelFuncType::NONE_MODE);
+    }
+    ASCENDC_REPORT_OVERFLOW_MEM(CheckDataCopyTensorSizeOverflow(dst, src, repeatParams));
+    ...
+#endif // ASCENDC_CPU_DEBUG
+    if (srcHWPos == Hardware::UB) {
+        // ub -> gm
+        DataCopyUB2GMImpl((__gm__ PrimType*)dst.GetPhyAddr(), (__ubuf__ PrimType*)src.GetPhyAddr(), repeatParams);
+    } else if (srcHWPos == Hardware::L1) {
+        // l1 -> gm
+        DataCopyL12GMImpl((__gm__ PrimType*)dst.GetPhyAddr(), (__cbuf__ PrimType*)src.GetPhyAddr(), repeatParams);
+    } else {
+        ASCENDC_CHECK_TPOSITION(
+            false, "src", "L1 Buffer(A1/B1)/UB(VECOUT)",
+            "DataCopy from LocalTensor to GlobalTensor with DataCopyParams",
+            GetPositionDisplay(static_cast<TPosition>(src.GetPosition())));
+    }
+    ...
+}
+```
+
+Two things to read off this:
+
+- **If `GetPhyType(src.GetPosition())` is neither `UB` nor `L1`, the function emits no move instruction at
+  all and returns silently.** The `else` arm is a check macro, and `ASCENDC_CHECK_TPOSITION` is compiled out
+  on an NPU build without `ASCENDC_DEBUG`. That is a mechanism whose symptom is exactly «the copy never lands
+  anywhere» — no hang, no error, no data. It is driven by the *source* `LocalTensor`'s `TPosition`, not by the
+  destination offset, so it fits a per-call-site difference rather than a per-offset one.
+- **The destination address is taken with the no-argument `dst.GetPhyAddr()`.** The offset must already be
+  baked into `dst` by `operator[]` (as §42.2) or by `SetGlobalBuffer` on an already-advanced pointer. There is
+  no offset parameter on this path at all.
+
+And the pointer-advance trap that follows from §42.1: because `SetGlobalBuffer` takes `__gm__ PrimType*` =
+`__gm__ int4b_t*` and `sizeof(int4b_t) == 1`, writing
+
+```cpp
+gm.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(base) + 12288, len);   // 12288 BYTES  = element 24576
+gm = gm[12288];                                                            // 12288 NIBBLES = byte 6144
+```
+
+gives two different addresses a factor of two apart. The official example uses the second form exclusively
+(§42.6).
+
+### 42.5 `int4b_t` `DataCopy` granularity: count must be a multiple of 64 elements
+
+`impl/basic_api/kernel_operator_data_copy_intf_impl.h:763-793`:
+
+```cpp
+template <typename T>
+__aicore__ inline void DataCopyCheck(const uint32_t count, DataCopyParams& repeatParams)
+{
+    using PrimType = PrimT<T>;
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 5102)
+    if constexpr (Std::is_same<PrimType, int2b_t>::value) {
+        ...
+        repeatParams.blockLen = count / ConstantsInternal::ONE_BLK_B2_NUM;
+    } else if constexpr (Std::is_same<PrimType, uint1b_t>::value) {
+        ...
+        repeatParams.blockLen = count / ConstantsInternal::ONE_BLK_B1_NUM;
+    } else if constexpr (
+        Std::is_same<PrimType, fp4x2_e2m1_t>::value || Std::is_same<PrimType, fp4x2_e1m2_t>::value ||
+        Std::is_same<PrimType, int4b_t>::value) {
+        ASCENDC_ASSERT((count % ConstantsInternal::ONE_BLK_FP4_NUM == 0), {
+            KERNEL_LOG(
+                KERNEL_ERROR, "DataCopy count is %d, which should be 32B align. \
+                    In NPU mode, no error is reported. The value is rounded down by 32B.",
+                count);
+        });
+        repeatParams.blockLen = count / ConstantsInternal::ONE_BLK_FP4_NUM;
+    } else
+    ...
+```
+
+with `impl/basic_api/utils/kernel_utils_constants.h:311-313`:
+
+```cpp
+const uint32_t ONE_BLK_FP4_NUM = 64;
+const uint32_t ONE_BLK_B2_NUM = 128;
+const uint32_t ONE_BLK_B1_NUM = 256;
+```
+
+So an `int4b_t` `DataCopy` moves whole 32-byte blocks of 64 nibbles, and the quantum is 64 elements.
+Note the assert's own wording: **「In NPU mode, no error is reported. The value is rounded down by 32B.」** — a
+misaligned count is silently floored on device. 2048 and 12288 are both multiples of 64, so this is not the
+present defect, but it is the rule for any future span.
+
+`int4b_t` is a first-class `DataCopy` type on 2201 — `impl/basic_api/kernel_operator_data_copy_check.h:31-51`:
+
+```cpp
+template <typename T>
+__aicore__ inline constexpr bool IsBasicDataCopySupportedType()
+{
+    return SupportType<
+               PrimT<T>, int4b_t, uint8_t, int16_t, uint16_t, int32_t, uint32_t, int64_t, uint64_t, half, float,
+               double>()
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+           || SupportType<PrimT<T>, bfloat16_t>()
+#endif
+        ;
+}
+
+template <typename T>
+__aicore__ inline constexpr bool IsNd2NzSupportedType()
+{
+    return SupportType<PrimT<T>, int4b_t, int8_t, uint8_t, int16_t, uint16_t, int32_t, uint32_t, half, float>()
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+           || SupportType<PrimT<T>, bfloat16_t>()
+#endif
+        ;
+}
+```
+
+and `IsDataCopyPadSupportedType<T>()` is defined as `IsBasicDataCopySupportedType<T>()`, so `DataCopyPad`
+accepts it too.
+
+### 42.6 The vendor's own int4 idiom: element-counted `SetGlobalBuffer`, then tensor `operator[]`
+
+`examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_int4/matmul_int4.asc`, verbatim — note that this
+is a `#define ASCENDC_CUBE_ONLY` kernel, the same mode as ours:
+
+```cpp
+#include "kernel_operator.h"
+#define ASCENDC_CUBE_ONLY
+#include "lib/matmul_intf.h"
+...
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ AType*>(a), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BType*>(b), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(c), tiling.M * tiling.N);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasType*>(bias), tiling.N);
+
+    int32_t offsetA = 0;
+    int32_t offsetB = 0;
+    int32_t offsetC = 0;
+    int32_t offsetBias = 0;
+    CalcOffset(AscendC::GetBlockIdx(), offsetA, offsetB, offsetC, offsetBias);
+    aGlobal = aGlobal[offsetA];
+    bGlobal = bGlobal[offsetB];
+    cGlobal = cGlobal[offsetC];
+    biasGlobal = biasGlobal[offsetBias];
+```
+
+The length is the element count (`M * Ka`, not `M * Ka / 2`), and the offset is applied with
+`tensor = tensor[offset]`, never by advancing the raw pointer. `AType` here is `AscendC::int4b_t`.
+
+### 42.7 The official int4 Matmul constraint list — and a 950 forward-compat warning
+
+`examples/01_simd_cpp_api/04_advanced_api/00_matmul/matmul_int4/README.md`, 「约束条件」 verbatim:
+
+```
+- 约束条件
+  - 左矩阵A、右矩阵B的数据类型必须同时为int4，对应输出C矩阵的数据类型只支持int32、half。
+  - 左矩阵A为int4数据类型时，不支持转置。
+  - int4数据类型输入的Matmul对象仅支持Norm、MDL、IBShare模板。
+```
+
+and the product table:
+
+```
+| 产品 | CANN软件版本 |
+|------|-------------|
+| Atlas A3 训练系列产品/Atlas A3 推理系列产品 | >= CANN 9.0.0 |
+| Atlas A2 训练系列产品/Atlas A2 推理系列产品 | >= CANN 9.0.0 |
+```
+
+This is the vendor's own, independent confirmation of our `mad_s4` finding: **both operands must be int4, C is
+int32 or half only, an int4 A matrix cannot be transposed, and only the Norm / MDL / IBShare templates
+support it.**
+
+`examples/01_simd_cpp_api/06_compatibility_guide/matmul_s4/README.md` adds the forward-compat shape, verbatim:
+
+```
+## 概述
+
+本样例演示 int4 矩阵乘计算的端到端实现，通过编译时宏隔离不同硬件实现。
+- Atlas A2/A3 训练/推理系列产品支持int4数据类型，可直接进行Matmul计算。
+- Ascend 950PR/Ascend 950DT的Cube计算单元不支持int4数据类型，需将int4x2解压为int8后再进行Matmul计算。
+```
+
+```
+## 样例实现：
+
+  - **Atlas A2/A3 训练/推理系列产品**：Cube计算单元支持int4数据类型，可直接执行Matmul计算。
+  - **Ascend 950PR/950DT**：Cube计算单元不支持int4数据类型，需通过mix模式在Vector Core执行Unzip操作，将int4x2解压为int8后再进行Matmul计算。
+```
+
+So the A3 int4 Cube path we rely on is removed on 950PR/950DT, where the sanctioned route is a Vector-core
+unzip of int4x2 to int8 in mix mode.
+
+### 42.8 ★ There is no unsigned int4 on 2201 — `uint4b_t` exists in the headers but is arch-gated away
+
+`impl/basic_api/utils/kernel_utils_constants.h:606-615`:
+
+```cpp
+using int4b_t = integer_sub_type<INT4_BIT_NUM, true>;
+
+#if (__NPU_ARCH__ == 5102)
+using int2b_t = IntegerSubType<INT2_BIT_NUM, true>;
+using int1b_t = IntegerSubType<INT1_BIT_NUM, true>;
+using uint1b_t = IntegerSubType<INT1_BIT_NUM, false>;
+#endif
+
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113))
+using uint4b_t = IntegerSubType<INT4_BIT_NUM, false>;
+```
+
+and its `SizeOfBits` specialization at `:684-688` carries the same gate:
+
+```cpp
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113))
+template <>
+struct SizeOfBits<uint4b_t> {
+    static int const value = INT4_BIT_NUM;
+};
+```
+
+`GlobalTensor::GetPhyAddr`'s `uint4b_t` arm (`kernel_tensor_impl.h:1343-1348`) sits inside the same
+`3003 || 3113` guard. **On `__NPU_ARCH__ == 2201` the type `AscendC::uint4b_t` does not exist**, so there is
+no unsigned-int4 operand to be had on A3 and no `Mmad` flag to ask for one: the signed −8..7 range plus a
+per-column `8*sum(w)` correction fold is the only route. The type being present-but-gated also means a
+compile error naming `uint4b_t` on 2201 is a *missing arch*, not a missing CANN version.
+
+## Relevance
+
+42.3 is the answer to the live question and it is a negative: the declared length in `SetGlobalBuffer` is in
+elements for `int4b_t`, and over-declaring it is inert on NPU — nothing on the `DataCopy` path reads
+`bufferSize_`, and the only check that could have fired is a `SIGABRT` macro that expands to nothing off CPU
+debug. 98304 versus 14336 is not the variable. 42.4 supplies the one mechanism in this code that produces
+exactly «never lands anywhere, no error»: if the source `LocalTensor`'s `TPosition` maps to neither `UB` nor
+`L1`, the Level-0 overload emits no instruction and returns, because its `else` arm is a debug-only check.
+42.1 and 42.2 give the factor-of-two trap to rule out next — `sizeof(int4b_t) == 1` but
+`SizeOfBits<int4b_t> == 4`, so a raw `int4b_t*` advance counts bytes while `tensor[i]` counts nibbles — and
+42.6 shows the vendor applying offsets only the second way, inside a `ASCENDC_CUBE_ONLY` kernel like ours.
+42.5 fixes the span quantum at 64 elements with silent floor-rounding on device. 42.7 independently confirms
+the `mad_s4` both-operands-int4 rule from Huawei's own README, adds two constraints we had not recorded (no
+transpose on an int4 A, and only Norm/MDL/IBShare templates), and warns that the whole A3 int4 Cube path
+disappears on 950PR/950DT. 42.8 closes the unsigned-int4 question for 2201.
+
+The actionable next probe follows from 42.4, not from the buffer length: build the failing kernel once with
+the vendor's own CPU-debug switch, which is the only configuration in which `ASCENDC_CHECK_TPOSITION`,
+`CheckFuncDataCopy` and `CheckDataCopyTensorSizeOverflow` are compiled in at all. The flag is in
+`examples/01_simd_cpp_api/06_compatibility_guide/matmul_s4/README.md`:
+
+```bash
+cmake -DCMAKE_ASC_RUN_MODE=cpu -DCMAKE_ASC_ARCHITECTURES=dav-2201 ..;make -j; # cpu调试模式
+```
+
+and `-DCMAKE_ASC_RUN_MODE=sim` for the NPU simulator. A silent drop becomes a named check failure under
+either.
