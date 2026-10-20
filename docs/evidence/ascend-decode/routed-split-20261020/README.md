@@ -62,6 +62,18 @@ layer, which at the die's measured streaming read is 45 µs. The vendor spends
 145 GB/s and the scaling past four is exactly what the expert split would
 test.
 
+## The core count is a hard ceiling on the launch
+
+The scaling measurement past four blocks did not complete: a sweep of 1, 2, 4,
+8, 16 and 32 blocks hung and was killed. 32 exceeds the die's physical AI core
+count, and the documented behaviour is that the framework's multi-round
+scheduling then inserts a sync that does not pair and the kernel hangs. So the
+expert split has a ceiling at the core count, not merely a preference for it,
+and the sweep has to stop at 16.
+
+Rerunning it needs the die to itself, and the whole machine freed up at the
+same moment — the queue that has been blocked all session took priority.
+
 ## Next
 
 Build it: one MIX kernel, expert-split, per-core dynamic quantisation, no
