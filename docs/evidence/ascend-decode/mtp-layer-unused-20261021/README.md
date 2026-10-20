@@ -60,3 +60,30 @@ So this checkpoint's `glm_moe_dsa` becomes `deepseek_mtp` and loads
 A first reading of the same function found a `glm5_next` branch and concluded
 `glm_moe_dsa` had no architecture mapping. That was reading one branch of a
 chain of them -- the mapping is two `if`s earlier.
+
+## The head's structure, and what a draft token actually costs
+
+Layer 78 holds 3113 tensors:
+
+    eh_proj.weight            the embedding-and-hidden projection
+    enorm.weight hnorm.weight a norm for each of the two inputs
+    embed_tokens.weight       its own embedding
+    input_layernorm.weight
+    mlp.experts.0..255        a complete 256-expert MoE, four tensors each
+    mlp.gate.e_score_correction_bias
+    (plus the attention tensors)
+
+That is a full transformer layer with an `eh_proj` in front -- exactly what
+`DeepseekV32MTPModel` expects, so loading should succeed without adaptation.
+
+It also fixes the cost. The head is not a lightweight projection: running it
+costs what a layer costs, about 710 us today or roughly 450 after the boundary
+merges. Drafting N tokens means running it N times autoregressively, so
+
+    --mtp-tokens=1   about 1.3 percent of the round
+    --mtp-tokens=3   about 4 percent
+
+Against a 35.1 ms round, three draft tokens need acceptance to rise by more
+than 6 percent to pay for themselves. A trained head against a suffix
+automaton that is blind inside rewrites should clear that by a wide margin, but
+the comparison in the queue measures it rather than assuming it.
