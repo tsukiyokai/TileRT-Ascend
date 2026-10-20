@@ -831,3 +831,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     operators -- making the pass match more often would cost 13 ms a round. Its
     sibling `npu_add_rms_norm` is the opposite, 19.189 against 37.913, worth
     1.46 ms. Fusion is not a direction, it is a per-operator measurement.
+
+89. The boundary-merging mechanism is exhausted at 20.3 ms a round. Five merges
+    taken -- routed experts 8.48 ms, one-sided reduce 6.50, four input
+    projections 2.46, residual-with-norm 1.46, CANN's own grouped matmul 1.40 --
+    and four closed by measurement: the norm with its quantisation at 4.8x
+    slower, o_proj with its residual add where addmm is slower than two calls,
+    the attention chain where the vendor already fused everything collectable,
+    and cross-layer nesting at 6.15x for eight layers. That leaves a 35.1 ms
+    round of device time in tuned operators that cost 12 to 19 us each
+    regardless of size, so the last factor of two must come from doing less a
+    round rather than from merging more: fewer layers per token, or more tokens
+    accepted per evaluation.
