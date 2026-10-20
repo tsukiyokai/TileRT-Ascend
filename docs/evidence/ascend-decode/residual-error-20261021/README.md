@@ -66,3 +66,30 @@ ratio with both sides under identical conditions -- 8.54 ms a round cold -- and
 five percent sits inside a W4A8C8 checkpoint's quantisation noise. What blocks
 progress is the absent steady-state capture and the absent end-to-end run, not
 this.
+
+## Bisecting on the shape localises it to the rows
+
+    experts  rows  blocks   vendor     kernel     ratio
+          1     1       1   0.40234    0.40625    1.0097
+          1     4       1   0.25781    0.17480    0.678
+          4     1       4   0.45312    0.48438    1.069
+         16     1      16   0.45117    0.47461    1.052
+
+One expert and one row agree to one percent. One expert and **four rows**
+differ by 32 percent. Many experts at one row differ by 7 percent.
+
+So the defect is in handling more than one row, not in the arithmetic -- which
+is what six excluded candidates were all about. The multi-expert term is
+secondary and may be the same thing seen through the stacking.
+
+## Where that points
+
+Two per-row quantities exist in the kernel: the per-token scale, read as
+`token_scale[expert * SCALE_SPAN + row]`, and the row's offset within the
+M-stacked `stacked` buffer, which uses `STRIDE = M_TILE / 2` separately from
+the loop bound. The scale slots were checked earlier -- every slot of every
+expert's block is filled -- so the offset is the remaining suspect, and it is a
+single constant with a measurable consequence.
+
+That is a far better position than six excluded arithmetic candidates, and it
+came from varying the shape rather than the inputs.

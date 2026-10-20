@@ -1322,3 +1322,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      column for every query whose slot is below it, and at an 8K context in a
      9344 cache none reaches it. Excluded on paper, which is where a suspect
      with an arithmetic answer should be settled.
+
+135. Bisect on the shape, not only on the inputs. The kernel's residual five
+     percent survived six excluded arithmetic candidates and localised in one
+     measurement: one expert and one row agree to 1.0 percent, one expert and
+     four rows differ by 32, many experts at one row by 7. So the defect is in
+     handling more than one row, which no input sweep could have shown -- every
+     one of them held the shape fixed at sixteen experts and one row. Two
+     per-row quantities remain, and the scale slots were already checked, so
+     the M-axis offset is one constant away.
