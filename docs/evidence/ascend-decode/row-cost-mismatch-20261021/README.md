@@ -151,3 +151,34 @@ graph would pay about 85 ms for the same work.
 That is also why width 12 won the original sweep, and it means the drafting
 work should be measured at a fixed captured width, with the tree shaped to fill
 it rather than to exceed it.
+
+## Where the width cost is, and two readings corrected
+
+Attention does not carry it. The gathered FIA call from `fia-mask-20261020`,
+which shapes key as `(width, 1, picks, 512)` so every row carries its own
+selected positions:
+
+    width  picks        us   us a row
+        8   2048   109.057     13.632
+        8   1024   106.797     13.350
+        8    512   103.898     12.987
+       16   2048   107.370      6.711
+       16    512   108.196      6.762
+
+Flat in both. Four times fewer picks moves it five percent and twice the width
+not at all. So the per-row scoring hypothesis is wrong, and the earlier
+rejection of `--index-topk` as a lever was right for a different reason than
+it gave.
+
+The graph records show one capture and one entry a width, with
+`BatchDescriptor(num_tokens=width)`. The `replays` counter -- 1350, 1128, 1098
+-- divided by one request's 225, 188 and 183 rounds gives exactly 6.0 each,
+which looked like six replays a round. It is not: three warmup requests and
+three measured ones at the same round count is 6 x 225 = 1350. One replay a
+round, and the six was two record scopes divided by each other.
+
+So the width cost sits in graph replay rather than in any single operator: a
+bare operator call on one die does not include the graph, every operator
+measured is flat in the rows, and the engine pays 0.66 ms per unit of width
+every round. That is the honest location, and narrowing it further needs the
+engine.
