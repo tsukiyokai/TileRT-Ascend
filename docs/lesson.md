@@ -1305,3 +1305,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      is exactly what tree verification needs -- while today's `tree_mask` and
      `tree_attention` were built to feed `sparse_indices` to an operator that
      rejected every probe. The shorter path was in the codebase.
+
+133. The shorter tree path is gated at width six. `install_gather_fia` raises
+     above `GATHER_FIA_MAX_WIDTH` because "widths above six failed
+     serial-equivalence checks" -- the failure `fia-mask-20261020` recorded as
+     unisolated -- and a tree wants 16 to 24. So the per-row mask already in
+     the codebase is not a shortcut: using it means isolating a correctness
+     failure first. It also explains why the engine runs SFA rather than
+     gather_fia, which is not an oversight but an unvalidated width. That gate
+     now bounds two things: the tree, and gather_fia's own 21.3 us a layer.

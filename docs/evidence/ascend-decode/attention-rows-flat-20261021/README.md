@@ -36,6 +36,19 @@ sixteen ranks a round.
 `shared_kv_fia` passes `atten_mask` of shape `(1, 1, width, capacity)` -- a
 per-row mask, already in use and already known to run. Tree verification needs
 exactly that, and this project built `tree_mask` and `tree_attention` today to
-feed `sparse_indices` instead. The mask path is the shorter one: a boolean of
-width by capacity, which `tree_mask.ancestor_rows` can fill directly, against
-an index set the sparse operator would not accept from a probe at all.
+feed `sparse_indices` instead. The mask path looks shorter -- a boolean of width by capacity, which
+`tree_mask.ancestor_bitmap` fills directly, against an index set the sparse
+operator would not accept from a probe at all.
+
+**But it is gated at width six.** `install_gather_fia` raises above
+`GATHER_FIA_MAX_WIDTH`, with the reason in its own docstring: "widths above six
+failed serial-equivalence checks". That is the unisolated failure
+`fia-mask-20261020` records, and a tree wants width 16 to 24.
+
+So the shorter path is shorter only if that gate opens, and opening it means
+isolating a correctness failure rather than adding a mask. Which also explains
+why the engine runs SFA instead: not that this path was missed, but that it is
+unvalidated at the widths that matter.
+
+The gate itself is now the item: it bounds the tree, it bounds `gather_fia`'s
+own 21.3 us a layer, and it has been recorded as unisolated since 10-20.
