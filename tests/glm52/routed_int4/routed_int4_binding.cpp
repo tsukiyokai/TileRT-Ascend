@@ -156,7 +156,9 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
                          const at::Tensor& gu_bias, const at::Tensor& gu_scale,
                          const at::Tensor& down, const at::Tensor& down_bias,
                          const at::Tensor& down_scale,
-                         const at::Tensor& token_scale, int64_t experts,
+                         const at::Tensor& token_scale,
+                         const at::Tensor& group_count,
+                         const at::Tensor& group_start, int64_t experts,
                          int64_t blocks)
 {
     TORCH_CHECK(rows.dtype() == at::kChar, "rows must be INT8");
@@ -165,9 +167,8 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
     TORCH_CHECK(gu_bias.dtype() == at::kFloat, "gu_bias must be FP32");
     TORCH_CHECK(down_bias.dtype() == at::kFloat, "down_bias must be FP32");
 
-    TORCH_CHECK(rows.size(0) == experts * ROWS, "rows must be ",
-                experts * ROWS, ", the kernel is built for ", ROWS,
-                " an expert");
+    TORCH_CHECK(group_count.dtype() == at::kInt, "group_count must be INT32");
+    TORCH_CHECK(group_start.dtype() == at::kInt, "group_start must be INT32");
     at::Tensor out = at::empty({rows.size(0), HIDDEN},
                                rows.options().dtype(at::kBFloat16));
     Resident& held = Resident::Instance(experts);
@@ -180,7 +181,8 @@ at::Tensor RoutedExperts(const at::Tensor& rows, const at::Tensor& gate_up,
         token_scale.data_ptr<float>(), held.partial(), held.middle(),
         held.middle_scale(), held.wide(), out.data_ptr(),
         held.gate_up_tiling(), held.down_tiling(), held.witness(),
-        held.workspace(), experts);
+        group_count.data_ptr(), group_start.data_ptr(), held.workspace(),
+        experts);
     return out;
 }
 
@@ -191,7 +193,8 @@ TORCH_LIBRARY(tilert, library)
     library.def(
         "routed_experts(Tensor rows, Tensor gate_up, Tensor gu_bias, "
         "Tensor gu_scale, Tensor down, Tensor down_bias, Tensor down_scale, "
-        "Tensor token_scale, int experts, int blocks) -> Tensor");
+        "Tensor token_scale, Tensor group_count, Tensor group_start, "
+        "int experts, int blocks) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(tilert, PrivateUse1, library)
