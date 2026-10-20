@@ -205,10 +205,18 @@ def _choose_collective_engine(aiv):
     The variable is read once when HCCL loads, so this has to run before any
     communicator exists and cannot be changed afterwards; setting it from
     inside the process works, measured at 181.50 us against 290.44 unset.
+
+    Determinism comes with it. The vector path reduces in its own order and is
+    not reproducible on its own -- two runs of the same sixteen-rank all_reduce
+    gave different digests -- while the AI CPU path is. `HCCL_DETERMINISTIC`
+    restores reproducibility for 6 to 8 percent: 189 us against 175
+    non-deterministic and 284 to 350 on the AI CPU. Bit-exactness is what every
+    comparison in this project is checked against, so it is not optional.
     """
     if not aiv:
         return
     os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+    os.environ.setdefault("HCCL_DETERMINISTIC", "true")
 
 
 class CannModel:

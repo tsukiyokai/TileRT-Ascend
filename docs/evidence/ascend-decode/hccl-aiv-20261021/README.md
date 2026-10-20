@@ -132,3 +132,33 @@ What remains is the handshake intrinsic to a collective on this communicator.
 Nothing on the configuration side reaches it, so the only way past is fewer
 calls -- which means an execution structure that does not synchronise every
 layer, not a better setting.
+
+## AIV is not reproducible on its own, and determinism costs 6 to 8 percent
+
+The vector cores reduce in their own order. Sixteen ranks, each contributing a
+pattern scaled by `1 << (rank % 8)` so the sum is order-sensitive in bf16:
+
+    AIV      digest 409d955c5abef8b9
+    AIV      digest c796858674b53689   same mode, different run
+    AI_CPU   digest a5708c551f9c34f1
+
+Two AIV runs disagree. Three AI_CPU runs give one digest, and three AIV runs
+with `HCCL_DETERMINISTIC=true` give one digest.
+
+The amplification in this probe -- 128x between ranks -- makes the absolute
+error figures useless, but non-determinism is not an amplification artefact:
+the same mode giving two digests is the finding.
+
+What determinism costs:
+
+    ai_cpu        349.85   284.32
+    aiv           172.77   177.86
+    aiv+determ    188.45   189.99
+
+So AIV with determinism is **1.5 to 1.85x faster than AI_CPU** and 6 to 8
+percent slower than AIV alone. Every comparison in this project is checked for
+bit-exactness -- the bank narrowing was verified that way today -- so
+reproducibility is not optional and the engine sets both.
+
+An earlier sweep tested `HCCL_DETERMINISTIC=false` and read it as no
+improvement. The useful direction was the one not tried.

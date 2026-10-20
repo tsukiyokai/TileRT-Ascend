@@ -1711,3 +1711,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      13.91 -- 30 percent of the 47 GiB budget for 3.6 ms a round. Both sides
      are linear in the layers made redundant, 46 us and 178 MB each, so it is a
      dial: twenty layers is 3.6 GB for 0.92 ms.
+
+166. AIV expansion is not reproducible on its own. Sixteen ranks with the sum
+     made order-sensitive: two AIV runs gave digests 409d955c and c7968586,
+     while three AI_CPU runs gave one digest and three AIV runs with
+     HCCL_DETERMINISTIC=true gave one. Determinism costs 6 to 8 percent --
+     189 us against 175 -- and still beats AI_CPU's 284 to 350 by 1.5 to 1.85x.
+     Since every comparison here is checked for bit-exactness, the engine sets
+     both. And the earlier knob sweep tested HCCL_DETERMINISTIC=false and read
+     it as no improvement: the useful direction was the one not tried.
