@@ -196,3 +196,18 @@ So the honest position is narrower than the previous paragraph claimed: the
 width cost is paid inside graph replay, every operator that could be measured
 on one die is flat in the rows, and the one that could not be measured is the
 one most likely to carry it.
+
+## Five attempts, and the operator stays unmeasurable on one die
+
+`aclnnSparseFlashAttention` rejects every argument set tried here with
+`Execution_Error(EZ1008): Failed to execute tiling function`, across five
+combinations: with and without `query_rope`, selection shaped `(1, rows,
+picks)` and `(rows, picks)`, per-row lengths and cumulative starts, and the
+MLA and plain head widths. The engine runs it, so what is missing is context
+this probe does not reproduce -- most likely the page view
+`_view_cache_as_operator_pages` builds, or the persistent sinks
+`SparseMLAMetadataState` owns.
+
+Recorded as unmeasurable from a single die rather than pursued further: the
+queued width arms measure the same quantity end to end, which is where the
+answer has to come from anyway.
