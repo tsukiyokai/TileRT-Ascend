@@ -67,3 +67,33 @@ The one-sided reduce arm failed on the first attempt for a dull reason —
 been shipped there, md5-verified, with the engine and bench contract checked
 against that tree and the module imported without touching a device. It goes
 last in the next queue, because `chain.sh` exits on a failing arm.
+
+
+## The re-run, with the launcher current
+
+Same tree, same flags, same machine; the one change is the launcher putting
+the static-kernel cache in each arm's own output directory. Six requests an
+arm, of which the first is plainly a warm-up -- 11.92, 12.07, 11.89, 11.74
+against steady states near 11.0 -- so the mean is over the other five.
+
+| arm | steady-state requests, ms | mean |
+|---|---|---|
+| base-a | 11.0403 11.0360 11.0435 11.0369 11.0638 | 11.0441 |
+| combine-a | 11.0108 10.9456 10.9132 10.9261 10.9054 | 10.9402 |
+| base-b | 11.1702 11.1130 11.1802 11.1700 11.0966 | 11.1460 |
+| combine-b | 10.8538 10.8528 10.8813 10.9050 10.8917 | 10.8769 |
+
+Pair A gives −0.104 ms and pair B −0.269, a mean of −0.19 against the
+−0.21 the kernel measurement predicted. The ordering is what makes it: inside
+each pair every combine request beats every base request, ten of ten --
+combine-a's worst, 11.0108, is below base-a's best, 11.0360, and combine-b's
+worst, 10.9050, below base-b's best, 11.0966. 10.8528 ms is the lowest single
+request this project has recorded.
+
+What to hold back: base-a and base-b differ by 0.102 ms, so the spread between
+nominally identical arms is about the size of pair A's effect, and pair B's is
+2.6 times it. The honest figure is 0.1 to 0.3 ms, consistent in sign, with no
+overlap inside either pair.
+
+This also closes the diagnosis above by construction rather than by argument.
+Nothing about the override changed between the void measurement and this one.

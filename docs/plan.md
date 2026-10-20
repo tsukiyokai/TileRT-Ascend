@@ -6,7 +6,7 @@
 
 ## 当前证据与优先级
 
-截至 2026-10-20，已测最好请求 TPOT 为 10.9285 ms(a3-84 整机、width32、lookup、三个实测请求,四臂全部低于11.05);此前为 11.6198 ms。该改善属于当前树(pinned staging 与 width32 的 lookup),不属于当日任何开关——`--plain-moe-combine` 的配对因四臂共享树下的 `static_kernel_compile_outputs/static_kernel_cache` 而无效,须清缓存重测。[整机记录](evidence/ascend-decode/free-machine-20261020/README.md)。pinned `seq_lens` 与 pageable 同会话交替，两对完整对照分别节省 3.384／3.791 ms/round；六个 pinned 请求均快于九个 pageable 请求。该组受共租户影响，运行利用率设为 0.78，pageable 为 12.3–12.6 ms/token；绝对最好值与配对差分别保留。[测量记录](probe.md)、[staging 机制](evidence/ascend-decode/metadata-h2d-20261019/README.md)
+截至 2026-10-20，已测最好请求 TPOT 为 10.8528 ms(a3-84 整机、width32、lookup、三个实测请求,四臂全部低于11.05);此前为 11.6198 ms。该改善属于当前树(pinned staging 与 width32 的 lookup),不属于当日任何开关——`--plain-moe-combine` 的配对因四臂共享树下的 `static_kernel_compile_outputs/static_kernel_cache` 而无效,须清缓存重测。[整机记录](evidence/ascend-decode/free-machine-20261020/README.md)。pinned `seq_lens` 与 pageable 同会话交替，两对完整对照分别节省 3.384／3.791 ms/round；六个 pinned 请求均快于九个 pageable 请求。该组受共租户影响，运行利用率设为 0.78，pageable 为 12.3–12.6 ms/token；绝对最好值与配对差分别保留。[测量记录](probe.md)、[staging 机制](evidence/ascend-decode/metadata-h2d-20261019/README.md)
 
 width-8 MTP 是当前计时控制组，单一冻结输入的平均实际提交数约 4.507，2 ms 对应稳态轮预算约 9.01 ms。旧相位参考为 verify 39.68、chain 10.27、conditioned 2.08 ms/round；这些来自旧配置，须随新组合重测。[宽度扫描](evidence/ascend-decode/width-sweep-20261019/README.md)、[同步相位](evidence/ascend-decode/phase-synced-20261019/README.md)
 

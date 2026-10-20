@@ -72,6 +72,8 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 
 | 10-20 | [Free machine](evidence/ascend-decode/free-machine-20261020/README.md) | First whole-machine arms since the fleet freed, width32 with lookup, three live requests each: base11.0052／10.9691／10.9937 and10.9848／11.0309／10.9811, combine10.9420／10.9553／10.9285 and11.0452／10.9897／10.9737. | New best request TPOT10.9285ms against the recorded 11.6198, and it belongs to the current tree, not to today's flag. The `--plain-moe-combine` pairing is void: all four arms shared `tree/static_kernel_compile_outputs/static_kernel_cache`, below the tree and outside the per-arm caches, so the combine arms restored the package `base-a` compiled. Redo with that cache cleared or `disable_static_kernel_compile_cache` set. |
 
+| 10-20 | [Combine, re-run](evidence/ascend-decode/free-machine-20261020/README.md) | Same tree and flags, launcher current so each arm keeps its own static-kernel cache. Steady-state means: base-a11.0441／combine-a10.9402, base-b11.1460／combine-b10.8769. | `--plain-moe-combine` is real: −0.104 and −0.269ms, mean −0.19 against the predicted −0.21, and inside each pair every combine request beats every base request, ten of ten. Lowest single request10.8528ms. The 0.102ms between base-a and base-b is the between-arm noise, so quote 0.1–0.3ms. |
+
 [Detailed historical experiments](probe-20261019-2340.md) retain the original
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
