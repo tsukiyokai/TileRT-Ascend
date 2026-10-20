@@ -61,6 +61,10 @@ int main(int argc, char** argv)
     const int32_t device = (argc > 2) ? std::atoi(argv[2]) : 0;
     const int repeats = (argc > 3) ? std::atoi(argv[3]) : 100;
     const int rounds = (argc > 4) ? std::atoi(argv[4]) : 5;
+    // 0 both arms, 1 the staged arm alone, 2 the fused arm alone. A hang
+    // tells you nothing unless you can run one side of it.
+    const int arm = (argc > 5) ? std::atoi(argv[5]) : 0;
+    const int stages = (argc > 6) ? std::atoi(argv[6]) : 7;
 
     std::vector<uint8_t> tiling_host(TILING_BYTES, 0);
     const int tiling_status = mix_build_tiling(static_cast<int>(rows),
@@ -139,14 +143,32 @@ int main(int argc, char** argv)
     Check(aclrtMemcpy(tiling, TILING_BYTES, tiling_host.data(), TILING_BYTES,
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload tiling");
 
-    mix_expert_fused_launch(BLOCK_DIM, stream, sync_base, x, weight, partial,
-                            (float*)scale, (float*)token, fused_out, tiling,
-                            rows);
-    Check(aclrtSynchronizeStream(stream), "fused once");
-    mix_expert_staged_launch(BLOCK_DIM, stream, sync_base, x, weight, partial,
-                             (float*)scale, (float*)token, staged_out, tiling,
-                             rows);
-    Check(aclrtSynchronizeStream(stream), "staged once");
+    if (arm != 2) {
+        std::printf("staged launching\n");
+        std::fflush(stdout);
+        mix_expert_staged_launch(BLOCK_DIM, stream, sync_base, x, weight,
+                                 partial, (float*)scale, (float*)token,
+                                 staged_out, tiling, rows);
+        Check(aclrtSynchronizeStream(stream), "staged once");
+        std::printf("staged returned\n");
+        std::fflush(stdout);
+    }
+    if (arm != 1) {
+        std::printf("fused launching\n");
+        std::fflush(stdout);
+        mix_expert_fused_launch(BLOCK_DIM, stream, sync_base, x, weight,
+                                partial, (float*)scale, (float*)token,
+                                fused_out, tiling, rows, stages);
+        Check(aclrtSynchronizeStream(stream), "fused once");
+        std::printf("fused returned\n");
+        std::fflush(stdout);
+    }
+    if (arm != 0) {
+        Check(aclrtDestroyStream(stream), "destroy");
+        Check(aclrtResetDevice(device), "reset");
+        Check(aclFinalize(), "finalize");
+        return 0;
+    }
 
     std::vector<uint16_t> fused_host(rows * HALF);
     std::vector<uint16_t> staged_host(rows * HALF);

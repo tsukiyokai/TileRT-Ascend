@@ -41,6 +41,54 @@ Each arm captures once and replays three times; peak allocation17,400,832B.
 The ON/OFF output bytes match the raw-Graph contrast. This covers the norm
 subgraph; full-model compilation and request delivery remain separate.
 
-Next propagate only these three substitutions through the frozen target
-rounds. Historical compiled device ELF identity remains unknown; the local
-operator contrast alone does not attribute the old token flip.
+## Full-model causal intervention
+
+A3-194/trt-asc, TP16,78 layers, two frozen M8 target calls. Only the three
+dense post-attention norm/quant computations change; attention, TP reduction,
+weights, cache and FP32 head use the accepted eager path.
+
+| Arm | Trusted predictions | Labels |
+|---|---|---|
+|Separate norm→BF16→quant|382,262,576,2524|4/4|
+|Fused norm/quant|382,262,576,6500|3/4 on all16 ranks|
+
+The prepared-input OFF control matches the accepted execution in384 saved
+field comparisons across three layers and16 ranks. The ON run validates
+1,264 model artifacts and48 norm snapshots; execution, metadata and rank
+agreement hold, while the expected teacher check fails at position8195.
+These substitutions alone reproduce the historical first token flip.
+The launcher exits1 because that teacher check fails.
+[Full audit](model-replay/on-full-78-02/audit.json),
+[intervention binding](model-replay/on-full-78-02/intervention-audit.json),
+[OFF control](model-replay/off-smoke-3/intervention-audit.json),
+[propagation curve](model-replay/on-full-78-02/propagation.json).
+
+Raw tensors remain at
+`a3-194:trt-asc:/workspace/experiments/m32-full-teacher-20261020/norm-fusion/model-replay/on-full-78-02/`.
+Peak Torch allocation is942,355,456B/die; no timing was collected. Historical
+compiled ELF identity is unknown; full compiled request acceptance remains.
+
+## Operator contract
+
+The [CPU contract audit](contract-audit/README.md) compares the captured
+294,912 INT8 outputs with independent FP32/FP64 formulas. Seven one-code
+differences fall exactly at half-integer boundaries; scales differ by at
+most 2 FP32 ULP and residuals match exactly. The separate custom norm has
+three BF16 rounding boundaries; simulating all three reproduces its saved
+outputs. These observations do not identify a CANN implementation defect.
+A fresh single-die replay is waiting for an idle device.
+
+## Resume
+
+Paused after this run. Device work and CPU prefetch have exited; `trt-asc`
+remains running. Recheck occupancy before the prepared33-output request:
+`/workspace/experiments/m32-full-teacher-20261020/norm-fusion/compiled-request-c29341d/run.sh`.
+It uses frozen source `c29341d`, fresh cache, fusion OFF and historical M8
+flags including draft projection TP. It has not been launched.
+
+The [delivery check](compiled-request/teacher_delivery.py) compares all warmup
+and measured requests with the33 frozen outputs. It binds the teacher to
+canonical prompt IDs and the request to the capture manifest; their different
+JSON encodings have different hashes. The [old-chain check](compiled-request/old-chain-teacher.json)
+rejects all six old requests at output offset4. Full compiled teacher parity
+precedes any new accepted TPOT measurement.

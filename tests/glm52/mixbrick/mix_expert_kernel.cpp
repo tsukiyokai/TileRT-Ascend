@@ -134,7 +134,11 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     // Two vector subblocks, alternate rows each. At eight rows the work is
     // 1024 elements, so the split is about keeping both subblocks fed rather
     // than about throughput.
-    for (int64_t row = GetSubBlockIdx(); row < rows; row += GetTaskRation()) {
+    // Two vector subblocks, alternate rows each. The stride is written out
+    // rather than taken from `GetTaskRation`, which is not 2 on every path and
+    // would make the loop never advance if it returned zero.
+    const int64_t subblocks = 2;
+    for (int64_t row = GetSubBlockIdx(); row < rows; row += subblocks) {
         DataCopy(held.product, product_global[row * GATE_UP], GATE_UP);
         PipeBarrier<PIPE_ALL>();
         Cast(held.gate, held.product, RoundMode::CAST_NONE, HALF);
@@ -154,27 +158,37 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
 
 }  // namespace
 
-extern "C" __global__ [[bisheng::core_ratio(1, 2)]] __schedmode__(1)
+extern "C" __schedmode__(1) __global__ [[bisheng::core_ratio(1, 2)]]
 __aicore__ void mix_expert_fused(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ float* gu_scale,
     __gm__ float* token_scale, __gm__ bfloat16_t* out,
-    __gm__ uint8_t* tiling, int64_t rows)
+    __gm__ uint8_t* tiling, int64_t rows, int64_t stages)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     SetSyncBaseAddr(sync_base);
     TPipe pipe;
+    // `stages` localises a hang: bit 0 the cube half, bit 1 the flag, bit 2
+    // the vector half.
     if ASCEND_IS_AIC {
-        Project(pipe, x, gate_up, partial, tiling, rows);
-        CrossCoreSetFlag<0x2, PIPE_FIX>(GATE_READY);
+        if (stages & 1) {
+            Project(pipe, x, gate_up, partial, tiling, rows);
+        }
+        if (stages & 2) {
+            CrossCoreSetFlag<0x0, PIPE_FIX>(GATE_READY);
+        }
     }
     if ASCEND_IS_AIV {
-        CrossCoreWaitFlag(GATE_READY);
-        Activate(pipe, partial, gu_scale, token_scale, out, rows);
+        if (stages & 2) {
+            CrossCoreWaitFlag(GATE_READY);
+        }
+        if (stages & 4) {
+            Activate(pipe, partial, gu_scale, token_scale, out, rows);
+        }
     }
 }
 
-extern "C" __global__ [[bisheng::core_ratio(1, 2)]] __schedmode__(1)
+extern "C" __schedmode__(1) __global__ [[bisheng::core_ratio(1, 2)]]
 __aicore__ void mix_expert_project(
     uint64_t sync_base, __gm__ int8_t* x, __gm__ int8_t* gate_up,
     __gm__ int32_t* partial, __gm__ uint8_t* tiling, int64_t rows)
@@ -203,12 +217,12 @@ void mix_expert_activate(__gm__ int32_t* partial, __gm__ float* gu_scale,
 void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                              void* x, void* gate_up, void* partial,
                              float* gu_scale, float* token_scale, void* out,
-                             void* tiling, int64_t rows)
+                             void* tiling, int64_t rows, int64_t stages)
 {
     mix_expert_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)x, (__gm__ int8_t*)gate_up,
         (__gm__ int32_t*)partial, gu_scale, token_scale,
-        (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)tiling, rows);
+        (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)tiling, rows, stages);
 }
 
 void mix_expert_staged_launch(uint32_t blocks, void* stream,

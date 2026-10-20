@@ -2,6 +2,8 @@
 
 目标：AgentX，A3 单机 8 模组／16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT 达到 2.x ms；开发验收继续采用 p50／p95 均≤2 ms。允许针对该形状优化。vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode；正式打榜使用 [AgentX workload 与统计规则](https://inferencex.semianalysis.com/agentx/methodology)。
 
+状态：按要求暂停；10-20 的78层融合因果实验及审计已完成，无运行中的实验。恢复时先重查环境，再执行已准备的关闭融合完整编译请求，验证33个冻结输出；通过后测同路径TPOT。
+
 ## 当前证据与优先级
 
 截至 2026-10-19，已测最好请求 TPOT 为 11.6198 ms。pinned `seq_lens` 与 pageable 同会话交替，两对完整对照分别节省 3.384／3.791 ms/round；六个 pinned 请求均快于九个 pageable 请求。该组受共租户影响，运行利用率设为 0.78，pageable 为 12.3–12.6 ms/token；绝对最好值与配对差分别保留。[测量记录](probe.md)、[staging 机制](evidence/ascend-decode/metadata-h2d-20261019/README.md)
@@ -11,6 +13,8 @@ width-8 MTP 是当前计时控制组，单一冻结输入的平均实际提交�
 10-20 复核：旧 `chain-w8` 三条轨迹均在输出 offset4 与冻结 teacher 分叉；prompt IDs 相同，hash 差异仅来自序列化。147 轮／A=6.959 只用于旧未验收轨迹的策略筛选。可信 teacher33 的独立 CPU 回放中，width8／16／32均为28轮、新增32个输出，计划验证行数224／448／896；这段窗口加宽无接受收益；相同30个新增输出，冻结MTP4候选为14轮、lookup8为26轮，完整轮价比须低于1.857才由MTP胜出。[短窗口回放](evidence/ascend-decode/lookup-contract-20261019/teacher33/README.md)。同一前缀的完整M32/SFA已通过32个冻结标签；shared-FIA完整对照为30/32，先定位其数值差异及旧链首个分叉，再核33输出的串行／M32／Graph／reset与完整请求。[证据](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md)
 
 2026-10-20 发射地板定调优先级:把实测 per-call 地板(AI_VECTOR_CORE 0.70、AI_CORE 2.30、MIX_AIV 12.04、MIX_AIC 13.58 µs)乘以一轮真实调用数,3008 次调用给出 11.512 ms;而 2 ms/token 在 A=6.959 下只允许 13.92 ms 的轮。地板占预算 83%,所以目标要的是更少的发射而不是更快的 kernel。地板的 82% 是 505 次 MIX_AIC,每层 6.5 个。同一捕获内的对照:MlaPrologV3 作为一个融合算子跑在声明字节的 1.1 倍,所有未融合邻居是 3 到 91 倍。两个 grouped matmul 合计 12.388 ms 对 3.484 ms 的 W4 权重(并集 44.35 时每轮 4.023 GB),3.56 倍。[发射地板与分族预算](evidence/ascend-decode/critical-path-20261020/README.md)
+
+TileRT 自己在 ROCm 上对同一个模型选的粒度已经拆出来了,它直接回答了"整层融合"这一问."pure_mla_moe_layer_kernel" 一个 kernel 覆盖 norm→MLA→O 投影→TP all-reduce→router→routed experts→shared expert→SwiGLU→第二次 all-reduce→bf16 尾巴,48 个特化、30–34 个 s_barrier,可证明就是两个半边(各自也单独发布)的拼接。但它不是 persistent megakernel:每层退出,无工作队列、无 grid-wide barrier、零 atomics。决定性的资源事实是 LDS 恰为 95232＋13840×tokens,而融合层 kernel 在三个宽度上与只做 attention 的 kernel 相等——把 MoE 半边融进来不需要任何额外片上状态,因为它复用 attention 的 arena。TP 归约在 kernel 内部,每层两次,靠对 32 位字高半部那个 16 位 epoch 标记自旋等待。KV 选择仍是独立发射,因为 topk 要 158896 B 的 LDS(总共 160 KiB)。另外它没有 W4:权重是 uint8 FP8 E4M3＋f32 scale,反量化是 MFMA 前紧挨着的四条 v_cvt;投机宽度(1/2/4)是编译期模板参数。[ROCm 结构](reference/tilert-rocm-glm52-structure.md)
 
 | 顺序 | 路线 | 下一项与通过条件 |
 |---|---|---|
@@ -36,7 +40,7 @@ GMM1 的 full-A、N 拆分与 K512 筛选均未改善 M32 随机路由的原始�
 
 冻结residual重建的75层teacher路由，M8／16／32平均专家并集44.35／68.07／99.36。GMM2新增条件：M32、每专家≤32行、活跃数≥64、超过16行者占比≤1/8；原小组条件保留，覆盖40→75层。正式新旧ABBA的三组teacher分布均改善11.18–22.12µs；58次Graph对CPU MSD逐位一致。同路径控制差值反转，开销未定；默认仍关闭，下一项核整模型teacher与实际lookup轮成本。这些统计不含拒绝尾部。[路由](evidence/ascend-decode/shared-fia-model-20261020/teacher-routes/README.md)、[发布对照](evidence/ascend-decode/gmm2-compact-20261020/guard-release/README.md)
 
-两轮冻结M8已通过TP16全部78层、4/4可信标签；对应hidden／residual／新KV及最终FP32 logits与已验收M32逐位一致，旧首差位置输出2524。[两轮证据](evidence/ascend-decode/shared-fia-model-20261020/two-round-replay/README.md)。历史编译图有3处稠密层norm＋量化融合。已关闭该开关并核实际IR；单die原输入→换输入→恢复输入的18项Graph对照通过，保留static／SuperKernel，OFF与未融合执行逐位一致。下一项只切换这3处算术并核完整78层传播，再测连续解码精度和同路径TPOT。[融合对照](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md)
+两轮冻结M8已通过TP16全部78层、4/4可信标签；对应hidden／residual／新KV及最终FP32 logits与已验收M32逐位一致，旧首差位置输出2524。[两轮证据](evidence/ascend-decode/shared-fia-model-20261020/two-round-replay/README.md)。历史编译图有3处稠密层norm＋量化融合。已关闭该开关并核实际IR；实际ACLGraph／SuperKernel的135项原始张量检查通过。TP16全部78层中，仅开启这3处融合，即使4/4可信标签变为3/4，并在所有rank复现2524→6500的旧首差；1,264份模型产物与48份norm快照已核验。下一项是关闭融合的完整编译请求，核33个冻结输出后再测同路径TPOT。[融合对照](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md)
 
 ## 执行不变量
 
