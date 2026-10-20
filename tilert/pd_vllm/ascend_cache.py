@@ -227,10 +227,12 @@ class AscendRankEngine:
     def inject(self, prefix):
         self._clear_request()
         self.target.inject(prefix.main)
-        self.draft.inject(prefix.mtp)
+        if self.draft is not None:
+            self.draft.inject(prefix.mtp)
         if (
             self.target.position != prefix.seq_len - 1
-            or self.draft.position != prefix.seq_len - 1
+            or (self.draft is not None
+                and self.draft.position != prefix.seq_len - 1)
         ):
             raise ValueError("Main/MTP replay prefixes have different lengths")
         result = self.target.verify(
@@ -311,15 +313,17 @@ class AscendRankEngine:
             raise ValueError("Retained position is outside the request")
         if retained_position != self.target.position:
             self.target.truncate(retained_position)
-        draft_position = min(retained_position, self.draft.position)
-        if draft_position != self.draft.position:
-            self.draft.truncate(draft_position)
+        if self.draft is not None:
+            draft_position = min(retained_position, self.draft.position)
+            if draft_position != self.draft.position:
+                self.draft.truncate(draft_position)
         self._mtp = None
 
     def reset(self):
         self._clear_request()
         self.target.reset()
-        self.draft.reset()
+        if self.draft is not None:
+            self.draft.reset()
 
 
 class CannRankEngine(AscendRankEngine):
@@ -328,9 +332,11 @@ class CannRankEngine(AscendRankEngine):
     def inject(self, prefix):
         self._clear_request()
         self.target.inject(prefix.main)
-        self.draft.inject(prefix.mtp)
+        if self.draft is not None:
+            self.draft.inject(prefix.mtp)
         if (self.target.position != prefix.seq_len
-                or self.draft.position != prefix.seq_len - 1):
+                or (self.draft is not None
+                    and self.draft.position != prefix.seq_len - 1)):
             raise ValueError("CANN main/MTP prefixes require P and P-1 rows")
         self.parent_hidden = prefix.parent_hidden.clone()
         result = self.target.predict(self.parent_hidden)
