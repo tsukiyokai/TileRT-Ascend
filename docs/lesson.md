@@ -374,3 +374,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     agree on every convention you thought to check and still not be the same
     tensor; when a shape is `(256, 128, 6144)` and the halved axis could be
     either, the scale's length is the witness.
+
+50. Experts can be tensor-sharded rather than distributed. Each rank here
+    holds all 256 of them and a sixteenth of each one's intermediate axis --
+    the checkpoint's per-expert `gate_proj.weight` is `(1024, 6144)` packed
+    along the output axis, so that projection's N is 2048, and the engine's
+    `w13_weight (256, 128, 6144)` is two projections at 64 bytes each, 2048/16
+    apiece. I had read it as 256 experts over 16 ranks, sixteen to a rank,
+    which the arithmetic permits and the data does not. The cost of the wrong
+    reading is a factor of two on `down_proj`, whose K is the intermediate
+    itself: a rank's share is 2048/16 outputs, not 1024/16 bytes, and nothing
+    objects to the narrower slice except the engine's own declared shape.
