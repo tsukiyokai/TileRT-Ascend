@@ -1089,3 +1089,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the one-sided push is worth 8.8 to 14.7 ms depending on whether its 6.2x
      advantage survives the engine's message size -- a range only sixteen ranks
      can narrow.
+
+113. The one-sided push is a latency optimisation, so batching defeats it. Two
+     ranks, float32: it beats HCCL 6.90x at 24 KB, 9.91x at the decode shape's
+     288 KB, 2.17x at 1.5 MB and loses at 6 MB, because HCCL spends 189 to 258
+     us on rendezvous regardless of size and the push skips it. The engine
+     makes 20.5 collective calls a round at 858 us where a layer-wise reduction
+     would make 156, so it already batches -- into the regime where the push
+     loses. The lever is therefore not "replace HCCL" but "unbatch and push",
+     156 pushes at 26 us being 4.1 ms a round against 17.56, and the two are
+     alternatives rather than complements.
