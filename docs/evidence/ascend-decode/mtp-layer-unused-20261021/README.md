@@ -87,3 +87,28 @@ Against a 35.1 ms round, three draft tokens need acceptance to rise by more
 than 6 percent to pay for themselves. A trained head against a suffix
 automaton that is blind inside rewrites should clear that by a wide margin, but
 the comparison in the queue measures it rather than assuming it.
+
+## A model of the pairing, and why it does not answer the question
+
+Prefixing the automaton's proposal with one token from a source right with
+probability p, at an edit rate of 0.05:
+
+    automaton alone          accepted 4.902  rows 6.5  TPOT  8.24
+    p = 0.60                 accepted 1.597  rows 4.1  TPOT 24.33
+    p = 0.80                 accepted 1.800  rows 4.4  TPOT 21.76
+    p = 0.95                 accepted 1.948  rows 4.7  TPOT 20.23
+
+Much worse, and the construction is why: prefixing shifts the automaton's whole
+proposal by one position, so a correct head token gains one accepted token
+while a wrong one voids the entire proposal behind it. That is not how MTP
+drafts. The head shares the target's context and drafts autoregressively --
+predict one token, extend the context with it, predict the next -- so there is
+no second drafter whose output it can invalidate.
+
+The probe therefore measures a wrong splice, not the pairing, and its numbers
+are not evidence about MTP. Recorded so they are not mistaken for it later.
+
+What does stand: with `n_predict 1` the head produces one token a pass, so
+`--mtp-tokens=N` costs N full layers where the automaton produces 32 tokens for
+nothing. The two have different economics per drafted token, and only a
+measured acceptance settles which wins. That is what the queued arms do.

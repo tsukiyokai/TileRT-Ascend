@@ -862,3 +862,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `glm_moe_dsa` to `deepseek_mtp` and then to `DeepseekV32MTPModel`. The
     checkpoint's draft head is fully supported upstream; what was missing was
     only the engine passing a speculative config.
+
+92. Modelling a mechanism you have not read is a way to generate numbers that
+    look like evidence. Prefixing the automaton's proposal with one
+    probabilistically-correct token measured 1.597 to 1.948 accepted against
+    the automaton's 4.902, which reads as "the pairing fails" -- but prefixing
+    shifts the whole proposal by a position, so a wrong head token voids
+    everything behind it. MTP drafts autoregressively against the target's own
+    context and has no second drafter to invalidate. The probe measured a
+    splice of my own invention.
