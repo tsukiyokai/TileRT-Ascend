@@ -1900,3 +1900,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      outlier is 9.2x too large to be that reduction -- it is a prefill figure,
      the capture being max_tokens 6. Third time today this capture's scope
      produced a number that does not transfer.
+
+182. A layer's two reductions cost 377.42 us on sixteen ranks at twelve rows,
+     which vindicates a figure this session withdrew. The 374 us was derived as
+     588 minus 214 and retracted as an artefact of dividing a round-wide fit by
+     the layer count; measured directly it is 377.42, so the derivation was
+     right and the retraction wrong. A synthetic TP16 layer is 870.63 us whole
+     and 493.22 as compute alone, which over 78 layers is 67.91 ms a round
+     against a measured 50.710 -- an upper bound, since the engine fuses into
+     637 super kernels and overlaps streams. The parts are what transfer:
+     collectives are 29.44 ms a round with AIV already on, and at 5.441
+     accepted that alone is 5.41 ms of TPOT. So the target is unreachable while
+     every layer reduces twice, and all five exits from the collective cost are
+     closed by measurement.
