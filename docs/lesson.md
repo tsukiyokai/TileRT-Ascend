@@ -180,3 +180,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     unfused stages have them, or the result is more accurate and not
     comparable.
     [Evidence](evidence/ascend-decode/epilogue-fused-20261020/README.md).
+
+34. A raw `<<<>>>` MIX kernel needs `__schedmode__`. Without batch
+    scheduling the AIC and its two AIVs are not dispatched together, so a
+    cross-core wait can be posted with nobody to answer it; a vendor probe
+    measured 3 hangs in 49 runs on small shapes, and our first two runs hung.
+    For the handoff after `Matmul` use what CANN's own example uses, mode 2
+    and flag 8 from `PIPE_FIX`; mode 0 is the all-AIV grid sync and wants
+    batchmode just as much. A3 allows flag ids 0 through 10 only, the Matmul
+    library consumes some itself, and a flag's counter saturates at 15 sets --
+    so a kernel persisting across 78 layers cannot give each layer its own
+    flag. A3 also has no L0C to UB path, so cube output reaches the vector
+    side through global memory, which is cheap only because it lands in L2.
+    `rtGetC2cCtrlAddr` returns the sync base address but only once a device is
+    bound. [Reference](reference/ascend-fusion-mechanics.md).

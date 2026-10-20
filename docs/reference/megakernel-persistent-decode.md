@@ -1,0 +1,2180 @@
+# Megakernel / persistent-kernel LLM decode — source material
+
+Verbatim excerpts. Each item carries URL, author, date. Nothing here is paraphrased except
+the short `## Relevance` lines, which tie the item to our own measured numbers
+(3008 kernels/round, MIX_AIC launch floor 13.58 us, MIX_AIV 12.04 us, AI_CORE 2.30 us,
+AI_VECTOR_CORE 0.70 us, 11.5 ms launch floor of which 82% on MIX, current TPOT 11.6198 ms).
+
+---
+
+## 1. Hazy Research — "Look Ma, No Bubbles! Designing a Low-Latency Megakernel for Llama-1B"
+
+URL: https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles
+Authors: Benjamin Spector\*, Jordan Juravsky\*, Stuart Sul, Owen Dugan, Dylan Lim, Dan Fu, Simran Arora, Chris Ré (Stanford Hazy Research)
+Date: May 27, 2025 · 13 min read
+
+This is the canonical megakernel post. Reproduced essentially in full because every paragraph
+is load-bearing for our design.
+
+### 1.1 The problem statement and the regime
+
+> There are some applications that benefit from running LLMs really, really fast. This low-latency regime encompasses applications like chatbots and human-in-the-loop workflows, where users care a lot about seeing responses come back immediately.
+>
+> Given the importance of these low-latency workloads, we wanted to explore just how fast we can run open-source models on modern GPUs. To really stress-test existing systems, we consider an aggressive low-latency scenario where we generate a single sequence with Llama-3.2-1B. This workload is strongly memory bound – our performance is dominated by how fast we can load model weights from GPU global memory.
+>
+> It turns out that popular LLM inference engines – vLLM and SGLang – are only able to use at most 50% of available GPU bandwidth when running this workload on an H100. The root of the problem, which we'll describe more below, is that existing systems break down a model forward pass into around a hundred separate kernels that each implement a few operations (e.g. RMS norm, attention, an MLP layer + activation, rotary). Each kernel comes with a setup and teardown period and during this time no useful work gets done – for instance, the all-important task of loading model weights is stalled.
+
+> Figure 1: Speed! Results generated with a 32-token prompt and 128 generated tokens, with no speculation
+
+> In this post, we show how we can bypass this problem by merging the entire Llama-1B forward pass into a single "megakernel" that eliminates kernel boundaries altogether. Doing this achieves brr – on an H100, we use 78% of memory bandwidth and outperform existing systems by over 1.5x. (To our knowledge, this is the lowest-latency forward pass for Llama-1B in bfloat16!) In the rest of this post, we'll walk through how and why one would do this. Specifically:
+>
+> First, we'll talk about how small kernels lead to AI systems that underutilize the GPU's full bandwidth.
+>
+> Second, we'll describe three important points about how we built our megakernel: how we fused lots of kernels together, how we share hardware resources across them to minimize overhead, and how we synchronize them efficiently.
+>
+> If you're interested in learning more of the details or using these ideas yourself, we're open-sourcing all of our code here.
+
+### 1.2 "Separate Kernels Kill the Vibe" — the three stall sources
+
+> In general, the way one runs code on a GPU is by launching a "kernel" – a small program that does a well-defined operation (e.g. RMS norm, MLP). Today, all AI workloads run as long sequences of relatively small kernels. To get an initial sense, let's look at the operations in the Llama-1B transformer block, and some example kernel boundaries of how they might be divided up (Figure 2).
+>
+> Figure 2: An example set of kernel boundaries for the Llama-1B transformer block. Red boxes delineate the work done by individual kernels.
+>
+> As we described earlier, decoding a single sequence with Llama-1B is a purely memory-bound workload: our performance depends on being able to always be loading weights from GPU global memory. So, why are existing approaches so far from using the full bandwidth of the GPU?
+>
+> When we dug into it, we noticed a key problem was that the current kernel-based approach to running models introduces stalls that prevent us from constantly loading memory:
+>
+> First: GPU kernels are launched with a strict ordering, so that a thread block in one kernel can't start until all thread blocks in previous kernels have completely finished. Consequently, every time we start a kernel, we have to wait for all the straggler thread blocks from the prior one to finish. For example, if a kernel runs 512 thread blocks (like our Llama-1B down projection), but we only have 148 streaming multiprocessors (like on a B200), we end up with 80 empty SM's at the end.
+>
+> Second, as we've previously highlighted, each kernel launch and teardown incurs costs. In principle, NVIDIA's CUDA graphs can help hide costs, but by our measurements they still leave a lot on the table. For a simple dummy kernel (which dumps a start time, sleeps, and dumps an end time) on an H100, we find that running on a CUDA stream incurs a launch cost of about 2.1 microseconds, and with CUDA graphs the launch cost only decreases to around 1.3 microseconds – time spent with the GPU doing no useful work! We'd like to have the GPU spend all of its time doing useful work.
+>
+> Finally, even after we start the next kernel, we still have to wait to load weights and activations before any compute can start. These latencies leave the GPU sitting idle for thousands of cycles! Ideally, we'd start loading the next weights while the previous computations and stores are happening. NVIDIA has also built a mechanism for this called Programmatic Dependent Launch (PDL), which allows the next kernel to start preparing while the previous kernel is running, but we found it still introduces unnecessary stalls because the PDL synchronization mechanism (cudaGridDependencySynchronize) is very coarse. For example, it means we have to wait for all queries, keys, and values to complete in order to start attention, as opposed to starting heads as soon as they are ready. We'll later show another specific case of where this is useful in Llama-1B.
+>
+> Taken together, these form the "memory pipeline bubbles" our title references – and they represent a key reason that we're not always loading from memory.  For short operations, these pauses add up, wasting a huge chunk of potential bandwidth. In part, this is because Llama-1B (actually 1.24B parameters) in batch size 1 is just so... small: if each operation is really fast, then the time spent in-between them really starts to matter.
+
+### 1.3 The arithmetic that motivates the whole thing
+
+> To illustrate the magnitude of the problem: for single-sequence generation in 16-bit precision on a single H100, the memory limit is 3.35TB/s / 2.48GB = ~1350 forward passes per second. But with 7 kernel launches per layer, and 16 layers, even with an optimistic 5 us of stalling per kernel (counting stragglers, kernel launch, and memory latencies), generation would run at just ~770 forward passes per second. In practice, it's often worse. On low-latency workloads, GPUs spend only a fraction of their time actually doing any useful work!
+>
+> So while CUDA does provide some existing features (e.g. graphs, streams, PDL) to partially solve these problems, we wanted to see if a different approach could solve all of these problems, where we just fuse the entire model forward pass into a single kernel.
+
+### 1.4 Issue 1/3 — the on-GPU interpreter and the instruction set
+
+> Next, we'll show you how we fused a whole Llama forward pass into a single kernel, and our methods for resolving three key problems:
+>
+> Fusing dozens of operations is hard to do from scratch. We need a mechanism for executing these operations within the megakernel.
+>
+> In order to overlap multiple operations on the same hardware, we need to prevent contention over limited resources, such as shared memory.
+>
+> The GPU synchronizes after each kernel in the traditional kernel model. Without kernels, we have to synchronize the GPU all by ourselves!
+
+> Traditional kernel fusion generally merges just two or three operations together. In contrast, we need to fuse about a hundred. Consequently, we need to have a sensible abstraction for how we can actually program a megakernel.
+>
+> Our approach is built on an on-GPU interpreter – essentially a more sophisticated version of our infrastructure underlying ThunderMLA. Our interpreter is designed such that each streaming multiprocessor (SM) within the GPU receives a sequence of instructions (each implemented using the same CUDA template) and executes them. We schedule each SM's instruction sequence ahead of time on the Python side, and notably we can reuse each schedule for hundreds of forward passes!
+>
+> For our end-to-end Llama forwards pass megakernel, we define the following set of instructions:
+>
+> A fused RMS norm & QKV & RoPE instruction.
+>
+> An attention computation instruction.
+>
+> An attention reduction instruction (for ThunderGQA on long sequences).
+>
+> An O-projection + residual instruction.
+>
+> A fused RMS norm & up-gate & SiLU instruction.
+>
+> A down-projection + residual instruction.
+>
+> An RMS norm & language modeling head instruction, for computing the final token logits.
+>
+> We implement each of these instructions using a common CUDA template (with load, store, compute boilerplate functions), facilitating interoperability within our interpreter framework.
+
+### 1.5 Issue 2/3 — paged shared memory (the exact page geometry)
+
+> The instruction-and-interpreter structure lets us cleanly organize our megakernel. However, we haven't yet addressed the key issue: making sure that model weights are always being loaded in order to maximize memory bandwidth utilization.
+>
+> The reason why a megakernel lets us solve this problem is that we can pipeline memory loads across instructions: our interpreter will start loading the model weights for an instruction as soon as it can, even if a previous instruction is still finishing up (e.g. storing out its results to global memory). It's this tight transitioning between instructions that minimizes the memory bubbles that would otherwise appear if we launched multiple kernels.
+>
+> However, there's a catch: loading the weights from global memory for the next instruction doesn't do you much good if you have no place to put the data you loaded! More precisely, all of our weight matrices are loaded from GPU global memory into our SM's "shared memory" – NVIDIA's term for the fast memory on each SM. Shared memory is a scarce resource on each SM, and we can't start a load for a new instruction if a previous instruction is using all of it. This necessitates a way to keep track of which instruction is using which piece of shared memory and quickly transition shared memory to the next instruction when the current instruction is done with it.
+>
+> We accomplish this by paging shared memory. We first divide the first 213kB of shared memory on an H100 into 13 16KiB pages, and use remaining shared memory for special purposes, like storing instruction parameters. To use one of these pages, instructions have to explicitly request and release them from the interpreter. The interpreter automatically passes released pages to the next instruction, allowing them to start issuing memory loads as early as shared memory becomes available.
+
+### 1.6 Issue 3/3 — the counter-based synchronization system
+
+> While megakernels let us minimize pipeline bubbles, they also introduce a new problem: synchronization. The performance limitation with the normal many-kernel execution model is that no thread blocks in a kernel can start until all thread blocks in previous kernels are finished. However, it's precisely this property that makes it easy to manage data dependencies. When a kernel launches, CUDA guarantees that all of the kernel's input tensors have already been produced and are safe to read from immediately.
+>
+> With megakernels, we have no such guarantees: when an SM starts to execute a new instruction, its inputs might not be ready! To address this, we explicitly synchronize the instructions inside of our megakernel. We accomplish this with a simple counter system. Before the megakernel launches, we initialize an array of counters (i.e. integers) in GPU global memory with a starting value of zero. Whenever an instruction completes, it increments one of these counters. Similarly, whenever a new instruction starts, it must wait for some of these counters to reach a target value, indicating that all of its dependencies have finished.
+>
+> One optimization this enables is in the big multi-layer perceptrons (MLPs) in Llama-1B.
+>
+> In a naive implementation using PDL, one must await completing the whole hidden state before beginning the down projection matrix multiply.
+>
+> We instead produce and consume the intermediate state in four chunks, each with their own counter. This way, an instruction for the down projection only needs to wait for its input chunk to finish.
+
+### 1.7 Results and the full runtime breakdown
+
+> To our knowledge, our H100 megakernel represents the first time anyone has run the forward pass for a 16-bit 1B+ parameter language model in under one millisecond on a GPU. Our B200 implementation pushes this even further to under 680 microseconds per forward pass!
+>
+> As shown in Figure 1, our megakernel outperforms vLLM and SGLang baselines (which use CUDA graphs and torch compilation):
+>
+> On an H100, our megakernel runs almost 2.5x faster than vLLM and over 1.5x faster than SGLang.
+>
+> On a B200, the gap with vLLM rises to over 3.5x, and we remain more than 1.5x faster than SGLang, too.
+>
+> We're still actually quite a ways off from the theoretical limit on a B200, which is around ~3,000 forward passes per second. Part of this gap is because this theoretical limit is based purely on memory bandwidth – but we still have to wait to load activations. And although these activations are small (and don't cost a lot of bandwidth), there are still latencies in loading them that we can't hide. A breakdown of the runtime of our current B200 forward pass (total runtime 600 microseconds):
+>
+> 250 microseconds are spent storing activations, awaiting consistency, and loading them. This is about 20% higher than a simple model would suggest: since each instruction has a dependence on the last one, we need to pay two load latencies (check ready, and then load activations) and two store latencies (store activations, then mark ready) per instruction. Using ~500 nanoseconds latency per load / store, this would impose about 200 microseconds of overhead. (We suspect some of the remaining 50 microseconds comes from time spent processing atomics in global memory.)
+>
+> 200 microseconds are spent actually running RMS norm and matrix-vector computations. 95% of this portion is devoted to matrix-vector. On Blackwell, we find that using the tensor cores is marginally helpful for this; on Hopper, we find it better to simply run on the CUDA cores. This difference comes from the fact that both GPUs have relatively similar CUDA core performance, but Blackwell tensor cores are much faster.
+>
+> 30 microseconds are spent awaiting weights from global memory (pipelining works!) Of these, 40% are spent in the LM head, which is the best-pipelined part of the whole megakernel due to its homogeneity and huge size.
+>
+> 40 microseconds are spent on low-level synchronization overhead across warps. A key issue here is that CUDA's asynchronous barriers are relatively slow, even when they're already in the "pass" state, requiring about 60 nanoseconds each time.
+>
+> 80 microseconds are on setup and various other overheads (e.g. passing instruction barriers, marking pages as complete, etc.)
+>
+> We think there's probably more to do on each of these, but that'll have to wait for a future update!
+
+### 1.8 Repo build/run commands
+
+URL: https://raw.githubusercontent.com/HazyResearch/Megakernels/main/README.md
+Author: HazyResearch
+Date: fetched 2026-10-20
+
+````markdown
+# Megakernels!
+
+## Installation
+
+Clone this repo and run:
+
+```bash
+git submodule update --init --recursive
+pip install uv
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+uv pip install -e .
+```
+
+## Low-Latency Llama Demo
+
+First, to compile the megakernel, run:
+
+```bash
+
+# from the repo root
+export THUNDERKITTENS_ROOT=$(pwd)/ThunderKittens
+export MEGAKERNELS_ROOT=$(pwd)
+export PYTHON_VERSION=3.12 # adjust if yours is different
+export GPU=H100 # options are {H100, B200}, else defaults to B200
+cd demos/low-latency-llama
+make
+
+```
+
+To start an interactive chat session with the model, run:
+
+```bash
+
+# from the repo root
+python megakernels/scripts/llama_repl.py
+
+```
+
+To benchmark the megakernel, run:
+
+```bash
+
+# from the repo root
+python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100
+
+```
+````
+
+## Relevance
+
+The structural argument transfers directly: their 7 launches/layer x 16 layers x 5 us optimistic
+stall = ~770 fwd/s against a 1350 fwd/s bandwidth limit is exactly the shape of our 3008
+kernels/round x MIX floors = 11.5 ms launch floor against a much smaller byte-movement time
+(e.g. GroupedMatmulSwigluQuantV2 6.793 ms spent vs 2.272 ms of bytes). Their fix list maps 1:1 onto
+what we must build: an ahead-of-time-scheduled instruction sequence per core, an explicit paged
+on-chip buffer allocator (our UB/L1 instead of their 213 kB shared memory in 13 x 16 KiB pages),
+and global-memory counters replacing the implicit kernel barrier. Their 250 us of 600 us spent on
+"store activations, await consistency, load them" at ~500 ns per load/store is the warning that a
+megakernel does not make inter-stage activation handoff free — it converts launch cost into
+sync-latency cost, and we must budget for that on Ascend too.
+
+---
+
+## 2. Mirage Persistent Kernel (MPK) — "A Compiler and Runtime for Mega-Kernelizing Tensor Programs"
+
+URL: https://arxiv.org/abs/2512.22219 · HTML: https://arxiv.org/html/2512.22219v1
+Authors: Xinhao Cheng, Zhihao Zhang, Yu Zhou, Jianan Ji, Jinchen Jiang, Zepeng Zhao, Ziruo Xiao, Zihao Ye, Yingyi Huang, Ruihang Lai, Hongyi Jin, Bohan Hou, Mengdi Wu, Yixin Dong, Anthony Yip, Songting Wang, Wenqin Yang, Xupeng Miao, Tianqi Chen, Zhihao Jia
+Date: arXiv:2512.22219v1 [cs.DC] 22 Dec 2025 (v2 revised 10 Jun 2026)
+License: CC BY 4.0
+Code: https://github.com/mirage-project/mirage
+
+This is the most complete published description of a megakernel *runtime* (work queues,
+schedulers, event graph, paged shared memory, hybrid launch). It is the blueprint closest to
+what we need to write.
+
+### 2.1 Abstract
+
+> We introduce Mirage Persistent Kernel (MPK), the first compiler and runtime system that automatically transforms multi-GPU model inference into a single high-performance mega-kernel. MPK introduces an SM-level graph representation that captures data dependencies at the granularity of individual streaming multiprocessors (SMs), enabling cross-operator software pipelining, fine-grained kernel overlap, and other previously infeasible GPU optimizations. The MPK compiler lowers tensor programs into highly optimized SM-level task graphs and generates optimized CUDA implementations for all tasks, while the MPK in-kernel parallel runtime executes these tasks within a single mega-kernel using decentralized scheduling across SMs. Together, these components provide end-to-end kernel fusion with minimal developer effort, while preserving the flexibility of existing programming models.
+>
+> Our evaluation shows that MPK significantly outperforms existing kernel-per-operator LLM serving systems by reducing end-to-end inference latency by up to 1.7×, pushing LLM inference performance close to hardware limits. MPK is publicly available at https://github.com/mirage-project/mirage.
+
+### 2.2 Why kernel-per-operator loses (three limitations)
+
+> First, modern GPUs implicitly insert a kernel barrier between consecutive launches on the same stream to ensure that all threads from the previous kernel complete before any thread from the next kernel begins. While this mechanism enforces data dependencies, it prevents cross-operator software pipelining, forcing dependent operators to execute strictly sequentially. NVIDIA recently introduced programmatic dependent launch (PDL) [11], which allows partial overlap between kernels on the same stream. However, adopting PDL requires significant engineering effort, as it fundamentally alters kernel structure and control flow.
+>
+> Second, the kernel-per-operator approach prevents fine-grained compute-communication overlap. Because dependencies are captured only at the coarse operator granularity, the runtime must enforce full-operator completion before launching dependent communication or computation. For example, when a matrix multiplication is followed by an all-reduce in separate kernels, the all-reduce must wait for the entire multiplication to complete, even though each piece of all-reduce depends only on a subset of the multiplication. Exploiting such opportunities requires representing and enforcing data dependencies at a granularity finer than individual kernels.
+>
+> Finally, the kernel-per-operator approach requires launching hundreds to thousands of kernels for each inference iteration. To mitigate launch overhead, current systems rely heavily on CUDA Graphs, which capture a sequence of GPU operations and launch them with minimal overhead. However, CUDA Graphs are largely static: any changes to control flow, tensor shapes, or data dependencies require re-instantiation or modification of the captured graph, limiting flexibility for dynamic workloads commonly seen in model inference.
+
+> A promising approach to overcoming these limitations is to fuse all computation and communication into a single mega-kernel (also known as a persistent kernel). In this design, the system launches one GPU kernel to execute the entire model, from layer computations to inter-GPU communication, without interruption.
+>
+> Mega-kernels address the limitations of the kernel-per-operator approach in several ways. First, they eliminate kernel launch overhead by avoiding repeated invocations. Second, by fusing all operator computations into a single kernel, they enable cross-operator software pipelining, allowing data for the next operator to be prefetched while computations for the current operator are still in progress. Third, they support fine-grained overlap of computation and inter-GPU communication, enabling simultaneous execution that more effectively hides communication latency.
+
+### 2.3 ttGraph — the SM-level task/event graph
+
+> This section introduces ttGraph, a representation that expresses the computation of a tensor program at the granularity of individual streaming multiprocessors (SMs). This fine-grained representation exposes additional parallelism and enables optimizations such as cross-operator software pipelining and fine-grained kernel overlap, both of which cannot be supported in existing kernel-per-operator execution model.
+>
+> Figure 4 illustrates an example ttGraph, where each node represents either a task or an event. Each task—shown as a blue (or orange) rectangle—denotes a unit of computation or communication executed on a single SM. Each event—shown as a green circle—represents synchronization across tasks. Tasks and events alternate in the graph: every task only has outgoing edges to triggering events and incoming edges from dependent events. A task is ready for execution when its dependent events are all activated and notifies its triggering event upon completion. An event is activated once it has received notifications from all tasks associated with it.
+>
+> This structure captures dependencies at a much finer granularity than traditional computation graphs. For example, multi-GPU LLM serving often involves a MatMul operator followed by an AllReduce operator (Figure 4a). Existing systems generally execute these operators sequentially due to coarse-grained kernel barriers that synchronize entire kernels. In contrast, SM-level task graphs can represent precise task-level dependencies: since AllReduce performs element-wise communication, each of its tasks depends only on one corresponding MatMul task. By inserting fine-grained events between dependent task pairs, MPK can overlap compute-intensive MatMul tasks with communication-intensive AllReduce tasks, maximizing overall GPU utilization.
+
+> **Comparison with CUDA Graphs.**
+>
+> ttGraphs can be viewed as a lower-level extension of CUDA Graphs, sharing several structural similarities. Like CUDA Graphs, ttGraphs are statically instantiated and encode explicit dependencies among operations. However, while CUDA Graphs capture dependencies only at the kernel level, ttGraphs operate at the granularity of individual SM tasks and sub-kernel events. CUDA Graphs primarily describe kernel launch order and rely on stream semantics for synchronization, which confines overlap and fusion to kernel boundaries. In contrast, ttGraphs explicitly model both intra- and cross-operator dependencies, enabling fine-grained synchronization across SMs and overlapping of computation and communication within a single kernel. This design allows MPK to exploit parallelism that is inaccessible to CUDA Graphs or kernel-level execution models.
+
+### 2.4 Compiler: operator decomposition, dependency analysis, event fusion
+
+> **Operator decomposition.**
+>
+> The MPK compiler decomposes each operator of the input computation graph into a set of tasks by partitioning the operator's output tensors such that all tasks compute disjoint subsets of the output and can therefore execute in parallel across SMs. Most tensor algebra operators can be partitioned across multiple output dimensions; for example, the output tensor of a matrix multiplication can be tiled along both the row and column dimensions to expose parallelization opportunities.
+>
+> The performance of a partitioning strategy depends on both the problem shape and the target GPU architecture. To discover an effective strategy, MPK selects a partitioning strategy that minimizes data loading from device memory to shared memory, since accessing device memory is significantly more expensive than accessing shared memory or performing computation on CUDA cores or tensor cores. By default, MPK generates a number of tasks proportional to the number of SMs to promote load balance across SMs during execution. MPK also provides an interface for users to easily specify custom partitioning strategy by setting the desired parallelization degree along each output dimension.
+
+> **Dependency analysis.**
+>
+> MPK uses events to capture dependencies between tasks. For any two operators that share a tensor, MPK enumerates all pairs of tasks from the two operators and introduces an event e for a task pair (t1,t2) if and only if the output region produced by task t1 overlaps with the input region consumed by task t2. The event serves as a synchronization point indicating that t2 cannot begin execution until t1 has completed producing the required data. Accordingly, MPK inserts two edges (t1,e) and (e,t2) into the resulting ttGraph. This fine-grained dependency analysis preserves all producer-consumer dependencies while exposing maximal parallelism across independent tasks.
+
+> **Event fusion.**
+>
+> MPK applies two complementary forms of event fusion—successor-set and predecessor-set fusion—to eliminate redundant synchronization points and simplify the constructed ttGraph. For an event e, we define two functions: InTasks(e), the set of tasks that trigger e, and OutTasks(e), the set of tasks that depend on e. These functions allow us to characterize when multiple events exhibit identical dependency structure and can therefore be fused.
+>
+> First, successor-set fusion merges events that serve as prerequisites for the same set of consumer tasks. Because these tasks cannot begin execution until all such events are activated, representing them separately provides no additional scheduling flexibility.
+>
+> Definition 4.1 (Successor-set fusion).
+> For any two events e1 and e2 of a ttGraph, successor-set fusion applies if and only if OutTasks(e1)=OutTasks(e2). MPK removes events e1 and e2 from T and introduces a fused event e′ with InTasks(e′)=InTasks(e1) ∪ InTasks(e2) and OutTasks(e′)=OutTasks(e1).
+>
+> As an example, successor-set event fusion fuses events e10 and e14 in Figure 5(b) into a new event (i.e., e4 in Figure 5(c)) since they are both prerequisites for task O1.
+>
+> Second, predecessor-set fusion merges events that depend on an identical set of producer tasks. Because such events are triggered simultaneously, maintaining them as separate synchronization nodes introduces unnecessary graph complexity.
+
+Figure 5 caption, verbatim:
+
+> Figure 5: The MPK compiler workflow. In (b), Q, K, V, A, O, and R denote the set of tasks produced by decomposing the query projection, key projection, value projection, attention, output projection, and RMSNorm operators, respectively. D1 and D2 in (e) are dummy tasks inserted during ttGraph normalization to guarantee that each task has exactly one triggering event. Finally, (f) shows how MPK linearizes the ttGraph and stores the resulting structure in GPU memory, where both tasks and events follow a uniform, canonical representation.
+
+### 2.5 In-kernel parallel runtime — workers, schedulers, queues
+
+> MPK employs an in-kernel parallel runtime that executes the ttGraph across all SMs within a single mega-kernel. This design eliminates kernel-launch overheads and enables fine-grained control over scheduling, synchronization, and execution order. Once launched, the mega-kernel continuously manages both computation and communication until the inference workload completes.
+>
+> To support this execution model, MPK partitions a GPU's SMs into workers and schedulers. Each worker runs on one physical SM and maintains an independent task queue. Workers execute a lightweight loop that repeatedly dequeues tasks, performs the associated computation or communication, and signals task completion by notifying the task's triggering event. This design ensures that workers are fully utilized while enabling asynchronous execution across operators.
+>
+> Schedulers are organized at warp granularity, with each SM hosting four scheduler warps. Each scheduler maintains an event queue and repeatedly polls for newly activated events, dispatching the corresponding tasks to workers. The allocation of workers and schedulers is fixed at kernel-launch time and matches the GPU's physical SM count, avoiding any dynamic role-switching overhead inside the kernel.
+
+> **5.1 Event-Driven Execution**
+>
+> MPK executes a ttGraph using an event-driven model. Each ttGraph begins with a designated start event (e.g., e0 in Figure 7) that has no prerequisites. This event is initially enqueued into a scheduler's event queue. Upon dequeuing the event, the scheduler (e.g., s1) launches all tasks that depend on it (e.g., AT1,…,AT4). Each launched task is dispatched to a worker, which executes the task and, upon completion, notifies the triggering event associated with that task.
+>
+> An event becomes activated once all of its prerequisites have completed and thus have collectively triggered the event the required number of times. When an event is activated, it is enqueued into a scheduler's event queue, allowing the runtime to continue propagating execution through the ttGraph. In this way, events serve as the mechanism for driving task execution, enabling fine-grained, asynchronous execution.
+
+### 2.6 Hybrid task launch — JIT vs AOT, and the exact sync-count argument
+
+> A task can be enqueued into a worker's task queue either just-in-time (JIT) or ahead-of-time (AOT). In the JIT mode, a scheduler assigns a task to a worker only after its dependent event has been fully activated; the task can therefore begin execution immediately upon assignment. In the AOT mode, the runtime pre-enqueues the task to a worker before its predecessor event is activated. The worker cannot execute the task until the dependent event is fully activated, and thus waits locally for the dependency to be satisfied.
+>
+> JIT and AOT approaches involve complementary advantages. On the one hand, JIT task launch enables MPK to adapt to workload imbalance. For example, attention operators in modern LLMs have highly variable execution times due to data-dependent sequence lengths—requests with long sequence lengths take substantially longer to finish than those with short ones. This variance makes static assignment ineffective. Under JIT, MPK launches downstream tasks (e.g., MatMul or AllReduce) only after the attention tasks that trigger them have completed. Workers that finish their attention tasks earlier can execute more downstream tasks, improving end-to-end latency and balancing load across SMs, as illustrated in Figure 7.
+>
+> On the other hand, JIT task launch involves higher latency due to additional worker–scheduler communication. Figure 8 illustrates the difference for launching task T2 after event e triggered by task T1. Under JIT (Figure 8a), the worker executing T1 must notify a scheduler, which then dequeues event e, launches T2, and enqueues it to a worker's task queue. The receiving worker must then dequeue T2 before execution. This chain requires two synchronizations (worker→scheduler and scheduler→worker). By contrast, under AOT (Figure 8b), T2 is already enqueued to a pre-assigned worker, which only needs to wait for the event activation. Thus, AOT requires only a single synchronization (worker→worker via the event trigger), reducing per-task launch latency.
+>
+> MPK uses hybrid task launch to combine the advantages of both approaches. During ttGraph construction, the compiler classifies each operator as JIT or AOT based on whether its execution time is data-dependent and likely to induce runtime imbalance. Operators with data-dependent durations (e.g., attention) are marked as JIT, and all downstream tasks remain JIT until encountering a global barrier (i.e., an event that must be triggered by all upstream tasks). Barriers eliminate imbalance, making subsequent operators suitable for AOT. All remaining operators are labeled AOT to minimize dispatch overhead. Labels apply at operator granularity: all tasks generated by the same operator share the same mode.
+>
+> Workers maintain two queues—one for JIT and one for AOT tasks. Workers always prioritize JIT tasks, as they are ready to execute immediately. When a worker exhausts its JIT queue, it checks whether the first AOT task's dependent event has been fully activated; if so, the worker executes that AOT task. This design ensures that workers block only when no ready work exists.
+>
+> Schedulers handle only JIT-related events. All AOT tasks are pre-enqueued before execution begins. Because operators typically produce a number of tasks proportional to the number of workers (Section 4), MPK distributes AOT tasks in a round-robin fashion across workers to maintain balanced load. Pre-launching AOT tasks reduces scheduler load and amortizes dispatch overhead, while JIT task launch dynamically maintains workload balance across SMs.
+
+### 2.7 Runtime optimizations — paged shared memory, cross-task pipelining, descriptor prefetch
+
+> **Paged shared-memory abstraction.**
+>
+> In conventional GPU programming models such as CUDA and Triton, shared memory is a fast on-chip memory that is private to each thread block. Shared memory exists only for the lifetime of a kernel—once the kernel finishes, its shared memory is automatically released. In the current kernel-per-operator approach, each kernel assumes exclusive access to the entire shared memory to comply with this programming model. However, this design prevents cross-task software pipelining (Section 2), which overlaps data loading for a subsequent task with the computation of the current task, since both tasks need to access shared memory.
+>
+> To enable such pipelining, MPK introduces a paged shared-memory abstraction. Shared memory is partitioned into multiple fixed-size pages, and task implementations are modified to operate on these pages instead of assuming monolithic allocation. A task may acquire one or multiple pages based on its shared-memory footprint and must release the pages when they are no longer needed. Once a task releases any of its pages, it is no longer permitted to acquire more shared memory, ensuring monotonic usage patterns that simplify scheduling. When the current task signals its release, MPK can immediately preallocate available pages for the next task and begin data prefetching. This design enables fine-grained, on-demand allocation of shared memory resources within the mega-kernel execution model.
+
+> **Cross-task software pipelining.**
+>
+> To enable software pipelining across tasks executed on the same worker (Section 2.1), MPK decomposes each task into a pre-loading phase and a compute phase. The pre-loading phase issues data transfer instructions to fetch a chunk of the required tensor from device memory into shared memory, initializing the intra-task software pipeline but performing no computation.
+>
+> MPK opportunistically overlaps the compute phase of the current task T1 with the pre-loading phase of the subsequent task T2 when two conditions hold: (1) T1 has already issued all of its own data-transfer instructions, and (2) sufficient shared-memory pages are available for T2's pre-loading phase. Note that such a pipeline does not interfere with T1's execution, as MPK inserts appropriate intra-SM synchronization barriers to ensure that T2's memory transfers do not conflict with ongoing data transfers for T1.
+
+> **Pre-fetching task descriptions.**
+>
+> Each worker maintains both JIT and AOT task queues in device memory. Every task is associated with a task description that encodes its input tensors, output tensors, and configuration parameters; in our current implementation, each description occupies 352 bytes (Section 6.1). To reduce enqueue/dequeue latency and hide device-memory access costs, MPK employs a lightweight prefetching mechanism that retrieves upcoming task descriptions into shared memory before they are needed.
+
+### 2.8 Implementation details and task-launch overhead techniques
+
+> We implement MPK as a kernel backend for PyTorch. A PyTorch program can be compiled into a MPK mega-kernel via PyTorch's compilation interface by specifying MPK as the backend, i.e., torch.compile(backend=MPK). This call invokes the MPK compiler, which generates a mega-kernel and returns it as a callable PyTorch function. Executing this function issues a single launch of the generated mega-kernel. The current MPK implementation consists of approximately 40K lines of C++, 84K lines of CUDA, and 10K lines of Python. The in-kernel parallel runtime is written in CUDA and uses semaphores in device memory to coordinate workers and schedulers. The MPK compiler, implemented in C++ and Python, automatically transforms an input tensor program into an optimized ttGraph tailored to specific GPU types. For compute tasks, the compiler integrates the Mirage superoptimizer [33] to automatically generate optimized CUDA implementations and uses NVSHMEM [10] to support in-kernel inter-GPU communication.
+
+> **Task-launch overhead.**
+>
+> Because MPK decomposes computation into tasks that are substantially finer-grained than traditional GPU kernels, minimizing per-task overhead is essential for performance. MPK employs several techniques to keep task-launch costs low. First, the runtime uses extremely lightweight workers and schedulers: event and task queues are implemented as circular buffers in GPU device memory, and enqueue/dequeue operations rely solely on low-cost atomicAdd instructions. Second, MPK adopts a decentralized scheduling strategy in which each scheduler assigns tasks using only local state. This design avoids global coordination and eliminates the communication and synchronization overheads inherent to globally coordinated scheduling.
+>
+> While MPK currently uses decentralized scheduling, the runtime is designed to support alternative strategies, including globally coordinated scheduling, with only minor code modifications. Exploring these designs and their performance trade-offs is an interesting direction for future work.
+
+> **Supporting runtime dynamism.**
+>
+> To demonstrate MPK's ability to support highly dynamic workloads, we extend the system with mechanisms required for LLM serving, including continuous batching [36] and paged attention [23]. When processing the start event of a task graph, the scheduler prepares a new decoding iteration by (1) removing completed requests from the previous iteration, (2) admitting newly arrived requests, and (3) updating per-request KV-cache metadata. All of this logic executes within a single task, and the KV-cache metadata is stored in device memory for direct use by paged-attention tasks.
+>
+> To handle the dynamic batch sizes intrinsic to LLM serving, MPK generates multiple ttGraphs specialized for representative batch sizes (powers of two up to the maximum batch). At runtime, the scheduler selects the appropriate graph based on the current batch size. This approach allows the compiler to produce ttGraphs optimized for specific batch sizes while still preserving flexibility for highly dynamic workloads.
+
+### 2.9 Worker/scheduler split and page geometry per GPU (Table 1 + setup)
+
+> Table 1: MPK configuration in our evaluation.
+>
+> | GPU | # SMs | # Workers | # Schedulers |
+> | --- | --- | --- | --- |
+> | A100 | 108 | 104 | 16 |
+> | H100 | 132 | 128 | 16 |
+> | B200 | 148 | 144 | 16 |
+
+> We evaluate MPK across five widely deployed LLMs that span a range of parameter scales and architectural families, as well as three generations of NVIDIA GPUs: A100, H100, and B200. Table 1 summarizes the MPK configuration for each GPU type. For all experiments, we reserve four SMs for schedulers, allocating a total of 16 scheduler warps (each SM accommodates up to four concurrently active warps). The remaining SMs are allocated to workers. We fix the shared-memory page size to 32KB on all GPUs. This configuration yields 5, 7, and 7 shared-memory pages per SM on A100, H100, and B200, respectively.
+
+> To control for variability in request-arrival patterns, all experiments are conducted under an offline, batched-inference setup, with varying maximum batch sizes. All requests use a fixed prompt length of 64 and decode 1024 tokens.
+
+### 2.10 End-to-end numbers
+
+> Figure 9 shows the end-to-end throughput results. For single-batch inference, MPK improves serving performance by 1.0–1.7× across models and hardware. The improvements are most significant for smaller models and newer GPU generations. This trend arises from three factors:
+> (1) kernel-per-operator approaches involve higher kernel-launch overheads, even when using CUDA Graphs;
+> (2) these systems suffer from pipeline bubbles because the kernel abstraction prevents cross-task pipelining (Figure 2); and
+> (3) SGLang and vLLM perform page allocation and request scheduling on the CPU, adding CPU–GPU synchronization delays.
+> These overheads become increasingly significant relative to computation as model sizes shrink and hardware improves.
+
+> The results show that MPK is well-suited for latency-optimized scenarios such as single-batch, low-latency model serving, and can drive LLM inference latency closer to hardware limits. For example, on Qwen3-8B running on an A100 GPU, MPK reduces per-token decoding latency from 14.5 ms—already achieved by highly optimized systems such as vLLM and SGLang—to 12.5 ms, approaching the theoretical lower bound of roughly 10 ms (estimated from loading 16 GB of model parameters over a 1.6 TB/s memory bandwidth).
+
+### 2.11 MoE case study — hybrid balancer and fused gather-GEMM
+
+> Figure 10: Comparing MPK with existing systems for Qwen3-30B-A3B on B200. Each value represents the actual MoE runtime in microseconds of each approach (lower is better), and the numbers above the bars indicate the speedup achieved by MPK-Hybrid-MoE over SGLang-MoE.
+
+> To efficiently serve dynamic workloads such as mixture-of-experts (MoE) models, MPK includes two MoE-specific optimizations: (1) a hybrid workload balancer and (2) a fused gather–GEMM implementation.
+>
+> **Hybrid workload balancer.**
+>
+> Because the number of tokens routed to each expert is known only at runtime, predetermining an effective workload partition is challenging. A naive static approach assigns a fixed group of SMs to a pre-designated subset of experts. However, when token routing is highly skewed, this strategy leads to severe load imbalance: some SM groups become oversubscribed while others remain underutilized. At the opposite extreme, a fully dynamic approach based on persistent Grouped-GEMM [8] can balance work across SMs, but introduces significant fine-grained synchronization overheads.
+>
+> MPK introduces a hybrid strategy that combines the strengths of both approaches. At compile time, the compiler statically partitions the work into expert-specific tasks. At runtime, each task receives a meta-tensor produced by the topk–softmax kernel containing global MoE information: specifically, the number of activated experts and the number of tokens assigned to each expert. Using this global metadata, tasks dynamically refine their workload allocation, splitting work uniformly while avoiding the synchronization overheads associated with fully dynamic scheduling. As shown in Figure 10, the hybrid approach consistently outperforms purely static partitioning across all batch sizes.
+>
+> **Fused gather-GEMM.**
+>
+> To leverage tensor memory accelerators (TMAs) on Hopper and Blackwell GPUs, current MoE implementations perform a gather step to pack tokens routed to the same expert into a contiguous memory layout. In the case of Qwen3-30B-A3B with batch size 1 on SGLang, this preprocessing step can account for up to 11% of total MoE execution time. Moreover, in MPK, introducing additional preprocessing tasks would further increase scheduling overhead.
+>
+> To address these issues, MPK replaces the TMA-based gather with an asynchronous token-level copy integrated directly into the data-loading phase of the GEMM tasks. This fusion eliminates the standalone gather kernel and avoids additional scheduling points while still enabling efficient memory movement. As a result, MPK with fused gather–GEMM achieves consistent speedups over SGLang's implementation.
+
+### 2.12 Multi-GPU: collectives compiled into in-kernel tasks
+
+> We further evaluate MPK's scalability across multiple GPUs on an NVIDIA H100 DGX instance. As with competing baselines, we adopt tensor model parallelism as introduced in Megatron-LM [27]. Users can easily specify tensor-parallel execution by inserting AllReduce layers after attention and gated MLP blocks; MPK then automatically compiles these collective operators into (1) inter-GPU data-transfer tasks (implemented using NVSHMEM's nvshmem_signal_wait_until) and (2) local reduction tasks. This decomposition transforms synchronous collective communication into fully asynchronous tasks, allowing it to integrate with MPK's task-based, event-driven runtime.
+>
+> Figure 11 shows the performance results. Compared to PyTorch, which uses a combination of hand-optimized kernels, CUDA Graphs, and torch.compile, MPK's mega-kernel execution improves throughput by up to 10×. Compared to highly optimized serving systems such as SGLang and vLLM, MPK achieves 1.1–1.4× speedups when scaling to 8 H100 GPUs. These gains arise from three key optimizations missing in kernel-per-operator baselines: (1) MPK integrates page allocation and request scheduling directly inside the mega-kernel, eliminating CPU-side dispatch overheads; (2) MPK's asynchronous execution model overlaps compute tasks with collective communication; and (3) MPK eliminates kernel barriers and enables cross-task software pipelining.
+
+### 2.13 Ablations
+
+> Figure 12: Ablation study on cross-task pipelining. We measure the performance of the final linear layer in Qwen3-8B on an NVIDIA B200 GPU and report the actual runtime in microseconds (lower is better), and the number shows the relative speed-up of MPK-Pipe over MPK-No-Pipe.
+
+> **Cross-task pipelining.**
+>
+> As described in Section 5.3, MPK enables cross-task pipelining by preloading chunks of input tensors for the next task in parallel with the computation of the current task. Figure 12 shows an ablation study to evaluate the impact of cross-task pipelining on the final linear layer in Qwen3-8B. Cross-task pipelining reduces the task runtime by 1.2-1.3× and even outperforms cuBLAS compiled kernels.
+
+> **Compute-communication overlap.**
+>
+> MPK captures fine-grained dependency between tasks (see Figure 5), allowing the MPK runtime to opportunistically overlap compute and communication tasks. Figure 13 shows an ablation study to evaluate the impact of such overlap. Specifically, we can disable such overlap by only capturing coarse-grained dependency between collective operators (e.g., AllReduce) and previous tasks using a single event (as shown in Figure 5c). Figure 13 shows the results. Enabling compute–communication overlap reduces per-iteration latency by 1.1×.
+
+### 2.14 Related-work note on prior megakernels
+
+> **Mega-kernels.**
+>
+> Prior efforts on mega-kernels largely rely on manual design. For example, FlashDMoE fuses mixture-of-experts computation with inter-GPU communication into a single handcrafted mega-kernel [13]. As another example, Spector et al. manually developed a low-latency mega-kernel for LLaMA-1B [30, 9]. These approaches require extensive engineering effort and deep GPU expertise, and they do not generalize across models or GPUs.
+
+## Relevance
+
+MPK gives us the runtime architecture we would otherwise have to invent: worker cores with
+per-core task queues, a small number of scheduler cores polling an event queue, events as
+counters in device memory activated by N notifications, AOT pre-enqueue for statically balanced
+work (one sync) versus JIT dispatch for data-dependent work (two syncs), a paged on-chip buffer
+allocator with the "once you release you may not acquire" monotonicity rule, and 352-byte task
+descriptors prefetched into on-chip memory. The AOT/JIT distinction is directly actionable for us:
+our MoE routed-expert work at batch=1 is data-dependent (top-8 of 256) and is the JIT case, while
+the dense/attention/projection chain is AOT. Section 6.4's statement that SGLang's gather step is
+up to 11% of MoE time at batch=1, and MPK's fix of folding the gather into the GEMM's data-loading
+phase, bears on our GroupedMatmul 5.596 ms vs 1.212 ms gap. Section 6.5's compilation of AllReduce
+into in-kernel transfer tasks + local reduce tasks is the template for removing our 5.35 ms
+fully-serial TP reduction.
+
+---
+
+## 3. FlashMoE / FlashDMoE — "Fast Distributed MoE in a Single Kernel"
+
+URL: https://arxiv.org/abs/2506.04667 · HTML v3: https://arxiv.org/html/2506.04667v3
+Authors: Osayamen Jonathan Aimuyo et al. (Cornell) — code https://github.com/osayamenja/FlashMoE
+Date: arXiv June 2025; v3 renamed FlashMoE; NeurIPS 2025 poster https://neurips.cc/virtual/2025/poster/119124
+
+The only published megakernel that fuses a *distributed MoE layer* — compute + inter-GPU
+communication — into one persistent kernel. Actor model with warp specialization.
+
+### 3.1 Abstract
+
+> The computational sparsity of Mixture-of-Experts (MoE) models enables sub-linear growth in compute cost as model size increases, thus offering a scalable path to training massive neural networks. However, existing implementations suffer from low GPU utilization, significant latency overhead, and a fundamental inability to leverage task locality, primarily due to CPU-managed scheduling, host-initiated communication, and frequent kernel launches. To overcome these limitations, we develop FlashMoE, a fully GPU-resident MoE operator that fuses expert computation and inter-GPU communication into a single persistent GPU kernel. FlashMoE enables fine-grained pipelining of dispatch, compute, and combine phases, eliminating launch overheads and reducing idle gaps. Unlike existing work, FlashMoE obviates bulk-synchronous collectives for one-sided, device-initiated, inter-GPU (R)DMA transfers, thus unlocking payload efficiency, where we eliminate bloated or redundant network payloads in sparsely activated layers. When evaluated on an 8-H100 GPU node with MoE models having up to 128 experts and 16K token sequences, FlashMoE achieves up to 9× higher GPU utilization, 6× lower latency, 5.7× higher throughput, and 4× better overlap efficiency compared to state-of-the-art baselines—despite using FP32 while baselines use FP16. FlashMoE shows that principled GPU kernel-hardware co-design is key to unlocking the performance ceiling of large-scale distributed ML. We provide code at https://github.com/osayamenja/FlashMoE.
+
+### 3.2 Kernel-count table — the single most quotable number
+
+> | MoE Implementation | GPU Ops |
+> | --- | --- |
+> | FlashMoE (this work) | 1 |
+> | COMET [12] | 33 |
+> | Megatron-LM CUTLASS [13, 16] | 85 |
+> | Megatron-LM TE [13, 16] | 261 |
+> | Megatron-LM + DeepEP [1] | 432 |
+> | DeepSpeedMoE [11] | 550 |
+>
+> Table 1: We report number of GPU operations launched by MoE implementations by profiling with Nsight Systems [17]. We count operations in a single MoE layer (Gate → Dispatch → Expert → Combine) on 2 A100 GPUs, where each GPU has 32 experts. FlashMoE is the first to fully fuse the distributed MoE layer into a single GPU kernel.
+
+> **Kernel Launch Overhead.**  We compare the kernel launch overheads between FlashMoE and existing baselines. Table 1 shows the number of kernel launches during a single forward pass: FlashMoE launches exactly one persistent kernel, while the baselines launch up to 550 short-lived kernels to perform the same computation. Figure 4 provides a visual comparison using CUDA API traces captured by NSight Systems, illustrating the difference between FlashMoE and DeepEP. DeepEP exhibits many small CUDA API calls, with frequent stalls between individual operators, leading to increased GPU idle time (Figure 4(a)). In contrast, FlashMoE maintains high GPU utilization by avoiding launch overhead and synchronization gaps—achieving 93.17% GPU utilization compared to 14% for DeepEP.
+
+> Figure 4: 4(a) shows GPU utilization averaged across 100 MoE forward passes on 2 A100s with 300 GB/s unidirectional bandwidth, where we observe up to 90% idle time, due to kernel launch gaps and non-overlapping communication.
+
+### 3.3 Actor model — Processor / Scheduler / Subscriber, and the block/warp split
+
+> **Actor-based model.**
+>
+> The design of FlashMoE is based on the actor model of concurrent computation [26, 27, 28]. We implement this model by specializing GPU thread blocks and warps into three distinct actor roles: (1) Processor (§F.1), (2) Subscriber (§F.3), and (3) Scheduler (§F.2). The Processor performs compute (GEMMs and element-wise operations) and tile communication. We use CUTLASS [19] as the underlying infrastructure for high-performance BLAS routines and NVSHMEM for kernel-initiated communication [18]. The Subscriber and Scheduler perform administrative functions. Specifically, the Scheduler assigns computational tasks to available thread blocks. Our key innovation is making the Scheduler both multithreaded, enabling high scheduling throughput, and work-conserving, ensuring consistently high GPU SM utilization. On the other hand, the Subscriber decodes tile packets from peer GPUs to task descriptors (§3.1). Of the N thread blocks on a GPU, we specialize N−1 to adopt the Processor role. We specialize the last block as the Operating System (OS). Within this block, we specialize three warps for the Subscriber role and one warp for the Scheduler role. This split of thread blocks across actors is intentional: our goal is to use few resources for administrative tasks while reserving bulk of the resources for performing MoE computation tasks.
+
+> **In-kernel Block scheduling and Tile parallelism.**
+>
+> FlashMoE implements tile-level parallelism, meaning it partitions input token matrices into smaller, independent units called tiles, which are processed by blocks but managed (scheduled and constructed) by warps. We specialize every thread block, except one, as processors to perform compute. In addition, we designate a dedicated Operating System (OS) block (4 warps) to perform administrative tasks of (1) scheduling computational work to processors (scheduler), and (2) decoding computational tasks from messages received from other GPUs (subscriber). This design allows FlashMoE to dynamically assign tasks to GPU blocks based on readiness, ensuring that no GPU SM remains idle throughout the lifetime of the MoE operator.
+
+### 3.4 Algorithm 1 — the whole kernel, verbatim structure
+
+> Algorithm 1  FlashMoE Distributed MoE Fused Kernel
+>
+> Input: A, O ∈ R^{S×H}, X ∈ R^{E×H×D}, N
+>
+> ```
+>  1  begin
+>  2    T_phi, G_phi <- FusedGate(A)
+>  3    if blockId+1 < N then
+>  4      Dispatch(T_phi, A)
+>  5      processor::start()
+>  6    else
+>  7      if warpID == 0 then
+>  8        scheduler::start()
+>  9      else
+> 10        subscriber::start(T_phi, G_phi, O, X)
+> 11      end if
+> 12    end if
+> 13  end
+> ```
+
+> Note that A ∈ R^{S×H} is the input token matrix; O ∈ R^{S×H} the output matrix; and X ∈ R^{E×H×D} is a 3-D tensor of expert weights, where E denotes the number of local experts for the executing GPU, H is the embedding dimension, D is the FFN intermediate dimension and S is the sequence length. T_phi ∈ (N×R)^{E×C} is a routing table data structure, where T_phi(e,c)=(i,w) indicates that token i at slot c dispatches to expert e. w is the combine weight (Equation 2) and C is expert capacity. ... G_phi ∈ R^{S×E} captures the affinity scores produced by the gate (Equation 3).
+
+### 3.5 Processor loop (Algorithm 2 body, as rendered)
+
+```
+ 2    signal <- 0
+ 3    // shared memory variables
+ 4    task <- {}
+ 5    interrupt <- False
+ 6    complete <- False
+ 7    while interrupt == False do
+ 8      if warpId == 0 then
+ 9        if threadId == 0 then
+10          awaitTaskFromScheduler(interrupt, signal)
+11          FencedNotifyRQ(ready)
+12        end if
+13        syncwarp()
+14        warpReadTQ(tQ, signal, task)
+15      end if
+16      syncthreads()
+17      if interrupt == False then
+18        switch task.Type do
+19          case GEMM_0 do
+20            // fused GEMM, epilogue and async tile staging
+21            fGET(GEMM_0, task)
+22            if threadId == 0 then
+23              complete <- NotifyTileCompletion()
+24            end if
+25            syncthreads()
+26            if complete == True then
+27              NotifySchedulerNextGEMM(tQ)
+28            end if
+29          end case
+30          case GEMM_1 do
+31            // fused GEMM, epilogue and async tile transfer
+32            fGET(GEMM_1, task)
+33          end case
+34          case Combine do
+35            combine(task)
+36          end case
+37        end switch
+38      end if
+39    end while
+```
+
+### 3.6 Tile dimension selection — concrete numbers and the reasoning
+
+> **Determining tile dimensions in FlashMoE.**
+>
+> Selecting appropriate tile dimensions in FlashMoE is crucial to ensure efficient GPU utilization. An undersized tile underutilizes the GPU, while excessively large tiles create register pressure, causing performance-degrading register spills to local memory. After careful parameter sweeps, we choose tile dimensions of (128, 64). Our key insights are: increasing tile width significantly raises the register usage per thread, potentially triggering costly spills; increasing tile height without adjusting thread count increases workload per thread, harming performance. Raising the thread count per block beyond our fixed value of 128 threads reduces the number of concurrent blocks, negatively affecting SM occupancy. Larger thread-block sizes also increase overhead from intra-block synchronization (__syncthreads() barriers), further degrading performance. Thus, our chosen tile dimensions balance register usage, shared-memory constraints, and GPU occupancy to deliver optimal performance.
+
+### 3.7 Unified task descriptor abstraction
+
+> **Unified task abstraction.**
+>
+> We unify the FFN and combine operations under a common abstraction called a task. Tasks provide a uniform interface for communicating tile-level work among Subscribers, Schedulers, and Processors. Formally, a task descriptor t ∈ T is defined as a tuple:
+>
+> t = (M, ⋆, φ)
+>
+> where M is a set of metadata (e.g., device ID, tile index), ⋆ is a binary tensor operation (specifically, matrix multiplication · or Hadamard product ⊙), and φ is an element-wise activation function (e.g., ReLU or identity).
+>
+> We define a task t operating on input tensors A, B, D, producing output tensor C, as follows:
+>
+> F_t(A,B,C,D) := C <- φ(A ⋆_t B + D)      (4)
+>
+> The operator ⋆_t (instantiated from ⋆) may behave differently depending on the task metadata M, and the result of A ⋆_t B is accumulated into D.
+>
+> In practice, we implement each task defined by Equation 4 as a single fused `__device__` decorated function which the Processor (Algorithm 2) invokes at runtime. Fusion for t entails applying φ and the succeeding addition operation to registers storing the results of the binary operator ⋆_t.
+
+The FFN and combine instantiations, verbatim:
+
+> t1 = (M, ·, φ1),   t2 = (M, ·, φ2),
+> F_t1(A,B1,C1,D1) := C1 <- φ1(A B1 + D1),
+> F_t2(C1,B2,C2,D2) := C2 <- φ2(C1 B2 + D2).
+>
+> Whereas, the expert-combine operation is formalized as:
+>
+> t3 = (M, ⊙, φ2),
+> F_t3(A,S,C,C) := C <- φ2(A ⊙ S + C).
+
+### 3.8 Symmetric tensor layout — the non-blocking one-sided communication trick
+
+> Within a single GPU device, the actors in FlashMoE communicate through the GPU's memory subsystem. Specifically, the Scheduler and Subscriber actors exchange data via fast shared memory, while other actor pairs communicate through global memory. For communication across multiple devices, FlashMoE uses device-initiated communication, leveraging the one-sided PGAS (Partitioned Global Address Space) programming model [30]. However, achieving scalable and correct one-sided memory accesses in PGAS without costly synchronization is a known challenge [1, 31]. We address this challenge with a provably correct and scalable solution: a symmetric tensor layout L, supporting fully non-blocking memory accesses. We define L as:
+>
+> L ∈ R^{P×R×B×E×C×H}
+>
+> where: P is the expert parallel world size, R identifies communication rounds (i.e., two rounds, one for token dispatch and one for combine), B is number of staging buffers, E is the number of local experts, C is the upscaled expert capacity (§3.2.1) and H is the token embedding dimension. Our core insight to enable non-blocking communication is temporal buffering. Specifically, we overprovision memory for the underlying token matrix by at least 2·r times, where r is the number of communication rounds in the dependency graph, and the factor of 2 accounts for separate buffers for incoming and outgoing data within each communication round. For MoE models, we have 2·r = 4. This modest increase in memory usage eliminates the need for synchronization during one-sided data transfers.
+>
+> Theorem 3.1. The symmetric tensor layout L is write-write conflict-free.
+
+> Empirically, we find Size(L) ≈ 4·Size(T), contributing memory overhead ≤2% of memory capacity for inference of popular models.
+
+> **3.2.1 In-place Padding for Payload Efficiency**
+>
+> Due to the dynamic and uneven distribution of tokens in MoE dispatch [32], GPUs commonly receive fewer tokens than their predefined expert capacity. Current MoE frameworks [11] typically pad these buffers with null tokens before computation, unnecessarily increasing communication payloads and degrading performance. In contrast, we propose in-place padding, performing padding directly within the local symmetric tensor buffers and thus eliminating excess network communication.
+>
+> As we show in Figure 7(a) as a reference, each cell Ei is sized according to the expert capacity C. We further align this capacity to ensure divisibility by the tile block size bM=128, guaranteeing safe and aligned memory reads by Processor threads consuming remote tokens.
+
+### 3.9 Technical challenges list (the engineering checklist)
+
+> **Technical challenges.**
+>
+> Realizing the single-kernel design of FlashMoE required solving several technical challenges to achieve high performance: (1) lightweight computational dependency management; (2) navigating optimal SM occupancy configurations; (3) implementing in-device BLAS operations; (4) minimizing inter- and intra-device synchronization overheads; (5) implementing transfer-awareness by leveraging DMA over Unified Virtual Addressing (UVA) when available. In addressing these challenges, FlashMoE's design presents a radical departure from traditional synchronous AlltoAll collectives, where GPUs exhibit significant idle time during layer execution. For device-initiated communication, FlashMoE uses NVSHMEM [18] to establish a global address space across all GPUs for Direct Memory Access (DMA) communication. For in-device BLAS, FlashMoE develops custom high-performance GEMM operations via CUTLASS [19].
+
+### 3.10 Limitations, verbatim
+
+> **Engineering complexity.**  Fully fused, persistent kernels demand deep GPU + distributed-systems expertise; future work may investigate compiler/DSL abstractions to lower this barrier.
+>
+> **FP16 inefficiency.**  Our FP16 path is suboptimal (§H) due to insufficient tuning. We anticipate addressing this gap with autotuned GEMM operators like cuBLASDx [35] or CUTLASS builders.
+>
+> **Training support.**  This work targets inference; enabling training will require fusing backward computation and gradient communication with new bookkeeping and task descriptors.
+
+## Relevance
+
+This is the closest published analogue to the MoE part of our problem: it is the existence proof
+that a routed-MoE layer plus its collectives can be one kernel, and it gives the actor split we
+could copy onto Ascend (N−1 compute blocks + one "OS" block of 4 warps = 1 scheduler warp +
+3 subscriber warps). Table 1 (1 vs 33/85/261/432/550 GPU ops for the same MoE layer) is the direct
+precedent for collapsing our 3008 kernels/round. The "complete <- NotifyTileCompletion(); if
+complete then NotifySchedulerNextGEMM" pattern in Algorithm 2 is exactly the GEMM0→GEMM1 chaining
+we need for gate/up → SwiGLU → down inside one kernel (our GroupedMatmulSwigluQuantV2 6.793 ms vs
+2.272 ms of bytes). The symmetric-tensor 4x overprovisioning theorem is the mechanism that makes
+one-sided device-initiated transfer safe without a barrier, which is what our 5.35 ms serial TP
+reduce needs.
+
+---
+
+## 4. CANN `SuperKernel` (graph-autofusion) — an Ascend-native megakernel interpreter, open source
+
+This is the single most actionable find for us: CANN ships an open-source, device-side
+task-queue interpreter that runs many sub-kernels inside one `__global__` entry on Ascend.
+It is structurally the same design as the Hazy Research interpreter and MPK's in-kernel
+runtime, already expressed in AscendC, already handling MIX core modes.
+
+Repo: https://gitcode.com/cann/graph-autofusion (CANN org on GitCode/AtomGit)
+Raw access pattern that works: `https://raw.gitcode.com/cann/graph-autofusion/raw/master/<path>`
+Fetched 2026-10-20.
+
+> Read together with `ascend-fusion-mechanics.md` §6 and §7, which cover the *host* side of the
+> same system: the public C API (`aclskOptimize`, `aclskScopeBegin`/`aclskScopeEnd`,
+> `aclskScopeVerify`, the full option enum) and how vllm-ascend wires it up via
+> `enable_super_kernel`, including a real GLM-5.2-W8A8C8 A3 config. This section covers the
+> device side — the interpreter, its task descriptors, its synchronization, and (in §4b) the
+> rules that decide what gets fused at all.
+
+### 4.1 Principle — README verbatim (Chinese, as published)
+
+URL: https://gitcode.com/cann/graph-autofusion/blob/master/super_kernel/README.md
+Raw: https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/README.md
+
+> # SuperKernel
+>
+> ## 原理介绍
+>
+>    SuperKernel 是一种面向网络图模型的调度优化技术。其核心思想是：基于网络图模型中算子的先验信息（如算子类型、前后序依赖关系等），结合即时编译（JIT）能力，将整个网络模型重新编译为单一算子，从而显著降低算子调度开销，并借助 ICache 预取、Early-Start、同步优化、子 Kernel 拆分等优化手段进一步提升性能。
+>
+> ***
+>    SuperKernel 的设计初衷是将多个子算子融合成一个 SuperKernel，以节省 N-1 次算子调度开销。然而，为维持子算子间的执行顺序，通常需插入全核同步操作，这在一定程度上削弱了调度优化的收益。得益于编译阶段即可获取全部子算子的先验信息，SuperKernel 可在此基础上实施更多深层优化。
+>
+> 1. **ICache Preload 优化**
+>
+>    SuperKernel 融合全部算子后，其二进制体积较大。系统在加载算子时通常仅预取入口处指令，导致 SuperKernel 内部大量指令未被预加载至指令缓存（ICache），从而引发较高的 ICache Miss。为此，我们引入 ICache Preload 机制：在当前子算子开始执行前，预加载其后续子算子的代码段，从而有效减少后续算子执行时的 ICache Miss。
+>
+> 2. **Early-Start 优化**
+>
+>    在常规调度中，必须等待前序算子全部执行完成后，才能启动后续算子。然而，多数前序算子的末尾指令为 MTE 数据搬运指令，而后续算子的起始指令通常为与输入数据无关的初始化标量指令。由于这两类指令分属不同计算单元，具备并发执行的条件。Early-Start 技术在前序算子的搬运指令前插入 Set 同步点，在后续算子的初始化指令后插入 Wait 同步点，从而实现两个子算子的部分指令并发执行，提升整体执行效率。
+>
+> 3. **同步优化**
+>
+>    为保障执行顺序正确，SuperKernel 在各子算子调度之间会插入全核同步操作。对于 Kernel Type 为 Mix 1:2 的混合类型算子，完整的全核同步需等待所有 Aicore 的 Vector 核与 Cube 核均完成同步。SuperKernel 在编译时能够识别每个子算子的类型，因此可针对前后子算子的 Kernel Type 定制同步范围。例如，对于连续的 Vector 算子，仅需执行全 Vector 核同步即可。通过细粒度控制同步范围，可有效降低子算子间的同步开销。
+>
+> 4. **子 Kernel 拆分**
+>
+>    在多核系统中，当多个计算核心执行同一段代码时，会并发访问内存中的同一指令地址。这种对同一地址的并发访问会在共享的 L2 Cache 层面形成串行化访问队列，引发资源争用，削弱多核并行带来的性能增益。为解决该问题，SuperKernel 将子 Kernel 代码复制为多份副本，使不同核心能根据核 ID 映射到不同的物理地址执行。这一方法有效缓解了多核对同一指令地址的争用，显著提升算子执行效率。
+>
+>    此外，SuperKernel 还支持基于内存语义的 Notify 与 Wait 事件，以适配 Tiling 下沉与 Weight 预取等场景。Tiling 下沉算子指的是 Tiling 计算依赖前序算子的输出结果，为避免主机与设备间的频繁交互，将 Tiling 计算部署于 AICpu 执行的算子。若 SuperKernel 融合了该 Tiling 算子的前序算子，则需在前序算子执行完成后通过 Notify 事件通知 AICpu 启动 Tiling 计算；若融合了 Tiling 下沉算子本身，则需通过 Wait 事件等待 AICpu 完成 Tiling 计算后再执行 Device 侧计算。Weight 预取则借助 CMO 任务调用专用硬件单元 SDMA，将数据提前加载至 L2 Cache，以提升计算效率。SDMA 与 Aicore 之间的协作正是通过内存语义的 Notify/Wait 事件实现的。
+
+Directory structure, verbatim:
+
+```text
+super_kernel/
+├── docs                   # 文档介绍
+├── examples               # 示例脚本或 Notebook，演示典型用法
+├── include                # SuperKernel 对外头文件
+├── kernel                 # 设备侧 Kernel 实现
+├── scripts                # 脚本路径
+├── src                    # SuperKernel 业务代码
+│   ├── aot                # AOT 编译与优化实现
+│   └── jit                # JIT 编译实现
+├── tests                  # 测试工程目录
+│   ├── aot                # AOT 测试
+│   ├── fixtures           # 共享测试数据与夹具
+│   ├── st                 # System Test
+│   ├── ut                 # Unit Test
+│   ├── utils              # 通用校验与工具函数
+│   └── conftest.py        # pytest 公共配置
+├── CMakeLists.txt         # CMake 配置文件
+├── pyproject.toml         # 项目元信息与打包配置
+├── README.md              # 中文说明文档
+├── README_en.md           # 英文说明文档
+└── requirements-dev.txt   # python 依赖配置文件
+```
+
+Developer-guide note fixing the target SoC, verbatim
+(https://raw.gitcode.com/cann/graph-autofusion/raw/master/docs/zh/super_kernel/developer_guide.md):
+
+> - `soc_version`（`fixtures/config.py`）：指定默认 SoC 信息，当前默认值为 `Ascend910_9391`；如需使用其他版本，可在场景内覆盖或增加新的 fixture。
+
+### 4.2 The device-side entry points — one `__global__` per MIX ratio
+
+Source: `super_kernel/kernel/sk_entry.asc`
+Raw: https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/kernel/sk_entry.asc
+
+```cpp
+#include "kernel_operator.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#define SK_ENTRY_ENABLE_SIMT 1
+#include "simt_api/asc_simt.h"
+#endif
+#include "sk_common.h"
+#include "sk_flag_diag.h"
+#include <cstdio>
+
+typedef void (*sk_sub_func)(const __gm__ void *param, const sk::SkSystemArgs *sysArgs);
+```
+
+```cpp
+extern "C" __global__ __attribute__((aligned(512))) __mix__(0, 1) void sk_entry_aiv(GM_ADDR skDevArgs) {
+  spk_entry_impl<0, 1, false, false>(skDevArgs);
+}
+
+extern "C" __global__ __attribute__((aligned(512))) __mix__(1, 0) void sk_entry_aic(GM_ADDR skDevArgs) {
+  spk_entry_impl<1, 0, false, false>(skDevArgs);
+}
+
+extern "C" __global__ __attribute__((aligned(512))) __mix__(1, 1) void sk_entry_mix11(GM_ADDR skDevArgs) {
+  spk_entry_impl<1, 1, false, false>(skDevArgs);
+}
+
+extern "C" __global__ __attribute__((aligned(512))) __mix__(1, 2) void sk_entry_mix12(GM_ADDR skDevArgs) {
+  spk_entry_impl<1, 2, false, false>(skDevArgs);
+}
+```
+
+Template signature of the interpreter, verbatim:
+
+```cpp
+template <uint8_t aic, uint8_t aiv, bool enable_debug = false, bool enable_profiling = false,
+          bool enable_op_trace = false, bool enable_early_start = false>
+__aicore__ inline void spk_entry_impl(GM_ADDR skDevArgs) {
+  const __gm__ SkHeaderInfo *sk_header = (const __gm__ SkHeaderInfo *)(get_para_base());
+```
+
+### 4.3 The dispatch loop — queue selection, then switch on task type
+
+Note `que_offset` picks a *different copy* of the queue per core
+(`(((uint8_t)get_coreid()) % 4) * aicQueSize`) — the sub-kernel-split / L2-ICache-contention
+mitigation, expressed in the queue addressing.
+
+```cpp
+  uint32_t que_offset = 0;
+  if ASCEND_IS_AIC {
+    que_offset = sk_header->aicQueOffset + (((uint8_t)get_coreid()) % 4) * sk_header->aicQueSize;
+    ...
+  }
+  if ASCEND_IS_AIV {
+    que_offset = sk_header->aivQueOffset + (((uint8_t)get_coreid()) % 4) * sk_header->aivQueSize;
+    ...
+  }
+  const __gm__ TaskQue *taskQue = (const __gm__ TaskQue *)((const __gm__ uint8_t *)sk_header + que_offset);
+  for (auto i = 0; i < taskQue->taskCnt; i++) {
+    const __gm__ TaskInfo *task = taskQue->taskInfos + i;
+    if (task->type == SkTaskType::TYPE_PRELOAD) {
+      auto blockId = AscendC::GetBlockIdx();
+      if (blockId < task->numBlocks) {
+        preload((const void *)(task->entry[((uint8_t)get_coreid()) % task->entryCnt]), task->args);
+        dc_preload((__gm__ uint64_t *)(task->extraInfo), 0);
+        dc_preload((__gm__ uint64_t *)(task->extraInfo) + 8, 0);
+        dc_preload((__gm__ uint64_t *)(task + 1), 0);
+      }
+    } else if (task->type == SkTaskType::TYPE_FUNC) {
+      auto blockId = AscendC::GetBlockIdx();
+      if (blockId < task->numBlocks) {
+        ...
+        sk::SkSystemArgs sysArgs = {
+            static_cast<uint16_t>(blockId), static_cast<uint16_t>(task->numBlocks),
+            static_cast<uint16_t>(task->extraInfo),  // extraInfo field used for early start sync config
+        };
+
+        if ((task->debugOptions & 0x4) != 0) {
+          dcci(nullptr, 1, 2);
+        }
+
+        ((sk_sub_func)(task->entry[((uint8_t)get_coreid()) % task->entryCnt]))((const __gm__ void *)task->args,
+                                                                               &sysArgs);
+        ...
+        if ((task->debugOptions & 0x20) != 0) {
+          dcci(nullptr, 1, 2);
+        }
+        ...
+      }
+      ...
+    } else if (task->type == SkTaskType::TYPE_SYNC) {
+      ...
+        if constexpr (enable_early_start) {
+          sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args, task->numBlocks, task->extraInfo);
+        } else {
+          sk::AutoCoreSyncImpl<aic, aiv>((SkCoreSyncType)task->args);
+        }
+      ...
+    } else if (task->type == SkTaskType::TYPE_EVENT_NOTIFY) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      if ASCEND_IS_AIC {
+        sk::NotifyFunc<true>(eventAddr, eventValue);
+      }
+      if ASCEND_IS_AIV {
+        sk::NotifyFunc<false>(eventAddr, eventValue);
+      }
+    } else if (task->type == SkTaskType::TYPE_EVENT_WAIT) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      const uint32_t waitFlag = static_cast<uint32_t>(task->extraInfo);
+      if ASCEND_IS_AIC {
+        sk::WaitFunc<true>(eventAddr, eventValue, waitFlag);
+      }
+      if ASCEND_IS_AIV {
+        sk::WaitFunc<false>(eventAddr, eventValue, waitFlag);
+      }
+    } else if (task->type == SkTaskType::TYPE_EVENT_RESET) {
+      GM_ADDR eventAddr = reinterpret_cast<GM_ADDR>(task->args);
+      const uint64_t eventValue = task->entry[0];
+      if ASCEND_IS_AIC {
+        sk::ResetFunc<true>(eventAddr, eventValue);
+      }
+      if ASCEND_IS_AIV {
+        sk::ResetFunc<false>(eventAddr, eventValue);
+      }
+    }
+  }
+  ...
+  pipe_barrier(PIPE_ALL);
+```
+
+### 4.4 Full-core barrier and the per-direction sync primitives
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void FullCoreSyncImpl() {
+  if constexpr (aic == 1 && aiv == 0) {
+    AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+    AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+  } else if constexpr (aic == 0 && aiv == 1) {
+    AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+    AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+  } else {
+    if ASCEND_IS_AIC {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+      AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+    }
+    if ASCEND_IS_AIV {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+      AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+  }
+}
+```
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void AutoCoreSyncImpl(SkCoreSyncType syncType) {
+  switch (syncType) {
+    case SkCoreSyncType::CROSS_SYNC_AIC_TO_AIC:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+      }
+      return;
+    case SkCoreSyncType::CROSS_SYNC_AIV_TO_AIV:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_SET_AIC_TO_AIV:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_SET_AIV_TO_AIC:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_WAIT_AIC_TO_AIV:
+      if ASCEND_IS_AIV {
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::INTER_SYNC_WAIT_AIV_TO_AIC:
+      if ASCEND_IS_AIC {
+        AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+      }
+      return;
+    case SkCoreSyncType::ALL_SYNC:
+      FullCoreSyncImpl<aic, aiv>();
+      return;
+    default:
+      AscendC::Trap();
+      return;
+  }
+}
+```
+
+### 4.5 Early-Start — the bitmask form of a split set/wait
+
+```cpp
+template <uint8_t aic, uint8_t aiv>
+__aicore__ inline void AutoCoreSyncImpl(SkCoreSyncType syncType, uint8_t numBlocks, uint64_t syncConfig) {
+  if (syncConfig == 0) {
+    AutoCoreSyncImpl<aic, aiv>(syncType);
+    return;
+  }
+
+  if (AscendC::GetBlockIdx() < numBlocks) {
+    return;
+  }
+
+  if ASCEND_IS_AIC {
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIC_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(AscendC::SYNC_AIC_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIC_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIV_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x02, PIPE_FIX>(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIC_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_FLAG);
+    }
+  }
+
+  if ASCEND_IS_AIV {
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIV_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(AscendC::SYNC_AIV_ONLY_ALL);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIV_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIV_ONLY_ALL);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIV_TO_AIC_SET)) != 0) {
+      AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(AscendC::SYNC_AIV_FLAG);
+    }
+    if ((syncConfig & static_cast<uint64_t>(SkEarlyStartMask::AIC_TO_AIV_WAIT)) != 0) {
+      AscendC::CrossCoreWaitFlag(AscendC::SYNC_AIC_AIV_FLAG);
+    }
+  }
+}
+```
+
+### 4.6 Memory-semantic Notify / Wait — the GM counter mechanism, spelled out
+
+This is the Ascend equivalent of Hazy Research's "array of counters in GPU global memory",
+and of MPK's "semaphores in device memory". Note the `dcci` cache-invalidate inside the spin
+loop — that is what makes the poll see remote writes.
+
+```cpp
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::EQ)) {
+        dcci(waitLock, 0, 2);
+        while (*waitLock != value) {
+          dcci(waitLock, 0, 2);
+        }
+      } else if (flag == static_cast<uint32_t>(SkMemoryWaitFlag::AND)) {
+        dcci(waitLock, 0, 2);
+        while ((*waitLock & value) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      } else {
+        dcci(waitLock, 0, 2);
+        while ((~(*waitLock | value)) == 0) {
+          dcci(waitLock, 0, 2);
+        }
+      }
+```
+
+```cpp
+template <bool aic_flag>
+__aicore__ inline void ResetFunc(GM_ADDR param, uint64_t value) {
+  if constexpr (aic_flag) {
+    if (get_block_idx() == 0) {
+      __gm__ uint64_t *resetLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *resetLock = value;
+      dcci(resetLock, 0, 2);
+    }
+  } else {
+    if (AscendC::GetBlockIdx() == 0) {
+      __gm__ uint64_t *resetLock = reinterpret_cast<__gm__ uint64_t *>(param);
+      *resetLock = value;
+      dcci(resetLock, 0, 2);
+    }
+  }
+}
+```
+
+### 4.7 All data structures and enums, verbatim
+
+Source: `super_kernel/src/aot/sk_common.h`
+Raw: https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/src/aot/sk_common.h
+
+```cpp
+enum class SkKernelArch : uint32_t {
+  UNKNOWN = 0,
+  DAV_2201,
+  DAV_3510,
+};
+
+constexpr std::array<SkKernelArch, 2> SK_SUPPORTED_KERNEL_ARCHS = {
+    SkKernelArch::DAV_2201,
+    SkKernelArch::DAV_3510,
+};
+
+constexpr uint32_t SK_EVENT_DAV_2201_CORE_NUM = 75;
+constexpr uint32_t SK_EVENT_DAV_3510_CORE_NUM = 108;
+constexpr uint32_t SK_DAV_2201_TICK_US_MULTIPLIER = 50;
+constexpr uint32_t SK_DAV_3510_TICK_US_MULTIPLIER = 1000;
+
+constexpr uint32_t MAX_SCOPE_NAME_LEN = 256;
+constexpr char DEFAULT_SK_SCOPE_NAME[] = "default_sk_scope_name";
+```
+
+```cpp
+enum class SkKernelType : uint8_t {
+  AIC_ONLY = 1,
+  AIV_ONLY = 2,
+  MIX_AIV_1_0 = 3,
+  MIX_AIC_1_0 = 4,
+  MIX_AIC_1_1 = 5,
+  MIX_AIC_1_2 = 6,
+  DEFAULT = 0xFF,
+};
+
+constexpr size_t SK_KERNEL_TYPE_COUNT = 6;
+```
+
+```cpp
+enum class SkTaskType : uint8_t {
+  TYPE_FUNC,
+  TYPE_SYNC,
+  TYPE_PRELOAD,
+  TYPE_EVENT_NOTIFY,
+  TYPE_EVENT_WAIT,
+  TYPE_EVENT_RESET,
+  TYPE_MAX,
+};
+
+enum class SkCoreSyncType : uint8_t {
+  ALL_SYNC = 0,
+  CROSS_SYNC_AIC_TO_AIC,
+  CROSS_SYNC_AIV_TO_AIV,
+  INTER_SYNC_SET_AIC_TO_AIV,
+  INTER_SYNC_SET_AIV_TO_AIC,
+  INTER_SYNC_WAIT_AIC_TO_AIV,
+  INTER_SYNC_WAIT_AIV_TO_AIC,
+  SYNC_NONE,
+};
+```
+
+```cpp
+// Memory wait rule for VALUE_WAIT tasks.
+// The numeric values must stay aligned with runtime's aclrtValueWait flag definition.
+enum class SkMemoryWaitFlag : uint32_t {
+  GEQ = 0x0,  // Wait until *addr >= value
+  EQ = 0x1,   // Wait until *addr == value
+  AND = 0x2,  // Wait until (*addr & value) != 0
+  NOR = 0x3,  // Wait until ~(*addr | value) != 0
+};
+
+constexpr uint64_t SK_DEFAULT_NOTIFY_VALUE = 1;
+constexpr uint64_t SK_DEFAULT_WAIT_VALUE = 1;
+constexpr uint64_t SK_DEFAULT_RESET_VALUE = 0;
+constexpr uint32_t SK_DEFAULT_WRITE_FLAG = 0;
+```
+
+```cpp
+struct TaskInfo {
+  uint32_t index;
+  SkTaskType type;
+  SkKernelType relatedType = SkKernelType::DEFAULT;
+  uint8_t numBlocks;
+  uint8_t entryCnt;
+  uint64_t entry[4];
+  // 根据bit位确定option选项
+  // 1： dcci_disable_on_kernel
+  // 2： debug_sync_all
+  // 4： dcci_before_kernel_start
+  // 8： dcci_after_kernel_end
+  // 16： debug_cross_core_sync_check
+  // 32： enable_dcci_after_func - 直接指示kernel是否需要在func执行后插入dcci
+  //      该bit由host端根据disableDcci和afterKernelEnd综合计算得出
+  //      kernel侧只需检查此bit即可，无需组合判断
+  uint64_t debugOptions;
+  uint64_t extraInfo;
+  uint64_t args;
+  uint32_t argsSize;
+  uint8_t isSimtKernel;
+  uint8_t reservedList[3];
+};
+```
+
+```cpp
+enum class SkEarlyStartMask : uint32_t {
+  NONE = 0U,
+  AIC_TO_AIC_SET = 1U << 0,
+  AIC_TO_AIC_WAIT = 1U << 1,
+  AIC_TO_AIV_SET = 1U << 2,
+  AIV_TO_AIC_WAIT = 1U << 3,
+  AIV_TO_AIV_SET = 1U << 4,
+  AIV_TO_AIV_WAIT = 1U << 5,
+  AIV_TO_AIC_SET = 1U << 6,
+  AIC_TO_AIV_WAIT = 1U << 7,
+  SPLIT_CORE_CTRL = 1U << 15,
+};
+```
+
+```cpp
+struct TaskQue {
+  uint32_t taskCnt;
+  uint32_t cap;
+  TaskInfo taskInfos[0];
+};
+
+struct SkHeaderInfo {
+  uint32_t aicQueSize;
+  uint32_t aivQueSize;
+  uint32_t aicQueOffset;
+  uint32_t aivQueOffset;
+  uint32_t counterOffset;
+  uint32_t dfxOffset;
+  uint32_t eventConfigOffset;  // 算子打印事件配置偏移量
+  uint32_t nodeCnt;
+  uint64_t modelIdIndexAndSkScopeId;
+  uint64_t totalSize;
+};
+```
+
+### 4.8 Entry-point variants and the AOT API
+
+The 16 declared entry points are the cross product of {aiv, aic, mix11, mix12} x
+{plain, _debug, _dump_profiling, _debug_dump_profiling}:
+
+```cpp
+void sk_entry_aiv / sk_entry_aic / sk_entry_mix11 / sk_entry_mix12
+void sk_entry_aiv_debug / sk_entry_aic_debug / sk_entry_mix11_debug / sk_entry_mix12_debug
+void sk_entry_aiv_dump_profiling / sk_entry_aic_dump_profiling
+void sk_entry_mix11_dump_profiling / sk_entry_mix12_dump_profiling
+void sk_entry_aiv_debug_dump_profiling / sk_entry_aic_debug_dump_profiling
+void sk_entry_mix11_debug_dump_profiling / ...
+```
+
+The AOT host API, from the internal design document (see
+`ascend-launch-overhead-and-sync.md` for the Wiki URL):
+
+```cpp
+// src/aot/super_kernel.cpp
+aclError aclskOptimize(aclmdlRI model, aclskOptions *options) {
+    SuperKernelGraph graph(model);
+    graph.InitSKGraph();
+
+    SuperKernelOptionsManager opts;
+    opts.ParseOptions(options);
+
+    SuperKernelOptimizer optimizer(opts);
+    optimizer.Process(graph);
+
+    return ACL_SUCCESS;
+}
+```
+
+The runtime API added for prefetch sizing:
+
+```cpp
+aclError aclrtGetFunctionSize(aclrtFuncHandle funcHandle, size_t *aicSize, size_t *aivSize);
+
+/**
+ * @ingroup rts_kernel
+ * @brief get kernel pc start address in device, if kernel is mix, the output param aicAddr and aivAddr are both valid,
+ * otherwise, there will be only one valid address.
+ * @param funcHandle the kernel
+ * @param aicAddr output param: kernel pc start address of aicore
+ * @param aivAddr output param: kernel pc start address of aivector
+ * @return RT_ERROR_NONE for ok
+ */
+RTS_API rtError_t rtsFuncGetAddr(const rtFuncHandle funcHandle, void **aicAddr, void **aivAddr);
+```
+
+### 4.9 Known limits of SuperKernel as shipped
+
+From the internal 串讲 notes (Wiki `WIKI2026022410189615`, 学习笔记):
+
+> 目前 superkernel 现在有诸多限制：
+>
+> * 未支持 aclgraph，据说有支持计划，后续可以关注下
+> * 存量的 TBE 算子无法融入 superkernel，目前有补丁办法可以解决，但是未合入正式的主线方案，据说是 2026/01 在 CANN 包中体现
+> * torch 原生的算子无法融入 superkernel <-- 其实没有原生算子这么一说，torch.xxx 这种算子在昇腾上就是用 TBE 实现的~
+> * ATB 加速算子不支持融入 superkernel
+>
+> 换句话说，​**superkernel 目前只支持融入使用 Ascend C 写的算子**​~
+
+> ## 八、重要技术决策
+>
+> | 决策 | 说明 |
+> |------|------|
+> | **串行调度** | 第一版采用纯串行调度，暂不支持 Cube/Vector 并行 |
+> | **Mix1:2 强制提升** | 混合算子检测 Mix1:2 后强制提升模式 |
+> | **待确定功能** | DFX 调试能力、双流并行调度、ACLGraph 正式接口集成 |
+
+> **Mix1:1 → Mix1:2 自适应**：
+>
+> - 检测序列中是否包含 Mix1:2 算子
+> - 若存在，强制整个 SuperKernel 按 Mix1:2 模式启动
+> - 防止因 Vector 核数量不足导致的同步错误
+
+And the reported benefit, verbatim from `WIKI202601229899315` (runtime 组):
+
+> 相对于单算子下发，SuperKernel技术可以减少任务调度等待时间和调度开销，同时利用Task间隙资源进一步优化算子头开销。
+>
+> superKernel的参数中融合多个子kernel，在superkernel内部直接调用算子，仅需一次stars调度后便可执行多个kernel。由于kernel内的调用路径比stars更短，性能更好，尤其是大量连续的aicore算子时，一个superkernel可以融合上千个子算子，调用收益可达15%以上，为了获得该收益ac IGraph需要支持superkernel。
+
+> * 两个Task之间的调度开销降低
+> * 每个Task结束后会执行Cache Flush操作，将所有修改的Cache内容刷新出去，其中包含一些不必要的栈空间
+> * 算子调度后的核启动时间，包括同地址访问的排队延迟、Scalar执行初始化等环节
+>   superkernel从这三个方面去减少
+
+## Relevance
+
+This is the Ascend megakernel substrate we were about to write from scratch, and it already
+exists, is open source, is written in AscendC, and compiles for `Ascend910_9391`. Direct
+mappings to what we need: `TaskQue`/`TaskInfo` in GM is the ahead-of-time instruction
+sequence; `TYPE_FUNC` with `entry[((uint8_t)get_coreid()) % task->entryCnt]` is the
+instruction dispatch plus the L2-ICache-contention fix (up to 4 code copies); `TYPE_PRELOAD`
+with `preload()` + `dc_preload()` is the weight/code prefetch that keeps MTE2 busy across
+stage boundaries; `SkMemoryWaitFlag::{GEQ,EQ,AND,NOR}` spinning on a `__gm__ uint64_t` with
+`dcci` in the loop is precisely the global-memory-counter dependency mechanism from Hazy
+Research §1.6 and MPK §5.1, and it is *not* subject to the 8-event-id / 15-count limits of
+`CrossCoreSetFlag`; `SkEarlyStartMask` is the mechanism that overlaps the tail MTE of one
+stage with the scalar init of the next. Two caveats to design around. First, as shipped the
+scheduler is 串行 (serial) — it inserts a barrier between sub-kernels and explicitly does not
+yet run Cube and Vector stages concurrently, so we cannot get the MPK-style JIT work-stealing
+for free. Second, mixing any MIX_AIC_1_2 sub-kernel forces the whole SuperKernel to 1:2 mode,
+which matters for us because our 505 MIX_AIC calls/round would set the mode for everything
+else. The claimed benefit (15%+, "一个superkernel可以融合上千个子算子") is for launch
+overhead only, consistent with our 11.5 ms launch floor being the thing to attack but *not*
+enough on its own — 15% of 11.6198 ms does not reach 2.x ms, so we need the fusion plus the
+Early-Start/preload overlap plus the elimination of the 5.35 ms serial TP reduce.
+
+---
+
+## 5. ThunderMLA — "FlashMLA, Faster and Fused-er!" (the interpreter template, and MLA decode as a megakernel)
+
+URL: https://hazyresearch.stanford.edu/blog/2025-03-04-thundermla
+Authors: Benjamin Spector, Aaryan Singhal, Dan Fu, Chris Ré (Stanford Hazy Research)
+Date: Mar 4, 2025 · 10 min read
+
+The precursor to the Llama-1B megakernel, and the one that is *specifically about MLA decode*.
+Same attention mechanism family as our MLA + SparseFlashAttention.
+
+### 5.1 The claim and the workload
+
+> We've been playing with some new schedulers to deal with variable length sequences. (This is a common case in LLM inference, when you're serving requests from many different users.) Like everyone else, we were really excited about DeepSeek MLA so we decided to look into it!
+>
+> We're excited to introduce ThunderMLA, our response to the performance challenges of large language model inference. ThunderMLA is a completely fused "megakernel" for decode that's 20-35% faster than DeepSeek's FlashMLA on diverse workloads. It turns out some simple scheduling tricks can get you pretty far! And although this release is focused on attention decoding, we think these techniques apply much more broadly.
+>
+> Figure 0: A caricature of the main message of this post. Fused, scheduled megakernels (B) can be much more performant than separate kernels (A)!
+>
+> Please be warned: this release is more art than product, although to our surprise, people are already using it in production!
+
+### 5.2 Why decode attention stalls — and the exact baseline numbers
+
+> Attention decode kernels can struggle on variable-prompt workloads. Whereas prefill usually allows for a single kernel to fill the GPU, parallelizing across batch and sequence, when decoding small batches and just a few queries at a time, one needs to use other tricks like FlashInfer to keep the GPU full, but incurs other costs in doing so. The core issue lies in the substantial overhead created by:
+>
+> Running two separate kernel launches
+>
+> Tail effects between kernel executions
+>
+> Limited batch sizes when running large reasoning models (which appear, at the present, to be the future of AI)
+>
+> These constraints can severely limit performance. For intuition, consider the following decode scenario with imbalanced inputs:
+>
+> A batch of 4 prompts, of lengths [4641, 45118, 1730, 1696]
+>
+> Generating 4 new tokens (e.g., for a speculator)
+>
+> 8-way tensor parallel -- that is, 16 heads per GPU for DeepSeek R1
+>
+> With 4 new tokens, FlashMLA runs in 52 us on an SXM H100, achieving just 144 TFLOPS and 1199 GB/s (out of the 939 TFLOPS / 3300 GB/s advertised by NVIDIA).
+>
+> As a partial solution, we're introducing ThunderMLA, a completely fused mega-kernel that represents the first step in our broader effort to rethink CUDA programming; on the same workload, ThunderMLA runs in just 41 us, achieving 183 TFLOPs and 1520 GB/s.
+>
+> ThunderMLA applies classical computing ideas (like job scheduling) to modern AI workloads through:
+>
+> A novel interpreter template for building megakernels
+>
+> The actual ThunderMLA megakernel
+>
+> Two simple schedulers
+>
+> Advanced timing infrastructure
+
+### 5.3 The three costs of the many-kernel model, and the instruction-tensor fix
+
+> Traditionally, GPU workloads are written as sequences of kernels that exchange data through global memory (L2 cache or HBM). While this approach allows kernels to be reused, it introduces significant overhead, illustrated in Figure 1:
+>
+> Kernels must be set up and torn down; each of these can consume several microseconds
+>
+> Single-wave tail effects can often be substantial in these small-batch, fast-decoding scenarios
+>
+> Using multiple kernels prevents data reuse, thereby increasing memory bandwidth required by the GPU
+>
+> Figure 1: a stylized Gantt chart of various kernel overheads. Sometimes, these costs are negligible, but often times they're not!
+>
+> Our solution eliminates these kernel launches by creating a simple virtual instruction set on the GPU. Instead of launching separate kernels, we fuse them into a single "megakernel," and then pass this megakernel its instructions at runtime through an instruction tensor, which in turn can dramatically modify its behavior. Within the megakernel, GPU SMs read from this instruction tensor, decide what work to perform next, and then execute it. Although we're initially focused on these megakernels for attention decoding scenarios, we think they're an important idea in general -- stay tuned!
+>
+> We've implemented this through an interpreter template within ThunderKittens, allowing arbitrary simple kernels to be plugged together into a megakernel, each with its own opcode and instructions. Key benefits include:
+>
+> Vastly simplified pipelining within instructions, across loop boundaries
+>
+> Asynchronous fetching of the future instructions, minimizing instruction overhead
+>
+> Deep pipelines that hide data fetch latencies within and across instructions
+
+### 5.4 Size of the implementation, and the template instantiation
+
+> Our implementation adapts a slot attention kernel and token reduction kernel into this interpreter template with just a few hundred lines of device code, and uses a global tensor as a semaphore to synchronize dependencies across instructions. Once both the two constituent kernels ("partial" and "reduction") of the megakernel for FlashMLA are implemented, the megakernel can be instantiated as interpreter::kernel<config, partial_template, reduction_template>. Altogether, this fused megakernel is just 250 lines of device code in ThunderKittens.
+
+### 5.5 The full results table, verbatim
+
+> | Kernel | B 1, Seq 64k, Q 1 | B 64, Seq 256-1024 (random), Q 4 | B 64, Seq 512 Q 2 | B 132, Seq 4k, Q 4 |
+> | --- | --- | --- | --- | --- |
+> | FlashMLA (μs, TFLOPs, GB/s) | 55.0, 42, 1378 | 47.0, 124, 1212 | 39.0, 59, 1092 | 226.0, 333, 2839 |
+> | ThunderMLA (μs, TFLOPs, GB/s) | 44.5, 52, 1700 | 39.5, 147, 2022 | 28.6, 80, 1489 | 210.0, 358, 3055 |
+> | Speedup (%) | 23.6% | 19.0% | 36.3% | 7.6% |
+
+### 5.6 The two schedulers — static heap, and makespan-backwards
+
+> Static Scheduler
+> Our first approach uses a simple static scheduler that:
+>
+> Divides jobs into small pieces
+>
+> Synthesizes a k-way reduction tree to merge operations
+>
+> Uses a heap-based priority queue to allocate work to available SMs
+>
+> This yields good performance across various settings, though it struggles to optimally overlap reduction and compute because it doesn't consider task timing when creating instructions. An example of a proposed schedule from the static scheduler can be seen in figure 2A.
+>
+> Makespan Backwards Scheduler
+> Our second, more advanced scheduler improves performance by optimizing the makespan more aggressively:
+>
+> We know the very last event of the kernel is a single reduction task for each token, so we can work backwards from it
+>
+> We then run heuristic rollouts to determine optimal execution path
+>
+> Assigns processor IDs to each task
+>
+> Taken together, this can shave an additional 10% off execution time, as visualized in figure 2B.
+>
+> Figure 2: Two simulated Gantt charts from our schedulers. (A) our simple static scheduler. Although this approach doesn't overlap very well, it nonetheless reduces both tail effects and kernel launch times. (B) Our makespan-focused backwards scheduler. Of particular note is that the schedule is determined relative to the end of the kernel, rather than its beginning.
+
+### 5.7 Why a slow (1–2 ms) scheduler is still acceptable — the amortization argument
+
+> Note that while these schedulers are currently slower than the kernel itself (currently requiring 1-2ms), this approach remains viable because:
+>
+> Schedules can be reused across dozens of layers on large models
+>
+> Generation can happen asynchronously on the CPU while previous batches are running
+>
+> Schedules between similar batch sizes change infrequently (e.g., a batch size of 4 only needs schedule regeneration at most every 8 forward passes on average)
+>
+> Even when schedules change, they usually change in simple enough ways that a simple update is possible
+
+### 5.8 Tooling note — standard profilers do not work on megakernels
+
+> During development, we realized that NVIDIA's tools are increasingly inadequate for understanding the performance of heterogeneous and dataflow-driven kernels. NCU, while an excellent tool we love very much, isn't as well-suited for analyzing these kernels where hardware resources are more constraining than thread execution.
+>
+> To address this, we've developed custom timing infrastructure that produces detailed Gantt charts of kernel execution, tracking events such as:
+>
+> Consumer setup phases
+
+## Relevance
+
+The 250-lines-of-device-code figure and the `interpreter::kernel<config, partial_template,
+reduction_template>` instantiation are the scope estimate for a staged megakernel if the
+interpreter substrate already exists — which on Ascend it does (CANN SuperKernel, §4). Their
+B=1, Seq 64k, Q=1 column (44.5 us, 1700 GB/s) is the closest published point to our batch=1
+regime, and the fact that even a fully fused MLA decode reaches only ~52% of H100 bandwidth at
+B=1 is the warning that fusing attention alone will not close our SparseFlashAttention gap
+(6.973 ms spent vs 1.382 ms of bytes = 5.0x). §5.7's amortization argument applies to us with
+*more* force: at batch=1 with a fixed 8K sequence, one schedule serves all 78 layers and every
+round, so we can afford an arbitrarily expensive offline scheduler. §5.8 is a practical
+warning: msprof/op_summary will stop being informative once the kernel count collapses, and we
+should plan on in-kernel `get_sys_cnt()` timestamping (which CANN SuperKernel already
+implements — see its `SkKernelEventRecord` / `WriteEventRecord` path in §4).
+
+---
+
+## 6. Event Tensor / ETC — "A Unified Abstraction for Compiling Dynamic Megakernel"
+
+URL: https://arxiv.org/pdf/2604.13327 · https://www.alphaxiv.org/abs/2604.13327
+Venue: MLSys 2026 — https://proceedings.mlsys.org/paper_files/paper/2026/hash/53d3f45797970d323bd8a0d379c525aa-Abstract-Conference.html
+Authors: Hongyi Jin, Bohan Hou, Songting Wang, Ruihang Lai, et al. (CMU et al.)
+Date: arXiv April 2026
+
+The newest of the three megakernel compilers, and the one that addresses the thing our MoE
+decode actually needs: *data-dependent* dynamism (top-8 of 256 experts, known only at runtime).
+
+### 6.1 Abstract, verbatim
+
+> Modern GPU workloads, especially large language model (LLM) inference, suffer from kernel launch overheads and coarse synchronization that limit inter-kernel parallelism. Recent megakernel techniques fuse multiple operators into a single persistent kernel to eliminate launch gaps and expose inter-kernel parallelism, but struggle to handle dynamic shapes and data-dependent computation in real workloads. We present Event Tensor, a unified compiler abstraction for dynamic megakernels. Event Tensor encodes dependencies between tiled tasks, and enables first-class support for both shape and data-dependent dynamism. Built atop this abstraction, our Event Tensor Compiler (ETC) applies static and dynamic scheduling transformations to generate high-performance persistent kernels. Evaluations show that ETC achieves state-of-the-art LLM serving latency while significantly reducing system warmup overhead.
+
+### 6.2 The launch-overhead arithmetic, verbatim — note the 5–10 us vs 2 us ratio
+
+> The first source of overhead arises from kernel launches. Current systems such as PyTorch (Paszke et al., 2019) launch GPU kernels sequentially from the host CPU (Figure 1, upper left). During LLM inference, each auto-regressive decoding step may involve hundreds or even thousands of fine-grained operations, where the launch overhead cannot be effectively amortized. Each kernel launch typically incurs 5–10 μs of latency, while the fastest kernels may complete in 2 μs, making the launch overhead dominant.
+>
+> The second source of overhead stems from kernel boundaries, which enforce implicit synchronization between consecutive kernels. In many cases, later kernels depend only ...
+
+### 6.3 Language constructs — Device Function, Event Tensor, Graph Function
+
+> **2.1 Language Constructs**
+>
+> We first introduce the main language constructs in Event Tensor–based programs.
+>
+> Device Function. A device function defines a grid of tasks launched in parallel on the GPU. Each launch is parameterized by a multidimensional coordinate, where each coordinate identifies a task tile executed on a streaming multiprocessor (SM). Each task can include specialized logic, such as warp specialization or tensor core calls.
+>
+> Event Tensor. An Event Tensor is a multi-dimensional structure whose elements represent events—the completion of task sets at the SM level—following established practices in parallel programming systems (Blumofe et al., 1995; Treichler et al., 2014; Bauer et al., 2012; Dagum & Menon, 1998). Each element has an initial wait count recording the number of tasks it depends on and supports several operations: E[i].notify() signals task completion, E[i].wait() blocks until the event is triggered, and in dynamic scheduling, events can also trigger dependent tasks. Compared with approaches that manage standalone events individually, Event Tensors greatly reduce task-graph management overhead when scaling to millions of fine-grained events in real LLM inference workloads.
+>
+> Graph function. A graph function represents a computational graph consisting of call device calls that explicitly launch device functions with specified task shapes. Unlike traditional computational graphs, it includes both data tensors and Event Tensors. Each device function launch can annotate explicit input/output dependencies and coordinate mappings that track fine-grained task relationships through Event Tensors.
+>
+> Figure 3 shows an example Event Tensor–based program. The general program can be viewed as a compact representation of task graphs in the form of “producer task → event → consumer task”. We use generic lambda functions to represent event task relations. These dependency annotations implicitly map to event notifications at the end of each producer task and waiting at the beginning of each consumer task.
+
+### 6.4 Figure 3 — the minimal program, verbatim
+
+```python
+class IRModule:
+    @device_func
+    def partial_sum(i: int, j: int, A: Tensor, B: Tensor):
+        # i, j are task coordinates
+        # The following tasks can be implemented at CTA/cluster level
+        B[i*32 : i*32+32, j] = sum(A[i*32 : i*32+32, j*32 : j*32+32])
+
+    @device_func
+    def final_sum(i: int, B: Tensor, C: Tensor):
+        # i is the task coordinate
+        # The following tasks can be implemented at CTA/cluster level
+        C[i*32 : i*32+32] = sum(B[i*32 : i*32+32, :])
+
+    @graph_func
+    def main_graph(A: Tensor(("n*32", 128))) -> Tensor(("n*32",)):
+        n = sym_var()  # an integer symbolic variable
+        E = ETensor((n,), wait_count=4)
+        B: Tensor((n * 32, 4)) = call_device(
+            IRModule.partial_sum, tile_num=(n, 4),
+            args=[A], in_edges={}, out_edges={E: "ij->i"},
+        )
+        C: Tensor((n * 32,)) = call_device(
+            IRModule.final_sum, tile_num=(n,),
+            args=[B], in_edges={E: "i->i"}, out_edges={},
+        )
+        return C
+```
+
+> Figure 3. Example Event Tensor–based program.
+
+Dependency edges are given in einsum notation (`"ij->i"`, `"i->i"`, `"bh->bh"`, `"h->bh"`).
+
+### 6.5 Shape dynamism — symbolic shapes, no recapture
+
+> Figure 4. Event Tensor handles shape dynamism with symbolic-shape tensors that define a template for dependency graphs. At runtime, the template is instantiated with concrete shape values (e.g., producing a 1 × 2 graph for batch size 1 or a 2 × 2 graph for batch size 2) without recompilation or repeated graph capture.
+
+### 6.6 Data-dependent dynamism — the MoE mechanism, verbatim
+
+This is the section to copy for our 256-expert / top-8 routing.
+
+> **2.4 Supporting Data-Dependent Dynamism**
+>
+> A critical challenge in modern workloads is handling irregular, data-dependent task graphs. A representative example is the Mixture-of-Experts (MoE) layer (Shazeer et al., 2017), where input tokens are dynamically routed to different expert sub-networks based on routing decisions computed at runtime. An efficient MoE implementation typically first groups tokens according to their assigned experts and then uses GroupGEMM operators to compute the results for all tokens within each group.
+>
+> Dynamic routing introduces fine-grained, data-dependent task dependencies that are unknown at compile time (specifically, which experts GroupGEMM tile processes which tokens). This dynamism poses a significant challenge for traditional compilers and schedulers, which assume a static task graph with fixed dependencies. To efficiently represent such dynamic workloads, we need an abstraction that can (1) determine at runtime which tasks each consumer task depends on, and (2) trigger a variable number of consumer tasks based on runtime data. The Event Tensor abstraction is designed precisely for this purpose. It manages data-dependent task graphs through two core mechanisms:
+>
+> Data-Dependent Event Update. Unlike conventional task graphs that support only static dependencies (Figure 5a), the Event Tensor abstraction allows dynamic event dependencies (Figure 5b). In the MoE example, runtime routing decisions stored in the topk tensor determine which grouping tiles (one per token) update which events (one per expert). Each expert's event counter is initialized to the number of tokens routed to it, and this initialization occurs dynamically at runtime, together with the computation of topk.
+>
+> Data-Dependent Task Triggering. Similarly, an event can trigger a runtime-dependent number of tasks. Based on routing decisions in topk, we can compute how many tokens each expert must process and, therefore, how many GroupGEMM tiles each expert requires. As illustrated in Figure 5b, this information is encoded in the tensor exp indptr, which stores the prefix sum of GroupGEMM tiles to be triggered per expert. Leveraging exp indptr, we enable data-dependent triggering, where expert i activates tiles in the range (exp indptr[i], exp indptr[i+1]).
+>
+> Together, these two mechanisms allow the compiler to generate megakernels that efficiently adapt to highly dynamic workloads—cases that static task graphs handle poorly. Combined with the symbolic-shape support described above, all compilation in ETC occurs offline; at inference time, the compiled binary handles both shape and data-dependent dynamism with zero compilation overhead.
+>
+> Note that the overall dependency chain remains strictly feed-forward (Figure 2, right): Attention Output → Token Routing (TopK) → Token Grouping → Token Computation (GroupGEMM). Computing TopK depends only on the preceding Attention output—a standard static dependency. The data-dependent Event Tensor mechanisms described above govern only the later stages, where routing results dynamically determine which grouping tasks notify which expert events and how many GroupGEMM tiles each expert triggers.
+
+(`indptr` footnote, verbatim: "indptr is a term commonly used in sparse matrix representations
+such as the compressed sparse row (CSR) format.")
+
+### 6.7 Fused GEMM + ReduceScatter — before/after static scheduling, verbatim
+
+This is the exact shape of our problem: one persistent device function containing both the
+matmul tiles and the reduce-scatter tiles, coordinated by an Event Tensor, with the collective
+expressed as `multimem_ld_reduce_cta`. Contrast with our 5.35 ms fully serial TP reduce.
+
+Before transformation — two device functions plus a distributed Event Tensor:
+
+```python
+# Constants: M, N, K (matrix dimensions),
+# BLK_M, BLK_N (block sizes), WORLD_SIZE (number of devices)
+LOCAL_M = M // WORLD_SIZE
+
+@device_func
+def matmul(i: int, j: int, A: Tensor, B: Tensor, C: Tensor):
+    # i is the task coordinate
+    with cta():
+        matmul_cta(C[i*BLK_M : (i+1)*BLK_M, j*BLK_N : (j+1)*BLK_N],
+                   A[i*BLK_M : (i+1)*BLK_M, :],
+                   B[:, j*BLK_N : (j+1)*BLK_N])
+
+@device_func
+def reduce_scatter(i: int, j: int, C: Tensor, D: Tensor):
+    # i, j are task coordinates
+    with cta():
+        offset = get_rank() * LOCAL_M
+        multimem_ld_reduce_cta(
+            D[i*BLK_M : (i+1)*BLK_M, j*BLK_N : (j+1)*BLK_N],
+            C[offset + i*BLK_M : offset + (i+1)*BLK_M,
+              j*BLK_N: (j+1)*BLK_N]
+        )
+
+@graph_func
+def main_graph(A: Tensor((M, K)), B: Tensor((K, N))) -> Tensor((LOCAL_M, N)):
+    # E is a distributed Event Tensor, sharded on dimension 0.
+    # Each device holds a shard of shape (LOCAL_M // BLK_M, N // BLK_N)
+    E = ETensor((M // BLK_M, N // BLK_N), wait_count=WORLD_SIZE, shard="S[0]")
+    C: Tensor((M, N)) = call_device(
+        matmul, tile_num=(M // BLK_M, N // BLK_N),
+        args=[A, B], in_edges={}, out_edges={E: "ij->ij"},
+    )
+    E_local = E.local_view()
+    D: Tensor((LOCAL_M, N)) = call_device(
+        reduce_scatter, tile_num=(LOCAL_M // BLK_M, N // BLK_N),
+        args=[C], in_edges={E_local: "ij->ij"}, out_edges={},
+    )
+    return D
+```
+
+After static scheduling transformation — one persistent device function with `SM_COUNT` tiles,
+an in-kernel tile scheduler, and explicit notify/wait:
+
+```python
+@device_func
+def fused_matmul_rs(
+    sm_id: int, A: Tensor, B: Tensor, C: Tensor, E: ETensor, D: Tensor
+):
+    # sm_id is the task coordinate
+    with cta():
+        tile_scheduler = init_tile_scheduler(sm_id)
+        while tile_scheduler.valid():
+            task_idx, task_type = tile_scheduler.get_task()
+            if task_type == 0:
+                i, j = task_idx
+                matmul_cta(C[...], A[...], B[...])
+                E[i, j].notify()
+            else:
+                i, j = task_idx
+                offset = get_rank() * LOCAL_M
+                E[i + offset // BLK_M, j].wait()
+                multimem_ld_reduce_cta(D[...], C[...])
+            tile_scheduler.next_tile()
+
+@device_func
+def main_graph(
+    A: Tensor((M, K)), B: Tensor((K, N))
+) -> Tensor((LOCAL_M, N)):
+    E = ETensor(
+        (M // BLK_M, N // BLK_N), wait_count=WORLD_SIZE, shard="S[0]"
+    )
+    C: Tensor((M, N)) = empty((M, N))  # Allocate intermediate tensor C
+    D: Tensor((LOCAL_M, N)) = call_device(
+        fused_matmul_rs, tile_num=(SM_COUNT,), args=[A, B, C, E],
+        in_edges={}, out_edges={},
+    )
+    return D
+```
+
+> Figure 6. GEMM + Reduce-Scatter before and after static scheduling transformation. Two separate device functions are fused into a single persistent function, with explicit notify and wait calls on the Event Tensor to coordinate dependencies.
+
+### 6.8 Reported results, verbatim
+
+> We evaluate ETC on a diverse set of LLM serving workloads, comparing against highly competitive, industry-level baselines (e.g., vLLM and SGLang) that already employ aggressive optimizations such as CUDA Graphs, Programmatic Dependent Launch (PDL), and torch.compile. Our results show that ETC achieves substantial speedups over these systems while efficiently supporting both shape- and data-dependent dynamism, without requiring runtime graph recapture or recompilation. For tensor-parallel workloads, our compiler-driven overlap of computation and communication achieves up to 1.40x speedup on fused GEMM and Reduce-Scatter kernels. For data-dependent workloads such as MoE, our megakernels outperform specialized libraries by up to 1.23x. In dynamic-shape, low-batch inference scenarios, ETC matches or exceeds the performance of these highly optimized inference systems, while reducing engine warm-up overheads by up to 3.5x. Achieving even moderate speedups over such strong baselines translates to substantial economic value at datacenter scale. Beyond raw speed, ETC achieves true ahead-of-time (AOT) compilation for dynamic workloads, completely eliminating runtime compilation ...
+
+> By unifying previously manual fusion and hand-crafted scheduling techniques (Spector et al., 2025; Cheng et al., 2025) into compiler transformations, ETC significantly reduces engineering effort to construct megakernels, while improving their runtime performance.
+
+## Relevance
+
+§6.6 is the design we should copy for MoE routing in a persistent kernel, because it is the
+only published mechanism that lets a *statically scheduled* megakernel handle a runtime
+top-k: initialize each expert's event counter to the token count routed to it (computed with
+topk), and use an `exp_indptr` prefix-sum tensor so expert `i` triggers tiles in
+`[exp_indptr[i], exp_indptr[i+1])`. At batch=1 with top-8 of 256, only 8 experts are live and
+every count is 1, so this collapses to something very cheap — but it still requires that the
+dependency structure be expressible without recompiling, which the CANN SuperKernel task queue
+(a flat `TaskInfo` array built on the host) currently is not. §6.7's `fused_matmul_rs` is the
+template for turning our 5.35 ms serial TP reduce into tiles interleaved with the producing
+matmul's tiles in one persistent kernel; `multimem_ld_reduce_cta` is the NVLS primitive, and
+the Ascend question is what plays that role (see `low-latency-tp-reduce.md`). §6.2's "each
+kernel launch typically incurs 5–10 μs of latency, while the fastest kernels may complete in
+2 μs" is the same ratio we measured with far worse constants: our MIX_AIC floor is 13.58 us.
+
+---
+
+## 7. Comparison table — what each system does, for picking our design
+
+Assembled from the quotes above. Every cell is sourced from the corresponding section.
+
+| | Hazy Megakernel (§1) | ThunderMLA (§5) | MPK (§2) | FlashMoE (§3) | ETC / Event Tensor (§6) | CANN SuperKernel (§4) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Hardware | H100 / B200 | H100 | A100/H100/B200 | 8x H100 | NVIDIA | Ascend (Ascend910_9391; DAV_2201, DAV_3510) |
+| Scope | whole Llama-1B fwd | MLA decode only | whole model, multi-GPU | one distributed MoE layer | whole model, multi-GPU | arbitrary AscendC subgraph |
+| Work unit | instruction (7 types) | opcode + instruction tensor | task + event (ttGraph) | tile + task descriptor | task + Event Tensor element | `TaskInfo` in a `TaskQue` |
+| Scheduling | AOT in Python, reused | AOT, static heap or makespan-backwards | hybrid JIT (scheduler warps) / AOT (round-robin) | fully dynamic, 1 scheduler warp | static + dynamic transforms, symbolic shapes | AOT on host, serial |
+| Dependency mechanism | GM counters, incremented on completion | global tensor as semaphore | device-memory semaphores, atomicAdd queues | shared mem (sched↔sub), GM (sched↔proc), NVSHMEM signal | Event Tensor, `notify()`/`wait()`, einsum edges | `CrossCoreSetFlag/WaitFlag` + GM `SkMemoryWaitFlag` spin w/ `dcci` |
+| On-chip buffer mgmt | 13 x 16 KiB pages of 213 kB | — | pages, 32 KB each (5/7/7 per SM) | tiles (128, 64), 128 thr/block | — | not managed; sub-kernels own UB/L1 |
+| Cross-stage prefetch | interpreter hands freed pages to next instruction | async instruction fetch, deep pipelines | pre-loading phase + compute phase | — | — | `TYPE_PRELOAD` + `preload()`/`dc_preload()` |
+| Collectives in-kernel | no | no | yes, `nvshmem_signal_wait_until` | yes, one-sided NVSHMEM (R)DMA | yes, `multimem_ld_reduce_cta` | `TYPE_EVENT_NOTIFY/WAIT` (AICPU/SDMA, not inter-device) |
+| Data-dependent routing | no | variable seq len via scheduler | hybrid MoE balancer w/ meta-tensor | expert capacity C, in-place padding | `topk` event init + `exp_indptr` triggering | no |
+| Headline number | 78% of H100 BW; <1 ms H100, <680 us B200 | 20–35% over FlashMLA; 41 us vs 52 us | up to 1.7x; 14.5 → 12.5 ms/token Qwen3-8B A100 | 1 vs 550 GPU ops; 93.17% vs 14% util | 1.40x GEMM+RS; 1.23x MoE; 3.5x less warmup | "调用收益可达15%以上" |
+
+---
+
+## 4b. CANN SuperKernel — what it will and will not fuse (host-side source)
+
+Source files, all under `https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/src/aot/`
+Fetched 2026-10-20. This closes the "what gets fused" question left open in §4.
+
+### 4b.1 `FusionFailReason` — the complete list of reasons a node cannot join a SuperKernel
+
+`sk_node.h`:
+
+```cpp
+// Unfused reason
+enum class FusionFailReason {
+  CAN_FUSE,                // 0: Can fuse (default)
+  OP_UNSUPPORT,            // 1: Failed to resolve SuperKernel bind map for the operator
+  DYNAMIC_TASK_UNSUPPORT,  // 2: Operator dynamically refreshes task info at runtime, SK does not support fusing
+                           // dynamically changing tasks
+  NOT_IN_SCOPE,            // 3: Operator is not within user-marked fusion range
+  IN_UNFUSIBLE_SCOPE,      // 4: User actively marked this operator as unfusible
+  EXCEED_CORE_MAX,         // 5: Operator requires more cores than device maximum
+  RESET_TYPE_NODE,         // 6: reset type node placed at end
+  ISOLATED_EVENT,          // 7: Isolated event exists
+  EXIST_DEADLOCK,          // 8: Deadlock exists
+  SCOPE_FUSE_PART,         // 9: Scope processing skipped part of the original scope
+  EXTERNAL_DEPEND,         // 10: Event has external dependency
+  UNSUPPORT_EVENT_TYPE,    // 11: Unsupported event type
+  MEMORY_WAIT_NODE_ONLY,   // 12: No memory write exists, meaning the memory write is outside modelRI,
+  MEMORY_WRITE_NODE_ONLY,  // 13: only exists memory write nodes, mask it as unfusible
+  DEFAULT_NODE,            // 14: default node uses aicpu resources, mask it as unfusible
+  KERNEL_ATTR_GET_FAILED,  // 15: Failed to get kernel attribute for SuperKernel fusion
+  EXCEED_SCOPE_MAX,        // 16: Exceeded maximum scope number limit for SuperKernel fusion
+};
+
+// Bindmap related fail reason detail
+enum class BindmapFailReason : uint8_t {
+  NONE,                      // 0: No error
+  BINDMAP_INIT_EMPTY,        // 1: Bindmap empty after initialization
+  BINHDL_NULL,               // 2: binHdl is null
+  FUNCHDL_NULL,              // 3: funcHdl is null
+  FUNC_NOT_FOUND,            // 4: Original function is not found in bind map
+  BIN_DEV_ADDR_GET_FAILED,   // 5: Failed to get binary device address
+  FUNC_ADDR_GET_FAILED,      // 6: Failed to get function address
+  BINDMAP_ENTRY_CONFLICT,    // 7: Duplicated bind map entry has inconsistent value
+```
+
+### 4b.2 `ScopeBreakReason` — why a fused scope is cut
+
+`sk_scope_info.h`:
+
+```cpp
+/*!
+ * \brief Reasons why a scope boundary was created (scope was split)
+ */
+enum class ScopeBreakReason : uint8_t {
+  NONE,
+  UNFUSIBLE_NODE,
+  DEADLOCK_DETECTED,
+  SYNCALL_OP_DROP,
+  DEBUG_PER_OP_MAX_CORE,
+};
+```
+
+### 4b.3 The stream walk that terminates a scope
+
+`sk_scope_split.cpp`:
+
+```cpp
+  // Check scopeBitFlags match
+  if (node->GetScopeBitFlags() != currentScopeBitFlags_) {
+    SK_LOGI("Stream %u: node %s scopeBitFlags mismatch, terminating stream", streamIdx, node->Format().c_str());
+    state.isTerminated = true;
+    return;
+  }
+
+  // Check fusibility
+  if (!node->IsFusible()) {
+    SK_LOGI("Stream %u: node %s is not fusible, terminating stream", streamIdx, node->Format().c_str());
+    state.isTerminated = true;
+
+    ScopeBreakInfo breakInfo;
+    breakInfo.SetReason(ScopeBreakReason::UNFUSIBLE_NODE)
+        .SetTriggerNode(node->GetNodeId(), streamIdx)
+        .SetDetail("unfused node causes scope break");
+    scopeSplitResultReporter_->ReportNewBreak(*currentScope_, std::move(breakInfo));
+```
+
+### 4b.4 How the scope's kernel type and block count are chosen
+
+`sk_scope_split.cpp`, `ScopeCoreInfoCalculator`. Note the `(minVectorNum + 1) >> 1` — in 1:2
+mode the block count is the number of *AIC*, so the AIV requirement is halved and rounded up.
+Note also that a single `MIX_AIC_1_2` node forces `requireMix12` for the whole scope, which is
+the mechanism behind the "Mix1:1 → Mix1:2 自适应" note in §4.9.
+
+```cpp
+bool ScopeCoreInfoCalculator::UpdateScopeCoreConstraints(const SuperKernelBaseNode &node,
+                                                         ScopeCoreConstraints &constraints) {
+  constraints.minCubeNum = std::max(constraints.minCubeNum, node.GetCubeNum());
+  constraints.minVectorNum = std::max(constraints.minVectorNum, node.GetVecNum());
+  constraints.requireMix12 = constraints.requireMix12 || node.GetKernelType() == SkKernelType::MIX_AIC_1_2;
+
+  if (!node.RequiresExactCoreMatch()) {
+    return true;
+  }
+
+  const bool vectorOnly = node.GetCubeNum() == 0 && node.GetVecNum() != 0;
+  auto &exactCoreNum = vectorOnly ? constraints.exactVectorNum : constraints.exactCubeNum;
+  const uint32_t taskCoreNum = vectorOnly ? node.GetVecNum() : node.GetCubeNum();
+  if (exactCoreNum.has_value() && exactCoreNum.value() != taskCoreNum) {
+    return false;
+  }
+  exactCoreNum = taskCoreNum;
+  return true;
+}
+```
+
+```cpp
+  const auto getCandidates = [](uint32_t minCubeNum, uint32_t minVectorNum, bool requireMix12) {
+    if (minCubeNum == 0 && minVectorNum == 0) {
+      return std::vector<ScopeCoreInfo>{{}};
+    } else if (requireMix12) {
+      const uint32_t vectorBlocks = static_cast<uint32_t>((static_cast<uint64_t>(minVectorNum) + 1U) >> 1U);
+      return std::vector<ScopeCoreInfo>{{SkKernelType::MIX_AIC_1_2, std::max(minCubeNum, vectorBlocks)}};
+    } else if (minCubeNum == 0 && minVectorNum != 0) {
+      return std::vector<ScopeCoreInfo>{{SkKernelType::AIV_ONLY, minVectorNum}};
+    } else if (minCubeNum != 0 && minVectorNum == 0) {
+      return std::vector<ScopeCoreInfo>{{SkKernelType::AIC_ONLY, minCubeNum}};
+    } else {
+      const uint32_t vectorBlocks = static_cast<uint32_t>((static_cast<uint64_t>(minVectorNum) + 1U) >> 1U);
+      const ScopeCoreInfo mix12{SkKernelType::MIX_AIC_1_2, std::max(minCubeNum, vectorBlocks)};
+      const ScopeCoreInfo mix11{SkKernelType::MIX_AIC_1_1, std::max(minCubeNum, minVectorNum)};
+      return minVectorNum <= minCubeNum ? std::vector<ScopeCoreInfo>{mix11, mix12}
+                                        : std::vector<ScopeCoreInfo>{mix12, mix11};
+    }
+  };
+```
+
+```cpp
+ScopeCoreInfo BuildDebugPerOpScopeCoreInfo(const SuperKernelBaseNode &node, int64_t maxDeviceCubeNum,
+                                           int64_t maxDeviceVectorNum) {
+  if (node.RequiresExactCoreMatch()) {
+    if (node.GetCubeNum() == 0 && node.GetVecNum() != 0 && (node.GetVecNum() & 1U) != 0U) {
+      return {SkKernelType::AIV_ONLY, node.GetVecNum()};
+    } else {
+      const uint32_t numBlocks = node.GetCubeNum() == 0 ? node.GetVecNum() / 2U : node.GetCubeNum();
+      return {SkKernelType::MIX_AIC_1_2, numBlocks};
+    }
+  } else {
+    const int64_t numBlocks = std::min(maxDeviceCubeNum, maxDeviceVectorNum / 2);
+    return {SkKernelType::MIX_AIC_1_2, static_cast<uint32_t>(numBlocks)};
+  }
+}
+```
+
+Other scope-splitting passes present in the same file, by the break reason they set:
+`DEADLOCK_DETECTED` (a `[DeadlockRefine]` pass that splits a scope into `scopeBefore` /
+`scopeAfter` around the deadlocking node and calls `SetFusionFailReason(FusionFailReason::EXIST_DEADLOCK)`),
+and `SYNCALL_OP_DROP` (a `[ScheModeSplit]` pass). `ISOLATED_EVENT` is set directly during the
+initial walk.
+
+## Relevance
+
+This is the acceptance test for adopting SuperKernel as our substrate. The two entries that
+decide it for us are `DYNAMIC_TASK_UNSUPPORT` ("Operator dynamically refreshes task info at
+runtime, SK does not support fusing dynamically changing tasks") and `DEFAULT_NODE` ("default
+node uses aicpu resources"). Our MoE routing produces exactly a runtime-refreshed task set
+(top-8 of 256 chosen per token), so a routed-expert GroupedMatmul is a candidate for
+`DYNAMIC_TASK_UNSUPPORT` and would break the scope there — which is precisely the gap Event
+Tensor's `exp_indptr` triggering (§6.6) was designed to fill and SuperKernel has no answer
+for. `EXCEED_CORE_MAX` and the `requireMix12` propagation also matter: one MIX_AIC_1_2 node
+anywhere in the scope forces the whole SuperKernel to 1:2, and with 505 MIX_AIC calls a round
+that will happen. The practical next step is to run `aclskOptimize` over one decode round and
+read the `PrintScopeBreakReasonReport()` output — it will tell us exactly how many scopes our
+3008 kernels collapse into and why each boundary exists, which is a measurement we can get
+before writing any kernel code.
+
+
+---
+
+## 8. MegaGDN — a real, working, public Ascend megakernel (and its grid barrier)
+
+Repo: https://github.com/huawei-csl/megagdn-pto (fork: https://github.com/vloncar/megagdn-pto)
+Report: `blog/mega_gdn_en.md` — "MegaGDN: One fused kernel cuts Qwen3.5/3.6 inference TTFT by 15%
+(accelerate vLLM-Ascend by PTO-ISA)"
+Dates: repo created 2026-06-22, last push 2026-10-13; presented on the CANN official account
+2026-05-19; merged into the SGLang NPU ecosystem 2026-05-20
+(https://github.com/sgl-project/sgl-kernel-npu/pull/462)
+Built on PTO-ISA: https://gitcode.com/cann/pto-isa
+
+This is the artifact that matters most in this file: a short, readable, **production** Ascend
+megakernel that fuses seven stages into one `<<< >>>` launch, with a working grid-wide barrier
+for both A2/A3 and A5. It is not a design document.
+
+### 8.1 What it claims
+
+> **TL;DR** This repo provides **1.5~3x faster**<sup>[1]</sup> NPU kernels for chunk GDN<sup>[2]</sup>, with integration to [vllm-ascend](https://github.com/vllm-project/vllm-ascend) to enable **~15% faster prefill** for Qwen3.5/3.6 models<sup>[3]</sup>.
+>
+> - [1] Compared to the triton kernels used [in vllm-ascend](https://github.com/vllm-project/vllm-ascend/tree/v0.19.1rc1/vllm_ascend/ops/triton/fla)/[sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu/tree/2026.05.01/python/sgl_kernel_npu/sgl_kernel_npu/fla). See [Performance highlights](#performance-highlights).
+> - [2] All 6 stages: `chunk_cumsum`, `scaled_dot_kkt`, `solve_tril`, `wy_fast`, `chunk_h`, `chunk_o`. Plus a merged metakernel to save kernel launch overhead.
+> - [3] Tested model sizes: `0.8B`, `2B`, `4B`, `9B`, `27B`, `35B-A3B`. (`122B-A10B`, `397B-A17B` are also compatible in principle, yet to test)
+
+> CANN 8.5.0~9.0.0 are verified on A2/A3; the experimental Ascend A5 support requires CANN >= 9.1.0.
+
+### 8.2 Why they wrote a megakernel instead of using ACL Graph — verbatim
+
+> ## Host overhead in eager PyTorch
+>
+> Kernel-only optimizations alone are not enough to speed up end-to-end inference on Atlas A2/A3 systems -- those machines are notoriously easy to become host-bound when running PyTorch eager mode. Profiling vLLM prefill (original Triton backend) shows large bubbles on the device side, due to host-side Python overhead and kernel launch overhead.
+>
+> The standard mitigation is [ACL Graph](https://docs.vllm.ai/projects/ascend/en/v0.18.0/developer_guide/Design_Documents/ACL_Graph.html), the NPU analogue of CUDA Graph. vLLM-Ascend's graph path applies to **`decode_only`**; prefill still runs in eager Torch. See [ACL graph limitations](https://docs.vllm.ai/projects/ascend/en/v0.18.0/developer_guide/Design_Documents/ACL_Graph.html#limitations). Prefill tensor shapes change often, but capturing and replaying graphs prefer fixed static shapes. Supporting dynamic-shape graphs means padding, bucketing, and other workarounds.
+
+### 8.3 The fusion method — "simpler but effective"
+
+> ## Simpler way for megakernel fusion
+>
+> To not struggle with graph mode workarounds, we take a simpler but effective approach: we have the source code for all 6 computation stages, each only a few hundred lines of C++. We just merged them into one NPU kernel function, launched once with the familiar `<<< >>>` syntax.
+>
+> Between the stages, we must fence across all cores for memory ordering. We use `TSyncAll` that is [just added to PTO-ISA](https://gitcode.com/cann/pto-isa/pull/878).
+>
+> The fused source code is at path `megagdn-pto/kernels/pto/mega_kernel.cpp`. The megakernel source stays short and readable. The `launch_mega_kernel` kernel entry is a few hundred lines of C++. Stages reuse the single-kernel sources without copy-paste duplication. **This is legal because one AICORE function can call another AICORE function, similar to CUDA `__forceinline__ __device__`.**
+
+That last sentence is the licence for the whole approach on Ascend.
+
+### 8.4 THE GRID BARRIER — `SyncAllMegaKernel`, working code for A2/A3 and A5
+
+Source: `kernels/pto/include/kernel_utils.h` (533-line `mega_kernel.cpp` uses it between every
+stage). This is the single most reusable piece of code found in this entire research pass.
+
+```cpp
+AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
+  constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+  constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+  return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
+          ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+
+template <bool isAIVOnly = true>
+AICORE inline void SyncAllA2A3() {
+// These constants are defined on A5
+#if __CCE_AICORE__ == 220
+  constexpr uint16_t SYNC_AIV_FLAG = 12;
+  constexpr uint16_t SYNC_AIC_FLAG = 11;
+  constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+  constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+  pipe_barrier(PIPE_ALL);
+  if constexpr (isAIVOnly) {
+    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+    wait_flag_dev(SYNC_AIV_ONLY_ALL);
+    return;
+  }
+#if defined(__DAV_CUBE__)
+  wait_flag_dev(SYNC_AIV_FLAG);
+  ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(SYNC_AIC_FLAG);
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+#elif defined(__DAV_VEC__)
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+  wait_flag_dev(SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+
+// ── A5 ── mirrors include/pto/npu/a5/SyncAll.hpp:101-111
+// Requires: getFFTSMsg from <pto/npu/a5/SyncAll.hpp> (A5 defines its own)
+AICORE inline void SyncAllMixA5() {
+#if __CCE_AICORE__ != 220
+  pipe_barrier(PIPE_ALL);
+#if defined(__DAV_CUBE__)
+  // 1. Wait for both paired AIVs: one flag ID per subblock (base, base +
+  // SYNC_FLAG_ID_MAX).
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+  // 2. Global all-AIC barrier.
+  ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
+  // 3. Release both paired AIVs.
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+#elif defined(__DAV_VEC__)
+  // Set on MTE3 so prior stores drain; wait on PIPE_S.
+  set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+#endif
+#endif
+}
+
+template <bool isAIVOnly = true>
+AICORE inline void SyncAllMegaKernel() {
+#if __CCE_AICORE__ == 220
+  SyncAllA2A3<isAIVOnly>();
+#else
+  static_assert(isAIVOnly == false, "No support for AIV only global sync");
+  SyncAllMixA5();
+#endif
+}
+```
+
+```cpp
+/**
+ * @brief Pipe in-core barrier for vector core that is a no-op for A5.
+ *
+ */
+AICORE inline void PipeBarrierVec() {
+#if __CCE_AICORE__ == 220
+  pipe_barrier(PIPE_V);
+#endif
+}
+```
+
+### 8.5 The megakernel body — stage list, barriers, early-exit instrumentation
+
+`kernels/pto/mega_kernel.cpp` header comment, verbatim:
+
+```cpp
+// mega_kernel.cpp — GDN Mega-Kernel (group-value / GQA): all PTO stages in one
+// launch
+//
+// Same pipeline as pto_mega_kernel, but scaled_dot_kkt / wy_fast / chunk_h /
+// chunk_o use runtime H/Hg dispatch from dynamic_bsnd_groupvalue; cumsum still
+// uses H (value heads) like dynamic_bsnd.
+//
+// Stages:
+//   1. cumsum      (Vec)
+//   2. transpose   (Vec)
+//   3. kkt         (Cube+Vec)  — K has Hg heads; β,g,A use H value heads
+//   4. solve_tril  (Cube)
+//   5. wy_fast     (Vec+Cube)
+//   6. chunk_h     (Cube+Vec)
+//   7. chunk_o     (Cube+Vec)
+```
+
+Compile-time shape parameters, with the explicit "one .so serves every head count" note — the
+exact static/dynamic tradeoff we face:
+
+```cpp
+#ifndef GDN_D
+#define GDN_D 128
+#endif
+#ifndef GDN_C
+#define GDN_C 128
+#endif
+// GDN_MAX_HEADS: compile-time ceiling on the value-head count. num_heads is a
+// RUNTIME argument (one .so serves every head count), so the transpose/cumsum
+// UB tiles are sized for this worst case; any num_heads <= GDN_MAX_HEADS works
+// with the unused columns zero-padded. Must match the host-side _MAX_HEADS
+// guard and the GDN_MAX_HEADS in chunk_cumsum.cpp.
+#ifndef GDN_MAX_HEADS
+#define GDN_MAX_HEADS 64
+#endif
+
+#include <runtime/rt_ffts.h>
+
+#include <pto/pto-inst.hpp>
+#include <type_traits>
+
+#include "acl/acl.h"
+#include "kernel_utils.h"
+
+using namespace pto;
+using namespace kernel_utils;
+```
+
+The body: note `set_ffts_base_addr(ffts_addr)` first, then stage calls separated by
+`SyncAllMegaKernel<false>()`, with `MEGA_STOP_AFTER_*` macros for per-stage bisecting.
+
+```cpp
+AICORE inline void mega_kernel_impl(
+    __gm__ uint8_t* q_ptr, __gm__ uint8_t* k_ptr, __gm__ uint8_t* v_ptr,
+    ...
+    int64_t total_tokens, uint32_t num_matrices, uint64_t ffts_addr) {
+  set_ffts_base_addr(ffts_addr);
+
+  constexpr int32_t D = GDN_D;
+  constexpr int32_t C = GDN_C;
+
+  if (num_key_heads == 0 || (static_cast<uint32_t>(H) % num_key_heads) != 0) {
+    return;
+  }
+
+  mk_cumsum::cumsum_kernel<C>(reinterpret_cast<__gm__ float*>(g_in_ptr),
+                              reinterpret_cast<__gm__ float*>(g_sum_ptr),
+                              reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr),
+                              batch_size, seq_len, H, ffts_addr);
+
+#ifdef MEGA_STOP_AFTER_CUMSUM
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+#ifdef MEGA_STOP_AFTER_SYNC1
+  return;
+#endif
+
+  mega_transpose_TH_to_HT<float>(...);
+  mega_transpose_TH_to_HT<half>(...);
+
+#ifdef MEGA_STOP_AFTER_TRANSPOSE
+  pipe_barrier(PIPE_ALL);
+  return;
+#endif
+
+  SyncAllMegaKernel<false>();
+
+  mk_kkt::kkt_kernel<D, C>(..., ffts_addr);
+```
+
+The AIC/AIV handshake drain between stages — note the explicit A2-vs-A5 divergence comment:
+
+```cpp
+// Drain the kkt handshake: Vec released both workspace slots (flags 2/3) one
+// last time after Cube's final iteration, so consume them before the next
+// stage. A2: Vec is a separate core → FFTS cross-core flag. A5: both Vec
+// sub-blocks share Cube's core → each signals its own intra-block
+//     flag (base, base + 16).
+#if defined(__DAV_CUBE__)
+  pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
+  wait_flag_dev(2);
+  wait_flag_dev(3);
+#else
+  WaitBothVecOnA5<PIPE_MTE2>(2);
+  WaitBothVecOnA5<PIPE_MTE2>(3);
+  pipe_barrier(PIPE_ALL);
+#endif
+#endif
+```
+
+### 8.6 Entry point and host launch
+
+```cpp
+extern "C" __global__ AICORE void launch_mega_kernel(
+    __gm__ uint8_t* q_ptr, __gm__ uint8_t* k_ptr, __gm__ uint8_t* v_ptr,
+    ...
+    __gm__ uint8_t* kkt_ws_ptr,
+    __gm__ uint8_t* wy_ws_a1_ptr, __gm__ uint8_t* wy_ws_a2_ptr,
+    __gm__ uint8_t* h_ws_ptr, __gm__ uint8_t* o_ws_qk_ptr,
+    __gm__ uint8_t* o_ws_qs_ptr, __gm__ uint8_t* o_ws_gated_ptr,
+    uint32_t num_heads, uint32_t num_key_heads, int64_t batch_size,
+    int64_t seq_len, int64_t total_tokens, uint32_t num_matrices,
+    uint64_t ffts_addr) {
+  // num_heads is a runtime kernel argument (one .so serves every head count).
+  // Guard the compile-time UB ceiling; the host validates before launch too.
+  if (num_heads == 0 || num_heads > GDN_MAX_HEADS) {
+    return;
+  }
+  mega_kernel_impl(...);
+}
+
+extern "C" void call_kernel(
+    uint32_t block_dim, void* stream, uint8_t* q, uint8_t* k, uint8_t* v,
+    ...
+    int64_t total_tokens, uint32_t num_matrices) {
+  uint32_t fftsLen{0};
+  uint64_t fftsAddr{0};
+  rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
+  launch_mega_kernel<<<block_dim, nullptr, stream>>>(
+      q, k, v, ..., num_matrices, fftsAddr);
+}
+```
+
+Note `rtGetC2cCtrlAddr(&fftsAddr, &fftsLen)` on the host and `set_ffts_base_addr(ffts_addr)`
+on the device — the FFTS control address must be fetched and passed in; it is the prerequisite
+for `ffts_cross_core_sync` working at all.
+
+### 8.7 Other files in the same kernel directory
+
+```
+chunk_cumsum.cpp      24829
+chunk_h.cpp           40744
+chunk_h_kda.cpp       35107
+chunk_o.cpp           66473
+chunk_o_kda.cpp       37959
+gate_cumsum_kda.cpp   15396
+include/              (kernel_utils.h, 5189 bytes)
+kkt_kda.cpp           21886
+mega_kernel.cpp       19694   (533 lines)
+mega_kernel_kda.cpp   14776
+scaled_dot_kkt.cpp    37959
+tri_inverse.cpp       43005
+wy_fast.cpp           44739
+wy_kda.cpp            46981
+```
+
+## Relevance
+
+This refutes the assumption that an Ascend megakernel has to be built from scratch, and it
+does so with the smallest possible design: no interpreter, no task queue, no scheduler — just
+`__aicore__` functions called in sequence from one `__global__` entry, with
+`SyncAllMegaKernel<false>()` between stages. §8.3's "one AICORE function can call another
+AICORE function" is the enabling fact, and §8.4 is the barrier we would otherwise have had to
+derive. Against our 3008 kernels/round, this pattern collapses a chain of stages at the cost
+of one full-core barrier per stage boundary — which is exactly the structure CANN SuperKernel
+imposes (§4.9, 串行调度) but written by hand and therefore tunable: we can drop barriers where
+a finer flag suffices, which SuperKernel cannot.
+
+Two caveats before copying. First, MegaGDN targets **prefill**, where stages are large and one
+barrier per boundary is cheap; at batch=1 decode our stages are tiny and the barrier cost is
+proportionally much larger, so a naive stage-by-stage port reproduces the serialization that
+Hazy Research §1.6 and MPK §5.1 specifically avoid with per-dependency counters. Second, the
+`GDN_MAX_HEADS` pattern — compile-time ceiling, runtime count, zero-padded columns, "one .so
+serves every head count" — is the opposite of our situation: we are allowed to specialize for
+batch=1 and should burn the shapes in rather than pad.
+
+
+---
+
+## Gaps
+
+Looked for and did not find:
+
+- **The Hazy Research megakernel's actual device code.** The blog (§1) is reproduced in full
+  and the repo's build/run commands are in §1.8, but I did not read
+  `demos/low-latency-llama/*` — the instruction templates, the page request/release API, or
+  the counter wait/increment primitives. That is the highest-value remaining read for anyone
+  copying the design: https://github.com/HazyResearch/Megakernels
+- **MPK's in-kernel runtime source.** The paper (§2) describes workers, schedulers, circular
+  task queues with `atomicAdd`, and 352-byte task descriptors, but I quoted only the paper.
+  The CUDA runtime is at https://github.com/mirage-project/mirage and would give the exact
+  queue, semaphore and page-allocator code.
+- **Event Tensor / ETC code.** No repository was found; the MLSys 2026 page and arXiv PDF
+  were the only sources. The data-dependent `exp_indptr` triggering mechanism (§6.6) is
+  described but not shown in code.
+- **ThunderMLA's interpreter template.** §5.4 names
+  `interpreter::kernel<config, partial_template, reduction_template>` and says the whole thing
+  is 250 lines, but the ThunderKittens interpreter header itself was not retrieved.
+- **X/Twitter threads.** Searched for technical replies to the megakernel announcements
+  (Spector, Juravsky, HazyResearch, mirage-project). The search returned only secondary blog
+  coverage and unrelated Spectre results; no thread with technical replies was retrievable.
+  If those threads matter, they need a direct handle lookup rather than keyword search.
+- **FlashInfer persistent decode.** Searched specifically for a persistent / CUDA-graph-free
+  decode path in FlashInfer. The retrievable material describes the opposite design (plan +
+  CUDA graph capture, `use_cuda_graph=False` by default on
+  `BatchDecodeWithPagedKVCacheWrapper`). Either the persistent path does not exist or it is
+  not documented; checking the repo for `persistent` in the decode sources would settle it.
+- **CANN SuperKernel's host-side optimizer.** §4 covers `kernel/sk_entry.asc` and
+  `src/aot/sk_common.h`; §4b covers the fusion-boundary logic from `sk_node.h`,
+  `sk_scope_info.h` and the scope-splitting walk plus core-selection in `sk_scope_split.cpp`
+  (78 KB, read selectively). Still not read: `sk_optimizer.cpp` (the top-level `Process()` /
+  `Schedule()` flow), `sk_task_builder.cpp` (how the dual queues and the up-to-4 entry copies
+  are actually built, including where `entryCnt` is decided), `sk_lock_detector.cpp` and
+  `sk_verify_scope_split.cpp` (the deadlock analysis that produces `EXIST_DEADLOCK`), and the
+  whole `src/jit/superkernel/*.py` tree. All are at
+  `https://raw.gitcode.com/cann/graph-autofusion/raw/master/super_kernel/src/aot/<file>`.
+- **Any megakernel number for a MoE model at batch=1 with top-k routing on Ascend.** MPK §6.4
+  gives Qwen3-30B-A3B on B200 and FlashMoE gives 8xH100, both NVIDIA. MegaGDN (§8) is a real
+  Ascend megakernel with a real number (~15% faster prefill, 1.5–3x kernel) but it is a linear-
+  attention prefill workload, not MoE decode. Nothing covers MoE + top-k + batch=1 on Ascend;
+  the internal Ascend material is in `ascend-launch-overhead-and-sync.md` and is design
+  documentation, not measurement.
+- **MegaGDN's remaining sources.** §8 covers `mega_kernel.cpp` and `include/kernel_utils.h`.
+  Not read: the per-stage kernels (`chunk_o.cpp` is 66 KB, `wy_kda.cpp` 47 KB,
+  `tri_inverse.cpp` 43 KB) which would show how a PTO-ISA stage is written to be *callable from
+  inside another kernel*; the Chinese report `blog/mega_gdn_zh.md`; the PTO-ISA `TSyncAll` PR
+  (https://gitcode.com/cann/pto-isa/pull/878); and the vllm-ascend / sgl-kernel-npu integration
+  PRs (sgl-project/sgl-kernel-npu#462, #517, #533).
+- **PTO-ISA itself.** `gitcode.com/cann/pto-isa` is the virtual tile ISA MegaGDN is written
+  against, and `CANN/pypto` / `CANN/pto-isa` appear in the GitCode CANN org listing. Whether
+  hand-written AscendC or PTO-ISA is the better substrate for our kernel was not evaluated.
