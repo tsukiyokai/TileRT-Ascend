@@ -1,42 +1,43 @@
-# What the engine's device actually spends a round on
+# What the engine's device spends a round on, deduplicated by name
 
-From this project's own capture, `profile-rope-20261018`, rank 1. Rounds from
-the attention call count, 244 over 78 layers: 3.13 rounds.
+From `profile-rope-20261018`, rank 1. Rounds from the attention call count,
+244 over 78 layers: 3.13. Kernels appearing once across three rounds are the
+domain build and are excluded.
 
-    decode kernels            5544
-    device sum              179.14 ms
-    device busy a round      57.27 ms
+    5544 repeated kernels, 57.27 ms of device time a round
 
-    SuperKernel              32.21 ms a round   56%
-    hcom_allGather            9.59 ms           17%
-    hcom_allReduce            7.97 ms           14%
-    FusedInferAttentionScore   2.92 ms            5%
-    Cast                      1.40 ms            2%
+    SuperKernel                610.9/round    52.7 us    32.21 ms   56.2%
+    hcom_allGather              10.9/round   882.5 us     9.59 ms   16.7%
+    hcom_allReduce               9.6/round   831.1 us     7.97 ms   13.9%
+    FusedInferAttentionScore    78.0/round    37.5 us     2.92 ms    5.1%
+    Cast                       533.5/round     2.6 us     1.40 ms    2.4%
+    MatMulV3                     7.7/round    61.2 us     0.47 ms    0.8%
+    Muls                        75.1/round     4.5 us     0.34 ms    0.6%
+    MatMulV2                    60.4/round     5.4 us     0.33 ms    0.6%
 
-## Two readings this settles
+Device busy of 57.27 ms against a measured round near 52.8: the vector and cube
+halves run concurrently so the durations add past the wall clock.
 
-**The engine is not paying eager cost inside a graph.** Device busy of 57.27 ms
-a round meets or exceeds the measured round of about 52.8 ms at that width,
-which happens because the vector and cube halves run concurrently and their
-durations add. So the device is saturated and the engine already replays at
-device cost. The 104 us a layer that a graph would save, read off a synthetic
-eager layer this morning, is not available -- that correction stands withdrawn.
+## The super kernel does not reduce the kernel count
 
-**The round is a SuperKernel plus collectives, not a sequence of operators.**
-Fifty-six percent is one fused kernel and 31 percent is HCCL. Every operator
-measured on one die today -- attention, the grouped matmul, the projections,
-the norms -- lives inside that SuperKernel, and their graph-replay sum of
-214 us a layer is 16.7 ms a round against the SuperKernel's 32.21. So either
-the SuperKernel carries work my synthetic layer omits, or it carries its own
-scheduling cost; the capture does not separate those.
+610.9 SuperKernel launches a round over 78 layers is 7.8 a layer, at 52.7 us
+each. A synthetic layer of eight operators measured 214 us in a graph on one
+die -- 26.8 us an operator. So the engine runs about the same number of kernels
+a layer and each costs twice what the same work costs on a single die at full
+width.
 
-## Which relocates the largest lever
+That factor of two is the shard: at TP16 each kernel does a sixteenth of the
+work and still pays its own fixed cost. It is the same observation the fused
+projections rested on -- the router's 3 MB running at 158 GB/s where q_a's
+24 MB reaches 1386 -- now visible at the level of the whole round.
 
-Collectives are 17.56 ms a round of device time, where the one-sided reduce was
-costed at 6.5 ms from an operator-level comparison -- 32.488 us against HCCL's
-201.995 at sixteen ranks. If the 17.56 ms is what that replaces, the lever is
-larger than recorded, and it is already built and correct at sixteen ranks.
+## Where the round's time is, in one line each
 
-That makes the queued one-sided arm the most valuable measurement outstanding,
-ahead of the routed kernel. The honest projection stays what the end-to-end
-arms produce, not what an operator-level sum suggests.
+    32.21 ms   610 kernels a round, each a sixteenth of an operator's work
+    17.56 ms   20.5 collectives a round at 858 us
+     2.92 ms   attention, outside the super kernel
+     1.40 ms   533 casts at 2.6 us
+
+The first two are 87 percent. Fewer, larger kernels is what the five boundary
+merges do -- 21.04 ms measured on one die -- and the collectives are what the
+one-sided push replaces. Both are built; neither has run end to end.

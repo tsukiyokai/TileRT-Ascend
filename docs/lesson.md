@@ -1054,3 +1054,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      figure is 20.4 calls a round at 858 us, 17.5 ms, which is what an earlier
      by-type sum had already given. Deduplicate by name before averaging by
      type.
+
+110. The super kernel does not reduce the kernel count. Deduplicated by name,
+     the engine issues 610.9 SuperKernel launches a round over 78 layers --
+     7.8 a layer at 52.7 us each -- where a synthetic eight-operator layer
+     replays in 214 us on one die, 26.8 us an operator. Same count, twice the
+     cost each, and the factor of two is the shard: at TP16 a kernel does a
+     sixteenth of the work and still pays its fixed cost. 32.21 ms of kernels
+     plus 17.56 of collectives is 87 percent of the round, which is exactly
+     what the boundary merges and the one-sided push address.
