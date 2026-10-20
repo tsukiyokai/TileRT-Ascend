@@ -1343,3 +1343,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      chosen: the target's own output, uninfluenced by the drafter being
      evaluated. The margins shrink and the ranking holds, and the minima of 1.7
      to 2.1 say streams differ widely in how much they repeat.
+
+137. The tree loses to the copy oracle by proposing nothing, not by stopping
+     short. Ninety-one rounds: the tree takes 3.41, the oracle has 5.48, and of
+     the 46 rounds where the tree falls short, 29 are rounds where it got
+     nothing at all while a run existed -- and 35 of the 46 were found in the
+     prompt rather than in the generated output. The automaton matches by
+     suffix and descends suffix links; after an edit the suffix is broken and
+     the descent finds nothing, while the same material still sits in the
+     prompt at a position the broken suffix no longer reaches. The oracle
+     matches by looking for the current token everywhere. That is the whole of
+     the gap, and closing it is a search-order change over an index the
+     automaton already holds.
