@@ -144,7 +144,7 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
 
 29. Local attention parity does not bound full-model drift. Same-source M32 shared-FIA reaches30/32 teacher labels, with final norm NRMSE0.15993 after78layers; keep it opt-in. At the old chain's first divergent prefix, SFA's2524/6500 margin is0.002617: capture logits and valid KV before attributing a token flip to state corruption. [Evidence](evidence/ascend-decode/shared-fia-model-20261020/layer-major/m32/full/README.md).
 
-30. Removing a memory write must not silently remove a rounding boundary. Dense norm/quant fusion changes451/6144 INT8 codes on frozen inputs. Disabling it preserves eager values in compiled Graph replay with static/SuperKernel retained. Use fresh processes and caches: patterns register globally and the installed compiler hash omits this flag. [Evidence](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md).
+30. Removing a memory write must not silently remove a rounding boundary. Dense norm/quant fusion changes451/6144 INT8 codes on frozen inputs. Disabling it preserves eager values in actual ACLGraph/SuperKernel replay. Changing only the three dense fusion sites reproduces the2524→6500 token flip after78 layers on all16 ranks; preserve the BF16 boundary before measuring the corrected full request. Use fresh processes and caches: patterns register globally and the installed compiler hash omits this flag. [Evidence](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md).
 
 31. A kernel's cost is not the round's cost. Measure the time each stream runs
     alone: every HCCL collective runs0.000ms alone while the TP reduction runs
@@ -167,3 +167,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     weight bytes scaled by the activated union, and put `DT_INT4` in the byte
     table or the weights vanish from the floor entirely.
     [Evidence](evidence/ascend-decode/critical-path-20261020/README.md).
+
+33. On this path a vendor operator costs 30x what its arithmetic needs, and
+    the operator count costs less than that excess. The MoE epilogue is
+    36.90 us as three vendor operators, 1.222 as three hand-written ones and
+    0.517 fused -- so hand-writing is worth 2.7 ms a round and the fusion
+    0.05. Keep both instruments: one launch a call measures what the host
+    pays, many passes inside a launch measure what an in-graph replay pays,
+    and the second is L2-resident so it is never a bandwidth figure. `Muls`
+    on `dav-c220` rejects BF16, which is why the vendor's own costs 8.641 us
+    to scale 98 KiB; compute in FP32 and `Cast` the roundings back where the
+    unfused stages have them, or the result is more accurate and not
+    comparable.
+    [Evidence](evidence/ascend-decode/epilogue-fused-20261020/README.md).
