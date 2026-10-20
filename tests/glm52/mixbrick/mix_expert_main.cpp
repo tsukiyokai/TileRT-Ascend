@@ -43,6 +43,25 @@ double Elapsed(const timespec& begin, const timespec& end)
            + (end.tv_nsec - begin.tv_nsec) / 1e3;
 }
 
+/** Round a float to IEEE half the way the device's `Cast` does.
+ *
+ * The kernel quantises float to INT8 through half, which is the Ascend C
+ * idiom, so the reference has to round where the device rounds -- twice --
+ * or 9% of the codes differ by one and the reference is what is wrong.
+ */
+float ToHalf(float value)
+{
+    const float magnitude = std::fabs(value);
+    if (magnitude < 6.103515625e-05F) {
+        return value;
+    }
+    int exponent = 0;
+    const float fraction = std::frexp(magnitude, &exponent);
+    const float quantum = std::ldexp(1.0F, exponent - 11);
+    const float rounded = std::nearbyintf(magnitude / quantum) * quantum;
+    return (value < 0.0F) ? -rounded : rounded;
+}
+
 uint16_t ToBf16(float value)
 {
     uint32_t bits;
@@ -170,7 +189,19 @@ int main(int argc, char** argv)
         down_scale_host[index] = 0.00047F
                                  + 0.0000003F * static_cast<float>(index);
     }
-    const float middle_scale = 0.0135F;
+    void* middle_scale = nullptr;
+    void* hidden = nullptr;
+    void* maxima = nullptr;
+    Check(aclrtMalloc(&middle_scale, 32 * sizeof(float),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "middle scale");
+    Check(aclrtMalloc(&hidden, rows * HALF * sizeof(float),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "hidden");
+    Check(aclrtMalloc(&maxima, 32 * 32 * 8 * sizeof(float),
+                      ACL_MEM_MALLOC_HUGE_FIRST), "maxima");
+    const std::vector<float> zeros(32 * 32 * 8, 0.0F);
+    Check(aclrtMemcpy(maxima, 32 * 32 * 8 * sizeof(float), zeros.data(),
+                      32 * 32 * 8 * sizeof(float),
+                      ACL_MEMCPY_HOST_TO_DEVICE), "clear maxima");
 
     Check(aclrtMemcpy(x, x_host.size(), x_host.data(), x_host.size(),
                       ACL_MEMCPY_HOST_TO_DEVICE), "upload x");
@@ -214,8 +245,8 @@ int main(int argc, char** argv)
         std::fflush(stdout);
         mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                  partial, (float*)scale, (float*)token,
-                                 staged_out, tiling, rows, middle,
-                                 middle_scale);
+                                 staged_out, tiling, rows, (float*)hidden,
+                                 (float*)maxima);
         Check(aclrtSynchronizeStream(stream), "staged once");
         std::printf("staged returned\n");
         std::fflush(stdout);
@@ -227,7 +258,8 @@ int main(int argc, char** argv)
                                 partial, (float*)scale, (float*)token,
                                 fused_out, tiling, rows, stages, middle, down,
                                 (float*)down_scale, wide, narrow_out,
-                                down_tiling, middle_scale);
+                                down_tiling, (float*)middle_scale,
+                                (float*)hidden, (float*)maxima);
         Check(aclrtSynchronizeStream(stream), "fused once");
         std::printf("fused returned\n");
         std::fflush(stdout);
@@ -346,6 +378,8 @@ int main(int argc, char** argv)
         // The whole chain on the host: two projections with a SwiGLU and a
         // static-scale quantisation between them.
         std::vector<int8_t> code(rows * HALF);
+        std::vector<float> activation(rows * HALF);
+        std::vector<float> row_scale(rows, 0.0F);
         for (int64_t row = 0; row < rows; ++row) {
             for (int64_t column = 0; column < HALF; ++column) {
                 int32_t gate_product = 0;
@@ -364,11 +398,49 @@ int main(int argc, char** argv)
                                  * scale_host[HALF + column]
                                  * token_host[row];
                 const float value = gate / (1.0F + std::exp(-gate)) * up;
-                const float scaled = value / middle_scale;
-                const float rounded = std::nearbyintf(scaled);
-                code[row * HALF + column] = static_cast<int8_t>(rounded);
+                activation[row * HALF + column] = value;
+                const float magnitude = std::fabs(value);
+                row_scale[row] = (magnitude > row_scale[row]) ? magnitude
+                                                              : row_scale[row];
             }
         }
+        for (int64_t row = 0; row < rows; ++row) {
+            row_scale[row] /= 127.0F;
+            for (int64_t column = 0; column < HALF; ++column) {
+                const float scaled = activation[row * HALF + column]
+                                     / row_scale[row];
+                code[row * HALF + column] =
+                    static_cast<int8_t>(std::nearbyintf(ToHalf(scaled)));
+            }
+        }
+        std::vector<float> scale_device(32, -1.0F);
+        Check(aclrtMemcpy(scale_device.data(), 32 * sizeof(float),
+                          middle_scale, 32 * sizeof(float),
+                          ACL_MEMCPY_DEVICE_TO_HOST), "download scale");
+        std::vector<float> maxima_device(32 * 32 * 8, -1.0F);
+        Check(aclrtMemcpy(maxima_device.data(), 32 * 32 * 8 * sizeof(float),
+                          maxima, 32 * 32 * 8 * sizeof(float),
+                          ACL_MEMCPY_DEVICE_TO_HOST), "download maxima");
+        std::vector<int8_t> middle_device(rows * HALF, 0);
+        Check(aclrtMemcpy(middle_device.data(), rows * HALF, middle,
+                          rows * HALF, ACL_MEMCPY_DEVICE_TO_HOST),
+              "download middle");
+        int64_t middle_nonzero = 0;
+        for (int8_t one : middle_device) {
+            middle_nonzero += (one != 0);
+        }
+        std::printf("quantised intermediate: %lld of %lld nonzero\n",
+                    (long long)middle_nonzero, (long long)(rows * HALF));
+        std::printf("row scale, want then got:");
+        for (int64_t row = 0; row < (rows < 4 ? rows : 4); ++row) {
+            std::printf("  %.6g/%.6g", row_scale[row], scale_device[row]);
+        }
+        std::printf("\n  block maxima row 0:");
+        for (uint32_t block = 0; block < blocks; ++block) {
+            std::printf(" %.6g", maxima_device[block * 32 * 8]);
+        }
+        std::printf("\n");
+
         std::vector<uint16_t> chain_host(rows * HIDDEN);
         Check(aclrtMemcpy(chain_host.data(),
                           rows * HIDDEN * sizeof(uint16_t), narrow_out,
@@ -383,7 +455,8 @@ int main(int argc, char** argv)
                                * down_host[column * HALF + inner];
                 }
                 const float want = static_cast<float>(product)
-                                   * down_scale_host[column] * middle_scale;
+                                   * down_scale_host[column]
+                                   * row_scale[row];
                 const int32_t slack =
                     static_cast<int32_t>(chain_host[row * HIDDEN + column])
                     - static_cast<int32_t>(ToBf16(want));
@@ -413,7 +486,8 @@ int main(int argc, char** argv)
                                     partial, (float*)scale, (float*)token,
                                     fused_out, tiling, rows, stages, middle, down,
                                 (float*)down_scale, wide, narrow_out,
-                                down_tiling, middle_scale);
+                                down_tiling, (float*)middle_scale,
+                                (float*)hidden, (float*)maxima);
         }
         Check(aclrtSynchronizeStream(stream), "fused timing");
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -423,8 +497,8 @@ int main(int argc, char** argv)
         for (int step = 0; step < repeats; ++step) {
             mix_expert_staged_launch(blocks, stream, sync_base, x, weight,
                                      partial, (float*)scale, (float*)token,
-                                     staged_out, tiling, rows, middle,
-                                 middle_scale);
+                                     staged_out, tiling, rows, (float*)hidden,
+                                 (float*)maxima);
         }
         Check(aclrtSynchronizeStream(stream), "staged timing");
         clock_gettime(CLOCK_MONOTONIC, &end);

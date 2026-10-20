@@ -37,6 +37,10 @@ constexpr int64_t MAX_ROWS = 32;
 constexpr int64_t SLACK = 64;
 // One tile of the 6144-wide output a vector core walks at a time.
 constexpr int64_t TILE = 512;
+// A reduction's destination is written a whole 32-byte block at a time.
+constexpr int64_t REDUCE_ALIGN = 8;
+// Partial maxima are one float a block a row, in a fixed-size workspace.
+constexpr int64_t MAX_BLOCKS = 32;
 constexpr int64_t GATE_UP = 2 * HALF;
 // CANN's own Matmul-to-vector example uses mode 2 and flag 8. A3 allows
 // flag ids 0 through 10 only, and the Matmul library consumes some itself, so
@@ -157,6 +161,8 @@ struct Epilogue {
     TBuf<TPosition::VECCALC> token_buffer;
     TBuf<TPosition::VECCALC> half_buffer;
     TBuf<TPosition::VECCALC> code_buffer;
+    TBuf<TPosition::VECCALC> reduced_buffer;
+    TBuf<TPosition::VECCALC> rowmax_buffer;
     LocalTensor<int32_t> product;
     LocalTensor<float> gate;
     LocalTensor<float> up;
@@ -166,6 +172,8 @@ struct Epilogue {
     LocalTensor<float> token;
     LocalTensor<half> half_value;
     LocalTensor<int8_t> code;
+    LocalTensor<float> reduced;
+    LocalTensor<float> rowmax;
 
     __aicore__ inline void Init(TPipe& pipe)
     {
@@ -184,6 +192,9 @@ struct Epilogue {
         pipe.InitBuffer(token_buffer, MAX_ROWS * sizeof(float));
         pipe.InitBuffer(half_buffer, (HALF + SLACK) * sizeof(half));
         pipe.InitBuffer(code_buffer, (HALF + SLACK) * sizeof(int8_t));
+        pipe.InitBuffer(reduced_buffer, REDUCE_ALIGN * sizeof(float));
+        pipe.InitBuffer(rowmax_buffer,
+                        MAX_ROWS * REDUCE_ALIGN * sizeof(float));
         product = product_buffer.Get<int32_t>();
         gate = gate_buffer.Get<float>();
         up = up_buffer.Get<float>();
@@ -193,6 +204,8 @@ struct Epilogue {
         token = token_buffer.Get<float>();
         half_value = half_buffer.Get<half>();
         code = code_buffer.Get<int8_t>();
+        reduced = reduced_buffer.Get<float>();
+        rowmax = rowmax_buffer.Get<float>();
     }
 };
 
@@ -219,7 +232,8 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
                                 __gm__ bfloat16_t* out, int64_t rows,
                                 int64_t first, int64_t stride,
                                 int64_t channel, int64_t channels,
-                                __gm__ int8_t* middle, float middle_scale)
+                                __gm__ float* hidden, __gm__ float* maxima,
+                                int64_t block)
 {
     Epilogue held;
     held.Init(pipe);
@@ -227,8 +241,11 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
     GlobalTensor<float> scale_global;
     GlobalTensor<float> token_global;
     GlobalTensor<bfloat16_t> out_global;
-    GlobalTensor<int8_t> middle_global;
-    middle_global.SetGlobalBuffer(middle, rows * HALF);
+    GlobalTensor<float> hidden_global;
+    GlobalTensor<float> maxima_global;
+    hidden_global.SetGlobalBuffer(hidden, rows * HALF);
+    maxima_global.SetGlobalBuffer(maxima,
+                                  MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN);
     // With a length. `SetGlobalBuffer(ptr)` alone leaves the tensor's extent
     // unset, and then only the offset-zero row reads back correctly: row 0
     // was right and rows 1 through 7 wrong, every run, from a `partial` that
@@ -281,17 +298,23 @@ __aicore__ inline void Activate(TPipe& pipe, __gm__ int32_t* partial,
         SwiGlu(held, channels);
         PipeBarrier<PIPE_ALL>();
         DataCopy(out_global[row * HALF + channel], held.narrow, channels);
-        // The same activation, quantised for the down projection. A static
-        // scale, so the row maximum over all `HALF` columns -- which this
-        // split spreads across blocks -- is a separate change.
-        Muls(held.work, held.gate, 1.0F / middle_scale, channels);
+        // The activation itself, and this block's largest magnitude in it.
+        // Per-token quantisation needs the maximum over all `HALF` columns
+        // and this split owns only `channels` of them, so each block leaves a
+        // partial for the pass after the barrier to reduce.
+        DataCopy(hidden_global[row * HALF + channel], held.gate, channels);
+        Abs(held.work, held.gate, channels);
         PipeBarrier<PIPE_V>();
-        Cast(held.half_value, held.work, RoundMode::CAST_RINT, channels);
-        PipeBarrier<PIPE_V>();
-        Cast(held.code, held.half_value, RoundMode::CAST_RINT, channels);
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(middle_global[row * HALF + channel], held.code, channels);
+        // A reduction's destination is written a whole 32-byte block at a
+        // time, so each row gets its own aligned block rather than its own
+        // float. Reading the result back as a scalar instead cost a
+        // retirement barrier a row and doubled the kernel.
+        ReduceMax(held.rowmax[row * REDUCE_ALIGN], held.work, held.work,
+                  channels, false);
     }
+    PipeBarrier<PIPE_ALL>();
+    DataCopy(maxima_global[block * MAX_ROWS * REDUCE_ALIGN], held.rowmax,
+             MAX_ROWS * REDUCE_ALIGN);
 }
 
 /** The second cube stage: the down projection, split on its own N axis.
@@ -330,7 +353,8 @@ __aicore__ inline void ProjectDown(TPipe& pipe, __gm__ int8_t* middle,
 
 /** Scale the down projection's INT32 product into BF16. */
 __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* wide,
-                              __gm__ float* down_scale, float middle_scale,
+                              __gm__ float* down_scale,
+                              __gm__ float* middle_scale,
                               __gm__ bfloat16_t* out, int64_t rows,
                               int64_t column, int64_t columns)
 {
@@ -346,6 +370,9 @@ __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* wide,
     LocalTensor<float> value = value_buffer.Get<float>();
     LocalTensor<float> scale = scale_buffer.Get<float>();
     LocalTensor<bfloat16_t> narrow = narrow_buffer.Get<bfloat16_t>();
+    TBuf<TPosition::VECCALC> row_buffer;
+    pipe.InitBuffer(row_buffer, MAX_ROWS * sizeof(float));
+    LocalTensor<float> row_scale = row_buffer.Get<float>();
 
     GlobalTensor<int32_t> wide_global;
     GlobalTensor<float> scale_global;
@@ -353,8 +380,14 @@ __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* wide,
     wide_global.SetGlobalBuffer(wide, rows * HIDDEN);
     scale_global.SetGlobalBuffer(down_scale, HIDDEN);
     out_global.SetGlobalBuffer(out, rows * HIDDEN);
+    GlobalTensor<float> middle_global;
+    middle_global.SetGlobalBuffer(middle_scale, MAX_ROWS);
+    DataCopy(row_scale, middle_global, MAX_ROWS);
+    PipeBarrier<PIPE_ALL>();
+    DataSyncBarrier<MemDsbT::UB>();
 
     for (int64_t row = 0; row < rows; ++row) {
+        const float scale_of_row = row_scale.GetValue(row);
         for (int64_t done = 0; done < columns; done += TILE) {
             const int64_t count = (columns - done < TILE) ? columns - done
                                                           : TILE;
@@ -366,13 +399,86 @@ __aicore__ inline void Narrow(TPipe& pipe, __gm__ int32_t* wide,
             PipeBarrier<PIPE_V>();
             Mul(value, value, scale, count);
             PipeBarrier<PIPE_V>();
-            Muls(value, value, middle_scale, count);
+            Muls(value, value, scale_of_row, count);
             PipeBarrier<PIPE_V>();
             Cast(narrow, value, RoundMode::CAST_RINT, count);
             PipeBarrier<PIPE_ALL>();
             DataCopy(out_global[at], narrow, count);
         }
     }
+}
+
+/** Reduce the partial maxima, quantise the activation, publish the scale.
+ *
+ * Runs after the barrier, so every block's partial is readable. Each block
+ * reduces the whole row -- the work is one float a block, cheaper than
+ * arranging for one core to do it and broadcast -- and then quantises only
+ * its own slice of the activation.
+ */
+__aicore__ inline void Quantise(TPipe& pipe, __gm__ float* hidden,
+                                __gm__ float* maxima, __gm__ int8_t* middle,
+                                __gm__ float* scale_out, int64_t rows,
+                                int64_t channel, int64_t channels,
+                                int64_t blocks)
+{
+    TBuf<TPosition::VECCALC> value_buffer;
+    TBuf<TPosition::VECCALC> half_buffer;
+    TBuf<TPosition::VECCALC> code_buffer;
+    TBuf<TPosition::VECCALC> partial_buffer;
+    pipe.InitBuffer(value_buffer, (HALF + SLACK) * sizeof(float));
+    pipe.InitBuffer(half_buffer, (HALF + SLACK) * sizeof(half));
+    pipe.InitBuffer(code_buffer, (HALF + SLACK) * sizeof(int8_t));
+    pipe.InitBuffer(partial_buffer,
+                    MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN * sizeof(float));
+    LocalTensor<float> value = value_buffer.Get<float>();
+    LocalTensor<half> half_value = half_buffer.Get<half>();
+    LocalTensor<int8_t> code = code_buffer.Get<int8_t>();
+    LocalTensor<float> partial = partial_buffer.Get<float>();
+    TBuf<TPosition::VECCALC> scale_buffer;
+    pipe.InitBuffer(scale_buffer, MAX_ROWS * sizeof(float));
+    LocalTensor<float> scale_row = scale_buffer.Get<float>();
+
+    GlobalTensor<float> hidden_global;
+    GlobalTensor<float> maxima_global;
+    GlobalTensor<int8_t> middle_global;
+    GlobalTensor<float> scale_global;
+    hidden_global.SetGlobalBuffer(hidden, rows * HALF);
+    maxima_global.SetGlobalBuffer(maxima,
+                                  MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN);
+    middle_global.SetGlobalBuffer(middle, rows * HALF);
+    scale_global.SetGlobalBuffer(scale_out, MAX_ROWS);
+
+    DataCopy(partial, maxima_global,
+             MAX_BLOCKS * MAX_ROWS * REDUCE_ALIGN);
+    PipeBarrier<PIPE_ALL>();
+    DataSyncBarrier<MemDsbT::UB>();
+
+    for (int64_t row = 0; row < rows; ++row) {
+        float largest = 0.0F;
+        for (int64_t block = 0; block < blocks; ++block) {
+            const float one = partial.GetValue(
+                (block * MAX_ROWS + row) * REDUCE_ALIGN);
+            largest = (one > largest) ? one : largest;
+        }
+        const float scale = largest / 127.0F;
+        // Gathered on chip and copied out once, by MTE. A scalar store to
+        // global memory goes through the per-core data cache, which is the
+        // one incoherent cache on this part -- the slots read back as zeros
+        // while the partial maxima that produced them read back correct.
+        scale_row.SetValue(row, scale);
+        DataCopy(value, hidden_global[row * HALF + channel], channels);
+        PipeBarrier<PIPE_ALL>();
+        Muls(value, value, 1.0F / scale, channels);
+        PipeBarrier<PIPE_V>();
+        Cast(half_value, value, RoundMode::CAST_RINT, channels);
+        PipeBarrier<PIPE_V>();
+        Cast(code, half_value, RoundMode::CAST_RINT, channels);
+        PipeBarrier<PIPE_ALL>();
+        DataCopy(middle_global[row * HALF + channel], code, channels);
+    }
+    PipeBarrier<PIPE_ALL>();
+    DataCopy(scale_global, scale_row, MAX_ROWS);
+    DataSyncBarrier<MemDsbT::DDR>();
 }
 
 }  // namespace
@@ -391,7 +497,7 @@ __aicore__ void mix_expert_fused(
     int64_t blocks, __gm__ int8_t* middle, __gm__ int8_t* down,
     __gm__ float* down_scale, __gm__ int32_t* wide,
     __gm__ bfloat16_t* narrow_out, __gm__ uint8_t* down_tiling,
-    float middle_scale)
+    __gm__ float* middle_scale, __gm__ float* hidden, __gm__ float* maxima)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     SetSyncBaseAddr(sync_base);
@@ -425,21 +531,24 @@ __aicore__ void mix_expert_fused(
         }
         return;
     }
+    // One `TPipe` a half, declared once and shared by every stage on it.
+    // A second one constructed mid-kernel, after the first has gone out of
+    // scope, silently did not work: the stage that owned it never ran.
+    TPipe pipe;
     if ASCEND_IS_AIC {
         const int64_t channel = GetBlockIdx() * channels;
-        TPipe cube_pipe;
         if (stages & 1) {
             // Bit 5 projects the whole axis in one call instead of two. Two
             // `Matmul` objects sharing one `TPipe` is the one variable the
             // regression arrived with, and the original single-call kernel
             // was repeatably correct.
             if (stages & 32) {
-                Project(cube_pipe, x, gate_up, partial, tiling, rows, 0,
+                Project(pipe, x, gate_up, partial, tiling, rows, 0,
                         GATE_UP);
             } else {
-                Project(cube_pipe, x, gate_up, partial, tiling, rows, channel,
+                Project(pipe, x, gate_up, partial, tiling, rows, channel,
                         channels);
-                Project(cube_pipe, x, gate_up, partial, tiling, rows,
+                Project(pipe, x, gate_up, partial, tiling, rows,
                         HALF + channel, channels);
             }
             // Drain the fixpipe, then publish out of the data cache, then
@@ -466,7 +575,6 @@ __aicore__ void mix_expert_fused(
     }
     if ASCEND_IS_AIV {
         const int64_t channel = (GetBlockIdx() / 2) * channels;
-        TPipe vector_pipe;
         if (stages & 8) {
             // Mode and pipe both spelled out. A bare `CrossCoreWaitFlag`
             // defaults to mode 0 on `PIPE_S`, and `PIPE_S` is listed as
@@ -488,8 +596,36 @@ __aicore__ void mix_expert_fused(
             // Every row, on whichever vector subblocks run. Splitting rows
             // by `GetSubBlockIdx` left half the output unwritten, and at
             // eight rows the vector work is too small to be worth a split.
-            Activate(vector_pipe, partial, gu_scale, token_scale, out, rows,
-                     0, 1, channel, channels, middle, middle_scale);
+            Activate(pipe, partial, gu_scale, token_scale, out, rows,
+                     0, 1, channel, channels, hidden, maxima,
+                     GetBlockIdx() / 2);
+        }
+    }
+    if (stages & 128) {
+        // The down projection reads every block's slice of the intermediate,
+        // not just its own pair's, and the per-token scale is a maximum over
+        // columns this split spreads across blocks. So two grid barriers,
+        // both at top level: every core must arrive even where its own stage
+        // work is skipped.
+        Publish();
+        SyncAll<false>();
+        if ASCEND_IS_AIV {
+            Quantise(pipe, hidden, maxima, middle, middle_scale, rows,
+                     (GetBlockIdx() / 2) * channels, channels, blocks);
+        }
+        Publish();
+        SyncAll<false>();
+        const int64_t columns = HIDDEN / blocks;
+        if ASCEND_IS_AIC {
+            ProjectDown(pipe, middle, down, wide, down_tiling, rows,
+                        GetBlockIdx() * columns, columns);
+            Publish();
+            CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
+        }
+        if ASCEND_IS_AIV {
+            CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
+            Narrow(pipe, wide, down_scale, middle_scale, narrow_out, rows,
+                   (GetBlockIdx() / 2) * columns, columns);
         }
     }
 }
@@ -523,14 +659,14 @@ __aicore__ void mix_expert_project(
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
 void mix_expert_activate(__gm__ int32_t* partial, __gm__ float* gu_scale,
                          __gm__ float* token_scale, __gm__ bfloat16_t* out,
-                         int64_t rows, int64_t blocks, __gm__ int8_t* middle,
-                         float middle_scale)
+                         int64_t rows, int64_t blocks, __gm__ float* hidden,
+                         __gm__ float* maxima)
 {
     TPipe pipe;
     const int64_t block = GetBlockIdx() * blocks / GetBlockNum();
     const int64_t channels = HALF / blocks;
     Activate(pipe, partial, gu_scale, token_scale, out, rows, 0, 1,
-             block * channels, channels, middle, middle_scale);
+             block * channels, channels, hidden, maxima, block);
 }
 
 void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
@@ -539,7 +675,8 @@ void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                              void* tiling, int64_t rows, int64_t stages,
                              void* middle, void* down, float* down_scale,
                              void* wide, void* narrow_out, void* down_tiling,
-                             float middle_scale)
+                             float* middle_scale, float* hidden,
+                             float* maxima)
 {
     mix_expert_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)x, (__gm__ int8_t*)gate_up,
@@ -547,20 +684,19 @@ void mix_expert_fused_launch(uint32_t blocks, void* stream, uint64_t sync_base,
         (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)tiling, rows, stages,
         blocks, (__gm__ int8_t*)middle, (__gm__ int8_t*)down, down_scale,
         (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)narrow_out,
-        (__gm__ uint8_t*)down_tiling, middle_scale);
+        (__gm__ uint8_t*)down_tiling, middle_scale, hidden, maxima);
 }
 
 void mix_expert_staged_launch(uint32_t blocks, void* stream,
                               uint64_t sync_base, void* x, void* gate_up,
                               void* partial, float* gu_scale,
                               float* token_scale, void* out, void* tiling,
-                              int64_t rows, void* middle, float middle_scale)
+                              int64_t rows, float* hidden, float* maxima)
 {
     mix_expert_project<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)x, (__gm__ int8_t*)gate_up,
         (__gm__ int32_t*)partial, (__gm__ uint8_t*)tiling, rows, blocks);
     mix_expert_activate<<<blocks, nullptr, stream>>>(
         (__gm__ int32_t*)partial, gu_scale, token_scale,
-        (__gm__ bfloat16_t*)out, rows, blocks, (__gm__ int8_t*)middle,
-        middle_scale);
+        (__gm__ bfloat16_t*)out, rows, blocks, hidden, maxima);
 }

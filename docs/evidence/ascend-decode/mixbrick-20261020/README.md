@@ -187,16 +187,47 @@ The vendor spends four kernels on this: `DynamicQuant` 3.84 µs,
 kernel does it in 13.863, **2.45x**, and over 75 MoE layers that is 1.51 ms a
 round.
 
-Not yet drop-in: the intermediate is quantised with a static scale. Per-token
-dynamic quantisation needs the row maximum over all 128 columns, which this
-channel split spreads across blocks, so it needs the published two-pass
-structure — one float per block into a workspace, a barrier, a second pass.
-The barrier is already there for the down projection, so the open question is
-whether the reduction folds into it rather than adding a second, and that is
-answerable by construction.
+## Per-token dynamic quantisation, correct and expensive
+
+The static scale is gone. Each block reduces its own channel slice to a
+per-row maximum, a barrier makes every block's partial readable, each block
+reduces across blocks and quantises its own slice, a second barrier makes the
+whole intermediate readable, and then the down projection runs. Two grid
+barriers, because the down projection reads every slice and the row maximum
+spans every slice. [raw](dynamic.txt)
+
+| 8 rows, µs | 1 block | 2 | 4 |
+|---|---|---|---|
+| static scale | 23.802 | 16.465 | 13.863 |
+| per-token dynamic | 61.678 | 36.948 | **29.343** |
+
+Correct: 0 of 49152 at one, two and four blocks, 0 of 196608 at 32 rows, and
+6 of 6 clean runs. Eight blocks fails entirely and is not yet understood.
+
+So the chain is still ahead of the vendor's four kernels — 29.343 against
+33.952, 1.16x — but the 2.45x the static scale showed was bought by skipping
+the reduction. Correctness costs 15.5 µs here, and that figure is the next
+thing to attribute rather than to optimise blind: the candidates are the two
+`SyncAll<false>()` barriers and the extra global round trip of the FP32
+activation, and removing the per-row scalar read of the reduction's result
+changed nothing, which rules out the one thing that looked obvious.
+
+Two findings from building it. A reduction's destination is written a whole
+32-byte block at a time, so one float a row stamps over the next seven rows'
+slots — give each row its own aligned block. And a scalar store to global
+memory from a vector core does not land: the per-row scales read back as zeros
+while the partial maxima that produced them read back exactly right. Gather on
+chip and copy out once, by MTE. That is the same rule as LCCL's, which moves
+its flags by MTE and never by scalar store, and it follows from the DCache
+being the one incoherent cache on this part.
+
+The reference had to be corrected too, not the tolerance. The kernel quantises
+float to INT8 through half, which is the Ascend C idiom, and a host reference
+rounding once instead of twice disagreed on 4587 of 49152 outputs — 9.3%,
+identical at every block count, which is what told us it was arithmetic rather
+than a race.
 
 ## Next
 
-Dynamic quantisation of the intermediate, folded into the existing barrier if
-it fits. Then the same shape for the routed experts, which is the same chain
-with a group dimension.
+Attribute the 15.5 µs, then the same chain for the routed experts, which is
+this shape with a group dimension.
