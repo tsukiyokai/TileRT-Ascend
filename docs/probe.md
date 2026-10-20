@@ -95,6 +95,23 @@ CPU replay and bounded single-die checks continue while whole hosts are occupied
 records and subsequent corrections. Raw artifacts remain on their producing
 server; current local summaries bind their input and source hashes.
 
+## 2026-10-21 头号未决：每行 0.814 ms 测的是什么
+
+代价模型 `round = 45.88 + 0.814/行` 拟合可靠（四宽度、跨 19.3 ms、残差几百
+微秒），而六个候选全排除：
+
+- 图分桶 — 引擎只捕获一个尺寸 `cudagraph_capture_sizes: [graph_width]`
+- TP 规约 — 两卡下字节涨 8 倍而斜率为负（111.27→93.24 µs）
+- 算子行成本 — 一整层 8→32 token 只多 8.07 µs，即 0.026 ms/行/轮
+- 轨迹长度 — 臂按 `--max-tokens 1024` 封顶，各宽度同样的 token 与上下文
+- Gloo 命令广播 — 宽度 0 时 305.0 µs、64 时 289.6；且命令只带标量
+- MTP 自回归草稿 — `--automaton` 走 `_advance_drafted`，一轮只有一次 verify
+
+**它决定 2.x 是否可达**：若那笔钱是实现代价，固定预算树（64 节点、接受
+14.510）给 TPOT 1.88 ms；若是物理代价，最好是自适应树的 3.90。二十二臂里
+宽度判别五臂排最前。
+[证据](evidence/ascend-decode/row-cost-mismatch-20261021/README.md)
+
 ## 2026-10-21 定案：一轮的代价在算子边界，不在算术也不在下发
 
 - 每 kernel 下发地板：eager 11.4 µs、**图回放 1.064 µs**。引擎跑图，所以下发只
