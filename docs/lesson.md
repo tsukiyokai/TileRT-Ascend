@@ -611,3 +611,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     with a single mechanism. The commit that produced the session's best
     kernel timing, 79.206 us against the vendor's 157.176, is the one whose
     output is absent; the timing stands and the saving it implied does not.
+
+69. The cube core cannot read unified buffer, and the failure is silent. The
+    stage-major kernel staged its group counts in a `TPosition::VECCALC`
+    buffer for the cube half to read: on dav-2201 the cube core's local memory
+    is L1 and the L0s, every `GetValue` returned zero, every expert was
+    skipped and no matmul ran. The vector half reads the same counts from
+    unified buffer correctly, so the split stage produced a plausible result
+    and only the cube stage did nothing -- an absent product with healthy
+    inputs, which is indistinguishable from an arithmetic fault by inspection.
+    A scalar read from global memory fixes it and costs 256 loads a launch
+    against the matmul each one guards.

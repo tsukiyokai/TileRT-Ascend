@@ -185,8 +185,16 @@ __aicore__ inline void Project(Matmul<APacked, BPacked, CProduct, BiasNone>& mm,
                                __gm__ int4b_t* rows,
                                __gm__ int4b_t* weight,
                                __gm__ int32_t* product, int64_t columns,
-                               int64_t inner, __gm__ uint8_t* tiling)
+                               int64_t inner, __gm__ uint8_t* tiling,
+                               TPipe& pipe)
 {
+    // Re-initialised every call, under a switch, because hoisting it out
+    // lifted the five-round limit and has to be checked for whether it also
+    // broke the arithmetic: the cube's product is zero at the real shape and
+    // Split's output is good, so Project is the only stage left.
+    TCubeTiling cube;
+    LoadTiling(cube, tiling);
+    mm.Init(&cube, &pipe);
     GlobalTensor<int4b_t> a;
     GlobalTensor<int4b_t> b;
     GlobalTensor<int32_t> c;
@@ -650,8 +658,15 @@ __aicore__ void routed_int4_fused(
     // matmul for every expert, and at the engine's 256 experts a round only
     // about seventy hold rows -- which is why 256 experts cost 583 us where
     // sixteen cost 47.
-    TBuf<TPosition::VECCALC> cube_group_buffer;
-    LocalTensor<int32_t> cube_group;
+    //
+    // Straight from global memory, because the cube core has no access to
+    // unified buffer: its local memory is L1 and the L0s. Staging the counts
+    // in a `TPosition::VECCALC` buffer and reading them here returned zero for
+    // every expert, so every matmul was skipped and the kernel's output was
+    // absent at any input -- while the vector half's copy of the same counts
+    // worked, which made the split stage look correct and the cube stage look
+    // like an arithmetic fault.
+    GlobalTensor<int32_t> cube_group;
     Matmul<APacked, BPacked, CProduct, BiasNone> gate_mm;
     Matmul<APacked, BPacked, CProduct, BiasNone> down_mm;
     TCubeTiling gate_cube;
@@ -661,13 +676,7 @@ __aicore__ void routed_int4_fused(
         LoadTiling(down_cube, down_tiling);
         gate_mm.Init(&gate_cube, &pipe);
         down_mm.Init(&down_cube, &pipe);
-        pipe.InitBuffer(cube_group_buffer,
-                        (MAX_EXPERTS + SLACK) * sizeof(int32_t));
-        cube_group = cube_group_buffer.Get<int32_t>();
-        GlobalTensor<int32_t> cube_count;
-        cube_count.SetGlobalBuffer(group_count, MAX_EXPERTS);
-        DataCopy(cube_group, cube_count, MAX_EXPERTS);
-        AfterLoadForScalar();
+        cube_group.SetGlobalBuffer(group_count, MAX_EXPERTS);
     }
     GlobalTensor<int32_t> count_global;
     GlobalTensor<int32_t> start_global;
@@ -724,7 +733,7 @@ __aicore__ void routed_int4_fused(
             Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
                     Nibbles(gate_up, expert * GATE_UP * HIDDEN),
                     partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
-                    gu_tiling);
+                    gu_tiling, pipe);
         }
         Publish();
     }
@@ -759,7 +768,7 @@ __aicore__ void routed_int4_fused(
             Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
                     Nibbles(down, expert * HIDDEN * HALF),
                     wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
-                    down_tiling);
+                    down_tiling, pipe);
         }
         Publish();
     }
