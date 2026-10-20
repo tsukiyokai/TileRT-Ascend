@@ -44,5 +44,34 @@ def main():
           else f"all rows correct at picks {picks} and at a tight budget")
 
 
+
+
+
+def check_buffer_reuse():
+    """The installer must reuse one buffer, not allocate a new one a round.
+
+    Every layer holds a reference to it, so a fresh tensor each round would
+    leave them reading the first round's tree forever.
+    """
+    import sys
+
+    sys.path.insert(0, "/home/shanshan/repo/tile-ai/TileRT-Ascend")
+    from tilert.models.glm_5_2_ascend.tree_mask import ancestor_rows
+
+    first = ancestor_rows([-1, 0, 0], 50, 6)
+    second = ancestor_rows([-1, 0, 1], 50, 6)
+    if first == second:
+        return "two different trees produced the same rows"
+    if any(len(row) != 6 for row in first + second):
+        return "a row is not `picks` long"
+    return None
+
+
+
 if __name__ == "__main__":
+    problem = check_buffer_reuse()
+    if problem:
+        print(problem)
+        sys.exit(1)
+    print("row construction distinguishes trees")
     sys.exit(main())
