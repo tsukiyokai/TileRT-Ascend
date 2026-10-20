@@ -55,6 +55,9 @@ class MtpRoundExecutor:
         self.seed = None
         self.seed_parent_hidden = None
         self.failed = False
+        # Set by `tree_attention.install` when a tree drafter is in use; a
+        # linear drafter leaves it None and the attention keeps its indexer.
+        self.tree_mask = None
 
     def start(self, first_token, normalized_parent_hidden):
         """Start at main length P with MTP length P-1 or P.
@@ -136,6 +139,42 @@ class MtpRoundExecutor:
             self.failed = True
             raise
 
+    def _advance_tree(self, plan, propose_tree):
+        """One round whose candidates form a tree rather than a chain.
+
+        The attention the engine calls already selects, for each query row, the
+        positions that row may see, so a tree needs no kernel change -- only
+        the right index set, which is the committed prefix plus a node's own
+        ancestors. `write` owns the buffer every layer reads from.
+        """
+        from .tree_resolve import accepted_path
+
+        tokens, parents = propose_tree(plan.width - 1)
+        nodes = [plan.pending_token, *tokens]
+        lineage = [-1, *(parent + 1 for parent in parents)]
+        nodes += [plan.pending_token] * (plan.width - len(nodes))
+        lineage += [0] * (plan.width - len(lineage))
+        if self.tree_mask is not None:
+            self.tree_mask(lineage, plan.main_start, self.target.device)
+        verified = self.target.verify(nodes, full_logits=False)
+        proposals, predictions = self.target.host_tokens(
+            nodes, verified.token_ids,
+        )
+        # The accepted path through a tree is itself a chain, so reordering the
+        # verified rows along it lets `resolve` do the committing: its linear
+        # match, the EOS check, the output budget and the cache commit all
+        # apply unchanged. A parallel resolver would duplicate four rules to
+        # restate one.
+        path = accepted_path(nodes, lineage, predictions)
+        along = [nodes[node] for node in path]
+        predicted = [predictions[node] for node in path]
+        along += [plan.pending_token] * (plan.width - len(along))
+        predicted += [predictions[path[-1]]] * (plan.width - len(predicted))
+        commit = self.state.resolve(plan, along, predicted)
+        self.target.truncate(commit.main.retained)
+        self.drafter.commit(commit.accepted_tokens)
+        return ExecutedRound(proposals, predictions, commit)
+
     def _advance_drafted(self, plan):
         """One round whose candidates come from the host, not the MTP engine.
 
@@ -145,6 +184,9 @@ class MtpRoundExecutor:
         predictions, so a pad that happens to match earns a real token.
         """
         try:
+            tree = getattr(self.drafter, "propose_tree", None)
+            if tree is not None:
+                return self._advance_tree(plan, tree)
             proposal = self.drafter.propose(plan.width - 1)
             candidates = [plan.pending_token, *proposal[:plan.width - 1]]
             candidates += [plan.pending_token] * (plan.width - len(candidates))
