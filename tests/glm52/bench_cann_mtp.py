@@ -243,6 +243,14 @@ def drive(backend, first, args):
                 if capture is not None:
                     capture.__exit__(None, None, None)
                     capture = None
+                    # Analyse here, not later: the collector writes raw data
+                    # and `kernel_details.csv` only exists after this call, so
+                    # leaving it out would hand the next session a directory it
+                    # has to remember to process.
+                    import torch_npu
+
+                    torch_npu.profiler.profiler.analyse(
+                        profiler_path=str(args.output / "capture"))
                 records.append({
                     "warmup": number < args.warmup, "tokens": tokens,
                     "returned_tokens": output, "timestamps_ns": clocks,
