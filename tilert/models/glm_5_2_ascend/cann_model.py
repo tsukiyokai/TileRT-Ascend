@@ -101,7 +101,7 @@ class CannStep:
 def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
                   *, compile_target=False, super_kernel=False,
                   expert_parallel=False, graph_width=4, index_topk=None,
-                  mtp_tokens=0):
+                  mtp_tokens=0, layers=None):
     """Construct TP16 config, optionally compiling the M4 target backbone.
 
     ``expert_parallel`` reshards the 256 routed experts over the sixteen
@@ -133,7 +133,15 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         # a thousand picks, measured on one die, so the checkpoint's 2048 is
         # 36 of its 87 us. Overriding the config rather than editing it keeps
         # the checkpoint's hash stable, which the run's own record checks.
-        hf_overrides=({"index_topk": index_topk} if index_topk else {}),
+        hf_overrides={
+            **({"index_topk": index_topk} if index_topk else {}),
+            # A shortened backbone fits the residue a tenant leaves. The round
+            # scales with the layer count, so absolute TPOT is not the full
+            # model's -- but the ratio between two arms is, and a ratio is what
+            # every lever here is measured as. Without this the engine needs
+            # 47 GiB a die and waits for the machine to empty.
+            **({"num_hidden_layers": layers} if layers else {}),
+        },
         kv_cache_dtype="auto", block_size=PAGE_SIZE,
         # AscendCompiler filters static token buckets by this sequence limit.
         max_num_seqs=max(4, graph_width) if super_kernel else 1,
@@ -184,7 +192,7 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
-        mtp_tokens=0,
+        mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
@@ -236,7 +244,7 @@ class CannModel:
             self.checkpoint, capacity, gpu_memory_utilization,
             compile_target=compile_target, super_kernel=super_kernel,
             expert_parallel=expert_parallel, graph_width=graph_width,
-            index_topk=index_topk, mtp_tokens=mtp_tokens,
+            index_topk=index_topk, mtp_tokens=mtp_tokens, layers=layers,
         )
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(

@@ -146,6 +146,10 @@ def arguments():
     parser.add_argument("--plain-moe-combine", action="store_true",
                         help="Add the shared and routed MoE outputs directly"
                              " instead of through the multi-tensor kernel")
+    parser.add_argument("--layers", type=int,
+                        help="Load only this many transformer layers, so an"
+                             " arm fits the residue a tenant leaves; ratios"
+                             " between arms carry, absolute TPOT does not")
     parser.add_argument("--profile-last", action="store_true",
                         help="Capture the device on the last request only,"
                              " at the real width and after the caches have"
@@ -435,7 +439,7 @@ def run(args, report):
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
                        routed_kernel=args.routed_kernel,
-                       mtp_tokens=args.mtp_tokens,
+                       mtp_tokens=args.mtp_tokens, layers=args.layers,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
                        hoist_metadata=args.hoist_metadata,
