@@ -41,9 +41,10 @@ class MeasuredRank(CannRankEngine):
     """Retain local round states and finish prefix copies before delivery."""
 
     def __init__(self, target, draft, group, lookup_prompt=None, *,
-                 lookup_min_ngram=2):
+                 lookup_min_ngram=2, lookup_automaton=False):
         super().__init__(target, draft, lookup_prompt,
-                         lookup_min_ngram=lookup_min_ngram)
+                         lookup_min_ngram=lookup_min_ngram,
+                         lookup_automaton=lookup_automaton)
         self.group = group
         self.requests = []
         self.current = None
@@ -143,6 +144,11 @@ def arguments():
     parser.add_argument("--plain-moe-combine", action="store_true",
                         help="Add the shared and routed MoE outputs directly"
                              " instead of through the multi-tensor kernel")
+    parser.add_argument("--automaton", action="store_true",
+                        help="Draft from a suffix automaton rather than the"
+                             " hash-tuple tail lookup, matching the longest"
+                             " tail with any continuation and taking the most"
+                             " frequent one at each step")
     parser.add_argument("--onesided-reduce",
                         help="Config-store endpoint, e.g."
                              " tcp://127.0.0.1:9421, replacing the TP sum"
@@ -395,11 +401,12 @@ def run(args, report):
                 (Path(args.capture_case) / "manifest.json").read_text()
             )
             lookup_prompt = manifest["prompt_token_ids"]
-            report["drafter"] = "lookup"
+            report["drafter"] = "automaton" if args.automaton else "lookup"
             report["lookup_prompt_tokens"] = len(lookup_prompt)
         engine = MeasuredRank(
             target, draft, channel.group, lookup_prompt,
             lookup_min_ngram=1 if args.lookup_unigram else 2,
+            lookup_automaton=args.automaton,
         )
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():
@@ -475,7 +482,8 @@ def run(args, report):
                         conditioned_width=(args.width
                                            if args.conditioned_graph else 0))
             sources = source_hashes(target, draft)
-            for name in ("mtp_session.py", "tp_runtime.py", "lookup_draft.py"):
+            for name in ("mtp_session.py", "tp_runtime.py",
+                         "lookup_draft.py", "automaton_draft.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
                 sources[str(path)] = digest(path)
             for path in (
@@ -578,7 +586,8 @@ def run(args, report):
                             "min": min(values), "max": max(values)},
                 "warmup": args.warmup, "requests": args.requests,
                 "output_tokens_per_request": args.max_tokens,
-                "drafter": "lookup" if args.lookup else "mtp",
+                "drafter": ("automaton" if args.automaton else "lookup")
+                           if args.lookup else "mtp",
                 "lookup_min_ngram": (
                     (1 if args.lookup_unigram else 2) if args.lookup else None
                 ),

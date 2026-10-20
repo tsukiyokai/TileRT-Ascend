@@ -26,6 +26,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[2]))
 
+from tilert.models.glm_5_2_ascend.automaton_draft import AutomatonDrafter
 from tilert.models.glm_5_2_ascend.lookup_draft import LookupDrafter
 from tilert.models.glm_5_2_ascend.tree_draft import TreeDrafter
 
@@ -96,10 +97,14 @@ def run(stream, prompt_length, width, budget, branches, longest):
     # measure a longer match rather than a tree.
     chain = LookupDrafter(prompt, longest=8, shortest=2)
     long_chain = LookupDrafter(prompt, longest=longest, shortest=2)
+    # The same contract as the chain drafters, so this column is what an
+    # engine would see from a module swap alone, with no tree verification.
+    automaton = AutomatonDrafter(prompt, longest=longest, shortest=2)
     tree = TreeDrafter(prompt, longest=longest, budget=budget,
                        branches=branches)
     chain_accepted = []
     long_accepted = []
+    automaton_accepted = []
     tree_accepted = []
     at = prompt_length
     while at < len(stream):
@@ -107,19 +112,23 @@ def run(stream, prompt_length, width, budget, branches, longest):
         linear = chain.propose(width)
         matched = accepted_by_chain(linear, truth)
         longer = accepted_by_chain(long_chain.propose(width), truth)
+        walked = accepted_by_chain(automaton.propose(width), truth)
         tokens, parents = tree.propose()
         through_tree = accepted_by_tree(tokens, parents, truth)
         # A round commits what the draft got right plus the one token the
         # target produces regardless.
         chain_accepted.append(matched + 1)
         long_accepted.append(longer + 1)
+        automaton_accepted.append(walked + 1)
         tree_accepted.append(through_tree + 1)
-        step = min(max(matched, longer, through_tree) + 1, len(stream) - at)
+        step = min(max(matched, longer, walked, through_tree) + 1,
+                   len(stream) - at)
         chain.commit(stream[at:at + step])
         long_chain.commit(stream[at:at + step])
+        automaton.commit(stream[at:at + step])
         tree.commit(stream[at:at + step])
         at += step
-    return chain_accepted, long_accepted, tree_accepted
+    return chain_accepted, long_accepted, automaton_accepted, tree_accepted
 
 
 def main():
@@ -140,32 +149,36 @@ def main():
           f"files {[len(body) for body in bodies]}")
     print(f"width {arguments.width}  budget {arguments.budget}  "
           f"branches {arguments.branches}  longest {arguments.longest}")
-    print(f"{'edit rate':>10}  {'chain8':>7}  {'chain32':>7}  {'tree':>7}  "
-          f"{'gain':>6}  {'rounds':>7}")
+    print(f"{'edit rate':>10}  {'chain8':>7}  {'chain32':>7}  "
+          f"{'automaton':>9}  {'tree':>7}  {'swap':>6}  {'rounds':>7}")
     for rate in [float(piece) for piece in arguments.rates.split(",")]:
         generator = random.Random(arguments.seed)
         chain_total = []
         long_total = []
+        automaton_total = []
         tree_total = []
         for body in bodies:
             if len(body) < 64:
                 continue
             output = perturb(body, rate, len(vocabulary), generator)
             stream = body + output
-            chain_accepted, long_accepted, tree_accepted = run(
-                stream, len(body), arguments.width, arguments.budget,
-                arguments.branches, arguments.longest)
+            columns = run(stream, len(body), arguments.width,
+                          arguments.budget, arguments.branches,
+                          arguments.longest)
+            chain_accepted, long_accepted, automaton_accepted, tree_accepted = columns
             chain_total.extend(chain_accepted)
             long_total.extend(long_accepted)
+            automaton_total.extend(automaton_accepted)
             tree_total.extend(tree_accepted)
         if not chain_total:
             continue
         chain_mean = sum(chain_total) / len(chain_total)
         long_mean = sum(long_total) / len(long_total)
+        walked_mean = sum(automaton_total) / len(automaton_total)
         tree_mean = sum(tree_total) / len(tree_total)
         print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {long_mean:>7.3f}  "
-              f"{tree_mean:>7.3f}  {tree_mean / long_mean:>6.3f}  "
-              f"{len(chain_total):>7}")
+              f"{walked_mean:>9.3f}  {tree_mean:>7.3f}  "
+              f"{walked_mean / chain_mean:>6.3f}  {len(chain_total):>7}")
 
 
 if __name__ == "__main__":

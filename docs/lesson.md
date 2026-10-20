@@ -397,3 +397,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `/root/shmem/log/`, and it names the failing call, the value it was given
     and the line it came from. A returned code tells you something failed; it
     is not a diagnosis, and treating it as one costs a launch each time.
+
+52. The experiment trees are snapshots, and `bench_cann_mtp.py` moves with
+    `cann_model.py`. Shipping the repository's bench into a tree whose model
+    file is older fails at `CannModel.__init__() got an unexpected keyword
+    argument 'plain_moe_combine'`, and the failure is shaped to mislead: every
+    rank raises the same TypeError, but rank 0 writes no record where the
+    others do, so it reads as a rank-0 problem -- and rank 0 is exactly the
+    one that builds the drafter. The remedy is to find a tree whose
+    `cann_model.py` has the same md5 and take its bench, then patch that in
+    place. Minimal patches to the tree's own files, never whole-file
+    replacement from the repository.
