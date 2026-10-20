@@ -1386,3 +1386,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      same fifteen nodes. The branch sweep had said the same thing from another
      direction, two to eight branches differing by one to two percent. Three
      failures converging on one reason is a bound, not a shortage of ideas.
+
+141. Price both halves in one table and the project reduces to one quantity.
+     TPOT is 78 layers times per-layer over accepted, and with every figure
+     measured today the cell at 214 us a layer and 6.872 accepted is 2.43 ms --
+     both measured, neither needing the copy oracle. So 2.x sits inside two
+     existing measurements, and what separates them from the engine is that it
+     pays 588 us a layer where the same operators replay in 214: 374 us a
+     layer, 29.2 ms a round, the same unattributed four fifths of the row cost
+     seen per layer. Every earlier estimate priced one half and assumed the
+     other; neither half reaches the target alone and the product of their
+     measured bests does.
