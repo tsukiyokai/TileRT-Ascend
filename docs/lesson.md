@@ -810,3 +810,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `query_rope` that the `_C_ascend` operator the engine calls does not need:
     two implementations behind one name, and the call site is the
     specification.
+
+87. Measure a tensor-parallel operator at its shard. Seven per-layer
+    projections measured 364 us a layer unsharded and 109.447 at the TP16
+    shard the engine runs -- o_proj alone fell from 178 us to 13.176, since its
+    200 MB weight is split sixteen ways. At the shard each costs 12 to 19 us
+    whatever its size, the router's 3 MB running at 158 GB/s where q_a's 24 MB
+    reaches 1386, so the small ones are boundary-bound. Concatenating the four
+    that read the hidden states along their output axis makes them one matmul:
+    68.724 us to 37.238, 2.46 ms a round, relative difference 4.058e-04 on
+    magnitudes near 308 where bfloat16's ULP is 1 to 2 -- reblocking, not
+    approximation. And an absolute difference means nothing without the
+    magnitude beside it: 0.125 was both the measured difference and what an
+    error of one part in a hundred would have looked like.
