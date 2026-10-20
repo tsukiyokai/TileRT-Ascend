@@ -112,3 +112,25 @@ unexplained. What the bisection establishes is where to look -- the multi-row
 path -- not which line. The honest state is a localised defect with its two
 obvious causes excluded, which is better than six excluded arithmetic
 candidates and not yet a diagnosis.
+
+## Five per-row index sites read, all correct
+
+- `STRIDE = M_TILE / 2 = 8`, and `C[r] = 16 C'[r] + C'[STRIDE + r]` holds for
+  any row count up to eight.
+- `SCALE_SPAN = 8`, matching what the vendor comparison builds.
+- `middle_low = Nibbles(middle, STRIDE * HALF)`, so a row's low nibbles land on
+  M-axis row `STRIDE + row` -- as the recombination needs.
+- `Narrow` combines `row * HIDDEN` with `(STRIDE + row) * HIDDEN`, and takes
+  `of_row`, `token` and `weight` at `row` and `taken_from + row`.
+- `Split` reads `rows_global[source * HIDDEN]` with `source` from
+  `held.source.GetValue(taken_from + row)`, in range for every shape tested.
+
+So the shape bisection localised the defect to the multi-row path and five
+readings of that path found nothing. The marginal return on reading further is
+low, and the defect does not block: the kernel's value is the launch merge,
+measured as a ratio with both sides identical, and five percent sits inside a
+W4A8C8 checkpoint's quantisation noise.
+
+Parked again, with a better position than before: the shape that reproduces it
+is one expert and four rows, which is the smallest case that shows it and the
+right place for a device-side probe when one is worth building.
