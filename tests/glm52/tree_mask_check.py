@@ -14,6 +14,34 @@ def ancestors(parents, node):
     return set(chain)
 
 
+def check_bitmap_matches_rows(width=6, prefix=40, capacity=64):
+    """The bitmap and the index rows must express the same visibility.
+
+    Two encodings of one rule invite divergence, so the check ties them: a
+    position is visible in the bitmap exactly when it appears in the row.
+    """
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError:
+        return None  # the other checks are pure Python and still run
+
+    from tilert.models.glm_5_2_ascend.tree_mask import ancestor_bitmap
+
+    parents = [-1, 0, 0, 1, 1, 2]
+    bitmap = ancestor_bitmap(parents, prefix, capacity)
+    rows = ancestor_rows(parents, prefix, picks=capacity,
+                         prefix_picks=prefix)
+    for node in range(width):
+        visible_bitmap = {index for index in range(capacity)
+                          if not bool(bitmap[node, index])}
+        visible_row = set(visible(rows, node))
+        if visible_bitmap != visible_row:
+            return (f"node {node}: bitmap sees "
+                    f"{sorted(visible_bitmap)[-4:]}, rows see "
+                    f"{sorted(visible_row)[-4:]}")
+    return None
+
+
 def main():
     # A tree where node 0 is the root, 1 and 2 branch from it, 3 from 1.
     parents = [-1, 0, 0, 1]
@@ -91,7 +119,8 @@ def check_buffer_reuse():
 
 
 if __name__ == "__main__":
-    problem = check_chain_is_causal() or check_buffer_reuse()
+    problem = (check_chain_is_causal() or check_buffer_reuse()
+               or check_bitmap_matches_rows())
     if problem:
         print(problem)
         sys.exit(1)

@@ -50,3 +50,29 @@ def ancestor_rows(parents, prefix_length, picks, prefix_picks=None):
 def visible(rows, node):
     """The positions a row actually selects, for checking a construction."""
     return [position for position in rows[node] if position != EMPTY]
+
+def ancestor_bitmap(parents, prefix_length, capacity, device=None):
+    """The tree's visibility as the mask `shared_kv_fia` already takes.
+
+    `cann_attention.selection_mask` states the convention -- True excludes a
+    cache row -- and builds its mask by scattering zeros at the selected
+    positions. This does the same with the tree's rule: a node sees the
+    committed prefix and its own ancestors, so those positions are zero and
+    everything else is one.
+
+    This is the shorter of the two paths into the engine. The other feeds
+    `sparse_indices` to the operator the engine calls, which rejected seven
+    argument sets from a probe; `shared_kv_fia` passes a mask of shape
+    (1, 1, width, capacity) and is known to run.
+    """
+    import torch
+
+    width = len(parents)
+    bitmap = torch.ones((width, capacity), dtype=torch.uint8, device=device)
+    bitmap[:, :prefix_length] = 0
+    for node in range(width):
+        walk = node
+        while walk >= 0:
+            bitmap[node, prefix_length + walk] = 0
+            walk = parents[walk]
+    return bitmap.view(torch.bool)
