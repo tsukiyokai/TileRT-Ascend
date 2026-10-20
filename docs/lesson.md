@@ -1949,3 +1949,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      quadrupling the bytes, and why 64 heads cost 1.85 times four. A 170 us
      intercept once a layer is 13.3 ms a round, the largest fixed cost after
      the collectives, and it is neither the cache nor the heads nor the rows.
+
+186. The FIA call is one device kernel of 49.52 us, so attention's 170 us
+     intercept is host-side. Profiled on one die at the engine's shape, twenty
+     calls give one kernel record averaging 49.52 us, against 171 to 196 us
+     measured with perf_counter_ns around a synchronise -- about 120 us of host
+     round trip, far more than this project's 11.386 us of eager dispatch,
+     which puts it in the call's own argument handling: seventeen parameters
+     including Python lists rebuilt every call. The capacity sweep stands and
+     its attribution does not: attention's device cost is 49.52 us a layer, 3.9
+     ms a round, not 309 us and 24 ms. Every absolute figure this session took
+     around a synchronise carries the same tax; the ratios survive because both
+     arms paid it.
