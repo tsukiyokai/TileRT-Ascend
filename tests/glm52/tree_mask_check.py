@@ -47,6 +47,28 @@ def main():
 
 
 
+def check_chain_is_causal(width=8):
+    """A chain draft's mask must be exactly the causal prefix.
+
+    `fia-mask-20261020` records that serial and speculative decoding disagree
+    at width eight and above, never isolated, and future leakage is the
+    candidate the mask would exclude: with parents forming a chain, node i may
+    see the committed prefix and nodes 0..i, and nothing later. So the tree
+    machinery doubles as the causality fix, and this is the property that makes
+    it one.
+    """
+    parents = [-1] + list(range(width - 1))
+    prefix = 100
+    rows = ancestor_rows(parents, prefix, picks=width + 4)
+    for node in range(width):
+        seen = sorted(position for position in visible(rows, node)
+                      if position >= prefix)
+        want = [prefix + index for index in range(node + 1)]
+        if seen != want:
+            return f"node {node} sees {seen}, causal prefix is {want}"
+    return None
+
+
 def check_buffer_reuse():
     """The installer must reuse one buffer, not allocate a new one a round.
 
@@ -69,7 +91,7 @@ def check_buffer_reuse():
 
 
 if __name__ == "__main__":
-    problem = check_buffer_reuse()
+    problem = check_chain_is_causal() or check_buffer_reuse()
     if problem:
         print(problem)
         sys.exit(1)
