@@ -208,3 +208,39 @@ settle one question each and drop the rest.
 When the gate refuses, bound the wait to something a real window would
 satisfy — tens of minutes, not a working day — and spend the refusal on the
 first tier instead.
+
+## 2026-10-20: the recipe a hand-written MIX kernel needs
+
+Four things that are not discoverable from the headers, each of which cost a
+build cycle.
+
+A standalone AscendC program builds with `bisheng -xcce
+--cce-aicore-arch=dav-c220`, include roots from the *source* tree under
+`$CANN/aarch64-linux/asc` and `tikcpp`, linking `-lascendcl -lruntime`. Add
+`-lstdc++` the moment the host side uses `std::vector`, or the link fails on
+`operator new` and `__gxx_personality_v0`. And do not pipe the compiler
+through `head`: it dies of SIGPIPE and the script reports a build failure with
+no errors in sight.
+
+A cube tiling comes from `matmul_tiling::MatmulApiTiling` on the host. Take
+the `GetTiling(AscendC::tiling::TCubeTiling&)` overload -- the `optiling`
+one drags in the operator registry's `TilingDef`. The link line needs
+`-ltiling_api -lplatform -lunified_dlog -lc_sec -lregister`, and the program
+must run under `set_env.sh` or `libruntime_common` fails to resolve
+`ErrorManager::ATCReportErrMessage`. `tests/glm52/mixbrick/` does this and
+prints the tiling; 8 rows gives baseM 16, 32 rows baseM 32, both with
+baseK 128 over the 6144 axis.
+
+Cross-core synchronisation in a raw-launched MIX kernel needs the sync base
+address, which the host gets from `rtGetC2cCtrlAddr` -- declare it
+`extern "C"`, it is not in the public headers -- and the kernel installs with
+`AscendC::SetSyncBaseAddr`. That is all `util_set_ffts_config` does in the
+SHMEM tree. Then `CrossCoreSetFlag<0, PIPE_FIX>` from the cube side and
+`CrossCoreWaitFlag` from the vector side. The reverse direction is not settled
+by the headers and a flag under `core_ratio(1, 2)` faces two waits per set, so
+design the first bricks to need the cube-to-vector direction only.
+
+`dav-c220` vector instructions are typed more narrowly than the model is:
+`Muls` takes half, float, int16 or int32 and rejects BF16. Compute in FP32 and
+`Cast` the roundings back where the unfused stages have them, or the result is
+more accurate and no longer comparable.
