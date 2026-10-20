@@ -360,3 +360,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     wired to the one kernel of the three that cannot serve this checkpoint,
     and moving it to the INT4 kernel also retires the memory blocker, since
     packed codes need no widening and so no 302 MB a layer.
+
+49. The packing axis is not the packing convention. Both sides pair two INT4
+    codes in a byte, low nibble first, and `_pack_to_int32` is only a
+    `view(torch.int32)` over that -- which I read as the layouts agreeing and
+    wrote down that nothing needed rearranging. They disagree about which axis
+    the pair runs along. The checkpoint pairs along the output axis:
+    `w13_weight (256, 128, 6144)` is `[expert][N/2][K]`, and its scale's 256
+    entries are what settle it -- 128 is N halved and 6144 is K, not the other
+    reading. The kernel pairs along K, two neighbours of a row to a byte. Same
+    nibble order, same byte, orthogonal axis, and no error anywhere until the
+    vendor operator asked for `[E][K][N]` and named the sizes. Two tensors can
+    agree on every convention you thought to check and still not be the same
+    tensor; when a shape is `(256, 128, 6144)` and the halved axis could be
+    either, the scale's length is the witness.

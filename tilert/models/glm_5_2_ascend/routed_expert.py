@@ -10,12 +10,16 @@ caller is reachable because the MoE body is already an opaque custom op, so
 the quant method is re-entered on every eager invocation and once during
 capture.
 
-Nothing about the weights is rearranged, but when they are taken matters.
-The checkpoint stores packed INT4 codes -- `w13_weight (256, 128, 6144)` is
-`[expert][N][K/2]` and `w2_weight (256, 3072, 128)` is `[expert][K][N/2]` --
-which is what the kernel reads, and `w13_scale_bias` and `w2_scale_bias` are
-the per-output-channel FP32 correction the asymmetric quantisation needs,
-added once after the MSD recombination and before the activation scale.
+The weights need repacking, and when they are taken matters. The checkpoint
+nibble-packs along the output axis: `w13_weight (256, 128, 6144)` is
+`[expert][N/2][K]`, which its scale's 256 entries confirm -- 128 is N halved,
+6144 is K -- and `w2_weight (256, 3072, 128)` is the same shape of thing with
+N 6144 and K 128. The kernel packs along K instead, two neighbours of a row
+to a byte. So `install` unpacks along N and repacks along K, once a layer.
+
+`w13_scale_bias` and `w2_scale_bias` are the per-output-channel FP32
+correction the asymmetric quantisation needs, added once after the MSD
+recombination and before the activation scale.
 
 `process_weights_after_loading` then casts both weights to fractal NZ, because
 the vendor's fused operator dispatches to `aclnnGroupedMatmulSwigluQuantWeightNzV2`
@@ -28,8 +32,31 @@ import ctypes
 import os
 
 LIBRARY_DIR = os.environ.get("TILERT_ROUTED_LIB_DIR", "/workspace/src/int4-so")
+HIDDEN = 6144
+GATE_UP = 256
 EXPERTS_PER_RANK = 16
 BLOCKS = 16
+
+
+def _repack(packed, columns):
+    """From nibbles paired along the output axis to pairs along K.
+
+    The checkpoint's byte holds outputs `2n` and `2n + 1` for one K; the
+    kernel's holds `k` and `k + 1` for one output. Unpacking to a full byte an
+    element and repacking the other way is one transpose between them.
+    """
+    import torch
+
+    experts, halved, inner = packed.shape
+    low = (packed & 0x0F).to(torch.int8)
+    high = ((packed >> 4) & 0x0F).to(torch.int8)
+    low = torch.where(low > 7, low - 16, low)
+    high = torch.where(high > 7, high - 16, high)
+    wide = torch.stack((low, high), dim=2).reshape(experts, 2 * halved, inner)
+    assert wide.shape[1] == columns, (wide.shape, columns)
+    pairs = wide.reshape(experts, columns, inner // 2, 2)
+    return ((pairs[..., 1] & 0x0F) << 4 | (pairs[..., 0] & 0x0F)).to(
+        torch.int8).contiguous()
 
 
 def _load():
@@ -57,10 +84,10 @@ def install(layers, experts=EXPERTS_PER_RANK, blocks=BLOCKS):
     undo = []
     for layer in layers:
         method = layer.quant_method
-        held = (method.w13_weight.data.clone(),
+        held = (_repack(method.w13_weight.data, GATE_UP),
                 method.w13_scale_bias.data.squeeze(-1).clone(),
                 method.w13_weight_scale.data.squeeze(-1).clone(),
-                method.w2_weight.data.clone(),
+                _repack(method.w2_weight.data, HIDDEN),
                 method.w2_scale_bias.data.squeeze(-1).clone(),
                 method.w2_weight_scale.data.squeeze(-1).clone())
         original_first = method.apply_gmm1_act_quant
