@@ -1213,3 +1213,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      of a tree. With the fixed term the measured merges leave, 30.15 ms, the
      floor is 6.12 ms -- the target bounded out of the identified mechanisms a
      second time, now with measured data on both sides.
+
+124. The workload's repetition, not the drafter, is the binding limit. For each
+     position in the engine's own output, the longest run that appeared
+     verbatim before: 83.8 percent of positions have four tokens, 57.9 have
+     sixteen, 37.2 have thirty-two. An oracle copy drafter -- always finding
+     the longest prior run -- accepts 9.660 at a sixteen-row budget, which is
+     TPOT 4.21 ms against the perfect predictor's 2.39. So no copy-based
+     drafter reaches 2.9 ms on this workload however well implemented, and the
+     tree at 6.649 is already 69 percent of the oracle. Reaching the target
+     needs prediction on the 42 percent of positions where nothing long enough
+     was seen -- and the published MTP figures, 1.85 to 3.9 accepted, are below
+     both.
