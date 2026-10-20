@@ -180,3 +180,25 @@ expert weights as one fused tensor per layer after
 `process_weights_after_loading` casts them to fractal NZ, so handing the
 operator sixteen separate tensors means intervening where
 `routed_expert.install_before_conversion` already does.
+
+## Bit-exact on one die, across the shapes that would break it
+
+Narrowing drops the slots with no rows and rebuilds the group list from the
+survivors. The group list is also what tells the operator where each slot's
+rows begin, so a wrong narrowing shifts every row after the first gap -- which
+reads as a model that still runs.
+
+| case | rows | kept | verdict |
+|---|---|---|---|
+| every expert holds rows | 96 | 16 | bit-exact |
+| six hold rows, scattered | 72 | 6 | bit-exact |
+| two hold rows | 96 | 2 | bit-exact |
+| the first is empty | 96 | 8 | bit-exact |
+| the last is empty | 96 | 8 | bit-exact |
+
+The first case takes `narrow`'s early return and so tests the bypass rather
+than the narrowing; the other four are the real ones, and they cover a
+scattered pattern of gaps, a leading gap and a trailing gap -- the three ways
+an off-by-one in the group list shows up.
+
+So the lever is semantics-preserving, not merely survivable.

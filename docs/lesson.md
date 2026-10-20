@@ -1560,3 +1560,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      so replay changes little; and the engine fuses its expert weights into one
      tensor a layer during the fractal-NZ cast, so the sixteen-tensor form has
      to be installed where install_before_conversion already intervenes.
+
+154. The bank narrowing is bit-exact on one die across the shapes that would
+     break it: a scattered pattern of gaps, a leading gap, a trailing gap, and
+     two experts holding every row. The group list is what tells the operator
+     where each slot's rows begin, so an off-by-one there shifts every row
+     after the first gap and reads as a model that still runs -- which is why
+     the verdict had to be equality rather than a tolerance. One of the five
+     cases takes the early return and tests the bypass; naming which cases
+     test what is part of the result.
