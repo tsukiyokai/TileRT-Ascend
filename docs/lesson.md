@@ -1413,3 +1413,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      compute at 159 us, against 317 measured warm, 214 replayed in a graph and
      203 profiled busy. Not a boundary to merge -- a different amount of
      arithmetic.
+
+143. The target reduces to an exact statement. The layer post-merge is 317.475
+     us on one die; attention and the grouped matmul are 158.869 of it, and 2.9
+     ms at the measured acceptance ceiling of 4.289 needs 159.463 -- a
+     difference of 0.6 us. So the target is the six small operators at zero:
+     158.6 us a layer, 12.37 ms a round, 468 boundaries at 26.4 us each, for
+     operators whose arithmetic at five rows is negligible. Not an unspecified
+     factor of two but one structural change: fold six operators into two,
+     within the layer rather than across it -- the direction the 15.73 ms of
+     merges already came from, and the one cross-layer fusion's 6.15x penalty
+     does not speak to.
