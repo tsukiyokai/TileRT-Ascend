@@ -1791,3 +1791,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      quantity that did not exist, each sound on its own terms. Before
      attributing a residual, check that the numerator belongs to the
      denominator.
+
+173. Two thirds of a round is not on the device, and it has never been
+     measured. The best arm's own record: 188 rounds at a p50 of 50.710 ms,
+     each `advance_mtp_n` carrying `rounds: 1`, so that is one round entire.
+     The kernel census puts 78 SuperKernels at 210 us, 16.4 ms. The missing 34
+     ms is not MTP (the arm runs `mtp None`, no draft graph) and not the
+     standalone collectives (64 over three requests is 0.11 a round). What
+     remains is the host: the drafter, the acceptance match, the Gloo
+     broadcast, and whatever happens between replays. Which bounds every lever
+     measured today -- AIV, the bank narrowing, attention redundancy all act on
+     the 16.4 ms that is on the device.

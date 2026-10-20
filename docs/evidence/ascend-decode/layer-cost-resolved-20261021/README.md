@@ -45,3 +45,40 @@ the question was wrong.
 The collectives dominate and they are outside the SuperKernel. That is where
 the round's time goes, and the capture's six-token scope means the absolute
 figures still need a steady-state run -- but the structure is now right.
+
+## And two thirds of a round is not on the device
+
+The record's own account of the best arm, `lever84-20261020/auto12`, drafter
+`lookup`, width 12, `mtp None`, `draft_graph false`:
+
+    operation           calls   total ms   ms each   share
+    advance_mtp_n         188    9602.50    51.077    98.9%
+    inject                  1      70.12    70.117     0.7%
+    reset                   1      18.30    18.303     0.2%
+    start_mtp               1      10.64    10.641     0.1%
+
+    advance rounds: 188, p50 50.710 ms, min 47.686, max 68.339
+
+Each `advance_mtp_n` carries `rounds: 1`, so 50.710 ms is one round entire.
+Against it, the kernel census puts 78 SuperKernels at 210 us -- **16.4 ms**.
+
+So about 34 ms of a round is outside the SuperKernel. What it is not:
+
+- MTP recomputation. The arm runs `mtp None` with no draft graph, so the draft
+  model is absent.
+- The standalone collectives. The census counts 64 over three requests, which
+  is 21 a request against 188 rounds -- 0.11 a round, not 34 ms of them.
+
+What remains is the host: the drafter, the acceptance match, the Gloo command
+broadcast, and whatever the round does between replays. The `operations` list
+does not break those out, so the next step is instrumenting inside
+`advance_mtp_n` rather than another device capture.
+
+## Which reorders every lever
+
+If two thirds of a round is host-side, the three levers measured today -- AIV's
+collectives, the bank narrowing, attention redundancy -- all act on the 16.4 ms
+that is on the device. Their combined effect on a 50.7 ms round is bounded by
+that third.
+
+The host side has never been measured at all.
