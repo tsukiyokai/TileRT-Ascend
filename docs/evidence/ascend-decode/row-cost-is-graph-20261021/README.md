@@ -97,3 +97,43 @@ the arms measure is where in that range the real engine sits.
     the removal is a list, not a rewrite     cudagraph_capture_sizes
     several sizes cost 195 MiB each          synthetic capture
     and do not slow each other               0.999
+
+## The spread is 1.17 ms a round, not 13.2 -- so the chain's third step fails
+
+Four layers of seven operators including the grouped matmul, captured at
+several widths:
+
+    rows   us a graph   a round of 78
+       4      488.437        9.52 ms
+       8      524.144       10.22
+      16      536.269       10.46
+      24      548.711       10.70
+    small against wide: 1.17 ms a round, 1.122x
+
+The round model charges 0.66 ms a verified row, which over the twenty rows
+between width 4 and 24 is 13.2 ms. The capture spread accounts for 1.17 -- a
+ninth of it.
+
+So the claim this page made, that the row cost is *entirely* the graph's, does
+not hold. What holds is narrower:
+
+- the operators are flat in rows, cold and warm, so the row cost is not their
+  work;
+- the captured width does cost something, 0.05 ms a row rather than 0.66;
+- and five sixths of the fitted slope remains unattributed.
+
+The arithmetic that followed -- removing the row cost reaches 2.24 ms -- was
+built on attributing all of it to capture, and is withdrawn. The multi-size
+capture is still worth about 1.2 ms a round by this measurement, which is a
+real lever and a small one.
+
+## What the fitted slope could still be
+
+The fit is within-arm and sound: 48.2, 50.5 and 53.5 ms at widths 8, 12 and 16.
+Excluded so far: the operators' own work (flat in rows, cold and warm), graph
+buckets (one size captured), the TP reduction at two ranks (flat to negative),
+the Gloo command (flat), trajectory length (arms cap tokens), MTP drafting (the
+drafted path runs one verify), and now capture width beyond 0.05 ms a row. What
+remains unexamined is the sixteen-rank behaviour of everything -- the reduction
+at TP16 rather than at two, and the attention operator the engine actually
+calls, which rejected five argument sets here.

@@ -1232,8 +1232,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      operators are flat eagerly, so a graph charges for rows that carry
      nothing.
 
-125. The row cost is entirely the graph's, and that makes 2.x an engineering
-     question. A layer's operators are flat in the row count cold -- 126.969 us
+125. [Withdrawn by 128.] The row cost is entirely the graph's, and that makes
+     2.x an engineering question. A layer's operators are flat in the row count cold -- 126.969 us
      at 8 rows against 121.955 at 32, negative at the margin -- as they were
      warm, so the operator-side row cost over 78 layers is between 0 and -0.02
      ms against the round model's fitted 0.66. The whole of it is capture: the
@@ -1258,3 +1258,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      lever's last unverified premise. Every link of the chain from the round
      model to a one-line configuration change is now measured on one die or in
      the arms' own records.
+
+128. The capture spread is a ninth of the fitted row cost, so the chain was not
+     closed. Seven operators including the grouped matmul, captured at four
+     widths: 9.52 ms a round at four rows against 10.70 at twenty-four, a
+     spread of 1.17 ms where the round model charges 13.2 over the same twenty
+     rows. So the operators are flat in rows and the captured width costs 0.05
+     ms a row rather than 0.66, and five sixths of the slope is still
+     unattributed. Multi-size capture is worth about 1.2 ms a round -- real and
+     small -- and the arithmetic that reached 2.24 ms by removing the whole row
+     cost is withdrawn. A chain is only as closed as its weakest measured link,
+     and this one was an extrapolation from five operators to the engine's
+     layer.
