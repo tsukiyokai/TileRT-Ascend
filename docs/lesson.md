@@ -469,3 +469,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     grid-wide barriers -- so the measurement settles the megakernel's
     foundation: mixbrick's grid-barrier structure carrying routed_int4's MSD
     path, because per-pair flags do not stretch across an N-split.
+
+58. A microbenchmark with nothing in it measures the runtime's fast path out.
+    An empty kernel taking no argument and touching no memory launched in
+    64.654 µs; the same kernel given one argument and one store launched in
+    3.384. The first number contradicted something I already knew -- a fused
+    kernel of mine costs 10.2 µs a call including its launch -- and that
+    contradiction is what caught it. It also overturned my own attribution:
+    at 3.4 µs a launch, a layer's operators over seventy-eight layers cost 6.6
+    ms of host issue, not the 36 ms residual I had assigned to "issue and
+    synchronisation". The cost is in the drain, which grows with the launch
+    count like a queue rather than sitting still like a fixed cost.
