@@ -588,3 +588,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     mechanism this project had filed as an optimisation and which is a
     correctness prerequisite. Timing measurements survive; the correctness
     claims behind them do not, and they are withdrawn.
+
+67. Two criteria disagreeing localises what one criterion never could. The
+    kernel matched the vendor under a constant weight to a bfloat16 ULP and
+    produces nothing at all under random weights -- 98304 of 98304 elements
+    unequal, the vendor at absmax 26.25 and the kernel at zero. A constant
+    weight makes every column's product identical, so column offsets, K-axis
+    mismatches and index displacements leave it unchanged: that mode cannot
+    see structural error, which is the second criterion today that could not
+    fail for the reason it was being trusted for. The pair together points at
+    misalignment rather than arithmetic. Prefer the vendor to a hand-written
+    reference: mine disagreed with the kernel about whether the scale bias
+    goes inside or outside the scale, so it could not settle which side was
+    wrong, while the vendor needs none of my checkpoint conventions to hold.
