@@ -1231,3 +1231,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      row cost is the graph's: replay rises with the captured width where the
      operators are flat eagerly, so a graph charges for rows that carry
      nothing.
+
+125. The row cost is entirely the graph's, and that makes 2.x an engineering
+     question. A layer's operators are flat in the row count cold -- 126.969 us
+     at 8 rows against 121.955 at 32, negative at the margin -- as they were
+     warm, so the operator-side row cost over 78 layers is between 0 and -0.02
+     ms against the round model's fitted 0.66. The whole of it is capture: the
+     same sequence replays 527.0 to 582.9 us across a fourfold row range while
+     eagerly it goes 568.7 to 554.4. And the copy oracle saturates at 13.474
+     accepted by budget 64, exactly what 2.9 ms needs, so the only thing
+     between recall and the target is 64 rows at 0.66 ms each. At 0.10 it is
+     2.72 ms; at zero, 2.24.
