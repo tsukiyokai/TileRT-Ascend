@@ -1756,3 +1756,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      again. Each reading was used to overturn the one before it, and each was a
      different scope: that is the error to stop repeating, not any one of the
      numbers.
+
+170. A collective absorbs arrival skew rather than serialising behind it, so
+     the straggler is not the engine's 858 us. Sixteen ranks under AIV with a
+     barrier before each measurement: aligned with no extra work the slowest
+     total is 231.51 us, and with one rank doing sixteen extra 6144x2048
+     matmuls -- about 480 us nobody else does -- it is 383.63, up only 152.
+     Time the early arrivals spend waiting is not time added. So the
+     explanation for the engine's figure is now excluded as host issue (it runs
+     in a graph), as the native device cost (80x smaller) and as arrival skew.
+     What remains is message size: a MoE all-gather carries rows x hidden x
+     world, 2.3 MB at twelve rows, against the 12 to 576 KB swept so far.

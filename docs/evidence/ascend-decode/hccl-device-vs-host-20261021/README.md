@@ -84,3 +84,32 @@ What would separate them is a capture with per-rank arrival timestamps at each
 collective, which is what `--arrival` style instrumentation gives and this
 profile does not carry. That is the next measurement, and it needs the machine
 the arms are queued on.
+
+## Arrival skew is not the explanation either
+
+Sixteen ranks under AIV with determinism, a barrier before each measurement, a
+skew step being one 6144x2048 matmul at roughly 30 us:
+
+| case | rank 0 | slowest rank |
+|---|---|---|
+| aligned, no extra work | 220.59 | 231.51 |
+| aligned, four steps each | 252.32 | 290.21 |
+| rank 0 idle, others four | 265.80 | 274.79 |
+| last rank sixteen, others none | 360.76 | 383.63 |
+
+One rank doing sixteen extra matmuls -- about 480 us of work nobody else does
+-- raises the slowest total from 231.51 to 383.63, which is 152 us. So the
+collective **absorbs most of the skew** rather than serialising behind it: time
+the early arrivals spend waiting is not time added to the round.
+
+Which removes arrival skew as the explanation for the engine's 858 us a call,
+and leaves the three incompatible readings standing. What is excluded now:
+host-side issue (the engine runs in a graph), the native device cost (80x
+smaller), and arrival skew (absorbed).
+
+The remaining candidate is message size: the engine's collectives carry whole
+hidden states across sixteen ranks for a MoE all-gather, which is a different
+shape from the 12 to 576 KB swept here. That is measurable without the engine
+-- the MoE's gather is rows x hidden x world, and at twelve rows that is 2.3 MB
+-- and it is the next thing to try rather than another reading of the same
+profile.
