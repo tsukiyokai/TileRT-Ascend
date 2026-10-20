@@ -763,3 +763,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     vendor chain makes for its intermediates, not the three launches: those are
     worth 0.25 ms. The case for one kernel over a chain is residency, which is
     the classical argument, reached after measuring the wrong quantity twice.
+
+83. Engine-side optimisation reaches about 7 ms, and the last factor of three
+    is drafting. Issue under graph replay is 1.064 us a kernel, so launches are
+    four percent of a layer; the decode attention is already three boundaries;
+    the routed experts in one kernel save 8.48 ms and the one-sided reduce 6.5,
+    taking the round to about 40 ms. TPOT is then 40 over acceptance, so 2.9 ms
+    needs 13.8 tokens accepted a round against today's 5.441 -- and width 32
+    accepts 6.053, so widening cannot reach it. The acceptance curve is flat
+    where the cost curve is steep. What remains is a drafter that is right far
+    more often, which for a model that copies its input is where the headroom
+    is.
