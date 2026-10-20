@@ -166,3 +166,25 @@ So the whole session ran on the only usable host, and its being held is a
 one-machine constraint rather than an unsearched alternative. Worth checking
 first on any day the machine looks busy -- this was the first time this project
 looked.
+
+## 2026-10-21 the truncated backbone, reopened for measurement and still blocked
+
+The truncated-backbone route was closed earlier on correctness grounds: sixteen
+ranks each randomly initialising disagree about the first token. For measuring
+a round's step timings and the rope graph's effect that does not matter -- the
+tokens need not be right.
+
+So it was reopened against the tenant-held machine, 6.7 GiB free of 64 a die.
+Six attempts: 6 layers, 2 layers, `--gpu-memory-utilization 0.09`, `--capacity
+1024`. Every one fails during load, at a different local rank each time -- 2,
+then 8 -- which is what memory exhaustion looks like when ranks race.
+
+The reason the layer count does not help: vLLM reserves its KV pool from
+`gpu_memory_utilization` times the device, independent of how many layers the
+model has. Shrinking the pool to fit 6.7 GiB then leaves too little for the
+capacity, and the run fails earlier still -- its log is 374 lines against 677.
+
+So the route is sound in principle and unreachable at 10 percent of a device.
+It needs either the machine free or a configuration search that costs five to
+seven minutes an iteration, and the four levers waiting on it are each already
+validated on one die.
