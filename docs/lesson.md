@@ -1621,3 +1621,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      `HCCL_IF_BASE_PORT` does not move the NPU socket port, which the tenant
      holds at 16666; `HCCL_NPU_SOCKET_PORT_RANGE=27000-27200` does, so
      sixteen-rank collective work runs on a memory-held machine.
+
+159. Explicit overlap of a collective with compute is slower, which closes the
+     third of three exits. Sixteen ranks, twelve rows: compute 89.14 us,
+     all_reduce 300.46, sum 389.61, serial on one stream 343.01, concurrent on
+     two 376.70. Serial already sits 46 us below the sum, so the hardware
+     overlaps part of it unasked, and the side stream costs 33.69 more. Third
+     appearance of one shape today -- vector-under-cube, the MoE fork, now a
+     collective: making a dependency explicit serialises what was already
+     overlapping and adds the event. So the collective's exits are smaller
+     messages (flat, no), explicit overlap (worse), fewer calls (mostly spent,
+     0.26 standalone a layer). The round is 214 us a layer of compute and 374
+     of collective latency, and the narrowing takes 59.4 from the first only.

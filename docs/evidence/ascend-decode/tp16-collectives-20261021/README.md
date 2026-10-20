@@ -44,3 +44,38 @@ socket port 16666 on every die. `HCCL_IF_BASE_PORT` does not move it --
 `HCCL_NPU_SOCKET_PORT_RANGE=27000-27200` does. Sixteen-rank collective work is
 therefore possible on a machine whose dies are memory-held, which is worth
 knowing for every future day the machine is busy.
+
+## Explicit overlap with compute is slower
+
+Sixteen ranks, twelve rows, an all_reduce against a matmul:
+
+    compute alone               89.14 us
+    all_reduce alone           300.46
+    sum                        389.61
+    larger of the two          300.46
+    serial, one stream         343.01
+    concurrent, two streams    376.70
+    concurrency gains          -33.69 us
+
+Serial on one stream is already 46 us below the sum, so the hardware overlaps
+part of it unasked. Putting the collective on a side stream behind an event
+costs 33.69 us more than that -- the third time today the same shape appears:
+making a dependency explicit serialises what was already overlapping and adds
+the event's cost. The other two were vector-under-cube and the MoE fork.
+
+## So the collective's three exits are all measured
+
+    smaller messages   flat to five percent over a 48x payload range -- no
+    explicit overlap   33.69 us worse than leaving it alone
+    fewer calls        the only one left
+
+And fewer calls is already mostly spent: the SuperKernel absorbs them, leaving
+0.26 standalone calls a layer. What a round pays is largely inside that kernel,
+where the count is not a host-side choice.
+
+## Which is the honest shape of the remaining gap
+
+The round is compute plus collectives, both now measured: 214 us a layer in a
+graph and 374 us a layer of collective latency. The bank narrowing takes 59.4
+from the first. Nothing measured today takes anything from the second, and its
+three mechanisms are each closed by a measurement rather than by argument.
