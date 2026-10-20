@@ -36,10 +36,20 @@ This is the trap
 documents — "the key, built at `:1071-1092`, covers the dumped operator
 parameters, the super-kernel option string and
 `torch.are_deterministic_algorithms_enabled()` — and nothing else", not the
-vendor source and not a monkeypatch — and it ships a patch for it. The
-measurement has to be redone with that cache cleared between arms, or with
-`disable_static_kernel_compile_cache` set, before the lever can be called
-anything.
+vendor source and not a monkeypatch.
+
+**And the fix was already written.** `launch_arm.sh` in the repository says
+"Static kernel packages are cached below cwd, outside `VLLM_CACHE_ROOT`" and
+then `cd "$out"`, which puts the cache in the arm's own output directory. The
+10-19 experiment tree's copy still does `cd "$tree"`, so every arm compiles
+into the tree and the first one to run decides what the rest replay. Two
+launchers, one line apart, md5 `2833c690` against `da8f45f7`.
+
+So the remedy is to ship the current launcher into the tree and redo the
+pairing. Not mid-queue: the arms still running change the drafting policy
+rather than the compiled graph, so a shared package is harmless to them, and
+swapping the launcher underneath them would break the one thing this queue
+still has — a consistent basis across its arms.
 
 So nothing is concluded about `--plain-moe-combine` either way. The kernel
 measurement that motivated it stands on its own: at matched shapes in one

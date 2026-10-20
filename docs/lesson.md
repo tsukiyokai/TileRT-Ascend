@@ -246,3 +246,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     takes the queue with it -- a one-sided-reduce arm referencing a module the
     experiment tree predates killed fourteen arms behind it -- and an arm must
     be checked against the tree it will run in, not against the repo.
+
+39. An experiment tree is a snapshot, and a fix in the repository is not a fix
+    in the tree. The whole-machine pairing of `--plain-moe-combine` measured
+    0.02 ms where the kernel figure predicted 0.21, because all four arms
+    replayed one static-kernel package: static kernel packages are cached
+    below cwd, the repository's `launch_arm.sh` already `cd`s into the arm's
+    own output directory for exactly that reason, and the 10-19 tree's copy
+    still `cd`s into the tree. One line apart. Before trusting a paired arm,
+    diff the launcher and the engine the tree will actually run against the
+    repository, the same way an arm's flags have to be checked against the
+    tree rather than the repo.
