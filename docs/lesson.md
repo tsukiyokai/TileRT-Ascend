@@ -344,3 +344,21 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     own round records: the gaps between delivered tokens are one a token
     however many a round accepted, which reads as a flat 1.001 and is a
     misread of the harness rather than a measurement.
+
+48. A kernel validated against my own reference is validated against my own
+    omissions. The INT8 and INT4 routed kernels report zero mismatches at
+    every shape, against a host reference I wrote from the same understanding
+    of the format that the kernel implements -- so the two agree about what
+    they both leave out. What they leave out is a term the checkpoint
+    carries: `quant_model_description.json` marks every expert projection
+    `W4A8_DYNAMIC` with a `weight_offset` and a `scale_bias`, 117,311 of them,
+    and `model.layers.3.mlp.experts.0.gate_proj.scale_bias` is F32 `[2048, 1]`
+    whose every sampled value is nonzero. The quantisation is asymmetric and
+    my kernels dequantise as though it were symmetric. The vendor passes that
+    tensor as `bias` to `npu_grouped_matmul` and as `weight_assist_matrix` to
+    the swiglu operator, both per output channel, so the fix is a column add
+    on an already-dequantised accumulator -- cheap, with the vector pipe at
+    1.3% -- but the lesson is the instrument, not the term: agreement with a
+    reference of one's own is evidence about consistency, never about
+    correctness, and the only reference that settles a format question is the
+    one that already ships. Found on the CPU, by reading the checkpoint.
