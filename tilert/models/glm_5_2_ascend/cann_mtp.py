@@ -134,7 +134,21 @@ class CannMtp:
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            self.model = self._load_model()
+            if self.config.model_config.hf_config.num_hidden_layers < LAYER:
+                # A truncated backbone's MTP layer index is its own depth,
+                # where the checkpoint's is 78, so the completeness check
+                # cannot be satisfied. It is checked here rather than in
+                # `cann_model`, because the draft model loads in this object
+                # and a ContextVar set around the target's load does not reach
+                # it.
+                from vllm.model_executor.model_loader.mtp_validation import (
+                    disable_mtp_completeness_check,
+                )
+
+                with disable_mtp_completeness_check():
+                    self.model = self._load_model()
+            else:
+                self.model = self._load_model()
             self._bind_cache()
             CannModel._allocate_inputs(self)
 
