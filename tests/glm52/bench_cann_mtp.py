@@ -470,12 +470,17 @@ def run(args, report):
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
         lookup_prompt = None
-        if args.lookup:
+        # A drafter choice implies the host-drafted path. `--automaton` and
+        # `--tree` select which drafter; without this they selected one and
+        # left the MTP engine running, so an arm named for a drafter measured
+        # the engine instead.
+        if args.lookup or args.automaton or args.tree:
             manifest = json.loads(
                 (Path(args.capture_case) / "manifest.json").read_text()
             )
             lookup_prompt = manifest["prompt_token_ids"]
-            report["drafter"] = "automaton" if args.automaton else "lookup"
+            report["drafter"] = ("tree" if args.tree else
+                             "automaton" if args.automaton else "lookup")
             report["lookup_prompt_tokens"] = len(lookup_prompt)
         engine = MeasuredRank(
             target, draft, channel.group, lookup_prompt,
