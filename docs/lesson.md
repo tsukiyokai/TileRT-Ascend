@@ -1607,3 +1607,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      `compiled_graph_warmup.rounds[0].elapsed_ns` is 84 to 91 seconds, the
      warmup round carrying compilation and capture, sitting where a reader
      looking for a round time would find it first.
+
+158. Sixteen-rank collectives at decode sizes are pure latency, and they are
+     the missing 374 us a layer. Measured on sixteen ranks with almost no
+     memory: all_reduce 289.62 us at 12 KB and 306.08 at 576 KB, all_gather
+     332.53 and 423.56, reduce_scatter 292.96 and 268.72 -- flat to five
+     percent over a 48x payload range. The engine fits 588 us a layer where the
+     same operators replay in 214 with no collective, a difference of 374, and
+     one all_reduce plus one all_gather is 575. So the unattributed four fifths
+     has a name. It rules out narrowing the draft, the width, or any message:
+     the cost does not follow the bytes. It leaves fewer calls or overlap. And
+     the port collision that blocked three attempts is worth keeping --
+     `HCCL_IF_BASE_PORT` does not move the NPU socket port, which the tenant
+     holds at 16666; `HCCL_NPU_SOCKET_PORT_RANGE=27000-27200` does, so
+     sixteen-rank collective work runs on a memory-held machine.
