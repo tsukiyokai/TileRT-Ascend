@@ -234,13 +234,15 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
-        narrow_bank=False, aiv_collectives=True,
+        narrow_bank=False, aiv_collectives=True, rope_graph=False,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
         _choose_collective_engine(aiv_collectives)
+        self.rope_graph = rope_graph
+        self._rope_graphs = {}
         if capacity < 128:
             raise ValueError("Capacity must be at least one 128-token page")
         if int(os.environ.get("WORLD_SIZE", "16")) != 16:
@@ -644,10 +646,24 @@ class CannModel:
         Nothing else the metadata holds depends on the round: every other
         field is either a view of a buffer the caller refreshes by H2D copy
         or is invariant for the captured width.
+
+        The refresh itself is 530 eager `copy_` calls a round -- one pair a
+        speculative builder's private RoPE storage -- so it is captured when
+        asked, which leaves the work and removes the dispatch.
         """
         hoisted = self._hoisted.get(width)
-        if hoisted is not None:
+        if hoisted is None:
+            return
+        if not self.rope_graph:
             refresh_rope(positions, width, hoisted[2])
+            return
+        captured = self._rope_graphs.get(width)
+        if captured is None:
+            from .rope_graph import RopeGraph
+
+            captured = RopeGraph(positions, width, hoisted[2])
+            self._rope_graphs[width] = captured
+        captured.refresh()
 
     def enable_graph(self, width=1):
         """Capture one query width; other widths retain eager execution."""

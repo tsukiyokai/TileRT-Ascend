@@ -203,6 +203,9 @@ def arguments():
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0,1]")
     return args
+    parser.add_argument("--rope-graph", action="store_true",
+                        help="capture the per-round rope refresh, which runs "
+                             "530 eager copies outside the model's graph")
     parser.add_argument("--round-phases", action="store_true",
                         help="time each step of a round on the host")
     parser.add_argument("--ai-cpu-collectives", action="store_true",
@@ -446,6 +449,7 @@ def run(args, report):
                        routed_kernel=args.routed_kernel,
                        narrow_bank=args.narrow_bank,
                        aiv_collectives=not args.ai_cpu_collectives,
+                       rope_graph=args.rope_graph,
                        mtp_tokens=args.mtp_tokens, layers=args.layers,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
