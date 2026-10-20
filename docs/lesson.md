@@ -1917,3 +1917,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      2.72 ms came from dividing only the collective term. The target needs the
      reduce count halved and the compute at the engine's fused figure and the
      drafting at its ceiling, together.
+
+183. A source pointer loses to suffix matching, which closes the fourth route
+     to the oracle's advantage. Twelve streams at width 16: lookup 3.148,
+     pointer 1.867, and the pointer re-matched 273 times against 118 advances
+     -- it breaks more than twice as often as it survives, so continuity is not
+     what this workload offers. With the root fallback, length-ranking and
+     several candidates at once, four independent routes now end at the same
+     wall: the oracle knows the answer. And the first run read 1.000 with zero
+     pointers formed, because the index kept one position a key and the query
+     rejected the context's own tail with nowhere to fall back to -- second time
+     today a broken index read exactly like a failed mechanism.

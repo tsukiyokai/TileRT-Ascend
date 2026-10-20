@@ -43,3 +43,34 @@ found nothing and acceptance read 1.724 to 1.782 -- which would have been
 reported as the mechanism failing. Indexing every length from 2 to `tail` moved
 it to 2.807 to 3.280. The mechanism still loses, and for a reason the broken
 version could not have shown.
+
+## A source pointer loses too, and says why
+
+Part of the oracle's advantage could be continuity rather than foresight: once
+a copy run starts, the source position is known and advancing it needs no
+decision, where a suffix automaton re-decides every round and can jump to a
+different occurrence. Twelve streams, width 16:
+
+    lookup    mean 3.148   min 1.561   max 3.821
+    pointer   mean 1.867   min 1.128   max 2.151
+    the pointer advanced 118 times and re-matched 273
+    the pointer beats lookup on 0 of 12
+
+The counts explain the loss. The pointer breaks more than twice as often as it
+survives -- 273 re-matches against 118 advances -- so continuity is not what
+this workload offers. What the target accepts diverges from the source
+constantly, and each rebuild takes the latest occurrence of a fixed eight-token
+tail, which is weaker than the multi-length backoff lookup already does.
+
+So the oracle's advantage is not continuity either. Four independent routes now
+end at the same wall -- the root fallback, length-ranking, several candidates at
+once, and a source pointer -- and all four say the same thing: it knows the
+answer.
+
+## The index bug, again worth recording
+
+The first run read 1.000 accepted with zero pointers ever formed. `_index` kept
+one position a key, so the context's own tail was stored there and the query
+rejected it as not earlier than itself, with nowhere to fall back to. Indexing
+every occurrence moved it to 1.867. Second time today that a broken index read
+exactly like a failed mechanism.
