@@ -305,3 +305,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     offset was named without a guess. The sanitizer did the same for two
     earlier defects, each fix halving the deviating count, which is how a real
     defect behaves.
+
+45. `PipeBarrier` is the single-pipe primitive and `PIPE_ALL` is not a
+    stronger version of it. It is absent from the headers' own
+    `SUPPORTED_PIPE`, the Ascend checker flags it `AKA3001`, and crossing
+    pipes is what `SetFlag`/`WaitFlag` are for. Every kernel in this
+    repository leaned on it -- 66 sites across ten -- and the ones that pass
+    do so on behaviour nobody specified, which is the class of defect a
+    published repro saw vanish on a driver upgrade rather than on a fix. Name
+    the hazard: `MTE2_V` after a load, `V_MTE3` before a store, `MTE3_V`
+    before overwriting what a store is reading. And on the cube half of a
+    `__mix__` kernel a vector-event `WaitFlag` compiles to nothing while its
+    `SetFlag` still fires, so a helper that names a `HardEvent` must only be
+    called from the half that owns it.

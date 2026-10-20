@@ -4,7 +4,8 @@
 #include <cstdint>
 
 void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
-                        void* rows, void* stacked, void* gate_up,
+                        void* rows, void* stacked, void* stacked_low,
+                        void* gate_up,
                         float* gu_bias, float* gu_scale, void* down,
                         float* down_bias, float* down_scale,
                         float* token_scale, void* partial, void* middle,

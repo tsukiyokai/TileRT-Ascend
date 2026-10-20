@@ -188,9 +188,28 @@ Four things we did not have before, all from this one page:
 
 Repository: `https://gitcode.com/cann/ops-transformer` (CANN Open Software License Agreement
 Version 2.0; headers carry `Copyright (c) 2025 Huawei Technologies Co., Ltd.`)
-Read from a local clone of that remote at commit `d6aaa9fe52300b2fc7138742eb71ba265000196b`
-(2026-10-19). A second clone at `e027a008be2766fa5cb6198bebbc7b9dcc08310b` (2026-09-01) carries
-the same files byte-for-byte for the paths quoted here.
+Read from a local snapshot at `d6aaa9fe52300b2fc7138742eb71ba265000196b` (2026-10-19). Every
+quote below was then re-verified line by line against a second clone whose `origin` is literally
+`https://gitcode.com/cann/ops-transformer.git`, at `e027a008be2766fa5cb6198bebbc7b9dcc08310b`
+(2026-09-01, 【bug修复】aclnnRainFusionAttentionGetWorkspaceSize 入参传递错误修复). The two are
+*not* byte-identical — the newer snapshot has been reformatted (`T *p` → `T* p`, macro
+continuation backslashes realigned) and a few lines moved — but every constant, type, instruction
+and comment quoted in §2-§4 is present verbatim in the gitcode-origin clone, at the line numbers
+checked below. `git ls-remote https://gitcode.com/cann/ops-transformer.git` answers from this
+machine (branches `8.5.0`, `8.5.0-beta.1`, `9.0.0`, ...), so the material is public; the
+`gitcode.com/.../raw/master/...` URL form, however, serves a JavaScript shell rather than file
+content to a fetcher, so quote from a clone, not a fetch.
+
+Verified line numbers in the gitcode-origin clone, for anyone re-checking:
+`..._msd_post.h:24` (`DEFAULT_MUL_SCALE`), `:122` (`// 2. high_4bit * 16 + low_4bit`), `:124-128`
+(the `Muls`/`Add`); `..._msd_mid.h:187` (`* 2; // 2: int8 has been split in 2 int4`), `:228`
+(`// 8, 256, 512 --> 514us`); `..._msd_pre.h:88` (the 7B UB budget), `:144` (`0x0F0F`), `:148`
+(`ONE_SIXTEENTH`), `:174` (`CAST_FLOOR`), `:194-195` (`MINUS_EIGHT`);
+`grouped_matmul_antiquant_a8w4_msd.h:120` (`// for 8 * weight`), `:368-369`, `:456`
+(`RIGHT_MOVE`), `:546`, `:569`; `grouped_matmul_antiquant_a8w4_msd_pre.h:126`, `:130`, `:179`,
+`:192` (`// shrink 0~15 to -8~7`); `docs/aclnnGroupedMatmulV4.md:570`, `:659`;
+`grouped_matmul_swiglu_quant_v2/docs/aclnnGroupedMatmulSwigluQuantV2.md:131`, `:135`, `:142`,
+`:147`, `:153`. `grouped_matmul_swiglu_quant.cpp` is identical up to whitespace in both.
 
 Paths, verbatim:
 
@@ -1334,3 +1353,583 @@ From `aclnnGroupedMatmulV5.md`, the `tuningConfigOptional` triple is spelled out
   `K >= 2048 && N >= 2048`. Our GLM-5.2 expert shapes are in that range.
 - **`aclnnGroupedMatmulV4默认确定性实现`** — determinism is claimed by default, which matters when
   we A/B our kernel against it.
+
+---
+
+## 5. The non-grouped W4A8 — `ops-nn/matmul/quant_batch_matmul_v4` and `aclnnQuantMatmulV5`
+
+Repository: `https://gitcode.com/cann/ops-nn`, local clone at commit
+`af66e479728bed0889c32b25c66afa4ece44a460` (2026-06-26).
+
+```
+matmul/quant_batch_matmul_v4/op_kernel/quant_batch_matmul_v4_msd.h
+matmul/quant_batch_matmul_v4/op_host/op_tiling/quant_batch_matmul_v4_msd_tiling.{h,cpp}
+matmul/quant_batch_matmul_v4/op_kernel/quant_batch_matmul_v4_tiling_key.h
+matmul/quant_batch_matmul_v4/docs/aclnnQuantMatmulV5.md
+matmul/quant_batch_matmul_v4/tests/ut/op_host/test_quant_batch_matmul_v4_a8w4_tiling.cpp
+matmul/convert_weight_to_int4_pack/docs/aclnnConvertWeightToINT4Pack.md
+```
+
+This matters because **not all our W4A8 GEMMs are MoE**. The attention and dense projections need a
+plain, non-grouped W4A8 matmul, and CANN ships MSD for that too, under a different parameter name.
+
+### 5.1 `quant_batch_matmul_v4_msd.h` — identical split, M doubled, `half` again
+
+```cpp
+constexpr uint32_t CONST_2 = 2;
+constexpr uint32_t UB_BLOCK_SIZE = 32;
+constexpr uint32_t INT4_SIZE = 2; // sizeof(int4)的倒数
+...
+constexpr uint32_t AND_ONE_REPEAT_LENGTH = 128; // and operation max length
+constexpr uint32_t DOUBLE_ROWS = 2; // in8 to in4, one rows will change two rows
+```
+
+```cpp
+    Duplicate(xLowI16Tensor_, static_cast<int16_t>(0x0F0F),AND_ONE_REPEAT_LENGTH);
+    const half OneEight = static_cast<half>(0.0625);
+    const uint32_t halfKSize = kSize_ / DOUBLE_ROWS;
+    ...
+    const half MINUS_EIGHT = static_cast<half>(-8);
+    for(uint32_t xLoop = coreIdx_; xLoop < mSize_; xLoop += blockDim_) {
+        uint64_t offset = xLoop * kSize_;
+        DataCopyGmToUb(xTensor_, xGlobal_[offset]);
+        Cast(xHighHalfTensor_, xTensor_, AscendC::RoundMode::CAST_NONE, kSize_);
+        Muls(xHighHalfTensor2_, xHighHalfTensor_, OneEight, kSize_);
+        Cast(xHighI4Tensor_, xHighHalfTensor2_, AscendC::RoundMode::CAST_FLOOR, kSize_);
+        DataCopyUbToGm(yGlobal_[offset], xHighI4Tensor_.ReinterpretCast<int8_t>());
+            And(xLowHalfTensor_.ReinterpretCast<int16_t>(), xTensor_.ReinterpretCast<int16_t>(), xLowI16Tensor_, AND_ONE_REPEAT_LENGTH, repeatTimes, {1,1,1,8,8,0});
+        ...
+        Cast(xLowHalfTensor2_.ReinterpretCast<half>(), xLowHalfTensor_.ReinterpretCast<int8_t>(), AscendC::RoundMode::CAST_NONE, kSize_);
+        Adds(xLowHalfTensor_, xLowHalfTensor2_, MINUS_EIGHT, kSize_);
+        Cast(xLowI4Tensor_, xLowHalfTensor_.ReinterpretCast<half>(), AscendC::RoundMode::CAST_NONE, kSize_);
+        DataCopyUbToGm(yGlobal_[offset + halfKSize], xLowI4Tensor_.ReinterpretCast<int8_t>());
+```
+
+Bit-for-bit the same split as §2.1 and §3.3, same `0x0F0F`, same `0.0625`, same `-8`, same
+adjacent-write layout. The M doubling:
+
+```cpp
+        uint32_t curSingleM = baseM_;
+        if (mIdx == blockDimM_ - 1) {
+            curSingleM = mSize_ * 2 - mIdx * baseM_;
+        }
+```
+
+and the recombine, with the comment that states the layout outright:
+
+```cpp
+    uint32_t computeSize = curVecBaseM * alignBaseN;
+    LocalTensor<half> mmOutInUb = vecInQueue_.DeQue<half>();
+    uint32_t castSize= computeSize + ops::CeilDiv(computeSize, HALF_ALIGN)*HALF_ALIGN;
+    Cast(buffer1_, mmOutInUb, RoundMode::CAST_NONE, castSize);  // 2: in pre process, x has been splited to [2m,n]
+    PipeBarrier<PIPE_V>();
+    vecInQueue_.FreeTensor(mmOutInUb);
+    const float RIGHT_MOVE = 16.0f;         // right move int4 to int8
+    Muls(buffer2_, buffer1_, RIGHT_MOVE, computeSize);
+    PipeBarrier<PIPE_V>();
+    uint32_t addStartAddr = ops::CeilDiv(computeSize, HALF_ALIGN)*HALF_ALIGN;
+    Add(buffer3_, buffer1_[addStartAddr], buffer2_, computeSize);
+    PipeBarrier<PIPE_V>();
+    uint32_t loop = alignBaseN / 64; // 256B为64个float，alignBaseN需约束为64倍数
+    uint8_t blkStride = static_cast<uint8_t>(alignBaseN * sizeof(float) / 32);  //32: 单位32B
+    BinaryRepeatParams param(1, 1, 1, blkStride, blkStride, 0);
+    uint64_t mask = 64;     // float is 32 bit, mask continous mode [1,64], set all params involved in the computation
+    for (uint32_t i = 0; i < loop; i++) {
+        uint32_t offset = i * 64; // 每次64个元素
+        Add(buffer2_[offset], buffer3_[offset], yOffsetInUb_[offset], mask, curVecBaseM, param);
+    }
+```
+
+`// 2: in pre process, x has been splited to [2m,n]` — the layout is `[2m, n]`, in CANN's own
+words. And the correction vector here is `yOffsetInUb_`, loaded from the operator's **`y_offset`**
+argument (`GM_ADDR y_offset` in `Init`) — a third name for the same `8*sum(w)` quantity, after
+`weightAssistMatrix` (§2/§4) and `bias` (§3).
+
+The cube/vector handshake is a credit window, which is directly relevant to our flag budget:
+
+```cpp
+        if (cubeCount >= tilingData_->parallNum) {
+            CrossCoreWaitFlag(SYNC_AIV_TO_AIC);
+        }
+        ...
+        CrossCoreSetFlag<2, PIPE_FIX>(SYNC_AIC_TO_AIV);
+```
+
+and the per-quant-group loop with `enAtomic` and `enSequentialWrite` both set:
+
+```cpp
+        if constexpr (quantType == QuantType::K_C) {
+            mmObj_.SetSingleShape(curSingleM, curSingleN, kSize_);
+            mmObj_.SetTensorA(x1Global_[x1Offset]);
+            auto weightSlice = x2Global_[x2Offset];
+            if (blockDimM_ == 1) {
+                weightSlice.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+            }
+            mmObj_.SetTensorB(weightSlice, bTrans);
+            mmObj_.SetQuantVector(x2ScaleGlobal_[nIdx * baseN_]);
+            mmObj_.Iterate();
+            mmObj_.GetTensorC(mmOutGlobal_[workSpaceOffset], 0, true);
+        } else {
+            mmObj_.SetSingleShape(curSingleM, curSingleN, groupSize_);
+            GlobalTensor<wType> weightSlice;
+            for (uint32_t loopK = 0; loopK < groupNum_; loopK++) {
+                mmObj_.SetTensorA(x1Global_[x1Offset + static_cast<uint64_t>(loopK) * groupSize_]);
+                auto weightSlice = x2Global_[x2Offset + static_cast<uint64_t>(loopK) * groupSize_ * nSize_];
+                ...
+                mmObj_.SetQuantVector(x2ScaleGlobal_[static_cast<uint64_t>(loopK) * nSize_ + x2Offset]);
+                mmObj_.Iterate();
+                mmObj_.GetTensorC(mmOutGlobal_[workSpaceOffset], loopK == 0 ? 0 : 1, true);
+            }
+        }
+```
+
+with `GlobalTensor<half> mmOutGlobal_;` — `half` once more.
+
+### 5.2 `aclnnQuantMatmulV5.md` — the published formula and the `yOffset` spec
+
+Verbatim, from the 「K-G量化模式」 formula block under 「Atlas A2 ... Atlas A3 训练系列产品/
+Atlas A3 推理系列产品」:
+
+> - x1为INT8，x2为INT32，x1Scale为FLOAT32，x2Scale为UINT64/INT64，yOffset为FLOAT32：
+>
+>   $$ out = ((x1 @ (x2*x2Scale)) + yOffset) * x1Scale $$
+>
+> - x1，x2为INT4，x1Scale，x2Scale为FLOAT32，x2Offset为FLOAT16，out为FLOAT16/BFLOAT16（pertoken-pergroup非对称量化）：
+>
+>   $$ out = x1Scale * x2Scale * (x1 @ x2 - x1 @ x2Offset) $$
+
+The `yOffset` constraint, from 「T-C && T-T && K-C && K-T量化场景约束」:
+
+> - yOffset的约束：shape支持1维（n）。为计算过程中离线计算的辅助结果，值要求为8\*x2\*x2Scale，并在第1维累加。
+
+The dtype table for the W4A8 row (K-C && K-T), verbatim, with the A8W8 rows for contrast:
+
+> | x1 | x2 | x1Scale | x2Scale | x2Offset | yScale | bias | yOffset | out |
+> | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+> | INT8 | INT32 | FLOAT32 | UINT64/INT64 | null | null | null | FLOAT32 | FLOAT16/BFLOAT16 |
+> | INT8 | INT8 | null | UINT64/INT64 | null | null | null/INT32 | null | FLOAT16 |
+> | INT8 | INT8 | null | UINT64/INT64 | null/FLOAT32| null | null/INT32 | null | INT8 |
+> | INT8 | INT8 | null/FLOAT32| FLOAT32/BFLOAT16| null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
+> | INT8 | INT8 | FLOAT32 | FLOAT32 | null | null | null/INT32/FLOAT16/FLOAT32 | null | FLOAT16 |
+> | INT4/INT32 | INT4/INT32 | null | UINT64/INT64 | null | null | null/INT32 | null | FLOAT16 |
+> | INT8 | INT8 | null | FLOAT32/BFLOAT16| null | null | null/INT32 | null | INT32 |
+> | INT8 | INT8 | FLOAT32 | FLOAT32 | null | null | FLOAT32 | null | BFLOAT16 |
+> | INT4/INT32 | INT4/INT32 | FLOAT32 | FLOAT32/BFLOAT16| null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
+> | INT4/INT32 | INT4/INT32 | FLOAT32 | FLOAT32 | null | null | null/INT32/FLOAT16/FLOAT32 | null | FLOAT16 |
+
+And the K-G shape table:
+
+> |量化类型| x1数据类型 | x2数据类型 | x1Scale数据类型| x2Scale数据类型| x1 shape | x2 shape| x1Scale shape| x2Scale shape|x2Offset shape| yOffset shape| [gsM，gsN，gsK]|
+> | ----- | --- | --- | --- | --- | --- | --- | --- | --- |--- | --- | --- |
+> | K-G量化 | INT8 |INT32 |FLOAT32 |UINT64/INT64 |(m, k) |(k, ceil(n / 8))|(m, 1)|(ceil(k / 256), n)|null| (n) | [0, 0, 256]|
+> | K-G量化 | INT4 |INT4 |FLOAT32 |FLOAT32 |(m, k)|(n, k)|(m, 1)|(ceil(k / 256), n)|(ceil(k / 256), n)| null | [0, 0, 256]|
+
+> - x1的约束：
+>   - 当数据类型为INT8时，k需与256对齐，并小于29576。transposeX1为false。
+>   - 当数据类型为INT4时，k需与1024对齐。transposeX1为false。
+
+> - x2的约束：
+>   - 数据类型为INT32时，每个INT32数据存放8个INT4数据，
+>      - 当前仅支持2维ND格式。
+>      - transposeX2为true时维度为：（n，ceil(k / 8)），要求k为8的倍数。
+>      - transposeX2为false时维度为：（k，ceil(n / 8)），要求n为8的倍数。
+>      - 可使用aclnnConvertWeightToINT4Pack接口完成x2从INT32（1个int32在0~3bit位存储1个int4）到INT32（1个int32存储8个int4）或INT4（1个int4表示1个int4）的数据格式转换，具体参见[aclnnConvertWeightToINT4Pack接口](../../convert_weight_to_int4_pack/docs/aclnnConvertWeightToINT4Pack.md)。
+
+### Relevance
+
+- **There is a non-grouped W4A8 MSD, and its correction vector is called `yOffset`**, shape `(n)`,
+  fp32, `8*x2*x2Scale` reduced over dim 1. Three names for one quantity across three operators
+  (`weightAssistMatrix`, `bias`, `yOffset`); the quantity is ours.
+- **The W4A8 path on a plain matmul is `x1 = INT8, x2 = INT32` (8 int4 per int32), K-G quant,
+  `gsK = 256`, `k % 256 == 0`, `k < 29576`, `x1Scale` shape `(m, 1)`,
+  `x2Scale` shape `(ceil(k/256), n)`.** Note `x2Scale` is `(K_group, N)` — K-major, not N-major.
+- **`// 2: in pre process, x has been splited to [2m,n]`** is the clearest statement of the layout
+  in any CANN source. Our M-stacking matches.
+- **Not one row of the table gives an INT32 `out` with an INT4 operand.** INT32 out exists only
+  for `INT8 x INT8`. Combined with §3.2's `biasT = int32_t` on the int4 path — an int32 bias is
+  added *inside* the cube for int4 operands, so the L0C accumulator is demonstrably int32 — this
+  narrows §2.4's open question precisely: the accumulator is int32, and what no public CANN code
+  does is *emit* it as int32 from Fixpipe when the operands are int4. That is a one-afternoon
+  experiment for us, not an assumption.
+- **`aclnnConvertWeightToINT4Pack`** is the supported way to get from one-int4-per-int32 to
+  eight-int4-per-int32 or to native INT4 — relevant to our weight loader.
+
+---
+
+## 6. CANN has a *second*, different thing also called MSD — `WeightQuantBatchMatmulV2`
+
+Repository: `https://gitcode.com/cann/ops-nn`, same clone as §5.
+
+```
+matmul/weight_quant_batch_matmul_v2/op_kernel/weight_quant_batch_matmul_v2_msd_multicore.h
+matmul/weight_quant_batch_matmul_v2/op_kernel/weight_quant_batch_matmul_v2_msd_group.h
+matmul/weight_quant_batch_matmul_v2/op_kernel/weight_quant_batch_matmul_v2_msd_split_k.h
+matmul/weight_quant_batch_matmul_v2/op_host/op_tiling/weight_quant_batch_matmul_v2_tiling_msd_group.cpp
+matmul/weight_quant_batch_matmul_v2/op_host/op_tiling/weight_quant_batch_matmul_v2_compute_matmul_tiling.cpp
+```
+
+This one is **A16W8**, and it decomposes a *float* activation into two int8 digits with radix
+~127.5. It is the decomposition that the acronym "multiple significant digit" actually describes.
+It is not the A8W4 scheme, and conflating them will send you to the wrong source.
+
+```cpp
+namespace WeightQuantBatchMatmulV2Msd {
+static constexpr int32_t SYNC_VECTOR_CUBE_FLAG = 1;
+static constexpr int32_t SYNC_CUBE_VECTOR_FLAG = 2;
+static constexpr float EXPAND_FACTOR_1 = 127.499;
+static constexpr float EXPAND_FACTOR_2 = 127.499 * 127.499 * 2;
+```
+
+The split, verbatim — row max, first digit, residual, second digit:
+
+```cpp
+        DivMC(xF32, xF32, xMax, baseM, kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        Muls(xAbs, xF32, EXPAND_FACTOR_1, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        Cast(xAbs, xAbs, RoundMode::CAST_ROUND, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        auto a12F16 = a12F16_.Get<half>();
+        Cast(a12F16, xAbs, RoundMode::CAST_NONE, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        auto a1S8 = outQueA1A2_.AllocTensor<int8_t>();
+        Cast(a1S8, a12F16, RoundMode::CAST_NONE, baseM * kSizeAligned);
+        ...
+        DataCopyPad(workspaceXS8Global_[(singleM * curBlockIdx_ + offsetM) * kSize_], a1S8, aOutParams);
+        outQueA1A2_.FreeTensor(a1S8);
+
+        Muls(xAbs, xAbs, static_cast<float>(1 / EXPAND_FACTOR_1), baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        if constexpr (precisionType == PrecisionType::HIGH_PRECISION) {
+            RowSumInplace(xSum, xAbs, baseM, kSizeAligned);
+            PipeBarrier<PIPE_V>();
+            // RowSumInplace 会修改 xAbs, 需要恢复数据
+            Muls(xAbs, xF32, EXPAND_FACTOR_1, baseM * kSizeAligned);
+            PipeBarrier<PIPE_V>();
+            Cast(xAbs, xAbs, RoundMode::CAST_ROUND, baseM * kSizeAligned);
+            PipeBarrier<PIPE_V>();
+            Muls(xAbs, xAbs, static_cast<float>(1 / EXPAND_FACTOR_1), baseM * kSizeAligned);
+            PipeBarrier<PIPE_V>();
+        }
+        Sub(xAbs, xF32, xAbs, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        Muls(xAbs, xAbs, EXPAND_FACTOR_2, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        Cast(xAbs, xAbs, RoundMode::CAST_ROUND, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        Cast(a12F16, xAbs, RoundMode::CAST_NONE, baseM * kSizeAligned);
+        PipeBarrier<PIPE_V>();
+        auto a2S8 = outQueA1A2_.AllocTensor<int8_t>();
+        Cast(a2S8, a12F16, RoundMode::CAST_NONE, baseM * kSizeAligned);
+```
+
+i.e. `a1 = round(x/xMax * 127.499)`, `a2 = round((x/xMax - a1/127.499) * 127.499²*2)`, so
+`x ≈ xMax * (a1/127.499 + a2/(127.499²·2))`. A two-digit radix-127.5 fixed-point representation,
+exactly analogous to MSD-A8W4's two-digit radix-16 representation of an int8.
+
+### 6.1 The decisive precision contrast — this MSD keeps `int32` out of the cube
+
+```cpp
+    using InputXType = MatmulType<TPosition::GM, CubeFormat::ND, int8_t, aTrans>;
+    using InputWType = MatmulType<TPosition::GM, weightFormat, int8_t, bTrans>;
+    using OutputYType = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
+    using InputBiasType = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
+    MatmulImpl<InputXType, InputWType, OutputYType, InputBiasType, CFG_MDL> mmObj;
+```
+
+```cpp
+    GlobalTensor<int8_t> workspaceXS8Global_;
+    GlobalTensor<int32_t> workspaceCS32Global_;
+```
+
+```cpp
+    LocalTensor<int32_t> tnsC1S32_;
+    LocalTensor<int32_t> tnsC2S32_;
+```
+
+and the recombination, from `int32` partials upward:
+
+```cpp
+            tnsC1S32_ = inQueC1_.AllocTensor<int32_t>();
+            DataCopyPad2D(tnsC1S32_, workspaceCS32Global_[offsetGm], curBaseM, curCubeSingleCoreN, n);
+            inQueC1_.EnQue(tnsC1S32_);
+            inQueC1_.DeQue<int32_t>();
+            Cast(tnsC1F32_, tnsC1S32_, RoundMode::CAST_NONE, curBaseM * cubeSingleCoreNAligned);
+            ...
+            tnsC2S32_ = inQueC2_.AllocTensor<int32_t>();
+            DataCopyPad2D(tnsC2S32_, workspaceCS32Global_[m * n + offsetGm], curBaseM, curCubeSingleCoreN, n);
+            inQueC2_.EnQue(tnsC2S32_);
+            inQueC2_.DeQue<int32_t>();
+            Cast(tnsC2F32_, tnsC2S32_, RoundMode::CAST_NONE, curBaseM * cubeSingleCoreNAligned);
+            PipeBarrier<PIPE_V>();
+            inQueC2_.FreeTensor(tnsC2S32_);
+            Muls(tnsC2F32_, tnsC2F32_, static_cast<float>(1 / EXPAND_FACTOR_2), curBaseM * cubeSingleCoreNAligned);
+            PipeBarrier<PIPE_V>();
+
+            Add(tnsC1F32_, tnsC1F32_, tnsC2F32_, curBaseM * cubeSingleCoreNAligned);
+            PipeBarrier<PIPE_V>();
+
+            // c * amax
+            MulMC(tnsC1F32_, tnsC1F32_, tnsMax_[offsetM * 8], curBaseM, cubeSingleCoreNAligned);
+            PipeBarrier<PIPE_V>();
+
+            if constexpr (hasAntiQuantOffset) {
+                // c * amax + offset
+                Add(tnsC1F32_, tnsAntiQuantOffsetMnF32_, tnsC1F32_, curBaseM * cubeSingleCoreNAligned);
+                PipeBarrier<PIPE_V>();
+            }
+
+            // (c * amax + offset) * scale
+            MulMV(tnsC1F32_, tnsC1F32_, tnsAntiQuantScaleF32_, curBaseM, cubeSingleCoreNAligned);
+            PipeBarrier<PIPE_V>();
+```
+
+Note also that this MSD stacks the two digits as **two separate `m*n` planes** in workspace
+(`workspaceCS32Global_[offsetGm]` and `workspaceCS32Global_[m * n + offsetGm]`), not interleaved —
+a third layout choice inside the same codebase.
+
+And one hard constraint, from the host tiling:
+
+```cpp
+bool WeightQuantBatchMatmulV2TilingMsdGroup::IsCapable()
+{
+    OP_LOGI(opName_, "Begin check msd group");
+    // MSD pergroup模板不支持确定性
+    if (context_->GetDeterministic() == 1) {
+        OP_LOGI(opName_, "MSD pergroup do not support deterministic");
+        return false;
+    }
+```
+
+```cpp
+        getTilingResult = MsdA16W8CommonTiling(matmulTiling, multiCoreResult, params, aicoreParams);
+        ...
+            "can not get tiling from SimpleIncreTiling/MsdA16W8CommonTiling. try to get tiling from cache tiling");
+...
+bool ComputeMatmulTiling::MsdA16W8CommonTiling(...)
+            "MsdA16W8CommonTiling only support b is transposed and b is ND, "
+...
+    // 计算MSD场景transLen，L1Size和L0CSize
+    CalcMsdBufferSize(matmulTiling, params);
+```
+
+### Relevance
+
+- **Two different decompositions in CANN share the acronym.** A16W8 MSD: float activation → two
+  int8 digits, radix 127.499, `int32` out of the cube. A8W4 MSD: int8 activation → two int4
+  nibbles, radix 16, `half` out of the cube. The second is ours. When searching, use `a8w4_msd`,
+  not `msd`, or you land in `weight_quant_batch_matmul_v2`.
+- **This is the strongest evidence for the §2.4 fix.** The sibling MSD operator, written by the
+  same team in the same source tree, does exactly what §2.4 proposes: `OutputYType = int32_t`,
+  per-digit `int32` planes in workspace, `Cast` to fp32, radix-multiply the high digit, `Add`,
+  then apply the scales. Our proposed int32 variant of A8W4-MSD is not novel — it is CANN's own
+  pattern, applied to the operator where they did not apply it. The one unproven step is int4
+  operands rather than int8 (see §5's Relevance).
+- **The two-separate-planes layout** (`workspaceCS32Global_[0]` and `[m*n]`) is the third of three
+  layouts CANN uses for the same "two partial products" problem. Combined with §3.4's interleave +
+  strided read, the design space is: interleaved-with-strided-read (A8W4, both operators),
+  two-planes (A16W8), blocked. We already chose M-stacking; the remaining choice is
+  interleave-vs-two-planes, and CANN's own A8W4 choice is interleave.
+- **`MSD pergroup do not support deterministic`** — CANN's own MSD pergroup template is excluded
+  when determinism is requested. If we need run-to-run bit-exactness (we do, for A/B testing), the
+  per-group atomic accumulation in §2.2 is the reason, and `quantGroupNum = 1` removes it.
+
+---
+
+## 7. "MSD" names at least four different decompositions in CANN — a taxonomy, so you search for the right one
+
+This section exists because the acronym cost us search time and will cost the next reader the
+same. All four are "split the activation into digits, matmul each digit against the quantized
+weight, recombine with a radix". They differ in the activation dtype, the radix, and — decisively
+for us — whether the cube output is `int32` or `half`.
+
+| # | Operator / file | activation in | digits | radix | cube out | expansion |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `grouped_matmul*/..._a8w4_msd*`, `quant_batch_matmul_v4_msd.h` | INT8 | 2 x int4 | **16** | `half` | 「Mixed-precision Split-activation Decomposition / 混合精度激活拆分分解」 (§1) |
+| 2 | `weight_quant_batch_matmul_v2_msd_*.h` (A16W8) | FP16/BF16 | 2 x int8 | **127.499**, then `127.499²·2` | `int32` | not expanded in source |
+| 3 | `grouped_matmul/op_kernel/a16w4_msd/` (A16W4) | FP16/BF16 | 2 x int8 | **127.0**, `254.0` | `int32` | not expanded in source |
+| 4 | `sparse_flash_attention_antiquant/..._gqa_msd.h` | FP16/BF16 | 2 x int8 | **127**, with `1024.0/127` and `1024.0` | `int32` | not expanded in source |
+
+**Row 1 is ours.** Rows 2-4 are a different mechanism that happens to share the acronym: they
+exist to avoid *dequantizing the weight* for a float activation, not to work around a missing
+mixed-width MAD. Searching for bare `msd` in the CANN trees lands you in rows 2-4, which is why
+the A8W4 scheme is hard to find.
+
+Evidence for row 3, verbatim from
+`gmm/grouped_matmul/op_kernel/a16w4_msd/grouped_matmul_weight_quant_a16w4_msd_vector_service.h`:
+
+```cpp
+    float multiFactors[2] = {127.0f, 254.0f};
+    ...
+    Muls<float, false>(aF32Tensor_, aF32TmpTensor_[defaultOffset], multiFactors, FP32_MAX_MASK_SIZE, mainRepeatK,
+```
+
+and from `..._a16w4_msd_cube_service.h`, the on-chip types — int8 L0A/L0B, **int32 L0C**, and an
+int32 bias table resident in BT:
+
+```cpp
+    LocalTensor<int8_t> s8l0a_;
+    LocalTensor<int8_t> s8l0b_;
+    ...
+    LocalTensor<int32_t> s32l0c_;
+    ...
+    LocalTensor<int32_t> datoBiasBT_;
+```
+
+```cpp
+    s8l0a_ = l0aBuffer.Get<int8_t>();
+    s8l0b_ = l0bBuffer.Get<int8_t>();
+    s32l0c_ = l0cTBuf.Get<int32_t>();
+    InitConstValueParams<int32_t> initDatoBiasParams;
+    ...
+    AscendC::InitConstValue(cFp16L1_.template ReinterpretCast<int32_t>()[1024], initDatoBiasParams);
+    ...
+    datoBiasBT_ = biasTableTBuf.Get<int32_t>();
+    DataCopy(datoBiasBT_, cFp16L1_.template ReinterpretCast<int32_t>()[1024], bias16InBTParams);
+```
+
+Evidence for row 4, verbatim from
+`experimental/attention/sparse_flash_attention_antiquant/op_kernel/sparse_flash_attention_antiquant_service_vector_gqa_msd.h`:
+
+```cpp
+    static constexpr T antiqCoeff1 = 127;
+    ...
+    static constexpr float scaleC1 = 1024.0 / 127;
+    static constexpr float scaleC2 = 1024.0;
+```
+
+```cpp
+    Muls(srcUb, srcUb, antiqCoeff1, calcSize); // 127 * A
+```
+
+### 7.1 arXiv 2605.13915 — "Multi-Scale Dequant", i.e. rows 2-4, not row 1
+
+URL: https://arxiv.org/abs/2605.13915 (PDF: https://arxiv.org/pdf/2605.13915)
+Title: "Multi-Scale Dequant: Eliminating Dequantization Bottleneck via Activation Decomposition
+for Efficient LLM Inference"
+Authors: Lingchao Zheng, Yuwei Fan, Jun Li, Chengqiu Hu, Qichen Liao, Junyi Fan, Rui Shi,
+Fangzheng Miao (no affiliations stated on the abstract page)
+Submitted: 13 May 2026 (history: "Wed, 13 May 2026 09:49:56 UTC (271 KB)")
+Subjects: primary stat.ML, also cs.AI, cs.LG
+
+Short quotes (the abstract page's full text was not reproducible at length through the fetcher):
+
+> presents Multi-Scale Dequant (MSD), a quantization framework
+
+> removes weight/KV dequantization from the GEMM critical path
+
+> decomposes high-precision BF16 activations into multiple low-precision components
+
+each multipliable
+
+> directly with quantized weights via native hardware-accelerated GEMM
+
+> two-pass INT8 decomposition achieves near 16 effective bits
+
+> two-pass MXFP4 decomposition yields near 6.6 effective bits with error bound 1/64 per block
+
+> surpassing single-pass MXFP8(5.24 bits)
+
+> architectures with decoupled compute units
+
+(the only hardware named is "Ascend NPUs"), and on accuracy:
+
+> does not degrade accuracy compared to dequantization baselines
+
+sometimes reaching
+
+> lower L2 error
+
+plus an efficiency claim that KV cache HBM traffic is reduced
+
+> by up to 2.5 times in attention
+
+**This is a paper about rows 2-4, not about row 1.** Its activation is BF16, its components are
+INT8 or MXFP4, and its stated purpose is removing weight/KV *dequantization* from the GEMM
+critical path. Our `16*high + low` is not reproducing this paper. The two are siblings — "split
+the activation, matmul the pieces, recombine" — but the arithmetic, the radix, the operand dtypes
+and the problem being solved are all different. The paper's "near 16 effective bits" for two-pass
+INT8 is the right way to read rows 2-4: two int8 digits buy you ~16 bits of activation precision.
+Row 1's two int4 nibbles buy you exactly 8 bits, because that is all an int8 had.
+
+The paper also does **not** report perplexity or benchmark accuracy — only L2 error against a
+dequantization baseline. There is no published accuracy number for the A8W4-MSD nibble split.
+
+### 7.2 Unsigned INT4 on Ascend: `uint4b_t` exists, and not on 2201
+
+Verified first-hand in the AscendC headers. `impl/basic_api/utils/kernel_utils_constants.h`,
+verbatim with its surrounding `#if`s:
+
+```cpp
+using int4b_t = integer_sub_type<INT4_BIT_NUM, true>;
+
+#if (__NPU_ARCH__ == 5102)
+using int2b_t = IntegerSubType<INT2_BIT_NUM, true>;
+using int1b_t = IntegerSubType<INT1_BIT_NUM, true>;
+using uint1b_t = IntegerSubType<INT1_BIT_NUM, false>;
+#endif
+
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113))
+using uint4b_t = IntegerSubType<INT4_BIT_NUM, false>;
+using uint3b_t = IntegerSubType<INT3_BIT_NUM, false>;
+using uint2b_t = IntegerSubType<INT2_BIT_NUM, false>;
+#endif
+```
+
+`int4b_t` is unconditional; `uint4b_t` is gated to `__NPU_ARCH__ == 3003 || 3113`. We are 2201, so
+**there is no unsigned int4 type for us** — the offset-fold is not one option among several, it is
+the only option. `uint4b_t` is nonetheless referenced in the tensor implementation, so the type is
+real where it is enabled: `impl/basic_api/kernel_tensor_impl.h`
+
+```cpp
+    } else if constexpr (IsSameType<PrimType, uint4b_t>::value) {
+        ...
+            KERNEL_LOG_INTERNAL(KERNEL_ERROR, "The offset for uint4b_t GetPhyAddr should be an even num."));
+```
+
+And `int4b_t`'s signedness is not nominal — the conversion operator sign-extends, which is exactly
+why `(x & 0x0F) - 8` is needed rather than storing `0..15` directly.
+`impl/utils/common_types.h`, verbatim:
+
+```cpp
+constexpr uint32_t INT4_BIT_NUM = 4;
+
+template <int bit_num, bool sign = true>
+struct integer_sub_type {
+    static int const k_bits = bit_num;
+    static bool const k_signed = sign;
+
+    using T = typename conditional<k_signed, int8_t, uint8_t>::type;
+    using Storage = uint8_t;
+
+    static Storage const mask = Storage(((static_cast<uint64_t>(1)) << static_cast<uint32_t>(k_bits)) - 1);
+    Storage storage;
+    ...
+    __aicore__ inline operator T() const
+    {
+        if (k_signed && ((storage & Storage(static_cast<uint64_t>(1) << static_cast<uint32_t>(k_bits - 1))) != 0)) {
+            // Sign extend
+            return T(storage) | ~T(mask);
+        }
+        return T(storage);
+    }
+```
+
+For the `Mmad`/`matmul_int4` side of this question — the both-operands-int4 rule, the
+「左矩阵A为int4数据类型时，不支持转置」 and 「int4数据类型输入的Matmul对象仅支持Norm、MDL、IBShare
+模板」 constraints, and C restricted to int32/half — see `ascend-fusion-mechanics.md` §42.8, which
+a parallel pass established from Huawei's own `matmul_int4` README. Not duplicated here.
+
+### Relevance
+
+- **Use `a8w4_msd` as the search key, never bare `msd`.** Four decompositions share the acronym;
+  three of them are the wrong one.
+- **arXiv 2605.13915 is not our scheme.** If someone cites it as "the MSD paper" for W4A8, that is
+  a category error. There is, as of 2026-10-20, no paper on the A8W4 nibble split.
+- **No unsigned int4 on 2201, confirmed from the header's own `#if`.** Our `8*sum(w)` fold is
+  forced, not chosen. The one thing to keep in mind is that `int4b_t`'s `operator T()`
+  sign-extends, so any host-side reference implementation must mask-then-subtract, not cast.
+- **The int32 pattern is the majority pattern.** Three of the four MSD families keep `int32` out of
+  the cube and apply scales in the vector unit; only the A8W4 one does not (§2.4). Row 3 even
+  keeps the int32 bias resident in the bias table (`datoBiasBT_`) rather than adding it in UB,
+  which is the natural place for our `8*sum(w)` if we take the int32 route.

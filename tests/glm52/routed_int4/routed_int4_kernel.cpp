@@ -44,7 +44,10 @@ constexpr int64_t SLACK = 64;
 constexpr int64_t BLOCK_FLOATS = 8;
 constexpr int64_t SCALE_SPAN = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
                                * BLOCK_FLOATS;
-constexpr int64_t TILE = 2048;
+#ifndef TILE_SPAN
+#define TILE_SPAN 2048
+#endif
+constexpr int64_t TILE = TILE_SPAN;
 constexpr float QUANTUM_SPAN = 127.0F;
 
 /** The address `elements` INT4 values along from `base`.
@@ -77,6 +80,41 @@ namespace {
 __aicore__ inline void Publish()
 {
     DataSyncBarrier<MemDsbT::DDR>();
+}
+
+/* `PipeBarrier` is the single-pipe primitive -- it orders instructions of the
+ * same pipe that carry a data dependency. Crossing pipes is what
+ * `SetFlag`/`WaitFlag` are for, so `PIPE_ALL` is not defined to cover a
+ * cross-pipe hazard: it is absent from the headers' own `SUPPORTED_PIPE` and
+ * the Ascend checker flags it as `AKA3001`. These three name the hazards this
+ * kernel actually has.
+ *
+ * All three name vector events, so they may only be called from the vector
+ * half: on the cube half of a `__mix__` kernel `WaitFlagImpl` guards those
+ * cases behind `#ifndef SPLIT_CORE_CUBE` and falls through to `break`, while
+ * `SetFlagImpl` has no such guard -- the flag would be raised and never
+ * consumed.
+ */
+
+/** Order a load into UB against the vector work that reads it. */
+__aicore__ inline void AfterLoad()
+{
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+}
+
+/** Order vector work against the store that carries it out. */
+__aicore__ inline void BeforeStore()
+{
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+}
+
+/** Order a store against the vector work that overwrites what it read. */
+__aicore__ inline void AfterStore()
+{
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
 }
 
 __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* tiling)
@@ -223,20 +261,33 @@ __aicore__ inline void Emit(LocalTensor<half>& staging,
     Cast(staging, source, RoundMode::CAST_RINT, span);
     PipeBarrier<PIPE_V>();
     Cast(packed, staging, RoundMode::CAST_RINT, span);
-    PipeBarrier<PIPE_ALL>();
+    BeforeStore();
     DataCopy(sink[at], packed, span);
-    PipeBarrier<PIPE_ALL>();
+    // The next call's cast writes this staging while this copy is reading
+    // it. `PipeBarrier<PIPE_ALL>` does not order a vector write against an
+    // outstanding MTE3 read: with it, two calls in a row through one staging
+    // pair gave the right halves on some runs and garbage on others, from the
+    // same binary. CANN's own `a8w4_msd_pre` uses these flags for exactly
+    // this pair.
+    AfterStore();
 }
 
 /** Stack one expert's rows as two INT4 halves. */
 __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
-                             __gm__ int4b_t* stacked, __gm__ int4b_t* witness)
+                             __gm__ int4b_t* stacked,
+                             __gm__ int4b_t* stacked_low,
+                             __gm__ int4b_t* witness)
 {
     GlobalTensor<int8_t> rows_global;
-    GlobalTensor<int4b_t> stacked_global;
+    GlobalTensor<int4b_t> high_global;
+    GlobalTensor<int4b_t> low_global;
     GlobalTensor<int4b_t> witness_global;
     rows_global.SetGlobalBuffer(rows, ROWS * HIDDEN);
-    stacked_global.SetGlobalBuffer(stacked, M_TILE * HIDDEN);
+    high_global.SetGlobalBuffer(stacked, ROWS * HIDDEN);
+    // The low region's base comes in already offset. Deriving it here with a
+    // cast produced a tensor whose writes never landed, while the identical
+    // write through a tensor built on a plain argument landed every time.
+    low_global.SetGlobalBuffer(stacked_low, ROWS * HIDDEN);
     witness_global.SetGlobalBuffer(witness, TILE);
 
     for (int64_t row = 0; row < ROWS; ++row) {
@@ -244,16 +295,16 @@ __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
             const int64_t count = (HIDDEN - done < TILE) ? HIDDEN - done
                                                          : TILE;
             DataCopy(held.narrow, rows_global[row * HIDDEN + done], count);
-            PipeBarrier<PIPE_ALL>();
+            AfterLoad();
             Cast(held.half_value, held.narrow, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
             Cast(held.value, held.half_value, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
             SplitHalves(held, count);
-            Emit(held.half_value, held.code, held.value, stacked_global,
+            Emit(held.half_value, held.code, held.value, high_global,
                  row * HIDDEN + done, count);
-            Emit(held.half_value, held.code, held.work, stacked_global,
-                 (ROWS + row) * HIDDEN + done, count);
+            Emit(held.half_value, held.code, held.work, low_global,
+                 row * HIDDEN + done, count);
             if (row == 0 && done == 0) {
                 Emit(held.half_value, held.code, held.work, witness_global, 0,
                      count);
@@ -286,19 +337,19 @@ __aicore__ inline void Combine(LocalTensor<float>& into,
                                int64_t high, int64_t low, int64_t span)
 {
     DataCopy(staging, product[high], span);
-    PipeBarrier<PIPE_ALL>();
+    AfterLoad();
     Cast(into, staging, RoundMode::CAST_NONE, span);
     PipeBarrier<PIPE_V>();
     Muls(into, into, 16.0F, span);
     PipeBarrier<PIPE_V>();
     DataCopy(staging, product[low], span);
-    PipeBarrier<PIPE_ALL>();
+    AfterLoad();
     Cast(spare, staging, RoundMode::CAST_NONE, span);
     PipeBarrier<PIPE_V>();
     Add(into, into, spare, span);
     PipeBarrier<PIPE_V>();
     DataCopy(spare, bias[at], span);
-    PipeBarrier<PIPE_ALL>();
+    AfterLoad();
     Add(into, into, spare, span);
     PipeBarrier<PIPE_V>();
 }
@@ -322,10 +373,12 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
     GlobalTensor<int32_t> product_global;
     GlobalTensor<float> scale_global;
     GlobalTensor<float> token_global;
-    GlobalTensor<int4b_t> middle_global;
+    GlobalTensor<int4b_t> middle_high;
+    GlobalTensor<int4b_t> middle_low;
     GlobalTensor<float> out_scale_global;
     GlobalTensor<float> bias_global;
-    middle_global.SetGlobalBuffer(middle, M_TILE * HALF);
+    middle_high.SetGlobalBuffer(middle, ROWS * HALF);
+    middle_low.SetGlobalBuffer(Nibbles(middle, ROWS * HALF), ROWS * HALF);
     bias_global.SetGlobalBuffer(gu_bias, GATE_UP);
     product_global.SetGlobalBuffer(product, M_TILE * GATE_UP);
     scale_global.SetGlobalBuffer(gu_scale, GATE_UP);
@@ -334,8 +387,7 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
 
     DataCopy(scale, scale_global, GATE_UP);
     DataCopy(token, token_global, SCALE_SPAN);
-    PipeBarrier<PIPE_ALL>();
-    DataSyncBarrier<MemDsbT::UB>();
+    AfterLoad();
 
     for (int64_t row = 0; row < ROWS; ++row) {
         Combine(held.value, held.work, product_global, staging, bias_global,
@@ -371,14 +423,14 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
         Cast(held.value, held.half_value, RoundMode::CAST_NONE, HALF);
         PipeBarrier<PIPE_V>();
         SplitHalves(held, HALF);
-        Emit(held.half_value, held.code, held.value, middle_global,
+        Emit(held.half_value, held.code, held.value, middle_high,
              row * HALF, HALF);
-        Emit(held.half_value, held.code, held.work, middle_global,
-             (ROWS + row) * HALF, HALF);
+        Emit(held.half_value, held.code, held.work, middle_low, row * HALF,
+             HALF);
         PipeBarrier<PIPE_ALL>();
         token.SetValue(row, quantum);
     }
-    PipeBarrier<PIPE_ALL>();
+    BeforeStore();
     // The scale leaves by MTE: a scalar store to global memory from a vector
     // core does not land.
     DataCopy(out_scale_global, token, SCALE_SPAN);
@@ -410,8 +462,7 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
     out_global.SetGlobalBuffer(out, ROWS * HIDDEN);
 
     DataCopy(row_scale, middle_global, SCALE_SPAN);
-    PipeBarrier<PIPE_ALL>();
-    DataSyncBarrier<MemDsbT::UB>();
+    AfterLoad();
 
     for (int64_t row = 0; row < ROWS; ++row) {
         const float of_row = row_scale.GetValue(row);
@@ -421,14 +472,15 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
                     bias_global, done, row * HIDDEN + done,
                     (ROWS + row) * HIDDEN + done, count);
             DataCopy(scale, scale_global[done], count);
-            PipeBarrier<PIPE_ALL>();
+            AfterLoad();
             Mul(held.value, held.value, scale, count);
             PipeBarrier<PIPE_V>();
             Muls(held.value, held.value, of_row, count);
             PipeBarrier<PIPE_V>();
             Cast(narrow, held.value, RoundMode::CAST_RINT, count);
-            PipeBarrier<PIPE_ALL>();
+            BeforeStore();
             DataCopy(out_global[row * HIDDEN + done], narrow, count);
+            AfterStore();
         }
     }
 }
@@ -438,7 +490,7 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
 extern "C" __global__ __mix__(1, 2) __schedmode__(1)
 __aicore__ void routed_int4_fused(
     uint64_t sync_base, __gm__ int8_t* rows, __gm__ int4b_t* stacked,
-    __gm__ int4b_t* gate_up, __gm__ float* gu_bias, __gm__ float* gu_scale,
+    __gm__ int4b_t* stacked_low, __gm__ int4b_t* gate_up, __gm__ float* gu_bias, __gm__ float* gu_scale,
     __gm__ int4b_t* down, __gm__ float* down_bias, __gm__ float* down_scale,
     __gm__ float* token_scale,
     __gm__ int32_t* partial, __gm__ int4b_t* middle,
@@ -493,7 +545,9 @@ __aicore__ void routed_int4_fused(
             // stays core-local.
             if (sub == 0) {
                 Split(held, rows + expert * ROWS * HIDDEN,
-                      Nibbles(stacked, expert * M_TILE * HIDDEN), witness);
+                      Nibbles(stacked, expert * M_TILE * HIDDEN),
+                      Nibbles(stacked_low, expert * M_TILE * HIDDEN),
+                      Nibbles(witness, expert * TILE));
                 Publish();
                 CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
             }
@@ -520,7 +574,8 @@ __aicore__ void routed_int4_fused(
 }
 
 void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
-                        void* rows, void* stacked, void* gate_up,
+                        void* rows, void* stacked, void* stacked_low,
+                        void* gate_up,
                         float* gu_bias, float* gu_scale, void* down,
                         float* down_bias, float* down_scale,
                         float* token_scale, void* partial, void* middle,
@@ -530,7 +585,7 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
-        (__gm__ int4b_t*)gate_up, gu_bias, gu_scale, (__gm__ int4b_t*)down,
+        (__gm__ int4b_t*)stacked_low, (__gm__ int4b_t*)gate_up, gu_bias, gu_scale, (__gm__ int4b_t*)down,
         down_bias, down_scale, token_scale, (__gm__ int32_t*)partial,
         (__gm__ int4b_t*)middle, middle_scale, (__gm__ int32_t*)wide,
         (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)gu_tiling,

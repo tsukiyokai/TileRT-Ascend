@@ -33,12 +33,14 @@ arch=${ARCH:---npu-arch=dav-2201}
 # Rows an expert is a build-time capacity: the cube is flat in rows, so
 # padding every expert to one may cost nothing and retire the group list.
 capacity=${CAPACITY:+-DROWS_PER_EXPERT=$CAPACITY}
+# How wide a tile every vector stage works on, hence the UB footprint.
+tile=${TILE:+-DTILE_SPAN=$TILE}
 host_incs="-I $H/tikcpp/tikcfw -I $H/tikcpp/tikcfw/lib -I $H/tikcpp/tikcfw/impl"
 host_incs="$host_incs -I $H/tikcpp/tikcfw/interface"
 host_incs="$host_incs -I /opt/ascend/cann-9.2.0/include -I $here"
 
 /opt/ascend/cann-9.2.0/bin/bisheng -xcce "$arch" \
-  -std=c++17 -O2 ${sanitize:-} ${debug:-} ${capacity:-} $device_incs \
+  -std=c++17 -O2 ${sanitize:-} ${debug:-} ${capacity:-} ${tile:-} $device_incs \
   -c "$here/routed_int4_kernel.cpp" \
   -o "$out/kernel.o" > "$out/kernel_build.log" 2>&1
 g++ -std=c++17 -O2 $host_incs -c "$here/routed_int4_tiling.cpp" \

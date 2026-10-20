@@ -40,6 +40,8 @@ constexpr int64_t BLOCK_FLOATS = 8;
 constexpr int64_t SCALE_STRIDE = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
                                  * BLOCK_FLOATS;
 constexpr size_t TILING_BYTES = 256;
+// One tile of INT4 a expert, which is how wide the kernel's stages work.
+constexpr int64_t TILE_BYTES = 1024;
 
 void Check(aclError status, const char* what)
 {
@@ -193,6 +195,8 @@ int main(int argc, char** argv)
     void* down_scale = Hold(down_scale_host.size() * sizeof(float), "d scale");
     void* token = Hold(token_host.size() * sizeof(float), "token");
     void* stacked = Hold(experts * M_TILE * HIDDEN / 2, "stacked");
+    // The low half's base, offset on the host rather than on the device.
+    void* stacked_low = (void*)((char*)stacked + ROWS * HIDDEN / 2);
     void* partial = Hold(experts * M_TILE * GATE_UP * sizeof(int32_t),
                          "part");
     void* middle = Hold(experts * M_TILE * HALF / 2, "middle");
@@ -201,7 +205,7 @@ int main(int argc, char** argv)
     void* out = Hold(experts * ROWS * HIDDEN * sizeof(uint16_t), "out");
     void* gu_tiling = Hold(TILING_BYTES, "gu tiling");
     void* down_tiling = Hold(TILING_BYTES, "down tiling");
-    void* witness = Hold(2048, "witness");
+    void* witness = Hold(experts * TILE_BYTES, "witness");
 
     const auto upload = [&](void* where, const void* what, size_t bytes,
                             const char* name) {
@@ -239,7 +243,8 @@ int main(int argc, char** argv)
     const std::vector<uint16_t> sentinel(experts * ROWS * HIDDEN, SENTINEL);
     upload(out, sentinel.data(), sentinel.size() * sizeof(uint16_t), "out");
 
-    routed_int4_launch(blocks, stream, sync_base, rows, stacked, gate_up,
+    routed_int4_launch(blocks, stream, sync_base, rows, stacked, stacked_low,
+                       gate_up,
                        (float*)gu_bias, (float*)gu_scale, down,
                        (float*)down_bias, (float*)down_scale, (float*)token,
                        partial, middle, (float*)middle_scale, wide, out,
@@ -324,7 +329,7 @@ int main(int argc, char** argv)
                         "%lld", (long long)high_at,
                         (long long)(ROWS * HIDDEN), (long long)found_at);
         }
-        std::vector<uint8_t> witness_host(1024);
+        std::vector<uint8_t> witness_host(experts * TILE_BYTES);
         Check(aclrtMemcpy(witness_host.data(), witness_host.size(), witness,
                           witness_host.size(), ACL_MEMCPY_DEVICE_TO_HOST),
               "down witness");
@@ -420,7 +425,7 @@ int main(int argc, char** argv)
         clock_gettime(CLOCK_MONOTONIC, &begin);
         for (int step = 0; step < repeats; ++step) {
             routed_int4_launch(blocks, stream, sync_base, rows, stacked,
-                               gate_up, (float*)gu_bias, (float*)gu_scale,
+                               stacked_low, gate_up, (float*)gu_bias, (float*)gu_scale,
                                down, (float*)down_bias, (float*)down_scale,
                                (float*)token, partial, middle,
                                (float*)middle_scale, wide, out, gu_tiling,

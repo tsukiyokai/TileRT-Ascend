@@ -263,3 +263,41 @@ of period sixteen. A search for where a half actually landed then matches at
 every aligned phase and answers almost anywhere; worse, a wrong answer can
 hide behind a right one. With a pseudo-random generator the same search
 returns −1 and means it.
+
+## The elimination list, and where it stops
+
+Everything below is measured, not reasoned. The low half of the split is
+correct and deterministic in a buffer of its own and never appears in the
+buffer it is addressed into.
+
+Eliminated as the cause:
+
+- The split arithmetic. A dedicated witness buffer holds
+  `-6, -8, -1, -8, 5, 6, -2, 0` for `x = 98, 112, -73, 80, 13, 14, -106, 24`,
+  which is exact, on three consecutive runs. The earlier "wrong data" reading
+  was a witness buffer shared by four blocks -- the third false signal this
+  probe produced, after sawtooth test data and a high-half comparison that
+  could not tell two nibble conventions apart.
+- The write mechanism. An isolated probe lands all 2048 values at offsets 256
+  through 24576, under `__mix__`, under `ASCENDC_CUBE_ONLY`, and with the
+  vector half gated to one subblock -- every factor the real kernel has.
+- The declared buffer length. `bufferSize_` has four readers in the whole
+  devkit and none on the `DataCopy` path; over-declaring it only disables a
+  CPU-debug abort.
+- Cross-pipe synchronisation. Every `PipeBarrier<PIPE_ALL>` straddling a real
+  hazard is now a named `MTE2_V`, `V_MTE3` or `MTE3_V` pair -- `PipeBarrier`
+  is the single-pipe primitive and `PIPE_ALL` is absent from the headers' own
+  `SUPPORTED_PIPE` and flagged `AKA3001`. No change.
+- Where the base is computed. Deriving it on the device through a byte-pointer
+  cast and passing it in already offset from the host fail identically.
+- Alignment. An INT4 `DataCopy` moves 64 elements at a quantum; the spans
+  here are 2048 and 128.
+
+What is left is one difference. The write that lands targets a separate
+allocation; the write that does not targets the same allocation as the high
+half, 6144 bytes in. Two `GlobalTensor<int4b_t>` into one allocation, written
+from one function, and only the one at offset zero takes.
+
+That is now a question for the reference work rather than for another build of
+this kernel. The INT8 form is unaffected, correct and 3.3 times the vendor, so
+it is what integration should carry.

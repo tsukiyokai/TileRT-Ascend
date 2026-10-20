@@ -1096,6 +1096,1088 @@ Four independent codebases agree on the single-chain policy: try the longest suf
 
 ---
 
+### SGLang `NGRAM` — a production n-gram TREE drafter (trie of previously seen suffixes, node-budgeted BFS-by-recency or best-first-by-frequency expansion, ancestor-row tree mask, first-child/next-sibling greedy verify, accepted-node KV compaction)
+
+https://github.com/sgl-project/sglang @ 1739d962a45d1c8ecd10cda5a7e387b5cc18c066 (committed 2026-10-20 00:35:29 -0700; retrieved 2026-10-20). Authors: SGLang team; the C++ trie design descends from Ant Group's `Lookahead` (see the Lookahead entry below). All excerpts are verbatim with file path and line numbers.
+
+#### 1. User-facing contract and defaults
+
+`docs/docs/advanced_features/speculative_decoding.mdx` lines 786-791:
+
+````markdown
+## Ngram Speculative Decoding
+
+SGLang also supports **ngram-based speculative decoding** (no separate draft model). It retrieves draft tokens from an ngram cache built from previously generated tokens, and then verifies them with the target model.
+
+Enable it with:
+- `--speculative-algorithm NGRAM`
+````
+
+`docs/docs/advanced_features/speculative_decoding.mdx` lines 840-858:
+
+````markdown
+</table>
+
+Notes:
+- Ngram speculative decoding **only supports CUDA**.
+- It currently **does not support** DP attention (`--attn-dp-size` > 1).
+- It disables the overlap scheduler and mixed chunked prefill.
+- If `--speculative-ngram-max-bfs-breadth > 1` (thus `speculative_eagle_topk > 1`) and `page_size > 1`, use `--attention-backend flashinfer`; otherwise the server will error.
+- Optional: set `SGLANG_NGRAM_FORCE_GREEDY_VERIFY=True` to force greedy verification.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --speculative-algorithm NGRAM \
+    --speculative-num-draft-tokens 16 \
+    --speculative-ngram-max-bfs-breadth 10 \
+    --mem-fraction-static 0.7 \
+    --cuda-graph-max-bs-decode 8 \
+    --log-level warning
+```
+````
+
+`python/sglang/srt/arg_groups/fields/spec.py` lines 249-281:
+
+````python
+    # Speculative decoding (ngram)
+    # -------------------------------------------------------------------------
+    speculative_ngram_min_bfs_breadth: A[
+        int,
+        "The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+    ] = 1
+    speculative_ngram_max_bfs_breadth: A[
+        int,
+        "The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
+    ] = 10
+    speculative_ngram_match_type: A[
+        Literal["BFS", "PROB"],
+        "The match type for cache tree.",
+    ] = "BFS"
+    speculative_ngram_max_trie_depth: A[
+        int,
+        "The max trie depth for ngram speculative decoding.",
+    ] = 18
+    speculative_ngram_capacity: A[
+        int,
+        "The cache capacity for ngram speculative decoding.",
+    ] = 10 * 1000 * 1000
+    speculative_ngram_external_corpus_path: A[
+        Optional[str],
+        "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
+    ] = None
+    speculative_ngram_external_sam_budget: A[
+        int,
+        "Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+    ] = 0
+    speculative_ngram_external_corpus_max_tokens: A[
+        int,
+        "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+````
+
+`python/sglang/srt/arg_groups/speculative_hook.py` lines 1205-1250:
+
+````python
+def _handle_ngram(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.device not in ("cuda", "cpu", "xpu"):
+        raise ValueError(
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
+        )
+
+    _disable_overlap_schedule_for_cpu(server_args)
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+    declare_resolution(
+        server_args,
+        "_handle_ngram",
+        enable_mixed_chunk=False,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_ngram",
+        speculative_eagle_topk=cfg.speculative_ngram_max_bfs_breadth,
+    )
+    if cfg.speculative_num_draft_tokens is None:
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            speculative_num_draft_tokens=12,
+        )
+        logger.warning(
+            "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+            "You can override this by explicitly setting --speculative-num-draft-tokens."
+        )
+    if cfg.speculative_num_steps is None:
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            speculative_num_steps=cfg.speculative_num_draft_tokens
+            // cfg.speculative_eagle_topk,
+        )
+````
+
+`python/sglang/srt/arg_groups/speculative_hook.py` lines 1274-1292:
+
+````python
+
+    view = resolved_view(server_args)
+    if (
+        cfg.speculative_eagle_topk > 1
+        and view.page_size > 1
+        and view.attention_backend != "flashinfer"
+    ):
+        raise ValueError(
+            f"speculative_eagle_topk({cfg.speculative_eagle_topk}) > 1 "
+            f"with page_size({view.page_size}) > 1 is unstable "
+            "and produces incorrect results for paged attention backends. "
+            "This combination is only supported for the 'flashinfer' backend."
+        )
+    if attn_dp_enabled_of(view):
+        # TODO: support dp attention for ngram speculative decoding
+        raise ValueError(
+            "Currently ngram speculative decoding does not support dp attention."
+        )
+
+````
+
+`python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py` lines 14-36:
+
+````python
+class NgramCorpus:
+    def __init__(
+        self,
+        max_trie_depth=18,
+        min_bfs_breadth=1,
+        max_bfs_breadth=8,
+        draft_token_num=8,
+        match_type="BFS",
+        capacity=1000000,
+        external_sam_budget=0,
+        external_corpus_max_tokens=10000000,
+    ) -> None:
+        cls = get_ngram_corpus_cls()
+        self._obj = cls(
+            capacity=capacity,
+            max_trie_depth=max_trie_depth,
+            min_bfs_breadth=min_bfs_breadth,
+            max_bfs_breadth=max_bfs_breadth,
+            draft_token_num=draft_token_num,
+            match_type=match_type,
+            external_sam_budget=external_sam_budget,
+            external_corpus_max_tokens=external_corpus_max_tokens,
+        )
+````
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/param.h` lines 17-38:
+
+````cpp
+struct Param {
+  bool enable;
+  bool enable_router_mode;
+  size_t min_bfs_breadth;
+  size_t max_bfs_breadth;
+  size_t max_trie_depth;
+  size_t draft_token_num;
+  size_t external_sam_budget = 0;
+  size_t external_corpus_max_tokens = 10000000;
+  std::string match_type;
+
+  std::vector<size_t> batch_draft_token_num;
+
+  size_t get_draft_token_num(size_t batch_size) const {
+    if (batch_size < batch_draft_token_num.size()) {
+      if (batch_draft_token_num[batch_size] !=
+          std::numeric_limits<decltype(batch_draft_token_num)::value_type>::max()) {
+        return batch_draft_token_num[batch_size];
+      }
+    }
+    return draft_token_num - 1;
+  }
+````
+
+#### 2. The trie: every suffix of every inserted token run is inserted, up to `max_trie_depth`; each node carries a frequency and an LRU position
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/trie.cpp` lines 23-67:
+
+````cpp
+void Trie::insert(const int32_t* tokens, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    auto start = tokens + i;
+    auto end = start + std::min(len - i, param_.max_trie_depth);
+
+    if (static_cast<size_t>(end - start) > free_node_count_) {
+      squeeze(end - start - free_node_count_);
+    }
+
+    TrieNode* cursor = root_;
+    path_.clear();
+    while (start != end) {
+      auto token = *start;
+      auto iter = cursor->child.find(token);
+      if (iter == cursor->child.end()) {
+        iter = cursor->child.insert({token, getNode()}).first;
+        auto node = iter->second;
+
+        cursor->lru.emplace_front(node);
+        global_lru_.emplace_back(node);
+
+        node->token = token;
+        node->parent = cursor;
+        node->parent_lru_pos = cursor->lru.begin();
+        node->global_lru_pos = --global_lru_.end();
+        node->freq = 1;
+        cursor->sorted_children.insert(node);
+      } else {
+        auto node = iter->second;
+        cursor->sorted_children.erase(node);
+        node->freq++;
+        cursor->sorted_children.insert(node);
+        cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
+      }
+      cursor = iter->second;
+      path_.emplace_back(cursor);
+      ++start;
+    }
+
+    for (auto it = path_.rbegin(); it != path_.rend(); ++it) {
+      TrieNode* node = *it;
+      global_lru_.splice(global_lru_.begin(), global_lru_, node->global_lru_pos);
+    }
+  }
+}
+````
+
+#### 3. Matching: ALL suffix lengths that exist in the trie become "anchors" (deepest first) — this is where multiple occurrences and multiple match lengths become branches
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/trie.cpp` lines 192-218:
+
+````cpp
+std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(const MatchState& state) const {
+  std::vector<std::pair<const TrieNode*, int32_t>> result;
+  result.reserve(state.anchors.size());
+  for (size_t depth = state.anchors.size(); depth > 0; --depth) {
+    const auto node = resolve(state, state.anchors[depth - 1]);
+    if (node != nullptr && !node->child.empty()) {
+      result.emplace_back(node, static_cast<int32_t>(depth));
+    }
+  }
+  return result;
+}
+
+std::vector<std::pair<const TrieNode*, int32_t>>
+Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+  const bool has_forward_progress = total_len >= state.processed_total_len;
+  const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
+  const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
+  const bool can_advance = state.trie_epoch == trie_epoch_ && has_forward_progress && appended_len <= len &&
+                           state.anchors.size() == expected_prev_depth;
+
+  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len)) {
+    return getExpandableAnchors_(state);
+  }
+
+  rebuildMatchState_(context, len, state, total_len);
+  return getExpandableAnchors_(state);
+}
+````
+
+#### 4. Tree expansion policy A (`--speculative-ngram-match-type BFS`, the default): recency-ordered children, breadth shrinking with match depth, shared node budget
+
+The breadth allotted to an anchor is `(max_match_depth - depth) * bfs_breadth_scale + min_bfs_breadth`, so the longest (most trusted) match is expanded narrowly (breadth near `min_bfs_breadth`=1) and shorter, less trusted matches are expanded widely (up to `max_bfs_breadth`=10); the breadth then decays by `bfs_breadth_scale` per tree level. Anchors are visited deepest-first and all draw from the same `draft_token_num` budget (`cursor <= draft_token_num`).
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/trie.cpp` lines 220-264:
+
+````cpp
+Result Trie::buildRecency(
+    const int32_t* context,
+    size_t len,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param,
+    MatchState& state,
+    size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
+  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
+  double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
+
+  std::vector<Node> tree(draft_token_num + 1);
+  int root = 0;
+  int cursor = 1;
+
+  for (auto [node, depth] : anchors) {
+    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
+    queue.push({root, (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
+    while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
+      auto front = queue.front();
+      queue.pop();
+
+      auto parent = std::get<0>(front);
+      auto cur_breadth = std::get<1>(front);
+      auto iter = std::get<2>(front)->lru.begin();
+
+      auto breadth = std::max(1, int32_t(cur_breadth));
+      for (int i = 0;
+           i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= static_cast<int>(draft_token_num);
+           ++i, ++iter) {
+        auto token = (*iter)->token;
+        auto pos = -1;
+        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
+          pos = tit->second;
+        } else {
+          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
+        }
+        queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
+      }
+    }
+  }
+
+  return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+````
+
+#### 5. Tree expansion policy B (`--speculative-ngram-match-type PROB`): best-first by cumulative frequency-normalised probability, identical in spirit to SuffixDecoding's `D(N)`
+
+`norm_freq = freq / sum_freq * prob` is the product of child-frequency fractions along the path; the heap pops the highest cumulative probability first; each parent contributes at most `top_k = max_bfs_breadth` children.
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/trie.cpp` lines 266-331:
+
+````cpp
+Result Trie::buildFrequency(
+    const int32_t* context,
+    size_t len,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param,
+    MatchState& state,
+    size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
+  struct CompareByLastDouble {
+    bool operator()(
+        const std::tuple<double, const TrieNode*, double>& a,
+        const std::tuple<double, const TrieNode*, double>& b) const {
+      return std::get<2>(a) < std::get<2>(b);
+    }
+  };
+
+  std::priority_queue<
+      std::tuple<double, const TrieNode*, double>,
+      std::vector<std::tuple<double, const TrieNode*, double>>,
+      CompareByLastDouble>
+      heap;
+
+  std::vector<Node> tree(draft_token_num + 1);
+
+  int root = 0;
+  int cursor = 1;
+  int top_k = param.max_bfs_breadth;
+
+  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
+    double sum_freq = 0.0;
+    int count = 0;
+    std::list<std::pair<TrieNode*, int32_t>> topk_children;
+    for (auto* child : trie_node->sorted_children) {
+      sum_freq += static_cast<double>(child->freq);
+      topk_children.emplace_back(child, child->freq);
+      if (++count >= top_k) break;
+    }
+    if (sum_freq <= 0) sum_freq = 1.0;
+    for (const auto& [child, freq] : topk_children) {
+      double norm_freq = static_cast<double>(freq) / sum_freq * prob;
+      heap.emplace(parent, child, norm_freq);
+    }
+  };
+
+  for (auto [node, _] : anchors) {
+    addToHeap(root, node, 1.0);
+
+    while (!heap.empty() && cursor <= static_cast<int>(draft_token_num)) {
+      auto [parent, trie_node, prob] = heap.top();
+      heap.pop();
+      auto token = trie_node->token;
+      int pos = -1;
+      auto tit = tree[parent].next.find(token);
+      if (tit != tree[parent].next.end()) {
+        pos = tit->second;
+      } else {
+        pos = cursor++;
+        tree[parent].next[token] = pos;
+      }
+      addToHeap(pos, trie_node, prob);
+    }
+  }
+
+  return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+````
+
+#### 6. Tree -> flat arrays: BFS order, parent pointers, and the mask built by copying the parent's row (so row i is the ancestor set of node i)
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/result.cpp` lines 12-51:
+
+````cpp
+Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
+  Result info;
+  std::vector<int32_t> prevs;
+  info.token.reserve(draft_token_num);
+  prevs.reserve(draft_token_num);
+  std::queue<std::tuple<int32_t, int32_t, int32_t>> queue;
+  info.token.emplace_back(last_token);
+  prevs.emplace_back(-1);
+
+  for (auto [token, next] : tree[root].next) {
+    queue.emplace(token, next, 0);
+  }
+  while (queue.size()) {
+    auto [token, next, prev] = queue.front();
+    queue.pop();
+    info.token.emplace_back(token);
+    prevs.emplace_back(prev);
+    for (auto [t, n] : tree[next].next) {
+      queue.emplace(t, n, info.token.size() - 1);
+    }
+  }
+
+  // zero padding to length
+  while (info.token.size() < static_cast<size_t>(draft_token_num)) {
+    info.token.emplace_back(0);
+    prevs.emplace_back(0);
+  }
+
+  int n = info.token.size();
+  info.mask.resize(n * n, 0);
+  info.mask[0] = 1;
+  for (int i = 0; i < n; ++i) {
+    if (prevs[i] != -1) {
+      memcpy(&info.mask[i * n], &info.mask[prevs[i] * n], prevs[i] + 1);
+    }
+    info.mask[i * n + i] = 1;
+  }
+
+  return info;
+}
+````
+
+#### 7. Budget split between the trie (generated text so far) and an external suffix automaton (a pre-loaded corpus), and the SAM-based builders
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/ngram.cpp` lines 144-207:
+
+````cpp
+Result Ngram::batchMatch(
+    const std::vector<int64_t>& state_ids,
+    const std::vector<std::vector<int32_t>>& tokens,
+    const std::vector<size_t>& total_lens) {
+  if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
+    throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  using TrieResultBuildFn =
+      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
+  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  TrieResultBuildFn trie_result_build_fn;
+  SamResultBuildFn sam_result_build_fn;
+  if (param_.match_type == "BFS") {
+    trie_result_build_fn = &Trie::buildRecency;
+    sam_result_build_fn = &SuffixAutomaton::buildRecency;
+  } else if (param_.match_type == "PROB") {
+    trie_result_build_fn = &Trie::buildFrequency;
+    sam_result_build_fn = &SuffixAutomaton::buildFrequency;
+  } else {
+    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
+  }
+
+  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
+  const size_t num_sams = sams_.size();
+  const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
+  const size_t total_sam_budget =
+      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
+  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
+  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
+
+  Result merged;
+  for (size_t i = 0; i < state_ids.size(); ++i) {
+    const auto& suffix = tokens[i];
+    if (suffix.empty()) {
+      throw std::runtime_error("batchMatch received an empty token tail");
+    }
+
+    auto& state = match_state_[state_ids[i]];
+
+    if (total_sam_budget == 0 || per_sam_budget == 0) {
+      auto res = (trie_.get()->*trie_result_build_fn)(
+          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+      merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+      merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+      continue;
+    }
+
+    auto combined = (trie_.get()->*trie_result_build_fn)(
+        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+
+    for (const auto& [_, sam] : sams_) {
+      auto sam_res =
+          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+    }
+
+    merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());
+    merged.mask.insert(merged.mask.end(), combined.mask.begin(), combined.mask.end());
+  }
+  return merged;
+}
+````
+
+`python/sglang/kernels/jit/csrc/ngram_corpus/suffix_automaton.cpp` lines 181-287:
+
+````cpp
+Result SuffixAutomaton::buildRecency(
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.max_trie_depth);
+  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
+  const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
+  std::vector<Node> tree(draft_token_num + 1);
+  int root = 0;
+  int cursor = 1;
+
+  for (const auto& anchor : anchors) {
+    std::queue<std::tuple<int, double, int>> queue;
+    queue.push(
+        {root, (max_match_depth - anchor.matched_len) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
+    while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
+      auto [parent, cur_breadth, state] = queue.front();
+      queue.pop();
+
+      const auto& children = states_[state].children_by_recency;
+      const auto breadth = std::max(1, static_cast<int32_t>(cur_breadth));
+      for (int i = 0;
+           i < breadth && i < static_cast<int>(children.size()) && cursor <= static_cast<int>(draft_token_num);
+           ++i) {
+        const auto [token, child_state] = children[i];
+        int pos = -1;
+        if (auto iter = tree[parent].next.find(token); iter != tree[parent].next.end()) {
+          pos = iter->second;
+        } else {
+          pos = tree[parent].next.insert({token, cursor++}).first->second;
+        }
+        queue.emplace(pos, cur_breadth - bfs_breadth_scale, child_state);
+      }
+    }
+  }
+  return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+Result SuffixAutomaton::buildFrequency(
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.max_trie_depth);
+  struct CompareByProb {
+    bool operator()(
+        const std::tuple<int, int32_t, int, double>& lhs, const std::tuple<int, int32_t, int, double>& rhs) const {
+      return std::get<3>(lhs) < std::get<3>(rhs);
+    }
+  };
+
+  std::priority_queue<
+      std::tuple<int, int32_t, int, double>,
+      std::vector<std::tuple<int, int32_t, int, double>>,
+      CompareByProb>
+      heap;
+  std::vector<Node> tree(draft_token_num + 1);
+  int root = 0;
+  int cursor = 1;
+  const int top_k = static_cast<int>(param.max_bfs_breadth);
+
+  auto addToHeap = [this, &heap, top_k](int parent, int state, double prob) {
+    if (top_k <= 0) {
+      return;
+    }
+    const auto& children = states_[state].children_by_freq;
+    if (children.empty()) {
+      return;
+    }
+    double sum_freq = 0.0;
+    int count = 0;
+    for (const auto& [_, child_state] : children) {
+      sum_freq += static_cast<double>(states_[child_state].occ_count);
+      if (++count >= top_k) {
+        break;
+      }
+    }
+    if (sum_freq <= 0) {
+      sum_freq = 1.0;
+    }
+    count = 0;
+    for (const auto& [token, child_state] : children) {
+      const auto scaled_prob = static_cast<double>(states_[child_state].occ_count) / sum_freq * prob;
+      heap.emplace(parent, token, child_state, scaled_prob);
+      if (++count >= top_k) {
+        break;
+      }
+    }
+  };
+
+  for (const auto& anchor : anchors) {
+    addToHeap(root, anchor.state, 1.0);
+    while (!heap.empty() && cursor <= static_cast<int>(draft_token_num)) {
+      auto [parent, token, child_state, prob] = heap.top();
+      heap.pop();
+
+      int pos = -1;
+      if (auto iter = tree[parent].next.find(token); iter != tree[parent].next.end()) {
+        pos = iter->second;
+      } else {
+        pos = cursor++;
+        tree[parent].next[token] = pos;
+      }
+      addToHeap(pos, child_state, prob);
+    }
+  }
+  return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+}  // namespace ngram
+
+}  // namespace sglang
+````
+
+#### 8. What is inserted into the corpus each round, and the verify-input contract (note the comment about `max_tree_depth` and `tree_topk`)
+
+`python/sglang/srt/speculative/ngram_worker.py` lines 238-311:
+
+````python
+    def _prepare_draft_tokens(
+        self, batch: ScheduleBatch
+    ) -> tuple[np.ndarray, np.ndarray]:
+        bs = len(batch.reqs)
+        stride = self.draft_token_num
+
+        # Overlap mode processes results one iteration behind, so the last
+        # round's accepted tokens are not yet in req.output_ids and must be
+        # spliced in from spec_info. Sync mode and grammar batches process
+        # results before the next draft prep, so output_ids is already
+        # complete and splicing would duplicate the tail.
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+
+        # Accept-independent prep, hoisted above the blocking .cpu() below.
+        req_ids = [req.rid for req in batch.reqs]
+        # Only the last max_trie_depth tokens can match; the ids are
+        # array.array, so list() the tails for list concat below.
+        # multimodal cache padding contains identities, not vocabulary token IDs
+        input_tails = [
+            list(req.origin_input_ids_unpadded[-self.max_trie_depth :])
+            for req in batch.reqs
+        ]
+        output_tails = [
+            list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+        base_lens = [
+            len(req.origin_input_ids_unpadded) + len(req.output_ids)
+            for req in batch.reqs
+        ]
+
+        if use_prev_tokens:
+            prev_token_ids, prev_accept_lens = (
+                batch.spec_info.accept_tokens,
+                batch.spec_info.accept_lens,
+            )
+            if not prev_token_ids.is_cpu:
+                prev_token_ids = prev_token_ids.cpu()
+                prev_accept_lens = prev_accept_lens.cpu()
+            # Worker-level staging: written here at draft prep, consumed by
+            # _update_ngram_corpus after verify within the same forward call.
+            self.prev_token_ids = prev_token_ids.tolist()
+            self.prev_accept_lens = prev_accept_lens.tolist()
+            assert bs == len(self.prev_accept_lens)
+        else:
+            # _update_ngram_corpus still reads the staging; fill it empty.
+            self.prev_token_ids = []
+            self.prev_accept_lens = [0] * bs
+
+        self.ngram_corpus.synchronize()
+        batch_tokens = []
+        total_lens = []
+        for i in range(bs):
+            prev_tokens = (
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                if use_prev_tokens
+                else []
+            )
+            check_token = self._efficient_concat_last_n(
+                input_tails[i],
+                output_tails[i] + prev_tokens,
+                self.max_trie_depth,
+            )
+            batch_tokens.append(check_token)
+            total_lens.append(base_lens[i] + len(prev_tokens))
+        req_drafts, mask = self.ngram_corpus.batch_get(
+            req_ids, batch_tokens, total_lens
+        )
+        total_draft_token_num = len(req_drafts)
+
+        # Check if speculative decoding is needed; here we always enforce it
+        assert total_draft_token_num == bs * self.draft_token_num, (
+            f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        )
+        return req_drafts, mask
+````
+
+`python/sglang/srt/speculative/ngram_worker.py` lines 402-426:
+
+````python
+    def _update_ngram_corpus(self, batch: ScheduleBatch):
+        batch_tokens = []
+        i, stride = 0, self.draft_token_num
+        # Same splice condition as _prepare_draft_tokens: only overlap mode
+        # has accepted tokens missing from req.output_ids.
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+        for req in batch.reqs:
+            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
+            # there is not much difference, so we will not insert it for now.
+            # if batch.forward_mode.is_extend():
+            #     put_ids = req.origin_input_ids + req.output_ids
+            # else:
+            prev_tokens = (
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                if use_prev_tokens
+                else []
+            )
+            put_ids = self._efficient_concat_last_n(
+                list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
+                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
+                self.max_trie_depth,
+            )
+            batch_tokens.append(put_ids)
+            i += 1
+        self.ngram_corpus.batch_put(batch_tokens)
+````
+
+`python/sglang/srt/speculative/ngram_info.py` lines 48-58:
+
+````python
+    @property
+    def max_tree_depth(self) -> int:
+        # NGRAM trees are node-budgeted with no depth cap: the corpus BFS only
+        # stops on the node budget, so a single long match can chain all
+        # draft_token_num nodes (spec_steps is meaningless for this tree).
+        return self.draft_token_num
+
+    @property
+    def tree_topk(self) -> int:
+        # Irregular tree: per-level branching follows the corpus matches.
+        return -1
+````
+
+#### 9. One tree-verify round on the target: write mask to flashinfer, rebuild positions / first-child / next-sibling links from the mask, verify, compact the accepted nodes' KV
+
+`python/sglang/srt/speculative/ngram_worker.py` lines 313-400:
+
+````python
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+        # Decode-only: extend goes through the plain target forward, and an
+        # IDLE batch must keep its forward_mode instead of being rewritten to
+        # TARGET_VERIFY below (relevant once DP attention support lands).
+        if not batch.forward_mode.is_decode():
+            return
+
+        bs = len(batch.reqs)
+
+        retrieve_index = self.retrieve_indexes_batch[bs]
+        retrieve_next_token = self.retrieve_next_token_batch[bs]
+        retrieve_next_sibling = self.retrieve_next_sibling_batch[bs]
+        positions = self.positions_batch[bs]
+        tree_mask = self.tree_mask_batch[bs]
+        draft_tokens = self.draft_tokens_batch[bs]
+
+        # Pre-sync: only needs seq_lens_cpu, so build before the blocking
+        # accept sync inside _prepare_draft_tokens.
+        ones_masks = None
+        if USE_FULL_MASK and not _is_cpu:
+            ones_masks = [
+                torch.ones(
+                    (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
+                )
+                for i in range(bs)
+            ]
+
+        req_drafts, mask = self._prepare_draft_tokens(batch)
+        tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
+        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+
+        # Staged for the grammar bitmask, derived after the verify launch below.
+        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+
+        # generate positions and some indices using tree_mask
+        reconstruct_indices_from_tree_mask(
+            tree_mask,
+            batch.seq_lens,
+            positions,  # mutable
+            retrieve_index,  # mutable
+            retrieve_next_token,  # mutable
+            retrieve_next_sibling,  # mutable
+            bs,
+            self.draft_token_num,
+        )
+
+        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
+        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
+        if USE_FULL_MASK and not _is_cpu:
+            tree_mask = []
+            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
+            for i in range(bs):
+                req_mask = torch.cat(
+                    (
+                        ones_masks[i],
+                        torch.from_numpy(mask[i]).to(
+                            device=self.device, non_blocking=True
+                        ),
+                    ),
+                    dim=1,
+                ).to(torch.bool)
+                tree_mask.append(req_mask.flatten())
+            tree_mask = torch.cat(tree_mask, dim=0)
+
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.input_ids = draft_tokens
+        batch.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + self.draft_token_num,
+            batch_size=bs,
+            draft_token_num=self.draft_token_num,
+            device=self.device,
+        )
+
+        prepare_mamba_track_for_verify(batch)
+
+        batch.spec_info = NgramVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            draft_token_num=self.draft_token_num,
+        )
+````
+
+`python/sglang/kernels/jit/include/sgl_kernel/speculative/ngram.cuh` lines 26-91:
+
+````cpp
+__global__ void reconstructIndicesFromTreeMask(
+    bool* tree_mask,
+    int64_t* verified_seq_len,
+    int64_t* positions,
+    int64_t* retrive_index,
+    int64_t* retrive_next_token,
+    int64_t* retrive_next_sibling,
+    int batch_size,
+    int draft_token_num) {
+  int bid = blockIdx.x;
+  int tid = threadIdx.x;
+
+  if (bid >= batch_size || tid >= draft_token_num) {
+    return;
+  }
+  int base_offset = draft_token_num * draft_token_num;
+  // token_idx: [bid * draft_token_num, (bid + 1) * draft_token_num)
+  int token_idx = bid * draft_token_num;
+  // tree_mask_idx: [bid * base_offset, (bid + 1) * base_offset)
+  int tree_mask_offset = bid * base_offset;
+
+  int depth = 0;
+  int parent_idx = -1;
+
+  for (int i = tid - 1, start_idx = tree_mask_offset + tid * draft_token_num; i >= 0; i--) {
+    if (tree_mask[start_idx + i]) {
+      depth++;
+      if (parent_idx == -1) {
+        parent_idx = i;
+      }
+    }
+  }
+  retrive_index[token_idx + tid] = token_idx + tid;
+  positions[token_idx + tid] = depth + verified_seq_len[bid];
+
+  int next_token_idx = -1;
+  for (int i = tid + 1; i < draft_token_num; i++) {
+    if (tree_mask[tree_mask_offset + i * draft_token_num + tid]) {
+      next_token_idx = i;
+      break;
+    }
+  }
+  retrive_next_token[token_idx + tid] = next_token_idx;
+
+  int next_sibling_idx = -1;
+  if (parent_idx != -1) {
+    for (int i = tid + 1; i < draft_token_num; i++) {
+      int start_idx = tree_mask_offset + i * draft_token_num + parent_idx;
+      if (tree_mask[start_idx]) {
+        bool is_sibling = true;
+        int end_idx = tree_mask_offset + i * draft_token_num + i;
+        for (int j = start_idx + 1; j < end_idx; ++j) {
+          if (tree_mask[j]) {
+            is_sibling = false;
+            break;
+          }
+        }
+        if (is_sibling) {
+          next_sibling_idx = i;
+          break;
+        }
+      }
+    }
+  }
+  retrive_next_sibling[token_idx + tid] = next_sibling_idx;
+}
+````
+
+`python/sglang/kernels/jit/include/sgl_kernel/speculative/eagle.cuh` lines 214-256:
+
+````cpp
+template <typename IdType, typename IdType2>
+__global__ void VerifyTreeGreedy(
+    IdType* predicts,
+    IdType* accept_index,
+    IdType* accept_token_num,  // mutable
+    IdType2* candidates,
+    IdType2* retrive_index,
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
+    IdType2* target_predict,
+    uint32_t batch_size,
+    uint32_t num_speculative_tokens,
+    uint32_t num_draft_tokens) {
+  uint32_t bx = blockIdx.x;
+
+  IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
+  accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
+  uint32_t num_accepted_tokens = 0;
+  IdType2 cur_index = 0;
+
+  for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
+    cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
+    while (cur_index != -1) {
+      IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
+      IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
+      IdType2 target_token_id = target_predict[last_accepted_retrive_idx];
+
+      if (draft_token_id == target_token_id) {
+        // accept token
+        predicts[last_accepted_retrive_idx] = target_token_id;
+        ++num_accepted_tokens;
+        accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
+        last_accepted_retrive_idx = draft_index;
+        break;
+      } else {
+        cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
+      }
+    }
+    if (cur_index == -1) break;
+  }
+  accept_token_num[bx] = num_accepted_tokens;
+  predicts[last_accepted_retrive_idx] = target_predict[last_accepted_retrive_idx];
+}
+````
+
+`python/sglang/srt/speculative/ngram_worker.py` lines 512-521:
+
+````python
+
+            # The KV mover expects drafts-only counts. NGRAM's
+            # accept_lens includes the bonus token, matching scheduler output.
+            num_correct_drafts_per_req = accept_lens - 1
+            move_accept_tokens_to_target_kvcache(
+                batch,
+                accept_index,
+                num_correct_drafts_per_req,
+                self.token_to_kv_pool_allocator,
+            )
+````
+
+`python/sglang/srt/speculative/spec_utils.py` lines 791-852:
+
+````python
+def move_accept_tokens_to_target_kvcache(
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+):
+    """
+    Move accepted tokens (drafts + bonus) to the target KV cache.
+
+    Args:
+        batch: The batch to run.
+        accept_index: The index of the accepted tokens (incl. bonus).
+        num_correct_drafts: Per-req count of correct drafts (excludes bonus);
+            seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+    """
+    bs = len(batch.seq_lens)
+    device = batch.seq_lens.device
+    # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+    # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
+    size = bs * accept_index.shape[1]
+
+    # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+    maybe_detect_oob(
+        accept_index,
+        -1,
+        batch.out_cache_loc.size(0),
+        "spec v2 move_accept_tokens accept_index",
+    )
+
+    tgt_cache_loc = torch.zeros(
+        size,
+        dtype=torch.int64,
+        device=device,
+    )
+    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
+        accept_index,
+        batch.out_cache_loc,
+        accept_out_cache_loc,
+        size,
+    )
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+        tgt_cache_loc, accept_out_cache_loc
+````
+
+## Relevance
+This is the one mainstream implementation that already does what the multiple-occurrence idea asks for, with a model-free CPU drafter: all suffix lengths that exist in the trie are expanded into ONE tree under a hard node budget (`speculative_num_draft_tokens`, default 12; docs example 16), the tree is flattened in BFS order with parent-row-copied mask (`result.cpp` lines 40-48: `memcpy(&info.mask[i * n], &info.mask[prevs[i] * n], prevs[i] + 1)`), and the target verifies the whole tree in one forward with that mask. Four design facts are directly reusable: (a) the node budget, not a depth cap, bounds the tree ("a single long match can chain all draft_token_num nodes" — a pure chain is the degenerate tree, so one code path serves both regimes); (b) the BFS breadth schedule gives LONG matches narrow breadth and SHORT matches wide breadth, i.e. width is spent where the match is least trustworthy; (c) greedy verify is a 25-line walk over first-child / next-sibling links and needs only the target's argmax per node, so it is host-side work; (d) after verify the KV of the accepted nodes is moved to the contiguous slots after the committed prefix (`move_accept_tokens_to_target_kvcache` -> `move_kv_cache(tgt_cache_loc, accept_out_cache_loc)`) and the rest is simply abandoned, which is the whole "rollback". Two caveats: SGLang inserts only the last `max_trie_depth` (18) tokens of prompt+output per step (`_update_ngram_corpus`; the FIXME says inserting the whole prompt "after testing, there is not much difference") so it is a self-history drafter, not a prompt-scanner — for agentic coding where the copy source is the prompt you would seed the trie (or `external_sam_budget`) with the full context; and the mask is handed to flashinfer as `custom_mask`, which the Ascend `npu_fused_infer_attention_score` verify path does not accept in this form (see the vllm-ascend entry).
+
+---
+
 ## Gaps
 
 Looked for and could not find:

@@ -2123,6 +2123,1067 @@ Hazy Research §1.6 and MPK §5.1 specifically avoid with per-dependency counter
 serves every head count" — is the opposite of our situation: we are allowed to specialize for
 batch=1 and should burn the shapes in rather than pad.
 
+## 9. `aclshmem` / CANN SHMEM — the official in-kernel cross-rank communication library (`gitcode.com/cann/shmem`)
+
+Repo: https://gitcode.com/cann/shmem (GitCode, org `cann`)
+Docs site: https://shmem-doc.pages.dev/
+SIG: https://gitcode.com/cann/community/tree/master/CANN/sigs/shmem
+Mailing list: https://mailweb.cann.osinfra.cn/mailman3/lists/shmem.cann.osinfra.cn/
+Releases: v1.7.0 (2026/10), v1.6.0 (2026/07), v1.3.0 (2026/04), first online 2025/12
+License: CANN Open Software License Agreement Version 2.0
+Contributor credit: 华南理工大学 陆璐教授团队 (SCUT, Prof. Lu Lu's group)
+Raw file base used below: `https://raw.gitcode.com/cann/shmem/raw/master/<path>`
+Retrieved 2026-10-20.
+
+This is the answer to "is there a one-sided all-reduce issuable from device code on Ascend".
+There is, it is first-party, it is open source under the `cann` org, and it is an OpenSHMEM
+dialect. Name: SHMEM / `aclshmem`. The README calls it 「基于对称内存的昇腾分布式内存通信加速库」.
+
+### 9.1 README — what it is, and the AICore-direct-drive claim
+
+`README.md`, verbatim:
+
+> ## 最新动态
+>
+> 🚀 [2026/10] [SHMEM v1.7.0](https://gitcode.com/cann/shmem/releases/v1.7.0) 正式发布。
+>
+>    - Ascend 950PR&950DT系列产品 RDMA/UDMA 新增 QP-specific put/get 接口，扩展聚合提交能力，支持 UDMA 多链路并发。
+>    - A2/A3 SDMA 新增 QP-specific put/get 接口，支持多 QP 通信。
+>    - 完善安装与运行时诊断，新增 MegaMoE、UDMA AllReduce 示例及多 QP 性能测试。
+>
+> 📌 [2026/07] [SHMEM v1.6.0](https://gitcode.com/cann/shmem/releases/v1.6.0) 发布：完善 Ascend 950PR&950DT系列产品 RDMA、UDMA/MTE 与 SIMT 能力，改进 Python wheel 安装与 `shmem-config` 诊断。
+>
+> 📌 [2026/04] [SHMEM v1.3.0](https://gitcode.com/cann/shmem/releases/v1.3.0) 发布：新增 AICore 直驱能力和 40+ 通信接口，并完善 DFX 工具链。
+>
+> 🔥 [2025/12] SHMEM 项目首次上线。
+
+> ## 一、项目简介
+>
+> SHMEM 是面向昇腾平台的多机多卡内存通信库，通过封装 Host 侧与 Device 侧接口，实现跨设备的高效内存访问与数据同步。其核心价值在于：
+>
+> - 支持 AICore 直驱 MTE、xDMA 使能 D2D/D2H/H2D/D2rH/rH2D 通信
+> - 简化分布式场景下的卡间通信逻辑，降低算子开发门槛
+> - 与 CANN 生态深度适配，支持通算融合类算子的快速部署
+
+> ## 二、核心功能
+>
+> **1. 双侧接口体系**
+>
+> - Host 侧：负责初始化、内存堆管理、通信域（Team）创建及全局同步
+> - Device 侧：提供远程内存访问（RMA）、设备级同步及通信域操作
+>
+> 接口设计贴合昇腾算子开发范式，支持 Host 与 Device 协同工作流。
+>
+> **2. 高性能通信优化**
+>
+> - 内置 MTE、xDMA 引擎支持，实现远程内存直接读写，减少数据传输延迟
+> - 兼容 MPI 通信框架，支持集合通信（Allgather/Allreduce 等）场景
+> - 针对昇腾硬件特性优化数据传输路径，提升多卡协同效率
+
+> **4. 通信通路覆盖**
+>
+> 下图展示了 SHMEM 支持的全链路通信通路（以910A3为例），覆盖 Host 侧与 Device 侧的不同传输引擎：
+>
+> 如图所示，SHMEM 支持多种通信引擎和通路：
+>
+> - **MTE Engine**：芯片级内存传输引擎，支持 D2D、D2H、H2D、D2rH、rH2D 多种通路
+> - **xDMA Engine**：高速直接内存访问引擎，支撑主机内/主机间高效数据传输
+
+Note the figure caption: 「以910A3为例」 — the full-link communication-path diagram is drawn
+*for 910 A3*, which is our part.
+
+> ## 四、典型使用场景
+>
+> **1. 通算融合类算子开发**：基于 Device 侧内存直接访问接口，开发融合「计算+通信」的自定义算子（如 matmul+allreduce），减少卡间数据拷贝，提升算子执行效率。
+
+The include tree (verbatim from the README's 代码结构 block):
+
+```text
+├── include/                            # 对外头文件
+│   ├── shmem.h                         # SHMEM 所有对外 API 汇总
+│   ├── device/                         # Device 侧头文件
+│   │   ├── gm2gm/                      # AICore 驱动 gm2gm 数据面接口
+│   │   │   └── engine/                 # AICore 直驱 gm2gm 低阶接口
+│   │   ├── team/                       # Device 侧通信域管理
+│   │   └── ub2gm/                      # AICore 驱动 ub2gm 数据面接口
+│   │       └── engine/                 # AICore 直驱 ub2gm 低阶接口
+```
+
+The actual header list (walked via the GitCode contents API,
+`https://api.gitcode.com/api/v5/repos/cann/shmem/contents/include/...`):
+
+```
+include/shmem.h
+include/device/shmem_def.h
+include/device/gm2gm/shmem_device_rma.h          45447 B
+include/device/gm2gm/shmem_device_amo.h          42372 B
+include/device/gm2gm/shmem_device_p2p_sync.h     35212 B
+include/device/gm2gm/shmem_device_so.h           26487 B
+include/device/gm2gm/shmem_device_cc.h            6013 B
+include/device/gm2gm/shmem_device_mo.h            2476 B
+include/device/gm2gm/engine/shmem_device_mte.h
+include/device/gm2gm/engine/shmem_device_sdma.h
+include/device/gm2gm/engine/shmem_device_rdma.h
+include/device/gm2gm/engine/shmem_device_udma.h
+include/device/ub2gm/shmem_device_rma.h          12047 B
+include/device/ub2gm/engine/shmem_device_mte.h
+include/device/team/shmem_device_team.h
+include/device_simt/gm2gm/shmem_device_simt_rma.h
+include/device_simt/gm2gm/shmem_device_simt_amo.h
+include/device_simt/gm2gm/engine/shmem_device_simt_mte.h
+include/device_simt/ub2gm/shmem_device_simt_rma.h
+include/device_simt/ub2gm/engine/shmem_device_simt_mte.h
+include/device_simt/team/shmem_device_simt_team.h
+include/device_simt/shmem_simt_common_types.h
+include/host/...
+include/host_device/shmem_common_macros.h
+include/host_device/shmem_common_types.h         17971 B
+```
+
+### 9.2 `include/device/gm2gm/shmem_device_cc.h` — THE DEVICE-SIDE COLLECTIVE CONTRACT
+
+This file is short and is the single most important text in this section. Reproduced in full
+minus the licence header. Note the first block: the all-core barrier **requires a MIX kernel**.
+
+```cpp
+// clang-format off
+/*
+ * Collective programming contract:
+ * - The all-core barrier and sync APIs require a MIX kernel; all participating local AIC and AIV
+ *   cores must enter. Vector-only sync APIs involve only AIV cores. The _all forms select
+ *   ACLSHMEM_TEAM_WORLD without changing the local core participation scope.
+ * - Every PE in a team must call its collectives in the same order. Do not overlap collective
+ *   calls on the same team. ACLSHMEM_TEAM_INVALID (-1) is a no-op for team-taking APIs;
+ *   other invalid handles are not covered by this rule.
+ * - Ordinary symmetric-memory stores from participating cores are synchronized on supported
+ *   HCCS/UB paths. The Cube scalar unit is outside this visibility guarantee.
+ * - Device collectives cover Device-issued work; Host-issued work needs the corresponding
+ *   Host-side completion and ordering.
+ */
+// clang-format on
+
+/*!
+ * \file shmem_device_cc.h
+ * \brief shmem device Collective Communication APIs
+ */
+#ifndef _DEVICE_GM2GM_ACLSHMEM_DEVICE_CC_H_
+#define _DEVICE_GM2GM_ACLSHMEM_DEVICE_CC_H_
+
+#include "host_device/shmem_common_types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @fn ACLSHMEM_DEVICE void util_set_ffts_config(uint64_t config)
+ * @brief Set runtime ffts address. Call this at MIX Kernel entry point (if the kernel contains barrier calls).
+ *
+ * @param config              [config] ffts config, acquired by util_get_ffts_config()
+ */
+ACLSHMEM_DEVICE void util_set_ffts_config(uint64_t config);
+#define shmemx_set_ffts_config util_set_ffts_config
+
+/**
+ * @brief Complete prior communication and synchronize the PEs in a team.
+ * @note All local cores in the declared participation scope must enter, and all team PEs
+ *       must call collectives in the same order. On return, prior communication covered
+ *       by this Device API is complete and its updates are visible to the destination PE.
+ *       The source buffer of a completed transfer may then be reused. QP-specific transfers
+ *       require their matching QP-specific quiet.
+ *
+ * @param[in] team Team to synchronize.
+ * @return 0 after the collective (also for ACLSHMEM_TEAM_INVALID); Device execution errors
+ *         are not reported through this return value.
+ */
+ACLSHMEM_DEVICE int aclshmem_barrier(aclshmem_team_t team);
+#define shmem_barrier aclshmem_barrier
+
+/**
+ * @brief Perform aclshmem_barrier over ACLSHMEM_TEAM_WORLD with the same local core scope.
+ */
+ACLSHMEM_DEVICE void aclshmem_barrier_all(void);
+#define shmem_barrier_all aclshmem_barrier_all
+
+/**
+ * @brief Collective synchronization over a team in which only vector cores participate. This routine does not
+ * ensure
+ *        completion of remote memory updates issued through ACLSHMEM communication APIs. Cube cores may call
+ * the API
+ *        but take no effect.
+ *
+ * @param team              [in] team to synchronize
+ */
+ACLSHMEM_DEVICE void aclshmemx_sync_vec(aclshmem_team_t team);
+
+/**
+ * @brief aclshmemx_sync_vec over ACLSHMEM_TEAM_WORLD.
+ */
+ACLSHMEM_DEVICE void aclshmemx_sync_vec_all(void);
+
+/**
+ * @brief Compatibility wrapper for aclshmemx_sync_vec.
+ *
+ * @param team              [in] team to synchronize
+ */
+[[deprecated("aclshmemx_barrier_vec is deprecated, please use aclshmemx_sync_vec instead.")]]
+ACLSHMEM_DEVICE void aclshmemx_barrier_vec(aclshmem_team_t team);
+#define shmemx_barrier_vec aclshmemx_barrier_vec
+
+/**
+ * @brief Compatibility wrapper for aclshmemx_sync_vec_all.
+ */
+[[deprecated("aclshmemx_barrier_all_vec is deprecated, please use aclshmemx_sync_vec_all instead.")]]
+ACLSHMEM_DEVICE void aclshmemx_barrier_all_vec(void);
+#define shmemx_barrier_all_vec aclshmemx_barrier_all_vec
+
+/**
+ * @brief Wait for all team PEs to reach this synchronization point.
+ * @note On supported HCCS/UB paths, ordinary symmetric-memory stores from participating
+ *       cores are synchronized within the applicable visibility scope. This call does not
+ *       complete outstanding NBI communication. Call the matching quiet before sync when
+ *       communication completion or source-buffer reuse is required, or use barrier instead.
+ *       All cores in the declared participation scope must enter in the same order.
+ *
+ * @param[in] team Team to synchronize.
+ */
+ACLSHMEM_DEVICE void aclshmem_sync(aclshmem_team_t team);
+
+ACLSHMEM_DEVICE int aclshmem_team_sync(aclshmem_team_t team);
+
+/**
+ * @brief Perform aclshmem_sync over ACLSHMEM_TEAM_WORLD with the same local core scope.
+ */
+ACLSHMEM_DEVICE void aclshmem_sync_all(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#include "gm2gm/shmemi_device_cc.h"
+
+#endif // _DEVICE_GM2GM_ACLSHMEM_DEVICE_CC_H_
+```
+
+Four things in that file matter to us directly:
+
+1. `util_set_ffts_config(uint64_t config)` — aliased `shmemx_set_ffts_config` — **"Call this at
+   MIX Kernel entry point (if the kernel contains barrier calls)"**, and `util_get_ffts_config()`
+   is the host-side getter. Same mechanism as MegaGDN's `rtGetC2cCtrlAddr` +
+   `set_ffts_base_addr` (§8.6): the FFTS control address must be plumbed in as a kernel argument.
+2. **"The all-core barrier and sync APIs require a MIX kernel; all participating local AIC and
+   AIV cores must enter."** First-party confirmation that the device-side cross-rank barrier is
+   not available to a non-MIX kernel.
+3. `aclshmemx_sync_vec(team)` / `aclshmemx_sync_vec_all()` — **a vector-only cross-rank sync**.
+   "Cube cores may call the API but take no effect." But: "This routine does not ensure
+   completion of remote memory updates issued through ACLSHMEM communication APIs" — so it is
+   a rendezvous, not a completion. You must `aclshmem_quiet()` first.
+4. **"The Cube scalar unit is outside this visibility guarantee."** Ordinary symmetric-memory
+   stores are synchronized on HCCS/UB paths, *except* those issued from the Cube scalar unit.
+
+### 9.3 `include/device/gm2gm/shmem_device_mo.h` — memory ordering; `fence == quiet` on Ascend
+
+Full body, verbatim:
+
+```cpp
+/**
+ * @brief The aclshmem_quiet routine ensures completion of all operations on symmetric data objects issued by the
+ *        calling PE.
+ *        On systems with only scale-up network (HCCS), updates are globally visible, whereas on systems with
+ *        both scale-up network HCCS and scale-out network (RDMA), ACLSHMEM only guarantees that updates to the
+ *        memory of a given PE are visible to that PE.
+ *        Quiet operations issued on the CPU and the NPU only complete communication operations that were
+ *        issued from the CPU and the NPU, respectively. To ensure completion of NPU-side operations from
+ *        the CPU, using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_quiet(void);
+#define shmem_quiet aclshmem_quiet
+
+/**
+ * @brief In OpenACLSHMEM specification, aclshmem_fence assures ordering of delivery of Put, AMOs, and memory store routines
+ *        to symmetric data objects, but does not guarantee the completion of these operations.
+ *        However, due to hardware capabilities, we implemented aclshmem_fence same as aclshmem_quiet, ensuring both ordering
+ *        and completion.
+ *        Fence operations issued on the CPU and the NPU only order communication operations that were issued from the
+ *        CPU and the NPU, respectively. To ensure completion of NPU-side operations from the CPU,
+ *        using aclrtSynchronizeStream/aclrtDeviceSynchronize or stream-based API.
+ *
+ */
+ACLSHMEM_DEVICE void aclshmem_fence(void);
+#define shmem_fence aclshmem_fence
+```
+
+Single-machine TP16 is HCCS-only, so the strong clause applies: **"On systems with only scale-up
+network (HCCS), updates are globally visible."** There is no weaker visibility caveat for us.
+
+### 9.4 `include/device/shmem_def.h` — the UB budget the library takes, and batched submit
+
+```cpp
+#include "kernel_operator.h"
+#include "host_device/shmem_common_types.h"
+
+constexpr uint64_t ACLSHMEM_INTERNAL_UB_BUF_START_ADDR = 188 * 1024;
+constexpr uint32_t UB_ALIGN_SIZE = 32;
+constexpr uint32_t UB_ALIGN_SIZE_64 = 64;
+constexpr uint32_t ACLSHMEM_NUM_CQE_PER_POLL_CQ = 100;
+
+/**
+ * @struct non_contiguous_copy_param
+ * @brief Non-Contiguous Datacopy Param.
+ *
+ * - uint32_t repeat: Data move times
+ * - uint32_t length: Data move unit length
+ * - uint32_t src_ld: Src data leading dimension. Interval between the head of the repeat and the
+ *   head of the following repeat.
+ * - uint32_t dst_ld: Dst data leading dimension.
+ */
+struct non_contiguous_copy_param {
+    uint32_t repeat;
+    uint32_t length;
+    uint32_t src_ld;
+    uint32_t dst_ld;
+};
+
+/**
+ * @brief State shared by aclshmemx_defer_t and aclshmemx_submit_t actions in one active batch.
+ *
+ * Value-initialize the object as aclshmemx_submit_state_t state{} before the first operation.
+ * The library maintains pending_count and resets it to zero after a successful submit; callers must not modify the
+ * field directly. Use one state object for only one active batch, and keep it alive until every action that references
+ * it is no longer used.
+ *
+ * @note If submit validation or completion polling fails, the calling device kernel is aborted
+ *       and pending_count is not reset.
+ * @note reserved is retained for ABI-compatible extension and must remain zero.
+ */
+struct aclshmemx_submit_state_t {
+    uint32_t pending_count = 0; ///< Number of operations currently added to the batch.
+    uint32_t reserved = 0;      ///< Reserved for future extension; callers must keep it zero.
+};
+
+/**
+ * @brief Action that adds the current operation to a batch without submitting the batch.
+ */
+struct aclshmemx_defer_t {
+    aclshmemx_submit_state_t& state; ///< Submit state for the active batch.
+    ACLSHMEM_DEVICE explicit aclshmemx_defer_t(aclshmemx_submit_state_t& st) : state(st) {}
+};
+
+/**
+ * @brief Action that adds the current operation and submits all operations in the batch.
+ */
+struct aclshmemx_submit_t {
+    aclshmemx_submit_state_t& state; ///< Submit state for the active batch.
+    ACLSHMEM_DEVICE explicit aclshmemx_submit_t(aclshmemx_submit_state_t& st) : state(st) {}
+};
+```
+
+`ACLSHMEM_INTERNAL_UB_BUF_START_ADDR = 188 * 1024` is a hard budget line: on a 192 KB UB the
+library reserves the top 4 KB for itself. Any megakernel that links `aclshmem` loses that.
+
+### 9.5 `include/device/gm2gm/shmem_device_p2p_sync.h` — the one-sided signal/wait pair
+
+```cpp
+/**
+ * @brief The aclshmemx_signal_op operation updates sig_addr with signal using operation sig_op on the specified PE.
+ *        This operation can be used together with aclshmem_signal_wait_until for efficient
+ *        point-to-point synchronization.
+ *        On Ascend950, RDMA is used as the communication engine, supporting signal_set with guaranteed atomicity.
+ *
+ * @param sig_addr              [in] Symmetric address of the signal word to be updated.
+ * @param signal                [in] The value used to update sig_addr.
+ * @param sig_op                [in] Operation used to update sig_addr with signal. Supported operations:
+ *                                   ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                    [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmemx_signal_op(__gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe);
+#define shmemx_signal_op aclshmemx_signal_op
+
+/**
+ * @brief This routine can be used to implement point-to-point synchronization between PEs or between threads within
+ *        the same PE. A call to this routine blocks until the value of sig_addr at the calling PE satisfies the wait
+ *        condition specified by the comparison operator, cmp, and comparison value, cmp_val.
+ *
+ * @param sig_addr              [in] Local address of the source signal variable.
+ * @param cmp                   [in] The comparison operator that compares sig_addr with cmp_val. Supported operators:
+ *                                   ACLSHMEM_CMP_EQ/ACLSHMEM_CMP_NE/ACLSHMEM_CMP_GT/
+ *                                   ACLSHMEM_CMP_GE/ACLSHMEM_CMP_LT/ACLSHMEM_CMP_LE.
+ * @param cmp_val               [in] The value against which the object pointed to by sig_addr will be compared.
+ * @return Return the contents of the signal data object, sig_addr, at the calling PE that satisfies the wait condition.
+ */
+ACLSHMEM_DEVICE int32_t aclshmem_signal_wait_until(__gm__ int32_t *sig_addr, int cmp, int32_t cmp_val);
+#define shmem_signal_wait_until aclshmem_signal_wait_until
+```
+
+The same header also machine-generates, for every type in `ACLSHMEM_TYPE_FUNC`
+(`half float double int8 int16 int32 int64 uint8 uint16 uint32 uint64 char bfloat16`):
+
+```cpp
+ACLSHMEM_DEVICE void   aclshmem_##NAME##_wait_until(__gm__ TYPE *ivar, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE void   aclshmem_##NAME##_wait(__gm__ TYPE *ivar, TYPE cmp_value)
+ACLSHMEM_DEVICE void   aclshmem_##NAME##_wait_until_all(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_wait_until_any(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_wait_until_some(__gm__ TYPE *ivars, size_t nelems, __gm__ size_t *indices, __gm__ const int *status, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE void   aclshmem_##NAME##_wait_until_all_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_wait_until_any_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_wait_until_some_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ size_t *indices, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+ACLSHMEM_DEVICE int    aclshmem_##NAME##_test(__gm__ TYPE *ivars, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_test_any(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_test_some(__gm__ TYPE *ivars, size_t nelems, __gm__ size_t *indices, __gm__ const int *status, int cmp, TYPE cmp_value)
+ACLSHMEM_DEVICE int    aclshmem_##NAME##_test_all_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_test_any_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+ACLSHMEM_DEVICE size_t aclshmem_##NAME##_test_some_vector(__gm__ TYPE *ivars, size_t nelems, __gm__ size_t *indices, __gm__ const int *status, int cmp, __gm__ TYPE *cmp_values)
+```
+
+`_test*` are the non-blocking polls — the primitive you want in a persistent kernel so a core
+can do other work instead of spinning.
+
+### 9.6 `include/device/gm2gm/shmem_device_so.h` — put-with-signal (data-then-flag as one op)
+
+```cpp
+/**
+ * @brief Synchronous interface. Copy contiguous data on local PE to symmetric address on the specified PE
+ *       then update sig_addr
+ *
+ * @note This interface supports single-core invocation only; multiple cores or writers are unsupported.
+ * @note For UDMA, transfers over 256 MB are split internally before updating sig_addr.
+ *
+ * @param dst               [in] Pointer on Symmetric memory of the destination data.
+ * @param src               [in] Pointer on local device of the source data.
+ * @param elem_size         [in] Number of bytes copied from src to dst.
+ * @param sig_addr          [in] Symmetric address of the signal word to be updated.
+ * @param signal            [in] The value used to update sig_addr.
+ * @param sig_op            [in] Operation used to update sig_addr with signal. Supported operations:
+ *                               ACLSHMEM_SIGNAL_SET/ACLSHMEM_SIGNAL_ADD
+ * @param pe                [in] PE number of the remote PE.
+ */
+ACLSHMEM_DEVICE void aclshmem_putmem_signal(
+    __gm__ void* dst, __gm__ void* src, size_t elem_size, __gm__ int32_t* sig_addr, int32_t signal, int sig_op, int pe);
+#define shmem_putmem_signal aclshmem_putmem_signal
+
+template <typename T>
+ACLSHMEM_DEVICE void aclshmem_putmem_signal(
+    AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, size_t elem_size, __gm__ int32_t* sig_addr,
+    int32_t signal, int sig_op, int pe);
+```
+
+and the per-type expansion macro:
+
+```cpp
+#define ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL(NAME, TYPE)                                                                \
+    ACLSHMEM_DEVICE void aclshmem_##NAME##_put_signal(                                                              \
+        __gm__ TYPE* dst, __gm__ TYPE* src, size_t elem_size, __gm__ int32_t* sig_addr, int32_t signal, int sig_op, \
+        int pe)
+ACLSHMEM_TYPE_FUNC(ACLSHMEM_PUT_TYPENAME_MEM_SIGNAL);
+```
+
+```cpp
+/**
+ * @brief Standard RMA Types and Names
+ *
+ * |NAME       | TYPE      |
+ * |-----------|-----------|
+ * |half       | half      |
+ * |float      | float     |
+ * |double     | double    |
+ * |int8       | int8      |
+ * |int16      | int16     |
+ * |int32      | int32     |
+ * |int64      | int64     |
+ * |uint8      | uint8     |
+ * |uint16     | uint16    |
+ * |uint32     | uint32    |
+ * |uint64     | uint64    |
+ * |char       | char      |
+ * |bfloat16   | bfloat16  |
+ */
+#define ACLSHMEM_TYPE_FUNC(FUNC) \
+    FUNC(half, half);            \
+    FUNC(float, float);          \
+    FUNC(double, double);        \
+    FUNC(int8, int8_t);          \
+    FUNC(int16, int16_t);        \
+    FUNC(int32, int32_t);        \
+    FUNC(int64, int64_t);        \
+    FUNC(uint8, uint8_t);        \
+    FUNC(uint16, uint16_t);      \
+    FUNC(uint32, uint32_t);      \
+    FUNC(uint64, uint64_t);      \
+    FUNC(char, char);            \
+    FUNC(bfloat16, bfloat16_t)
+```
+
+There is also a non-contiguous (strided) put-with-signal taking `non_contiguous_copy_param`:
+
+```cpp
+ACLSHMEM_DEVICE void aclshmem_NAME_put_signal(__gm__ TYPE *dst, __gm__ TYPE *src,
+    const non_contiguous_copy_param &copy_params, __gm__ int32_t *sig_addr, int32_t signal, int sig_op, int pe)
+```
+
+The critical constraint, repeated on every signalling variant:
+**"This interface supports single-core invocation only; multiple cores or writers are
+unsupported."**
+
+### 9.7 `include/host_device/shmem_common_types.h` — enums, limits, and the sync-pool arithmetic
+
+```cpp
+enum aclshmem_data_op_type_t {       // (values quoted as found)
+    ACLSHMEM_DATA_OP_SDMA = 0x02,
+    ACLSHMEM_DATA_OP_ROCE = 0x04,
+    ACLSHMEM_DATA_OP_UDMA = 0x08,
+    ACLSHMEM_DATA_OP_MAX  = 0x08,
+};
+
+/**
+ * @brief Memory type of NPU or host
+ */
+enum aclshmem_mem_type_t {
+    HOST_SIDE = 0, // The memory address allocated by shmem is on the host side
+    DEVICE_SIDE    // The memory address allocated by shmem is on the device side
+};
+
+/**
+ * @brief Signal operations, used by the signaler in peer-to-peer synchronization
+ */
+enum aclshmem_signal_op_type_t { ACLSHMEM_SIGNAL_SET, ACLSHMEM_SIGNAL_ADD };
+
+/**
+ * @brief Signal comparison operations, used by the signalee in peer-to-peer synchronization
+ */
+enum aclshmem_cmp_op_type_t {
+    ACLSHMEM_CMP_EQ = 0,
+    ACLSHMEM_CMP_NE,
+    ACLSHMEM_CMP_GT,
+    ACLSHMEM_CMP_GE,
+    ACLSHMEM_CMP_LT,
+    ACLSHMEM_CMP_LE
+};
+
+typedef int aclshmem_team_t;
+typedef uint64_t aclshmemx_team_uniqueid_t;
+
+/// \brief Maximum number of Processing Elements (PE) supported by ACLSHMEM (16384)
+#define ACLSHMEM_MAX_PES 16384
+/// \brief Maximum number of teams supported by ACLSHMEM (2048)
+#define ACLSHMEM_MAX_TEAMS 2048
+/// \brief Size of the signal structure (8 bytes)
+#define ACLSHMEM_SIGNAL_SIZE 8
+/// \brief Maximum capacity of ACLSHMEM local memory (40GB)
+#define ACLSHMEM_MAX_LOCAL_SIZE (40UL * 1024 * 1024 * 1024)
+/// \brief Padding bytes for the team configuration structure, used for memory alignment (48 bytes)
+#define TEAM_CONFIG_PADDING 48
+
+/* arch related */
+/// \brief Size of the scalar data cache line (64 bytes), used for cache alignment optimization
+#define SCALAR_DATA_CACHELINE_SIZE 64
+/// \brief Size of the L2 cache line (512 bytes), used for advanced cache alignment optimization
+#define L2_CACHELINE_SIZE 512
+/// \brief ACLSHMEM memory page size (2MB), complying with system memory paging specifications
+#define ACLSHMEM_PAGE_SIZE (1024UL * 1024UL * 2)
+/// \brief notify_addr offset (14KB)
+#define ACLSHMEM_STARS_NOTIFY_ADDR_OFFSET (14 * 1024)
+/// \brief SDMA flag data length
+#define ACLSHMEM_SDMA_FLAG_LENGTH 64
+/// \brief SDMA shared workspace capacity, covering channel metadata, notify IDs, and three flag regions for up to 72
+/// AIVs
+#define ACLSHMEM_SDMA_WORKSPACE_SIZE (28U * 1024U)
+/// \brief Minimum UB scratch size in bytes for UDMA PIPE_MTE3 WQE staging
+#define ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE 128U
+/// \brief Minimum UB scratch size in bytes for RDMA MTE3 WQE staging
+#define ACLSHMEM_RDMA_MTE_STAGING_UB_SIZE 128U
+
+#define ALIGN_TO(size, page) (((size) + (page) - 1) / (page) * (page))
+
+/* synchronization related */
+/// \brief Memory size of the ACLSHMEM synchronization bit, consistent with the scalar data cache line size
+#define ACLSHMEM_SYNCBIT_SIZE SCALAR_DATA_CACHELINE_SIZE
+
+// npu level sync
+/// \brief Number of log bits required for NPU-level synchronization (5 bits), calculated as: ceil(log₈(16384)) = 5
+#define SYNC_LOG_MAX_PES 5
+/// \brief Task group dissemination coefficient (8) for ACLSHMEM barrier synchronization, used for synchronization
+/// algorithm optimization
+#define ACLSHMEM_BARRIER_TG_DISSEM_KVAL 8
+/// \brief Total size of the NPU-level synchronization array, calculated from sync bit size, log bits and dissemination
+/// coefficient
+#define SYNC_ARRAY_SIZE (ACLSHMEM_SYNCBIT_SIZE * SYNC_LOG_MAX_PES * ACLSHMEM_BARRIER_TG_DISSEM_KVAL)
+#define SYNC_COUNTER_SIZE ACLSHMEM_SYNCBIT_SIZE
+#define SYNC_POOL_SIZE (SYNC_ARRAY_SIZE * ACLSHMEM_MAX_TEAMS)
+#define SYNC_COUNTERS_SIZE (SYNC_COUNTER_SIZE * ACLSHMEM_MAX_TEAMS)
+
+// core level sync
+/// \brief Maximum number of AIV (AI Core) supported per NPU (72)
+#define ACLSHMEM_MAX_AIV_PER_NPU 72
+/// \brief Number of log bits required for core-level synchronization (7 bits), calculated as: ceil(log₂(72)) = 7
+#define ACLSHMEM_LOG_MAX_AIV_PER_NPU 7
+/// \brief Total size of the core-level synchronization pool, calculated from AIV count, log bits and sync bit size
+#define ACLSHMEM_CORE_SYNC_POOL_SIZE (ACLSHMEM_MAX_AIV_PER_NPU * ACLSHMEM_LOG_MAX_AIV_PER_NPU * ACLSHMEM_SYNCBIT_SIZE)
+#define ACLSHMEM_CORE_SYNC_COUNTER_SIZE ACLSHMEM_SYNCBIT_SIZE
+
+#define ACLSHMEM_EXTRA_SIZE_UNALIGNED SYNC_POOL_SIZE
+#define ACLSHMEM_EXTRA_SIZE ALIGN_TO(ACLSHMEM_EXTRA_SIZE_UNALIGNED, ACLSHMEM_PAGE_SIZE)
+```
+
+Read the barrier arithmetic: the all-PE barrier is a **dissemination barrier with radix
+K = 8** (`ACLSHMEM_BARRIER_TG_DISSEM_KVAL 8`) over `ceil(log_8(16384)) = 5` rounds, each round
+having its own 64-byte sync bit, times 2048 teams. For TP16 the radix-8 dissemination needs
+`ceil(log_8 16) = 2` rounds. The *core-level* barrier is radix-2 over
+`ceil(log_2 72) = 7` rounds, 64 B per round per AIV: `72 * 7 * 64 = 32256 B` of GM.
+
+So the device barrier is a **software, GM-resident, log-depth tree over 64-byte cache lines** —
+not an FFTS flag. That is why it costs what it costs, and why `aclshmemx_sync_vec` exists.
+
+## Relevance
+
+This is the sanctioned answer to the question this file was opened to answer, and it is better
+than expected: a one-sided `put`, a one-sided `signal_op`, a `put`+`signal` fused into one
+ordered operation, a non-blocking `test`, and a blocking `signal_wait_until` — all callable
+from `__aicore__` device code, all first-party, all open source. §9.5+§9.6 are literally the
+epoch-tagged-flag protocol we were going to hand-roll, with `ACLSHMEM_SIGNAL_ADD` giving the
+monotone counter that removes the stale-flag race without zeroing buffers.
+
+Three facts land directly on our measurements. (a) `shmem_device_cc.h` states the all-core
+barrier **requires a MIX kernel** and that all local AIC *and* AIV cores must enter — the same
+conclusion our `KERNEL_TYPE_AIC_ONLY` rejection forces on us, arrived at from the library side.
+(b) `aclshmemx_sync_vec` is an AIV-only cross-rank sync, i.e. there is a sanctioned path that
+does *not* drag Cube into the rendezvous — relevant because our 49.3 us MoE chain is MIX and we
+do not want to pay a full-core barrier to publish an all-reduce. (c) **"The Cube scalar unit is
+outside this visibility guarantee"** — if the Cube scalar unit writes the activation we are
+about to all-reduce, the collective does not cover it; the write must come from AIV or from an
+explicit `put`.
+Two hard costs to budget: `ACLSHMEM_INTERNAL_UB_BUF_START_ADDR = 188 * 1024` takes the top 4 KB
+of UB, and `aclshmem_putmem_signal` is **single-core only** ("multiple cores or writers are
+unsupported"), so the publish step serialises onto one AIV unless we shard by destination PE.
+
+## 10. `examples/tp_allreduce_udma` — a complete device-side TP all-reduce in AscendC, first-party
+
+URL: https://gitcode.com/cann/shmem/tree/master/examples/tp_allreduce_udma
+Raw: https://raw.gitcode.com/cann/shmem/raw/master/examples/tp_allreduce_udma/tp_allreduce_udma_kernel.cpp
+Author: Huawei Technologies Co., Ltd. (copyright header reads `Copyright (c) 2026`)
+Date: shipped with SHMEM v1.7.0, 2026/10 ("新增 MegaMoE、UDMA AllReduce 示例")
+Wiki writeup referenced by the README: https://gitcode.com/cann/shmem/wiki/operator-practice-tp-allreduce-udma
+Retrieved 2026-10-20.
+
+This is a TP=2 all-reduce written as reduce-scatter + local reduce + all-gather, with the
+communication issued from `__aicore__` code by AIV cores driving UDMA. Reproduced nearly in
+full; the licence header and the profiling wrappers are the only things cut.
+
+### 10.1 The constants and the kernel entry — note `[[bisheng::core_ratio(0, 1)]]`
+
+```cpp
+#include "tp_allreduce_udma_kernel.h"
+
+#include "kernel_operator.h"
+#include "shmem.h"
+#include "utils/prof/shmemi_prof.h"
+
+namespace {
+
+constexpr uint32_t TP_SIZE = 2;
+#if defined(ACLSHMEM_RELAY_SUPPORT)
+constexpr uint32_t BOX_SIZE = 4;
+constexpr uint32_t TAILCUT_PATH_COUNT = 3;
+#endif
+constexpr uint32_t REDUCE_TILE_BYTES = 16 * 1024;
+constexpr uint32_t REDUCE_QUEUE_DEPTH = 1;
+constexpr uint32_t UDMA_WQE_SCRATCH_BYTES = 256;
+constexpr int32_t PROF_FRAME_TOTAL = 0;
+constexpr int32_t PROF_FRAME_REDUCE_SCATTER = 1;
+constexpr int32_t PROF_FRAME_LOCAL_REDUCE = 2;
+constexpr int32_t PROF_FRAME_ALLGATHER = 3;
+```
+
+```cpp
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void tp_allreduce_udma_int32_t_kernel(
+    uint64_t fftsConfig, GM_ADDR workspace, uint32_t elements, int teamId, int32_t perfMode, int32_t mode,
+    int32_t stage, uint32_t directWeight, uint32_t relay0Weight, uint32_t relay1Weight)
+{
+    TpAllReduceUdmaImpl<int32_t>(
+        fftsConfig, workspace, elements, teamId, perfMode, mode, stage, directWeight, relay0Weight, relay1Weight);
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void tp_allreduce_udma_float16_t_kernel(...)
+
+void launch_tp_allreduce_udma_int32_t(
+    uint32_t blockDim, void* stream, uint64_t fftsConfig, uint8_t* workspace, uint32_t elements, aclshmem_team_t tpTeam,
+    int32_t perfMode, int32_t mode, int32_t stage, uint32_t directWeight, uint32_t relay0Weight, uint32_t relay1Weight)
+{
+    tp_allreduce_udma_int32_t_kernel<<<blockDim, nullptr, stream>>>(
+        fftsConfig, workspace, elements, static_cast<int>(tpTeam), perfMode, mode, stage, directWeight, relay0Weight,
+        relay1Weight);
+}
+```
+
+`[[bisheng::core_ratio(0, 1)]]` — **0 cube : 1 vector**, i.e. an AIV-only kernel declared through
+a Bisheng C++ attribute rather than through a `KERNEL_TYPE_*` macro. The companion
+`examples/barrier_all/barrier_all_kernel.cpp` (§10.4) uses `[[bisheng::core_ratio(1, 2)]]`, the
+1:2 MIX ratio. This is the first-party spelling of the kernel-type declaration in current CANN
+examples.
+
+### 10.2 The communication primitives actually called
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void SendShardDirect(
+    __gm__ T* remoteDst, __gm__ T* localSrc, __ubuf__ T* udmaBuffer, uint32_t elementCount, int32_t targetPe)
+{
+    aclshmemx_udma_put_nbi(remoteDst, localSrc, udmaBuffer, elementCount, targetPe);
+    aclshmemx_udma_quiet(targetPe);
+}
+```
+
+and the multi-path ("tailcut") variant, which is the interesting one: three cores each submit a
+different *path* to the same destination PE, two of them bouncing through a relay PE, then
+**one** `AscendC::SyncAll<true>()` and **one** core calls quiet:
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void SendShardTailcut(
+    __gm__ T* remoteDst, __gm__ T* localSrc, __ubuf__ T* udmaBuffer, uint32_t elementCount, int32_t targetPe,
+    int32_t myPe, uint32_t coreIdx, uint32_t directWeight, uint32_t relay0Weight, uint32_t relay1Weight)
+{
+    int32_t relay0 = -1;
+    int32_t relay1 = -1;
+    bool enableTailcut = GetRelayPeers(myPe, targetPe, relay0, relay1);
+
+    if (!enableTailcut) {
+        if (coreIdx == 0) {
+            SendShardDirect(remoteDst, localSrc, udmaBuffer, elementCount, targetPe);
+        }
+        return;
+    }
+
+    if (coreIdx < TAILCUT_PATH_COUNT) {
+        uint32_t offset = 0;
+        uint32_t currentElements = 0;
+        GetTailcutSegment(coreIdx, elementCount, directWeight, relay0Weight, relay1Weight, offset, currentElements);
+        if (currentElements > 0) {
+            if (coreIdx == 0) {
+                aclshmemx_udma_put_nbi(remoteDst + offset, localSrc + offset, udmaBuffer, currentElements, targetPe);
+            } else {
+                int32_t relayPe = coreIdx == 1 ? relay0 : relay1;
+                aclshmemx_udma_relay_put_nbi(
+                    remoteDst + offset, localSrc + offset, udmaBuffer, currentElements, targetPe, relayPe);
+            }
+        }
+    }
+
+    // Every active-path NBI call must return before core0 starts scanning the completion slots.
+    AscendC::SyncAll<true>();
+    if (coreIdx == 0) {
+        aclshmemx_udma_quiet(targetPe);
+    }
+}
+```
+
+`GetRelayPeers` / `GetTailcutSegment` — the relay topology and the weighted split:
+
+```cpp
+ACLSHMEM_DEVICE bool GetRelayPeers(int32_t myPe, int32_t targetPe, int32_t& relay0, int32_t& relay1)
+{
+    int32_t boxBase = myPe / static_cast<int32_t>(BOX_SIZE) * static_cast<int32_t>(BOX_SIZE);
+    uint32_t relayCount = 0;
+    for (uint32_t i = 0; i < BOX_SIZE; ++i) {
+        int32_t candidate = boxBase + static_cast<int32_t>(i);
+        if (candidate == myPe || candidate == targetPe) {
+            continue;
+        }
+        if (relayCount == 0) {
+            relay0 = candidate;
+        } else if (relayCount == 1) {
+            relay1 = candidate;
+        }
+        ++relayCount;
+    }
+    return relayCount == 2;
+}
+
+ACLSHMEM_DEVICE void GetTailcutSegment(
+    uint32_t pathIdx, uint32_t totalElements, uint32_t directWeight, uint32_t relay0Weight, uint32_t relay1Weight,
+    uint32_t& offset, uint32_t& elementCount)
+{
+    uint64_t totalWeight =
+        static_cast<uint64_t>(directWeight) + static_cast<uint64_t>(relay0Weight) + static_cast<uint64_t>(relay1Weight);
+    if (totalWeight == 0) {
+        offset = 0;
+        elementCount = 0;
+        return;
+    }
+    // Cumulative floor boundaries keep zero-weight paths empty while covering the complete range.
+    uint32_t directEnd = static_cast<uint32_t>(static_cast<uint64_t>(totalElements) * directWeight / totalWeight);
+    uint32_t relay0End = static_cast<uint32_t>(
+        static_cast<uint64_t>(totalElements) * (static_cast<uint64_t>(directWeight) + relay0Weight) / totalWeight);
+    if (pathIdx == 0) {
+        offset = 0;
+        elementCount = directEnd;
+    } else if (pathIdx == 1) {
+        offset = directEnd;
+        elementCount = relay0End - directEnd;
+    } else {
+        offset = relay0End;
+        elementCount = totalElements - offset;
+    }
+}
+```
+
+### 10.3 The body — symmetric-memory layout, UB WQE scratch, and the STAGE split
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void TpAllReduceUdmaImpl(
+    uint64_t fftsConfig, GM_ADDR workspace, uint32_t elements, int teamId, int32_t perfMode, int32_t mode,
+    int32_t stage, uint32_t directWeight, uint32_t relay0Weight, uint32_t relay1Weight)
+{
+    util_set_ffts_config(fftsConfig);
+
+    aclshmem_team_t tpTeam = static_cast<aclshmem_team_t>(teamId);
+    int32_t rankInTp = aclshmem_team_my_pe(tpTeam);
+    int32_t tpSize = aclshmem_team_n_pes(tpTeam);
+    if (tpSize != TP_SIZE || elements % TP_SIZE != 0) {
+        return;
+    }
+
+    int32_t peerInTp = rankInTp ^ 1;
+    int32_t myGlobalRank = -1;
+#if defined(ACLSHMEM_RELAY_SUPPORT)
+    if (mode == static_cast<int32_t>(TpAllReduceUdmaMode::TAILCUT)) {
+        myGlobalRank = aclshmem_team_translate_pe(tpTeam, rankInTp, ACLSHMEM_TEAM_WORLD);
+    }
+#endif
+    int32_t peerGlobalRank = aclshmem_team_translate_pe(tpTeam, peerInTp, ACLSHMEM_TEAM_WORLD);
+    uint32_t shardElements = elements / TP_SIZE;
+    uint32_t coreIdx = AscendC::GetBlockIdx();
+    uint32_t coreCount = AscendC::GetBlockNum();
+
+    __gm__ T* input = reinterpret_cast<__gm__ T*>(workspace);
+    __gm__ T* reduceScatterRecv = input + elements;
+    __gm__ T* output = reduceScatterRecv + elements;
+
+    __gm__ T* shardForPeer = input + peerInTp * shardElements;
+    __gm__ T* peerRecvSlot = reduceScatterRecv + rankInTp * shardElements;
+    __gm__ T* localShard = input + rankInTp * shardElements;
+    __gm__ T* receivedPeerShard = reduceScatterRecv + peerInTp * shardElements;
+    __gm__ T* reducedLocalShard = output + rankInTp * shardElements;
+
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECOUT> udmaBuffer;
+    pipe.InitBuffer(udmaBuffer, UDMA_WQE_SCRATCH_BYTES);
+    AscendC::LocalTensor<uint8_t> udmaUb = udmaBuffer.GetWithOffset<uint8_t>(UDMA_WQE_SCRATCH_BYTES, 0);
+    __ubuf__ T* udmaUbAddr = reinterpret_cast<__ubuf__ T*>(udmaUb.GetPhyAddr());
+
+    TpAllReduceUdmaStage currentStage = static_cast<TpAllReduceUdmaStage>(stage);
+    if (currentStage == TpAllReduceUdmaStage::REDUCE_SCATTER) {
+        ProfStart(perfMode, PROF_FRAME_TOTAL);
+        ProfStart(perfMode, PROF_FRAME_REDUCE_SCATTER);
+        SendShard(
+            peerRecvSlot, shardForPeer, udmaUbAddr, shardElements, peerGlobalRank, myGlobalRank, coreIdx, mode,
+            directWeight, relay0Weight, relay1Weight);
+        ProfEnd(perfMode, PROF_FRAME_REDUCE_SCATTER);
+        return;
+    }
+    if (currentStage != TpAllReduceUdmaStage::LOCAL_REDUCE_ALLGATHER) {
+        return;
+    }
+    ...
+    if (reduceElements > 0) {
+        ReduceTwoShards(
+            localShard + reduceOffset, receivedPeerShard + reduceOffset, reducedLocalShard + reduceOffset,
+            reduceElements, pipe);
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::SyncAll<true>();
+
+    ProfStart(perfMode, PROF_FRAME_ALLGATHER);
+    SendShard(
+        reducedLocalShard, reducedLocalShard, udmaUbAddr, shardElements, peerGlobalRank, myGlobalRank, coreIdx, mode,
+        directWeight, relay0Weight, relay1Weight);
+    ProfEnd(perfMode, PROF_FRAME_ALLGATHER);
+    ProfEnd(perfMode, PROF_FRAME_TOTAL);
+}
+```
+
+and the header that declares the stage enum, i.e. the admission that the example does **two
+launches**:
+
+```cpp
+enum class TpAllReduceUdmaMode : int32_t {
+    BASELINE = 0,
+    TAILCUT = 1,
+};
+
+enum class TpAllReduceUdmaStage : int32_t {
+    REDUCE_SCATTER = 0,
+    LOCAL_REDUCE_ALLGATHER = 1,
+};
+```
+
+The local reduce, for completeness — a plain double-buffer-free UB tile loop, `AscendC::Add`:
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void ReduceTwoShards(
+    __gm__ T* localShard, __gm__ T* peerShard, __gm__ T* outputShard, uint32_t shardElements, AscendC::TPipe& pipe)
+{
+    AscendC::GlobalTensor<T> localGm; ... localGm.SetGlobalBuffer(localShard); ...
+    AscendC::TQue<AscendC::TPosition::VECIN, REDUCE_QUEUE_DEPTH> localQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, REDUCE_QUEUE_DEPTH> peerQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, REDUCE_QUEUE_DEPTH> outputQueue;
+    pipe.InitBuffer(localQueue, REDUCE_QUEUE_DEPTH, REDUCE_TILE_BYTES);
+    pipe.InitBuffer(peerQueue, REDUCE_QUEUE_DEPTH, REDUCE_TILE_BYTES);
+    pipe.InitBuffer(outputQueue, REDUCE_QUEUE_DEPTH, REDUCE_TILE_BYTES);
+
+    constexpr uint32_t tileElements = REDUCE_TILE_BYTES / sizeof(T);
+    for (uint32_t offset = 0; offset < shardElements; offset += tileElements) {
+        ...
+        AscendC::DataCopyPad(localUb, localGm[offset], copyParams, padParams);
+        AscendC::DataCopyPad(peerUb, peerGm[offset], copyParams, padParams);
+        ...
+        AscendC::Add(outputUb, localUb, peerUb, currentElements);
+        ...
+        AscendC::DataCopyPad(outputGm[offset], outputUb, copyParams);
+    }
+}
+```
+
+### 10.4 `examples/barrier_all/barrier_all_kernel.cpp` — the MIX device-side cross-rank barrier, in full
+
+Raw: https://raw.gitcode.com/cann/shmem/raw/master/examples/barrier_all/barrier_all_kernel.cpp
+
+```cpp
+#include "kernel_operator.h"
+#include "shmem.h"
+#include "barrier_all_kernel.h"
+
+namespace barrier_all_demo {
+
+extern "C" [[bisheng::core_ratio(1, 2)]] __global__ __aicore__ void device_barrier_all_demo(
+    uint64_t fftsAddr, GM_ADDR buffer)
+{
+    util_set_ffts_config(fftsAddr);
+    int pe = aclshmem_my_pe();
+    int n_pes = aclshmem_n_pes();
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    // Only AIV sub-block 0 submits the puts; other AIV sub-blocks and AIC
+    // still participate in the collective barrier below.
+    if ASCEND_IS_AIV {
+        if (AscendC::GetSubBlockIdx() == 0) {
+            auto data = reinterpret_cast<__gm__ uint8_t*>(buffer);
+            // The high-level API selects MTE for same-machine PEs and RDMA for cross-machine PEs.
+            for (int peer = 0; peer < n_pes; ++peer) {
+                if (peer == pe) {
+                    continue;
+                }
+                aclshmem_putmem_nbi(data + pe * kSlotBytes, data + pe * kSlotBytes, kSlotBytes, peer);
+            }
+        }
+    }
+
+    aclshmem_barrier_all();
+}
+
+void launch_barrier_all(void* stream, uint64_t fftsAddr, uint32_t* buffer)
+{
+    device_barrier_all_demo<<<1, nullptr, stream>>>(fftsAddr, reinterpret_cast<uint8_t*>(buffer));
+}
+} // namespace barrier_all_demo
+```
+
+Note: **"The high-level API selects MTE for same-machine PEs and RDMA for cross-machine PEs."**
+Single machine TP16 ⇒ `aclshmem_putmem_nbi` goes over MTE, not RDMA/UDMA. And note blockDim is
+literally `1` in the launch — one AIC + its two AIVs.
+
+### 10.5 The README's constraints — THE PLATFORM LIMIT
+
+`examples/tp_allreduce_udma/README.md`, 约束 section, verbatim:
+
+> ## 约束
+>
+> - `baseline` 与 `tailcut` 算子依赖 UB-Mesh 互联，以及 AIV Core 直驱 UDMA 的能力，**当前仅支持 Ascend 950PR&950DT系列产品**。
+> - `tailcut` 需借助其他 NPU 中转部分通信数据，**当前 relay 功能仅支持 Atlas 950 SuperPoD**；非该形态部署下，无法保证绕路转发可用，请勿使用 `tailcut` 模式。
+> - TP 大小固定为 2。
+> - `elements` 必须为正数且能被 2 整除。
+> - Tailcut 模式要求 PE 数量能被 4 整除，且 AIV Core 数量至少为 3。
+> - `--ratio` 仅用于 Tailcut 模式，三个权重必须为非负整数且总和大于 0。
+> - 每阶段的流量边界按 `floor(shard_elements * 累计权重 / 总权重)` 计算，权重为 0 的路径不发送数据。
+
+> ## 示例概述
+>
+> 本示例在单机启动多个 PE，并将相邻的两个 PE 划分为一个 TP=2 通信组。每个 TP 组独立执行
+> `reduce-scatter + local reduce + all-gather`，不同 TP 组之间不传输 AllReduce 数据。
+>
+> 示例通过 `--mode` 提供两种通信模式，并复用相同的 Host 初始化、Local Reduce、性能统计和
+> golden 数据校验逻辑：
+>
+> - `baseline`：Core 0 调用 `aclshmemx_udma_put_nbi` 直发数据，并调用 `aclshmemx_udma_quiet` 等待完成。
+> - `tailcut`：将通信分片按比例切分到一条直发路径和两条绕路路径，Core 0、1、2 分别提交 direct、relay0、relay1 路径，随后由 Core 0 调用一次 `aclshmemx_udma_quiet`。
+>
+> Local Reduce 按 tile 切分给所有启动的 AIV Core 计算。Tailcut 模式将每四个连续 PE 视为一个
+> box，当前 TP 对之外的两个 PE 作为 relay PE，默认流量权重为 `2:1:1`。
+
+Parameter defaults, for the shape of the measurement they do:
+
+> | `-pes` | PE 数量；baseline 支持 2、4、8、16，tailcut 支持 4、8、16 | 未指定时 baseline 为 2、tailcut 为 4 |
+> | `-elements` | 每个 PE 输入 Tensor 的元素数量 | 1024 |
+> | `-type` | 数据类型，支持 `int32_t`、`float16_t` | `float16_t` |
+> | `-aiv` | Kernel 使用的 AIV Core 数量；tailcut 至少为 3，且不能超过设备的 Vector Core 数量 | 未指定时 baseline 为 1、tailcut 为 3 |
+
+### 10.6 `docs/api/sync_barrier_api_usage.md` — the sanctioned in-kernel ordering recipes
+
+> ## 三、Device kernel 中的使用顺序
+>
+> 以下两种顺序均要求 team 内所有 PE 和声明参与范围内的核按相同顺序调用集体接口：
+>
+>     // 方式一：NBI -> barrier
+>     aclshmem_putmem_nbi(dst, src, bytes, peer);
+>     aclshmem_barrier_all();
+>     // barrier 返回后，先前通信完成；可读取对应目标数据、复用源缓冲区。
+>
+>     // 方式二：NBI -> quiet -> sync
+>     aclshmem_putmem_nbi(dst, src, bytes, peer);
+>     aclshmem_quiet();     // 本 PE 的先前通信完成，可复用本地源缓冲区
+>     aclshmem_sync_all();  // 等待所有 PE 到达；之后再读取其他 PE 的写入结果
+>
+> 普通对称内存 store 的同步/可见性与通信 API 的完成范围不同：sync 同步参与核在受支持的 HCCS/UB 内存域中的普通存储，但不能代替 quiet 完成 NBI；barrier 同时提供通信完成与 PE 到达同步。**对混合核，Cube 标量单元不在这些 API 的同步保证范围内**；参与核范围见 Device public header。Host 发出的通信应使用 Host 对应接口完成，Device 发出的通信应在 Device 执行范围内完成。
+
+> **屏障、同步与通信完成：**
+>
+> - sync 表示指定 team 的 PE 到达同一同步点；对参与核此前的普通对称内存存储提供适用范围内的同步与可见性，但不保证此前发出的非阻塞通信已完成。Host 的 aclshmem_team_sync 与流式 sync 均应按这一最低保证使用；不要以 sync 代替通信完成操作。
+> - quiet 完成调用 PE 在对应 Host 或 Device 执行范围内先前发出的通信，但不等待其他 PE 到达同步点。
+> - barrier 先完成相应执行范围内此前发出的通信，再等待指定 team 的所有 PE 到达同步点。所有集体调用必须由 team 内 PE 按相同顺序参与。
+> - 在 Device kernel 中，NBI 后如需读取远端结果或复用源缓冲区，使用 barrier；或者先 quiet 完成本 PE 通信，再 sync 等待其他 PE。fence 仅用于建立顺序，不作为通用的通信完成保证。
+
+## Relevance
+
+Two things to take and one to reject.
+
+Take: `[[bisheng::core_ratio(aic, aiv)]]` is the current first-party way to declare the core mix
+of a kernel — `(0, 1)` for AIV-only, `(1, 2)` for the A2/A3 MIX ratio. That is a second,
+attribute-based spelling alongside the `KERNEL_TYPE_*` macros, and it is what CANN's own 2026
+examples use. If `KERNEL_TYPE_AIC_ONLY` is rejected at submission with
+`sqe_type=3, errType=0x20`, `[[bisheng::core_ratio(1, 0)]]` is the obvious next thing to try —
+the notation can at least *express* cube-only, and it is the notation the toolchain itself ships.
+
+Take: the ordering recipe `NBI -> quiet -> sync` with the explicit note that `sync` alone does
+**not** complete an NBI. Our one-sided all-reduce therefore needs, per layer, exactly: put_nbi
+(or putmem_signal) → quiet → a cross-rank rendezvous. `aclshmemx_sync_vec_all()` (§9.2) is the
+AIV-only rendezvous, so the whole sequence can stay off Cube.
+
+Reject: the structure of this example is *not* what we want. `TpAllReduceUdmaStage` splits the
+all-reduce into **two kernel launches** with a host barrier between reduce-scatter and
+local-reduce — exactly the host round trip we are trying to delete. Nothing in the example says
+this is required; the stage split appears to exist so the benchmark can time the halves
+separately (the three `PROF_FRAME_*` IDs). But it does mean the first-party example does not
+demonstrate a single-launch all-reduce; §11 does.
+
+Hard limit to note: the UDMA path, i.e. "AIV Core 直驱 UDMA", is 「当前仅支持 Ascend 950PR&950DT
+系列产品」 — A5 only, NOT A3. On A3 the engine is MTE/SDMA (§10.4: "The high-level API selects MTE
+for same-machine PEs"), and §9.1's communication-path figure is drawn 「以910A3为例」, so MTE
+one-sided put is the A3 path. The UB cost is small: `UDMA_WQE_SCRATCH_BYTES = 256`, and the
+header constants say `ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE 128U` /
+`ACLSHMEM_RDMA_MTE_STAGING_UB_SIZE 128U` minimum.
+
 
 ---
 

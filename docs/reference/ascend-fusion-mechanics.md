@@ -17830,3 +17830,637 @@ cmake -DCMAKE_ASC_RUN_MODE=cpu -DCMAKE_ASC_ARCHITECTURES=dav-2201 ..;make -j; # 
 
 and `-DCMAKE_ASC_RUN_MODE=sim` for the NPU simulator. A silent drop becomes a named check failure under
 either.
+
+## 43. ★ The authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule, the complete `HardEvent` enumeration per core half, and the Set/Wait asymmetry that makes a foreign-core `WaitFlag` a silent no-op on 2201
+
+Sources, all read 2026-10-20:
+
+- 「同步控制简介」, CANN 商用版 8.0.RC2.2 — https://www.hiascend.com/doc_center/source/zh/canncommercial/80RC22/apiref/opdevgapi/atlasascendc_api_07_0262.html
+  (the `document/detail/...` twin at `.../canncommercial/80RC22/apiref/opdevgapi/atlasascendc_api_07_0262.html`
+  returns an empty body to a fetcher; the `doc_center` form works — see §35.0)
+- 「PipeBarrier」, same book — `.../atlasascendc_api_07_0264.html`
+- 「SetFlag/WaitFlag」, same book — `.../atlasascendc_api_07_0263.html`; the newer ISASI copy is
+  `https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC3alpha003/apiref/opdevgapi/atlasascendc_api_07_0260.html`
+- the shipped AscendC implementation on this machine, `/home/shanshan/repo/cann/asc-devkit/` — which settles
+  everything the doc pages leave open
+
+### 43.1 The official rule: `PipeBarrier` is SAME-pipe only. It is not a cross-pipe primitive at all.
+
+From 「同步控制简介」, the two categories as published:
+
+> **多流水同步**：通过SetFlag/WaitFlag完成不同流水线之间的同步控制。
+> SetFlag：「当前序指令的所有读写操作都完成之后，当前指令开始执行，并将硬件中的对应标志位设置为1。」
+> WaitFlag：标志位为0时「该队列的后续指令将一直被阻塞」；为1则清零并继续执行。
+>
+> **单流水同步**：通过PipeBarrier完成同一流水线内的同步控制，用于在同一流水线内部约束执行顺序，
+> 「保证前序指令中所有数据的读写工作全部完成，后序指令才能执行。」
+
+And the hardware pipe table from the same page, verbatim:
+
+```
+PIPE_S     — scalar 流水，Tensor GetValue 等
+PIPE_V     — vector 计算，以及 L0C→UB 搬运
+PIPE_M     — matrix 计算
+PIPE_MTE1  — L1→L0A / L1→L0B 搬运
+PIPE_MTE2  — GM→L1 / GM→L0A / GM→L0B / GM→UB 搬运
+PIPE_MTE3  — UB→GM / UB→L1 搬运
+PIPE_FIX   — L0C→GM / L0C→L1 搬运（当前版本暂不支持该流水类型）
+```
+
+Manual-versus-automatic insertion, verbatim from the same page — this is the sentence that matters most:
+
+> Vector 单元：单流水同步中「PIPE_V由编译器自动完成同步插入」，PIPE_MTE2/PIPE_MTE3「在搬运地址有重叠的情况下需要开发者插入同步」。
+> 多流水同步中 PIPE_V、PIPE_MTE2、PIPE_MTE3、PIPE_S 之间的同步「都是双向的」，图中黄色连线由编译器插入，其余由 Ascend C 框架完成。
+>
+> Cube 单元：「Cube侧所有流水同步都由Ascend C框架完成，不需要算子开发者插入同步。」
+
+with the caveat the page itself attaches:
+
+> 编译器自动插入强依赖于 LocalTensor 的依赖关系，部分场景仍需手动同步，约束见《毕昇编译器使用指南》。
+
+The `PipeBarrier` page (`..._0264.html`) is shorter and blunter. 功能说明, verbatim:
+
+> 阻塞相同流水，具有数据依赖的相同流水之间需要插此同步。
+
+函数原型:
+
+```cpp
+template <pipe_t pipe>
+__aicore__ inline void PipeBarrier();
+```
+
+参数说明: 「pipe — 模板参数，表示阻塞的流水类别。」 返回值: 无. 支持的型号: 「Atlas 训练系列产品 /
+Atlas推理系列产品AI Core / Atlas A2训练系列产品、Atlas 800I A2推理产品」. 约束说明, verbatim, and this is a
+trap worth writing on the wall:
+
+> Scalar流水之间的同步由硬件自动保证，调用PipeBarrier<PIPE_S>()会引发硬件错误。
+
+调用示例, verbatim — note that the example's two instructions are both on PIPE_V, i.e. the documented use is
+*same pipe*:
+
+> Mul指令的输入dst0Local是Add指令的输出，两个矢量运算指令产生依赖，需要插入PipeBarrier保证两条指令的执行顺序。
+
+```cpp
+LocalTensor<half> src0Local;
+LocalTensor<half> src1Local;
+LocalTensor<half> src2Local;
+LocalTensor<half> dst0Local;
+LocalTensor<half> dst1Local;
+
+Add(dst0Local, src0Local, src1Local, 512);
+PipeBarrier<PIPE_V>();
+Mul(dst1Local, dst0Local, src2Local, 512);
+```
+
+**So the authoritative rule is a taxonomy, not a strength ordering.** `PipeBarrier` is the 单流水 primitive —
+it drains one named pipe. `SetFlag`/`WaitFlag` is the 多流水 primitive — it orders two *different* pipes.
+`PipeBarrier` is not a weaker version of `SetFlag`; it is a different instrument, and no amount of it
+substitutes for a cross-pipe event. A `Cast` on V followed by a `DataCopy` to GM on MTE3 reusing the same UB
+buffer is a V→MTE3 then MTE3→V hazard, which is by construction outside what `PipeBarrier` is defined to do.
+
+### 43.2 `PIPE_ALL`: legal, used by the vendor, and absent from the documented pipe set
+
+`pipe_t` is a Bisheng builtin — it is not declared anywhere in the devkit headers. What the headers do declare
+is the *supported* set, `impl/basic_api/kernel_event.h:244-250`:
+
+```cpp
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ != 1001) && (__NPU_ARCH__ != 2002)
+constexpr int32_t PIPE_NUM = 7;
+constexpr pipe_t SUPPORTED_PIPE[PIPE_NUM] = {PIPE_S, PIPE_V, PIPE_M, PIPE_MTE1, PIPE_MTE2, PIPE_MTE3, PIPE_FIX};
+#else
+constexpr int32_t PIPE_NUM = 6;
+constexpr pipe_t SUPPORTED_PIPE[PIPE_NUM] = {PIPE_S, PIPE_V, PIPE_M, PIPE_MTE1, PIPE_MTE2, PIPE_MTE3};
+#endif
+```
+
+`PIPE_ALL` is not in `SUPPORTED_PIPE` and is not in the doc page's 流水类型 table. It is nevertheless used by
+the vendor's own header-conformance suite, `tests/api/basic_api/ascendc_header_checker/kernel_operator_block_sync_intf.cpp:37,91`:
+
+```cpp
+extern "C" __global__ __aicore__ void KernelTestPipeBarrier1() { AscendC::PipeBarrier<PIPE_ALL>(); }
+...
+    AscendC::CrossCoreSetFlag<0, PIPE_ALL>(flagId);
+```
+
+and freely throughout `tests/api/basic_api/ascendc_case_common/` in the C form `pipe_barrier(PIPE_ALL)`. So it
+compiles and runs. But it is an undocumented pipe selector, it drains pipes rather than establishing a
+cross-pipe dependency, and §43.1's taxonomy says a drain of every pipe is still a set of same-pipe
+constraints. There is also a direct third-party judgement on it: the Ascend static-analysis checker emits
+**`AKA3001 "PipeBarrier(PIPE_ALL) antipattern"` at Warning level**, and
+https://github.com/tile-ai/tilelang-ascend/issues/110 — "In double buffer scenarios, using the automatic
+synchronization insertion feature, the generated AscendC code does not meet expectations, using
+`AscendC::PipeBarrier<PIPE_ALL>()`" — is a filed bug whose expected behaviour is two `set_flag`/`wait_flag`
+pairs on distinct flag ids instead.
+
+Also quoted, from the Huawei Cloud performance guide 「Ascend C算子性能优化实用技巧05——API使用优化」
+(https://bbs.huaweicloud.com/blogs/438903): fine-grained event sync is preferred because it blocks only the
+dependency chain, whereas each `PipeBarrier` or `WaitFlag` costs a pipeline stall.
+
+### 43.3 ★ The complete `HardEvent` enumeration, and the two reduced per-core-half enumerations
+
+`impl/basic_api/kernel_event.h:38-111`, verbatim and complete — the naming convention is
+源流水_目标流水, so `MTE2_V` means PIPE_V waits on PIPE_MTE2:
+
+```cpp
+enum class HardEvent : uint8_t {
+    // src_dst
+    MTE2_MTE1,
+    MTE1_MTE2,
+    MTE1_M,
+    M_MTE1,
+    MTE2_V,
+    V_MTE2,
+    MTE3_V,
+    V_MTE3,
+    M_V,
+    V_M,
+    V_V,
+    MTE3_MTE1,
+    MTE1_MTE3,
+    MTE1_V,
+    MTE2_M,
+    M_MTE2,
+    V_MTE1,
+    M_FIX,
+    FIX_M,
+    MTE3_MTE2,
+    MTE2_MTE3,
+    S_V,
+    V_S,
+    S_MTE2,
+    MTE2_S,
+    S_MTE3,
+    MTE3_S,
+    MTE2_FIX,
+    FIX_MTE2,
+    FIX_S,
+    M_S,
+    FIX_MTE3,
+    MTE1_FIX,
+    FIX_MTE1,
+    FIX_FIX,
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 5102) || (__NPU_ARCH__ == 3003))
+    FIX_V,
+    V_FIX,
+#endif
+    MAX,
+};
+
+enum class HardEventAic : uint8_t {
+    // src_dst
+    MTE2_MTE1,
+    MTE1_MTE2,
+    MTE1_M,
+    M_MTE1,
+    MTE3_MTE1,
+    MTE1_MTE3,
+    MTE2_M,
+    M_MTE2,
+    M_FIX,
+    FIX_M,
+    MTE3_MTE2,
+    MTE2_MTE3,
+    S_MTE2,
+    MTE2_S,
+    S_MTE3,
+    MTE3_S,
+    MTE2_FIX,
+    FIX_MTE2,
+    FIX_S,
+    M_S,
+    FIX_MTE3,
+    MTE1_FIX,
+    FIX_MTE1,
+    FIX_FIX,
+    MAX,
+};
+
+enum class HardEventAiv : uint8_t {
+    // src_dst
+    MTE2_V,
+    V_MTE2,
+    MTE3_V,
+    V_MTE3,
+    V_V,
+    MTE3_MTE2,
+    MTE2_MTE3,
+    S_V,
+    V_S,
+    S_MTE2,
+    MTE2_S,
+    S_MTE3,
+    MTE3_S,
+    MAX,
+};
+```
+
+So the **legal `HardEvent` set on an A3 AIV is exactly thirteen**: `MTE2_V, V_MTE2, MTE3_V, V_MTE3, V_V,
+MTE3_MTE2, MTE2_MTE3, S_V, V_S, S_MTE2, MTE2_S, S_MTE3, MTE3_S`. On an A3 AIC it is exactly twenty-four, the
+`HardEventAic` list. The vendor's own comments state the counts and the reason, at `:140` and `:197`:
+
+```cpp
+    // in v220 aic, only 21 events is useful, so convert evt to index in event pool
+    // in other chip version, all events are valid;
+```
+
+```cpp
+    // in v220 aiv, only 13 events is useful, so convert evt to index in event pool
+    // in other chip version, all events are valid;
+```
+
+**`MTE3_V` and `V_MTE3` are both in `HardEventAiv` and in neither `HardEventAic`.** `M_V`, `V_M`, `MTE1_V` and
+`V_MTE1` are in NEITHER reduced enum — they cross the AIC/AIV boundary, which on a split core is not a pipe
+event at all.
+
+### 43.4 How many event IDs: eight, per `HardEvent` kind, per `TPipe`
+
+`impl/basic_api/kernel_macros.h:98-104`:
+
+```cpp
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 2002) || (__NPU_ARCH__ == 2201) || (__NPU_ARCH__ == 3002) || \
+                              (__NPU_ARCH__ == 3102) || (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102) || \
+                              (__NPU_ARCH__ == 3003) || (__NPU_ARCH__ == 3113)) // Available for V200 and V210
+constexpr int32_t QUE_MAX_EVENT = 8;
+#else
+constexpr int32_t QUE_MAX_EVENT = 4;
+#endif
+```
+
+and both `SetFlagImpl` and `WaitFlagImpl` open with the same range check
+(`impl/basic_api/kernel_event.h:911-915` and `:1046-1050`):
+
+```cpp
+    ASCENDC_ASSERT((eventID >= 0 && eventID < QUE_MAX_EVENT), {
+        KERNEL_LOG(KERNEL_ERROR, "eventID %d should be in range [0, %d)", eventID, QUE_MAX_EVENT);
+    });
+```
+
+So on 2201 the ids are **0-7, eight of them, and the budget is per `HardEvent` kind** — `MTE3_V` id 0 and
+`V_MTE3` id 0 are different hardware events, exactly as the 「核内同步」 page says
+(「SetFlag<HardEvent::S_MTE3>(1)和SetFlag<HardEvent::MTE3_MTE1>(1)设置的不是同一个EventID，因为其模板参数不同。
+只有当模板参数和事件ID完全一致时，才表示同一个EventID。」). The pool is a bitmask per kind,
+`impl/basic_api/kernel_tpipe_base.h:103-105` and `:136-137`:
+
+```cpp
+struct TEventPool {
+    uint64_t eventOccupy;
+};
+...
+struct TPipeImpl {
+    struct TEventPool eventPool_[EVENT_NUM];
+    struct TPipeBufPool bufPool_[static_cast<uint8_t>(Hardware::MAX)];
+```
+
+`impl/basic_api/kernel_tpipe_impl.h:497-540`:
+
+```cpp
+template <HardEvent evt>
+__aicore__ inline TEventID TPipe::AllocEventID()
+{
+    ASCENDC_DEBUG_ASSERT(
+        (evt < HardEvent::MAX), KERNEL_LOG_INTERNAL(KERNEL_ERROR, "illegal event %d", static_cast<int32_t>(evt)));
+    auto ptr = this->g_tpipeImpl.eventPool_ + EventToIndex(evt);
+    auto lastId = sff0(ptr->eventOccupy);
+    ASCENDC_DEBUG_ASSERT(
+        (lastId < QUE_MAX_EVENT && lastId >= 0),
+        KERNEL_LOG_INTERNAL(
+            KERNEL_ERROR, "current id is %ld, max buffer number in same queue position is %d", lastId, QUE_MAX_EVENT));
+    ptr->eventOccupy = sbitset1(ptr->eventOccupy, lastId);
+    return lastId;
+}
+...
+__aicore__ inline TEventID TPipe::FetchEventID(HardEvent evt)
+{
+    auto ptr = this->g_tpipeImpl.eventPool_ + EventToIndex(evt);
+    auto lastId = sff0(ptr->eventOccupy);
+    ...
+    return lastId;
+}
+```
+
+`AllocEventID` *claims* a bit; `FetchEventID` only *peeks* at the first free bit and does not claim it.
+**Reusing one id in a loop is safe iff the Set/Wait pairs on that id are strictly nested or strictly
+sequential**, because the hardware event is a single bit per (pipe-pair, id): a second Set before the first
+Wait is the documented 「不允许连续设置同一个EventID」 and merges the two dependencies. `FetchEventID` returning
+the same id on every iteration — which it will, since it does not claim — is therefore only correct for a
+Set…Wait pair that closes inside the iteration. A cross-iteration (double-buffered) protocol needs two ids and
+must prime the first `WaitFlag` before the loop.
+
+### 43.5 ★★★ The Set/Wait asymmetry: on 2201 a foreign-core `WaitFlag` is a SILENT no-op while its `SetFlag` really fires
+
+`SPLIT_CORE_CUBE` is the cube half of a split-architecture kernel, `impl/utils/sys_macros.h:55-62`:
+
+```cpp
+#if (defined(__DAV_CUBE__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510))
+#define SPLIT_CORE_CUBE
+#endif
+
+#if (defined(__DAV_VEC__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510))
+#define SPLIT_CORE_VEC
+#endif
+```
+
+— so in a `__mix__(1,2)` kernel the cube-half translation unit has `SPLIT_CORE_CUBE` defined and the vector
+half has `SPLIT_CORE_VEC`, independently of `ASCENDC_CUBE_ONLY`.
+
+The public entry points, `include/basic_api/kernel_operator_block_sync_intf.h:42-46`:
+
+```cpp
+template <HardEvent event>
+__aicore__ inline void SetFlag(int32_t eventID);
+
+template <HardEvent event>
+__aicore__ inline void WaitFlag(int32_t eventID);
+```
+
+routed in `impl/basic_api/kernel_operator_block_sync_intf_impl.h:84,110` to
+
+```cpp
+    SetFlagImpl<event>(eventID);
+```
+```cpp
+    WaitFlagImpl(event, eventID);
+```
+
+Both bottom out in a `switch` with a bare `default: break;`. The two switches are **not guarded the same way.**
+
+`WaitFlagImpl` (`impl/basic_api/kernel_event.h:1046-1200`) is per-core-half gated:
+
+```cpp
+    switch (event) {
+#ifndef SPLIT_CORE_VEC // CUBE core
+        case HardEvent::MTE2_MTE1:
+            WaitFlagInternal<PIPE_MTE2, PIPE_MTE1>(e);
+            break;
+        ...
+#endif
+#ifndef SPLIT_CORE_CUBE // VECTOR core
+        case HardEvent::MTE2_V:
+            WaitFlagInternal<PIPE_MTE2, PIPE_V>(e);
+            break;
+        case HardEvent::V_MTE2:
+            WaitFlagInternal<PIPE_V, PIPE_MTE2>(e);
+            break;
+        case HardEvent::MTE3_V:
+            WaitFlagInternal<PIPE_MTE3, PIPE_V>(e);
+            break;
+        case HardEvent::V_MTE3:
+            WaitFlagInternal<PIPE_V, PIPE_MTE3>(e);
+            break;
+#endif
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ != 2201) && (__NPU_ARCH__ != 3510))
+        case HardEvent::M_V:
+            WaitFlagInternal<PIPE_M, PIPE_V>(e);
+            break;
+        case HardEvent::V_M:
+            WaitFlagInternal<PIPE_V, PIPE_M>(e);
+            break;
+        case HardEvent::MTE1_V:
+            WaitFlagInternal<PIPE_MTE1, PIPE_V>(e);
+            break;
+        case HardEvent::V_MTE1:
+            WaitFlagInternal<PIPE_V, PIPE_MTE1>(e);
+            break;
+#endif
+        ...
+        case HardEvent::V_V:
+            return;
+        case HardEvent::MAX:
+            break;
+        default:
+            break;
+    }
+```
+
+and under CPU debug it says the same thing as an explicit early return, `:1051-1070` — which is the vendor
+documenting the intent in their own code:
+
+```cpp
+#ifdef ASCENDC_CPU_DEBUG
+    if ASCEND_IS_AIC {
+        if (event == HardEvent::MTE2_V || event == HardEvent::V_MTE2 || event == HardEvent::MTE3_V ||
+            event == HardEvent::V_MTE3 || event == HardEvent::V_V || event == HardEvent::S_V ||
+...
+            event == HardEvent::V_S) {
+            return;
+        }
+    }
+    if ASCEND_IS_AIV {
+        if ((event == HardEvent::MTE2_MTE1) || (event == HardEvent::MTE1_MTE2) || (event == HardEvent::MTE1_M) ||
+            (event == HardEvent::M_MTE1) || (event == HardEvent::M_FIX) || (event == HardEvent::FIX_M)) {
+            return;
+        }
+    }
+#endif
+```
+
+`SetFlagImpl` (`:910-1044`) has **neither** guard. It opens straight with the eventID assert and the switch,
+and its `MTE2_V / V_MTE2 / MTE3_V / V_MTE3` cases, and its `M_V / V_M / MTE1_V / V_MTE1` cases, are compiled
+unconditionally — the only `#if`s in its switch are around `V_V` (`!= 3002 || == 3003`), the `FIX_*` block
+(2201 included), and `FIX_V`/`V_FIX` (5102 only). And the emitter itself is unguarded on 2201,
+`impl/basic_api/kernel_event.h:299-316`:
+
+```cpp
+template <pipe_t srcPipe, pipe_t dstPipe>
+__aicore__ inline void SetFlagInternal(event_t evt)
+{
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+    if constexpr (IsSplitVectorPipe<srcPipe>() && IsSplitVectorPipe<dstPipe>()) {
+        if ASCEND_IS_AIV {
+            set_flag(srcPipe, dstPipe, evt);
+        }
+    }
+    if constexpr (IsSplitCubePipe<srcPipe>() && IsSplitCubePipe<dstPipe>()) {
+        if ASCEND_IS_AIC {
+            set_flag(srcPipe, dstPipe, evt);
+        }
+    }
+#else
+    set_flag(srcPipe, dstPipe, evt);
+#endif
+}
+```
+
+The per-core `if constexpr` screen exists only for `__NPU_ARCH__ == 3510` (A5/950). **On 2201 the `#else`
+fires and `set_flag` is emitted unconditionally.**
+
+Two consequences, both exact and both silent:
+
+1. **On the CUBE half of a 2201 mix kernel, `WaitFlag<HardEvent::MTE3_V>`, `V_MTE3`, `MTE2_V`, `V_MTE2`
+   compile to `default: break;` — nothing — while the matching `SetFlag` emits a real
+   `set_flag(PIPE_MTE3, PIPE_V, e)`.** The flag is raised and never consumed.
+2. **`WaitFlag<HardEvent::M_V>`, `V_M`, `MTE1_V`, `V_MTE1` are compiled out on 2201 on BOTH halves** (the
+   `__NPU_ARCH__ != 2201 && != 3510` gate), while their `SetFlag`s still fire. These four are the events that
+   cross the AIC/AIV boundary, so they have no meaning on a split core — but the API accepts them and the Set
+   half still runs.
+
+There is no `static_assert`, no runtime log and no compile diagnostic for either. The only check is
+`ASCENDC_DEBUG_ASSERT((evt < HardEvent::MAX))` in `AllocEventID`, and `MTE3_V < HardEvent::MAX` is true, so it
+passes — and it is compiled out on NPU anyway. And the docs say precisely what an unpaired Set costs:
+
+> SetFlag和WaitFlag必须成对使用，且SetFlag和WaitFlag的参数必须完全一致（包括模板参数和事件ID）。
+> 如果不匹配，可能导致当前核的计算异常，或影响下一个核的算子执行，引发timeout问题。
+
+### 43.6 ★ The event pool indexes one past its end for any foreign-core `HardEvent`
+
+`EventToIndex` maps a `HardEvent` to a slot in `eventPool_`, `impl/basic_api/kernel_event.h:127-145,236-246`:
+
+```cpp
+#if defined(ASCENDC_CPU_DEBUG) || (defined(__NPU_ARCH__) && (__NPU_ARCH__ != 2201) && (__NPU_ARCH__ != 3510))
+constexpr uint8_t EVENT_NUM = static_cast<uint8_t>(HardEvent::MAX);
+#else
+#ifdef SPLIT_CORE_CUBE
+constexpr uint8_t EVENT_NUM = static_cast<uint8_t>(HardEventAic::MAX);
+#else
+constexpr uint8_t EVENT_NUM = static_cast<uint8_t>(HardEventAiv::MAX);
+#endif
+#endif
+```
+
+```cpp
+__aicore__ constexpr uint8_t EventToIndex(HardEvent evt)
+{
+#if defined(ASCENDC_CPU_DEBUG) || \
+    defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 5102) || ((__NPU_ARCH__ != 2201) && (__NPU_ARCH__ != 3510)))
+    return static_cast<uint8_t>(evt);
+#elif defined(SPLIT_CORE_CUBE)
+    return EventToIndexAic(evt);
+#else
+    return EventToIndexAiv(evt);
+#endif
+}
+```
+
+and both mappers end with
+
+```cpp
+    } else {
+        return static_cast<uint8_t>(HardEventAic::MAX);
+    }
+```
+```cpp
+    } else {
+        return static_cast<uint8_t>(HardEventAiv::MAX);
+    }
+```
+
+i.e. **an unmapped event returns exactly `EVENT_NUM`, one past the last valid slot of
+`TEventPool eventPool_[EVENT_NUM]`.** The next member is `bufPool_[Hardware::MAX]`, and the two structs are
+different sizes — `TEventPool` is one `uint64_t`, `TPipeBufPool` is one `uint32_t`
+(`impl/basic_api/kernel_tpipe_base.h:103-109`) — so a `uint64_t` access at `eventPool_[EVENT_NUM]` straddles
+`bufPool_[0]` and `bufPool_[1]`, which with
+
+```cpp
+enum class Hardware : uint8_t { GM, UB, L1, L0A, L0B, L0C, BIAS, FIXBUF, MAX };
+```
+
+(`impl/utils/common_types.h:23`) are **`bufPool_[Hardware::GM].maxAddr` and `bufPool_[Hardware::UB].maxAddr`** —
+the UB allocator's high-water mark. `FetchEventID` reads there; `AllocEventID` writes there with `sbitset1`;
+`ReleaseEventID` writes there with `sbitset0`. On 2201, `ASCENDC_CPU_DEBUG` builds take the
+`EVENT_NUM = HardEvent::MAX` arm and `EventToIndex` becomes the identity, so **the out-of-range aliasing only
+exists on the NPU build and cannot be reproduced under CPU debug.**
+
+The out-of-range sets on 2201 are therefore:
+
+- cube half (`SPLIT_CORE_CUBE`, `EVENT_NUM = 24`): `MTE2_V, V_MTE2, MTE3_V, V_MTE3, M_V, V_M, V_V, MTE1_V,
+  V_MTE1, S_V, V_S` — eleven events, all aliasing slot 24.
+- vector half (`SPLIT_CORE_VEC`, `EVENT_NUM = 13`): `MTE2_MTE1, MTE1_MTE2, MTE1_M, M_MTE1, M_V, V_M,
+  MTE3_MTE1, MTE1_MTE3, MTE1_V, MTE2_M, M_MTE2, V_MTE1, M_FIX, FIX_M, MTE2_FIX, FIX_MTE2, FIX_S, M_S,
+  FIX_MTE3, MTE1_FIX, FIX_MTE1, FIX_FIX` — twenty-two events, all aliasing slot 13.
+- `M_V`, `V_M`, `MTE1_V`, `V_MTE1` alias out of range on **both** halves.
+
+Note also that all aliased events share one slot, so two different out-of-range events hand back the *same*
+id from `FetchEventID`.
+
+### 43.7 `V_V` and `FIX_FIX` are not flags
+
+`SetFlagImpl`/`WaitFlagImpl`, `impl/basic_api/kernel_event.h`:
+
+```cpp
+        case HardEvent::V_V:
+            return;
+```
+
+and
+
+```cpp
+        case HardEvent::FIX_FIX:
+            PipeBarrierInternal<PIPE_FIX>();
+            break;
+```
+
+`V_V` is a no-op by design on every arch — consistent with 「PIPE_V由编译器自动完成同步插入」 — and `FIX_FIX`
+is not a flag at all but a `PipeBarrier<PIPE_FIX>` wearing a `HardEvent`'s clothes.
+
+### 43.8 An independent measurement of exactly this nondeterminism, and the warning it carries
+
+"AccelSync: Verifying Synchronization Coverage in Accelerator Pipeline Programs", https://arxiv.org/html/2605.07881,
+read 2026-10-20. It checks cross-unit write-read pairs for a happens-before path. Results, verbatim where
+quoted:
+
+> Across 6,292 CANN production kernels, 6,289 came back SAFE and 3 were flagged (0.048%).
+
+| Kernel | Unit Pair | Violations | Missing Coverage |
+|---|---|---|---|
+| cross_v2 | VPU→scalar | 27 | V-to-S sync |
+| quest_block_select_paged | MTE→VPU | 10 | MTE2-to-V sync |
+| unique_consecutive_apt | scalar→VPU | 6 | "sync coverage under review" |
+
+Corpus statistics: 5,618 kernels (89.3%) have at least one cross-unit write-read pair; 14,827 pairs checked;
+4,291 (68.2%) use explicit pipe-drain APIs. Separately: 23/120 LLM-generated kernels unsafe (19.2%, CI
+[13.0%, 27.4%]), dominant mode scalar↔MTE; 688/688 non-equivalent mutants detected; 5/5 microbenchmarks
+detected versus msSanitizer's 2/5 at roughly 400× lower cost. Its `HardEvent`-level model is coarse — it
+names only `HardEvent::V_S` and `HardEvent::MTE2_V`, never enumerates pairs, and **never mentions `PIPE_ALL`**,
+treating "barrier" as "an abstract ordering primitive in the model, covering vendor pipe barriers, hard-event
+synchronization, and equivalent frontend-normalized synchronization points… not necessarily the literal
+Ascend C PipeBarrier API."
+
+The part that matters to us is the hardware confirmation of the `cross_v2`-shaped hazard on Ascend 910B2 under
+CANN 8.0.RC3:
+
+> 30/30 correct with sync, but only 9/29 correct without, outputs ranging 336–1993 (nondeterministic).
+
+and then:
+
+> After a driver upgrade to 25.0.rc1.1, this vanished — the authors label it "observed but unconfirmed,"
+> attributing the change to "a toolkit/driver compatibility issue rather than a fix."
+
+## Relevance
+
+43.1 is the authoritative answer and it reframes the question: `PipeBarrier` is the 单流水 primitive, defined
+as 「阻塞相同流水」, and `SetFlag`/`WaitFlag` is the 多流水 primitive for 「不同流水线之间」. These are different
+instruments, not a strength ordering, so no quantity of `PipeBarrier` — `PIPE_ALL` included — is defined to
+cover a V→MTE3 or MTE3→V hazard on a reused UB buffer. 43.2 adds that `PIPE_ALL` is not in the documented
+pipe set nor in the headers' `SUPPORTED_PIPE`, is used anyway by the vendor's own conformance tests, and is
+flagged as an antipattern (`AKA3001`) by the Ascend checker, with a filed tilelang-ascend bug whose expected
+fix is two distinct `set_flag`/`wait_flag` pairs. 43.3 gives the complete enumeration asked for, and the key
+structural fact: the legal set is thirteen events on an AIV and twenty-four on an AIC, not the thirty-five in
+`HardEvent`. 43.4 fixes the id budget at 0-7 per `HardEvent` kind and says exactly when loop reuse of one id
+is safe — only for a Set…Wait pair that closes inside the iteration, because `FetchEventID` peeks without
+claiming and will hand back the same id every time.
+
+43.5 and 43.6 are the finding, and they are the reason the `V_MTE3`/`MTE3_V` attempt behaved the way it did.
+In a `__mix__(1,2)` kernel the cube-half TU has `SPLIT_CORE_CUBE` defined, and on that half
+`WaitFlag<HardEvent::MTE3_V>` compiles to `default: break;` — nothing at all — while `SetFlag<HardEvent::MTE3_V>`
+still emits a real `set_flag`, because the per-core `if constexpr` screen in `SetFlagInternal` exists only for
+`__NPU_ARCH__ == 3510` and 2201 takes the unguarded `#else`. The result is a raised, never-consumed hardware
+flag, which is exactly the 「可能导致当前核的计算异常…引发timeout问题」 the docs warn about. Worse, on the same
+half `FetchEventID(HardEvent::MTE3_V)` returns `EVENT_NUM` and indexes one past the end of
+`TEventPool eventPool_[EVENT_NUM]`, landing on `bufPool_[Hardware::GM].maxAddr` and
+`bufPool_[Hardware::UB].maxAddr` — the UB allocator's high-water mark — which `AllocEventID` then writes with
+`sbitset1`. So the operational rule for our megakernel is: **any `SetFlag`/`WaitFlag`/`FetchEventID` naming a
+vector event must be inside `if ASCEND_IS_AIV`, and any naming a cube event inside `if ASCEND_IS_AIC`; an
+`__aicore__` helper shared by both halves must never name a `HardEvent` unguarded.** `M_V`, `V_M`, `MTE1_V`
+and `V_MTE1` must never be named at all on 2201 — their Waits are compiled out on both halves and they alias
+out of the pool on both halves.
+
+43.6 also explains why this class of bug survives a CPU-debug run: on 2201, `ASCENDC_CPU_DEBUG` switches
+`EVENT_NUM` to `HardEvent::MAX` and `EventToIndex` to the identity, so the out-of-range aliasing exists only
+on the NPU build. The CPU-debug path additionally early-returns on foreign-core waits, so it also hides the
+missing wait. A kernel that passes CPU debug is not cleared of either defect.
+
+43.8 is the warning to carry: an independent group measured this exact failure shape — 9 of 29 runs correct,
+nondeterministic garbage in between — and then watched it disappear on a driver bump without a fix, which
+they call 「observed but unconfirmed」. A sync defect on this part can be masked by a toolkit or driver change.
+Our 24-consecutive-clean-runs standard for the fused brick is the right bar, and it must be re-run after any
+CANN or driver change rather than assumed to carry over.
