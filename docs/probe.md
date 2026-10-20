@@ -149,3 +149,20 @@ kernel 的 2.33x 劣势无关紧要，它的价值只在**一次下发覆盖多�
 同一算子同一形状：干净进程 61.617 µs，某种混合态 153.325 µs，两个时钟一致到
 1%。加载 kernel 库、跑过 kernel、建过通信域**全部排除**。引擎记的 157.2 µs 属
 于慢档，而干净进程能跑 61.6——找出引擎落入慢档的条件约值 7 ms，不需写 kernel。
+
+## 2026-10-21 the A3 inventory, first time checked
+
+Six A3 hosts in `~/.ssh/config`: `a3-gs`, `a3-main`, `a3-3`, `a3-4`, `a3-78`,
+`a3-84`. Only two answer, and only one is usable:
+
+    a3-gs     7.150.10.55   connection timed out
+    a3-main   7.150.12.90   connection timed out
+    a3-3      7.150.13.67   connection timed out
+    a3-4      7.150.8.233   connection timed out
+    a3-78     7.150.10.78   reachable, no trt-asc container, 58.8/65.5 GB held
+    a3-84     7.150.14.84   reachable, trt-asc present, tenant holds 54.6 GB
+
+So the whole session ran on the only usable host, and its being held is a
+one-machine constraint rather than an unsearched alternative. Worth checking
+first on any day the machine looks busy -- this was the first time this project
+looked.
