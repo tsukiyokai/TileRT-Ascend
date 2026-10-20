@@ -1779,3 +1779,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      us was never a decode figure and two of today's reversals leaned on it.
      The queued steady-state capture is not one experiment among several; it is
      the only thing that closes this.
+
+172. The layer costs 210 us and the 374 us gap was my own arithmetic. A kernel
+     census of the capture shows `sk_*_full_model_start_static` -- the
+     SuperKernel, one a layer, three calls each for three measured requests --
+     at 209 to 215 us, matching the synthetic layer's in-graph 214 to within
+     two percent. The 588 us a layer came from dividing the round model's
+     fitted 45.88 ms fixed term by 78, and that fit holds the standalone
+     collectives, the drafting, the Gloo command and the MTP recomputation as
+     well as the layers. So four explanations were measured and excluded for a
+     quantity that did not exist, each sound on its own terms. Before
+     attributing a residual, check that the numerator belongs to the
+     denominator.
