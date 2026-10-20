@@ -21,16 +21,34 @@ LIBRARY_DIR = os.environ.get(
 HEAP_BYTES = 1024 * 1024 * 1024
 
 
-def _load():
-    """Resolve the kernel globally before the binding that references it.
+# The binding's dependencies in the order the loader needs them. It records
+# the kernels but not their directory, and `LD_LIBRARY_PATH` cannot carry it
+# here because the arm's activate.sh resets the environment -- the same trap
+# the launch script documents for ASCEND_CUSTOM_OPP_PATH. Resolving each by
+# full path and globally is what makes the chain hold without it.
+DEPENDENCIES = ("libshmem_utils.so", "libshmem.so", "libtp_push_kernel.so",
+                "libkv_shuffle_kernel.so", "liballgather_kernel.so")
 
-    The binding links the kernel target but does not record the library as a
-    runtime dependency, so loading it first is what makes `tp_push_demo`
-    resolvable.
-    """
+
+def _bind(device):
+    """Bind this thread's device, so the runtime can report one."""
     import torch
 
-    ctypes.CDLL(f"{LIBRARY_DIR}/libtp_push_kernel.so", mode=ctypes.RTLD_GLOBAL)
+    torch.npu.set_device(device)
+    index = device.index if hasattr(device, "index") else int(
+        str(device).rsplit(":", 1)[-1])
+    runtime = ctypes.CDLL("libascendcl.so")
+    bound = runtime.aclrtSetDevice(ctypes.c_int(index))
+    if bound != 0:
+        raise RuntimeError(f"aclrtSetDevice({index}) returned {bound}")
+
+
+def _load():
+    """Resolve the binding's own libraries before torch sees the operators."""
+    import torch
+
+    for name in DEPENDENCIES:
+        ctypes.CDLL(f"{LIBRARY_DIR}/{name}", mode=ctypes.RTLD_GLOBAL)
     torch.ops.load_library(f"{LIBRARY_DIR}/aclshmem_torch.so")
 
 
@@ -40,13 +58,14 @@ class OneSidedReduce:
     def __init__(self, rank, device, world_size, endpoint):
         import torch
 
+        # Before the library, not after. The backend reads the device in its
+        # own constructor -- `aclrtGetDevice` at shmem_init_backend.cpp:60 --
+        # and that constructor runs when the binding is dlopened, so a device
+        # bound afterwards is bound too late: the id stays -1, hybm_init
+        # latches -1, and every later AclrtSetDevice(-1) fails with 107001,
+        # surfacing as -4 from setup_heap with nothing about devices in it.
+        _bind(device)
         _load()
-        # The SDK latches its device once per process inside hybm_init, so
-        # binding the thread here is only about being bound at all; the -4 this
-        # used to return came from EINTR being classed as a link error in the
-        # bootstrap handshake, which a vLLM worker hits because it is full of
-        # signals and a quiet test process is not.
-        torch.npu.set_device(device)
         self.manager = torch.classes.ShmemOps.Manager()
         status = self.manager.attr_init(rank, world_size, HEAP_BYTES, endpoint)
         if status != 0:

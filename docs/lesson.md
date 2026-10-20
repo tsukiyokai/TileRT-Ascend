@@ -385,3 +385,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     reading is a factor of two on `down_proj`, whose K is the intermediate
     itself: a rank's share is 2048/16 outputs, not 1024/16 bytes, and nothing
     objects to the narrower slice except the engine's own declared shape.
+
+51. One error code, several causes, and the log was on disk the whole time.
+    `aclshmem` returns -4 from `setup_heap` for at least three unrelated
+    reasons, and the module's own docstring records one of them -- EINTR
+    misclassified in the bootstrap handshake -- which is not the one in front
+    of me, since `EINTR` is already in the SDK's reconnect set. I blocked
+    signals on the strength of that comment, then bound the thread's device,
+    then moved the bind earlier, three fixes in a row that each left the log
+    byte-identical. `SHMEM_LOG_LEVEL` turns on the SDK's own trace under
+    `/root/shmem/log/`, and it names the failing call, the value it was given
+    and the line it came from. A returned code tells you something failed; it
+    is not a diagnosis, and treating it as one costs a launch each time.
