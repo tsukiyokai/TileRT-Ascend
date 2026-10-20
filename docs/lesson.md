@@ -1203,3 +1203,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      leads lookup by 13 to 21. Source files repeat themselves differently from
      a model rewriting its input. The real stream was available all along, in
      the records of the run that set the project's best result.
+
+123. The tree's optimum is a sixteen-node tree with four branches, and
+     branching barely matters. On the engine's own stream, acceptance climbs
+     monotonically to 8.678 at budget 64 while TPOT worsens past 16, because
+     0.66 ms a verified row outruns what the extra acceptance buys; two, four
+     and eight branches differ by one to two percent throughout. Depth beats
+     breadth here, which is why a single-path automaton comes within 10 percent
+     of a tree. With the fixed term the measured merges leave, 30.15 ms, the
+     floor is 6.12 ms -- the target bounded out of the identified mechanisms a
+     second time, now with measured data on both sides.
