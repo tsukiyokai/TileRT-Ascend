@@ -1019,3 +1019,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the grouped matmul 19.5 and already the fastest of four implementations,
      and the remaining six items are operator fixed cost on twelve rows, which
      is what the boundary merges already collected.
+
+107. The item-by-item layer account was eager and the engine runs a graph.
+     Summing a layer's parts gave 317.476 us and matched the round model's
+     post-merge fixed term over 78 layers to a third of a percent, which read
+     as "no unattributed remainder" and put 2.x outside reach. But the same
+     layer replays in 213.913 us -- 5.6 percent above its profiled device-busy
+     202.514 -- so capture removes the 32 percent eager spends on issue. At
+     214 us a layer the post-merge round is 16.7 ms and TPOT at width 24 is
+     2.98. An agreement between two numbers is not a closed account when both
+     were measured in the wrong execution mode.
