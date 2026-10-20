@@ -1595,3 +1595,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      What it rests on is named -- that the engine's own layer can be brought to
      the synthetic layer's cost, where it currently fits 588 us, 2.7 times the
      graph figure, with the difference unexplained.
+
+157. The engine does decode inside its graph, which removes capture failure as
+     the explanation for its 588 us a layer against the synthetic layer's 214.
+     Every arm's record carries `target_graph: true`, one capture, and 1350,
+     1128 and 1098 replays at widths 8, 12 and 16 -- tracking rounds inversely
+     with width, as a wider draft needs fewer rounds -- with `has_aclgraph`
+     true on the entry whose descriptor matches the width. So 588 us is an
+     in-graph cost and the 2.7x is not the host. What the synthetic layer omits
+     is sixteen ranks, and that is what remains. Also in these records:
+     `compiled_graph_warmup.rounds[0].elapsed_ns` is 84 to 91 seconds, the
+     warmup round carrying compilation and capture, sitting where a reader
+     looking for a round time would find it first.
