@@ -332,3 +332,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     not elements, and read back the raw bytes at both candidate offsets before
     believing any of it -- the readback was the one link this elimination list
     never checked.
+
+47. Never read TPOT without its two factors and the output tokens.
+    `sparse_block_size = 16` lowered TPOT from 10.93 to 4.59 ms and was a
+    catastrophe: its round went from 56.9 to 116.0 ms while the model
+    collapsed into emitting token zero forever, which the prompt-lookup
+    drafter guesses perfectly -- 25.6 of 32 drafts accepted against a normal
+    5.27. A metric that is a ratio can be improved by destroying its
+    denominator's meaning. Report round time, accepted a round, and the first
+    tokens of the output, every time. And read acceptance from the engine's
+    own round records: the gaps between delivered tokens are one a token
+    however many a round accepted, which reads as a flat 1.001 and is a
+    misread of the harness rather than a measurement.

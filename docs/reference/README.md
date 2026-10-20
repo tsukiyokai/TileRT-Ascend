@@ -23,7 +23,7 @@ ForeachAddList 1.622 / 0.018.
 | File | Covers |
 | --- | --- |
 | `megakernel-persistent-decode.md` | Hazy Research Llama-1B megakernel (full text), MPK / Mirage Persistent Kernel, FlashMoE/FlashDMoE, **CANN SuperKernel device-side source**, ThunderMLA, Event Tensor / ETC, plus a cross-system comparison table. **§9-§72 are the in-kernel cross-rank collective**: `cann/shmem`'s `aclshmem_ptr` and `aclshmemx_mte_atomic_add`, MegaMoE's epoch-tagged `SynchronizeRanks()`, the `sqe_type`/`errType` decode from `cann/runtime`, and the A3 `SyncAll` flagId budget |
-| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence). **§42-§48 are the `int4b_t` and intra-core-sync block**: §42 sub-byte addressing from the shipped headers (and the hard negative on `SetGlobalBuffer`'s length), §43 the authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule with the per-core-half `HardEvent` split, §44 the two shipped vendor int4 kernels and the 950PR unzip tax, §45 the public found-and-fixed W4A4 erratum, §46 `GetQueEvt` as the barrier→event conversion table, §47 the `Cast`/`DataCopy` guard asymmetry and `REGIST_CUBE_OBJ`'s half-partition, §48 the ISASI constraint list and API allowlist. **§49-§57 are the performance block** — Fixpipe dtypes, kernel types, the 512-byte same-address rule, split-K, IBShare, constant tiling, the 256-byte inner-axis rule, the GM-traffic formula, and working `AIC_ONLY`/`MIX_AIC_1_0` code |
+| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence). **§42-§48 are the `int4b_t` and intra-core-sync block**: §42 sub-byte addressing from the shipped headers (and the hard negative on `SetGlobalBuffer`'s length), §43 the authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule with the per-core-half `HardEvent` split, §44 the two shipped vendor int4 kernels and the 950PR unzip tax, §45 the public found-and-fixed W4A4 erratum, §46 `GetQueEvt` as the barrier→event conversion table, §47 the `Cast`/`DataCopy` guard asymmetry and `REGIST_CUBE_OBJ`'s half-partition, §48 the ISASI constraint list and API allowlist. **§49-§57 are the performance block** — Fixpipe dtypes, kernel types, the 512-byte same-address rule, split-K, IBShare, constant tiling, the 256-byte inner-axis rule, the GM-traffic formula, and working `AIC_ONLY`/`MIX_AIC_1_0` code. **§58 is the closed AIV sync matrix** — all sixteen legal intra-core combinations on 2201 with `PipeBarrier` on the diagonal only, the fact that `PipeBarrier` cannot name `PIPE_S` at all, that `--cce-auto-sync` is a build-system default a bare `bisheng` line does not get, that `ReduceMax`'s `sharedTmpBuffer` may alias its source on A3, and that a UB→UB `DataCopy` is PIPE_V |
 | `ascend-launch-overhead-and-sync.md` | **Internal Wiki only — do not publish.** Measured MIX head-overhead decomposition, the CrossCoreSetFlag counter limit and MlaPrologV3's real CV pipeline, the 0–7 event-id budget, A3 buffer capacities, `blade/runtime` (an existing Ascend megakernel runtime with `aclrtLaunchMega`), an internal plan for an Ascend MPK, heterogeneous workers, Async-MoE scoreboard sync |
 | `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming. **Part 8 is grouped matmul over 256 experts inside a hand-written kernel** — `group_list_type`'s three modes, per-expert weight addressing, the 128-group TensorList cap. **§B7 is arXiv 2605.13915 "Multi-Scale Dequant"** — one of four things CANN calls MSD, with the M-stacked single-GEMM form as its equation (16); read §B7.-1 first for the four-family taxonomy and the authoritative A8W4 expansion |
 | `w4a8-msd-int4-mmad.md` | The A8W4 MSD decomposition as CANN actually ships it: the four MSD families and which kernels hold each, the documented nibble split and `weightAssistMatrix` / `bias` / `yOffset` correction term, and the `Mmad` both-operands-int4 wall |
@@ -264,6 +264,23 @@ finding 3.
   range is **0-5**, not 0-7: 6 and 7 are reserved and using them is 「未定义行为」.
 - **`GroupedMatmul` is not in `ops-nn`.** It is in `hicann/ops-transformer` under `gmm/`, with the fused MoE
   megakernel in `mc2/mega_moe` including an A3-specific `mega_moe_kernel_a3.hpp` (`fused-moe-expert.md` Part 8).
+- **SUPERSEDED — finding 6's 「`PIPE_ALL` is not defined to cover a cross-pipe hazard」, and §43.1-§43.2 with it.**
+  That rested on the CANN 8.0.RC2.2 `PipeBarrier` page's 「阻塞相同流水」. The 9.2.0 page
+  (`asc-devkit/docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/PipeBarrier_ISASI.md`) says
+  「如果不关注流水类别，希望阻塞所有流水，可以传入PIPE_ALL」 and
+  「`PipeBarrier<PIPE_ALL>()`会等待所有流水线中所有先前提交的接口完成，这会对性能产生影响」. So `PIPE_ALL` **is** an
+  all-pipe wait on the line we run, and the reason to prefer a named pair is cost, not coverage. The claim that
+  survives, and is narrower and more useful, is in §58.3: `PipeBarrier` **cannot name `PIPE_S`** (「其中不支持PIPE_S」),
+  so a Scalar edge — `MTE2`→`GetValue`, `SetValue`→`DataCopyPad` — is the one edge for which no barrier exists and
+  only `MTE2_S` / `S_MTE3` will do. Anything in this repository that converted a `PipeBarrier<PIPE_ALL>` site to
+  named events *on correctness grounds* was acting on the superseded reading; the conversions are still right, for
+  a different reason, and they do not cover the Scalar edges or the `V_MTE2` edge.
+- **There is no compiler auto-sync in `tests/glm52/`.** `key_features.md:135`'s 「异构编译直调（<<<>>>调用）…已默认设置
+  `--cce-auto-sync=on`」 is about the *project templates*; the switch is opt-in
+  (`ai_core_operator_compilation.md:119`) and the build system appends it (`compile_op.py:1100-1108`) — while the
+  TBE path appends `--cce-auto-sync=off` for A3 (`ccec.py:329-337`). Every `build.sh` here calls `bisheng -xcce`
+  directly without it, so **every** edge in §58.2's matrix is the author's to write, `PipeBarrier<PIPE_V>()`
+  included. §58.6.
 - **Finding 12's tiling-key-switched design may not be expressible, and moving into an operator project costs
   `__mix__` and `__schedmode__` rather than buying anything.** `ascend-custom-op-packaging.md` §5.1-§5.2, from the
   installed compiler. The op-project build textually includes your `.cpp` with `#define __global__ inline` and
@@ -327,7 +344,12 @@ The `int4b_t` / synchronization / silent-failure block, in the order it was lear
    uncoordinated writer** on the cube half. `DataCopyPad` has the guard; `DataCopy` does not. Check this before
    anything else.
 2. §42 — sub-byte addressing: `sizeof(int4b_t) == 1` but `SizeOfBits<int4b_t> == 4`; `operator[]` counts
-   nibbles and floors an odd index silently; and `SetGlobalBuffer`'s length argument is **inert on NPU**.
+   nibbles and floors an odd index silently; and `SetGlobalBuffer`'s length argument is **inert on NPU**. Read
+   §58.14 with it: `GlobalTensor<int4b_t>::operator[]` counts nibbles *correctly*, and is bit-for-bit identical to
+   a hand-rolled `(__gm__ int8_t*)base + elements / 2`, so a helper written to work around it is redundant and the
+   subscript is never the variable to suspect. When an int4 store looks like it lands only at offset zero, suspect
+   the transfer's **length** — an element count where the API wants bytes writes twice as far and spills one span
+   past the region, which presents as identical bytes at two offsets one span apart.
 3. §45 — the public found-and-fixed W4A4 erratum, whose root cause is exactly that `sizeof`. Carries the GM
    packing contract (low nibble = even element, row *r* at byte `r*N/2`), the K/N-multiple-of-64 rule, the
    elements-vs-bytes split between `DataCopy(count)` and `Nd2NzParams`, and the fact that `torch.int4` is
@@ -337,6 +359,15 @@ The `int4b_t` / synchronization / silent-failure block, in the order it was lear
 5. §46 — `GetQueEvt`, the library's own `PipeBarrier → HardEvent` conversion table, for converting barrier
    sites to named pairs. §48 — the mandatory exit barrier, the 0-5 event-id range, the API allowlist that
    applies once you allocate ids yourself, and `InitSocState` for any kernel without a `TPipe`.
+6. §58 — the **closed** sixteen-cell AIV sync matrix, which turns "which barrier do I need" into a lookup, plus
+   the three things it settles that §43 got partly wrong or did not reach: `PipeBarrier<PIPE_ALL>()` on 9.2.0 **is**
+   an all-pipe wait and the objection to it is cost; `PipeBarrier` **cannot name `PIPE_S`**, so an `MTE2`-written
+   UB word read by `GetValue` (`MTE2_S`) and a `SetValue`-written word read by `DataCopyPad` (`S_MTE3`) have no
+   barrier form at all; and `--cce-auto-sync`, which would insert exactly those Scalar edges, is set by the
+   **project templates** and not by the compiler — a hand-rolled `bisheng -xcce` line, which is how every kernel in
+   `tests/glm52/` is built, has no auto-sync whatever. §58 also carries the licence to alias `ReduceMax`'s
+   `sharedTmpBuffer` onto its source on A3, what that API really writes to `dst` (a 4-byte scalar store, already
+   fenced), and the fact that a UB→UB `DataCopy` is PIPE_V rather than an MTE pipe.
 
 The running list of **silent** failure modes on this part, all with sources in the sections above: a
 foreign-core `WaitFlag` (§43.5); a `DataCopy` whose source `TPosition` is neither UB nor L1 (§42.4); a `Cast`
@@ -348,7 +379,23 @@ on the cube half (§47.1); `ndNum = 0` on a Fixpipe (§49.5); an odd `operator[]
 `AllocMutexID()` returns 0 — so an `ENABLE_LOCK`-style arm is completely unsynchronized on A3 while looking
 synchronized in the source, and `vllm-ascend`'s `csrc/attention/common/op_kernel/init_output.h` is that shape
 (§56); and, under `ASCENDC_CUBE_ONLY`, `REGIST_CUBE_OBJ` expanding to a bare `return` on the vector half, after
-which no vector stage runs on any core (§47.4).
+which no vector stage runs on any core (§47.4). Two more from §58: a `GetValue` of a UB word that `MTE2` has only
+just been told to fetch, which needs `MTE2_S` and gets nothing from any `PipeBarrier` and nothing from the
+compiler unless `--cce-auto-sync` was typed on the command line (§58.3, §58.6); and a UB buffer loaded twice from
+GM with a vector read between the loads, which needs `V_MTE2` before the second load and survives both the
+all-`PipeBarrier<PIPE_ALL>` style and its conversion to named events, because every barrier in that idiom sits
+*after* each load rather than before the next one (§58.2, Relevance). The keystone fact behind that second one,
+and the reason a `SetFlag` between two `DataCopy`s to one buffer is not the serialiser it looks like:
+「SetFlag只是设置硬件标志位，**不会阻塞源流水中的下一个指令**」 (`SetFlag_WaitFlag_ISASI.md:42`, `:72`). Two
+transfers into one UB buffer are concurrently in flight; after the first flag fires the buffer can already hold
+32-byte blocks of the second. Converting a `PipeBarrier<PIPE_ALL>` site to `MTE2_V` pairs *introduces* that
+overlap while closing nothing, and a saturated defect metric will not show it. And it is steady state, not a coin
+flip: the flag is **one bit** per (`HardEvent`, `eventID`), set to 1 and cleared to 0
+(`intra_core_sync_overview.md:61-65`, which calls the pair a 「锁」机制), `WaitFlag` blocks only the *consumer*
+pipe, and `CrossCoreWaitFlag`'s `pipe` argument is discarded on 2201 — so a kernel writing only `MTE2_V`,
+`V_MTE3` and `MTE3_V` has placed **no stall at all on `PIPE_MTE2`**, which then runs ahead of its consumer. The
+cheapest audit that catches it: count the Set/Wait pairs sharing one event id inside one straight-line region.
+One is safe; three on `EVENT_ID0` collapse onto one bit.
 
 `Mutex`/`Lock`/`Unlock` would otherwise be the right tool for a reused staging buffer — 28 ids against the 6
 hand-allocatable event ids, and the vendor's own stated advantage is 「简化反向同步」 — but all five of its API

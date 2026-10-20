@@ -20863,3 +20863,502 @@ both AIVs busy. That turns the −29.3% step from inapplicable into applicable.
 One more thing worth noting from the 功能说明: 「耦合模式下，固定返回1」. On a coupled-architecture part
 `GetTaskRatio()` is a constant 1, so any alternation written on it silently degenerates to "AIV 0 does
 everything" there — a portability trap for code written against a separated part like ours.
+
+## 58. ★★★ The complete AIV intra-core sync matrix on 2201, the four edges a hand-written kernel must name itself, and the one that is neither nameable with `PipeBarrier` nor inserted for you: Scalar
+
+This section **supersedes part of §43** and **retires the premise of one commit in this repository**. §43 concluded
+that `PipeBarrier`, `PIPE_ALL` included, is 「阻塞相同流水」 and therefore cannot cover a cross-pipe hazard. That
+quotation is from the CANN 8.0.RC2.2 page. The CANN 9.2.0 page says the opposite in its 参数说明 and 约束说明, and
+the correct objection to `PipeBarrier<PIPE_ALL>()` is cost, not coverage. What *is* true, and is what §43 was
+reaching for, is narrower and sharper: **`PipeBarrier` cannot name `PIPE_S` at all**, so the Scalar edge is the one
+edge no quantity of `PipeBarrier` reaches.
+
+Source: the local devkit clone `/home/shanshan/repo/cann/asc-devkit/`, HEAD `6a51d0b167dd8f5555456a0ebb783ef0427e366e`,
+whose version is CANN 9.2.0 (`version.cmake:11`). All paths below are relative to it.
+
+### 58.1 An AIV has exactly four pipes, and the doc names `GetValue` as one of them
+
+`docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/intra_core_sync_overview.md:33`:
+
+> 四个执行单元Scalar、Vector、DMA（MTE2）、DMA(MTE3)并行执行，若访问同一片Local Memory，需要同步机制来控制它们的访问时序：保证先搬入Local Memory后再计算，计算完成后再搬出。
+
+表1, 指令流水类型和相关说明, the first and the two DMA rows verbatim (`:47-53`):
+
+> | 流水类型 | 含义 |
+> | --- | --- |
+> | PIPE_S | 标量流水线，使用GlobalTensor/LocalTensor的GetValue函数时为此流水 |
+> | PIPE_V | 矢量计算流水及部分硬件架构下的L0C Buffer->UB数据搬运流水 |
+> | PIPE_MTE2 | GM->L1 Buffer、GM->UB等数据搬运流水 |
+> | PIPE_MTE3 | UB->GM、L1 Buffer->GM等数据搬运流水 |
+
+`GetValue` is named in the PIPE_S row of the official pipe table. It is not a vector access that happens to be
+scalar-ish; it is the canonical PIPE_S access. The declarations carry the compiler's marker for it —
+`include/basic_api/kernel_tensor.h:176` and `:181`:
+
+```cpp
+    __aicore__ inline __inout_pipe__(S) PrimType GetValue(const uint32_t index) const;
+    __aicore__ inline __inout_pipe__(S) void SetValue(const uint32_t index, const S value) const;
+```
+
+and the body is a bare dereference with no implicit wait, `impl/basic_api/kernel_tensor_impl.h:806-808`:
+
+```cpp
+    } else {
+        return *(reinterpret_cast<__ubuf__ PrimType*>(GetPhyAddr(index)));
+    }
+```
+
+### 58.2 表3 — every legal AIV sync combination, verbatim. `PipeBarrier` is only on the diagonal
+
+Same file, 表3 「AIV中所有合法的核内同步组合」, `:91-96`, complete and unaltered:
+
+> | 源流水 | PIPE_S | PIPE_V | PIPE_MTE2 | PIPE_MTE3 |
+> | --- | --- | --- | --- | --- |
+> | PIPE_S | 不涉及 | SetFlag\<S_V\>(0)<br>WaitFlag\<S_V\>(0) | SetFlag\<S_MTE2\>(0)<br>WaitFlag\<S_MTE2\>(0) | SetFlag\<S_MTE3\>(0)<br>WaitFlag\<S_MTE3\>(0) |
+> | PIPE_V | SetFlag\<V_S\>(0)<br>WaitFlag\<V_S\>(0) | PipeBarrier\<PIPE_V\>() | SetFlag\<V_MTE2\>(0)<br>WaitFlag\<V_MTE2\>(0) | SetFlag\<V_MTE3\>(0)<br>WaitFlag\<V_MTE3\>(0) |
+> | PIPE_MTE2 | SetFlag\<MTE2_S\>(0)<br>WaitFlag\<MTE2_S\>(0) | SetFlag\<MTE2_V\>(0)<br>WaitFlag\<MTE2_V\>(0) | PipeBarrier\<PIPE_MTE2\>() | SetFlag\<MTE2_MTE3\>(0)<br>WaitFlag\<MTE2_MTE3\>(0) |
+> | PIPE_MTE3 | SetFlag\<MTE3_S\>(0)<br>WaitFlag\<MTE3_S\>(0) | SetFlag\<MTE3_V\>(0)<br>WaitFlag\<MTE3_V\>(0) | SetFlag\<MTE3_MTE2\>(0)<br>WaitFlag\<MTE3_MTE2\>(0) | PipeBarrier\<PIPE_MTE3\>() |
+
+and its preamble, `:76`, which is what makes this table a *closed* list rather than a set of examples:
+
+> 以NPU架构2201为例，该硬件架构下所有合法的核内同步组合如表2和表3所示。其中，"不涉及"表示硬件层面不存在此种同步组合，"暂无应用场景"表示存在此种同步组合，但在实际开发场景中暂不需要使用。
+
+Sixteen cells. Four are `PipeBarrier` and they are the diagonal. One is 不涉及 (S→S). The other eleven are
+`SetFlag`/`WaitFlag` and nothing else is offered. The practical reading: **on an AIV, `PipeBarrier` is for a
+same-pipe dependency and a named event pair is for every other dependency.**
+
+### 58.3 Correction to §43: `PipeBarrier<PIPE_ALL>()` *is* an all-pipe wait on 9.2.0 — but it cannot name `PIPE_S`
+
+`docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/PipeBarrier_ISASI.md`, 参数说明 (`:55`):
+
+> | pipe | 模板参数，表示阻塞的流水类别。<br>支持的流水参考硬件流水类型，其中**不支持PIPE_S**。<br>如果不关注流水类别，希望阻塞所有流水，可以传入PIPE_ALL。 |
+
+约束说明, same file, the first three bullets verbatim:
+
+> - Scalar流水之间的同步由硬件自动保证，PipeBarrier接口不支持PIPE_S单流水的同步。
+> - `PipeBarrier<PIPE_ALL>()`会等待所有流水线中所有先前提交的接口完成，这会对性能产生影响。若仅阻塞单条流水线即可解决问题，应避免随意调用`PipeBarrier<PIPE_ALL>()`。
+> - PIPE_MTE2/PIPE_MTE3在搬运地址有重叠的情况下需要开发者插入同步。例如，当需要执行多个DataCopy指令，且DataCopy的目的地址存在重叠时，需要调用PipeBarrier接口插入单流水同步指令，保证多个DataCopy指令的串行化，防止出现异常数据。
+
+Three things follow, and the middle one overturns a claim this project acted on.
+
+1. `PIPE_ALL` is a legitimate all-pipe drain — 「会等待所有流水线中所有先前提交的接口完成」. §43's "PIPE_ALL is not
+   defined to cover a cross-pipe hazard" is **superseded**: it rested on the 8.0.RC2.2 wording 「阻塞相同流水」, which
+   9.2.0 replaced. The reason to convert a `PipeBarrier<PIPE_ALL>` site to a named pair is that it drains everything
+   (「这会对性能产生影响」), not that it fails to order anything.
+2. `PIPE_S` is not a value `PipeBarrier` accepts — 「其中不支持PIPE_S」. So **a Scalar edge is the one edge that no
+   `PipeBarrier`, `PIPE_ALL` included, can be written for.** 「Scalar流水之间的同步由硬件自动保证」 covers S→S only.
+   An `MTE2`-written UB word read by `GetValue`, or a `SetValue`-written UB word read by `MTE3`, needs `MTE2_S`
+   or `S_MTE3` from 表3 and has no barrier equivalent.
+3. Two `DataCopy`s whose **destination** UB addresses overlap need a developer-inserted `PipeBarrier<PIPE_MTE2>()`
+   between them. The vendor ships a figure for exactly this
+   (`figures/datacopy_address_overlap_pipebarrier.png`). A function that loads one staging buffer twice is this
+   case, not merely a WAR case.
+
+### 58.4 `DataSyncBarrier<MemDsbT::UB>()` is not an instrument for any of this
+
+`impl/basic_api/kernel_event.h:821-832`, the 2201 arm complete:
+
+```cpp
+template <MemDsbT arg>
+__aicore__ inline void DataSyncBarrierImpl()
+{
+    if constexpr (arg == MemDsbT::UB) {
+        if ASCEND_IS_AIC {
+            return;
+        }
+    }
+    dsb((mem_dsb_t)arg);
+}
+```
+
+It is a scalar-side `dsb`, a no-op on the cube half for the `UB` selector, and its documented job is 「用于解决
+Scalar的内存依赖」 — the scalar unit waiting on *its own* prior accesses. The `UB` selector has **zero** uses in the
+whole shipped tree. It belongs next to a `DataCacheCleanAndInvalid` as the thing that waits for a cache-maintenance
+op (§58.7), never in place of a 表3 event pair. A `DataSyncBarrier<MemDsbT::UB>()` placed before a `GetValue` of an
+`MTE2`-written address orders nothing.
+
+### 58.5 ★ The vendor's own proof that a `PIPE_ALL` bracket does not cover the Scalar edge
+
+`impl/basic_api/dav_c220/kernel_operator_sync_impl.h:63-110`, `SoftSyncAllImpl` — the A3 soft `SyncAll`. It opens
+with `PipeBarrier<PIPE_ALL>()` at `:70` and *still* writes the `MTE2_S` pair by hand before dereferencing the UB
+word the copy just filled:
+
+```cpp
+    copy_gm_to_ubuf(static_cast<__ubuf__ void*>(localUbAddr), static_cast<__gm__ void*>(localSyncGM), 0, 1, 1, 0, 0);
+    event_t eventIdMte2ToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
+    SetFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    WaitFlag<HardEvent::MTE2_S>(eventIdMte2ToS);
+    int32_t curValue = *(reinterpret_cast<__ubuf__ int32_t*>(localUbAddr)) + 1;
+```
+
+Three more shipped sites give the same idiom. `examples/01_simd_cpp_api/.../compare/compare.asc:61-64` and
+`.../select/select.asc:63-66` use `MTE2_S`; `impl/basic_api/kernel_operator_block_sync_intf_impl.h:157-172` uses
+`MTE2_S`; and `examples/05_simd_simt_hybrid/02_best_practices/simd_simt_adaptive_max_pool3d_grad/adaptive_max_pool3d_grad_common.h:53-57`
+names it:
+
+```cpp
+__aicore__ inline void wait_mte2_to_scalar()
+{
+    asc_sync_notify(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    asc_sync_wait(PIPE_MTE2, PIPE_S, EVENT_ID0);
+}
+```
+
+with `wait_v_to_scalar` and `wait_mte3_to_scalar` beside it. The rule is also stated in prose, in the memory-model
+chapter, `docs/zh/guide/programming_guide/advanced_programming/memory_model/cache_coherence.md:590`:
+
+> 其中，`sync V->S`用于保证同一AI Core内Scalar读取发生在Vector写UB之后；`Scalar.DCCI`用于处理DCache与UB的一致性，使Scalar后续读取不再使用旧DCache副本；`Scalar.DSB`用于等待DCCI相关操作完成。若生产者是MTE2把GM数据搬入UB，也需要先建立`MTE2 -> S`的流水顺序，再处理Scalar DCache中的旧UB副本。
+
+### 58.6 ★★★ `--cce-auto-sync` would insert the Scalar edges for you — and a bare `bisheng` command line does not have it
+
+This is the trap, because the documentation's phrasing invites the opposite conclusion.
+`docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/key_features.md:135`:
+
+> - 异构编译直调（<<<>>>调用）、核函数（Kernel）直调算子工程以及自定义算子开发工程已默认设置`--cce-auto-sync=on`，如果开发者手动设置`--cce-auto-sync=off`，毕昇编译器无法自动插入同步。
+
+Read as "a `<<<>>>` kernel has auto-sync", that sentence is wrong. 「已默认设置」 is a statement about the *project
+templates*, not about the compiler. The option is listed as optional and opt-in in the compile-option table,
+`docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.md:119`:
+
+> | --cce-auto-sync | 否 | 开启毕昇编译器自动同步。AI Core内部的执行单元是异步并行的，Tensor的读写可能存在数据依赖，开启后可由毕昇编译器自动插入部分同步。 |
+
+and the build system is what appends it — `tools/build/asc_op_compile_base/asc_op_compiler/compile_op.py:1100-1108`:
+
+```python
+    if (
+        "--cce-auto-sync=off" not in compile_option_tuple.compile_options
+        and js.get("auto_sync") is not False
+    ):
+        compile_option_tuple.compile_options.append("--cce-auto-sync")
+        compile_option_tuple.compile_options.append("-mllvm")
+        compile_option_tuple.compile_options.append("-api-deps-filter")
+```
+
+while the TBE path turns it **off** for A3 — `tools/build/asc_op_compile_base/common/ccec.py:329-337`:
+
+```python
+    if (
+        get_soc_spec("SHORT_SOC_VERSION") != ASCEND_610LITE
+        and get_soc_spec("SHORT_SOC_VERSION") != BS9SX2A
+    ):
+        if (
+            get_soc_spec("SHORT_SOC_VERSION") != MC61AM21A
+            and get_soc_spec("SHORT_SOC_VERSION") != ASCEND_950
+        ):
+            cmd += ["--cce-auto-sync=off"]
+```
+
+**Operational rule: if you invoke `bisheng -xcce` yourself, you have no auto-sync unless you typed
+`--cce-auto-sync`.** Every kernel in `tests/glm52/` is built that way (`build.sh`:
+`bisheng -xcce "$arch" -std=c++17 -O2 … -c …`), so every one of them is hand-synchronised in full, including the
+PIPE_V↔PIPE_V edges.
+
+What the option would have covered, had it been on — 表3 of the same file, `:171-176`:
+
+> | 源流水\目的流水 | PIPE_S | PIPE_V | PIPE_MTE2 | PIPE_MTE3 |
+> | --- | --- | --- | --- | --- |
+> | PIPE_S | - | 支持 | 支持 | 支持 |
+> | PIPE_V | 支持 | 支持 | - | - |
+> | PIPE_MTE2 | 支持 | - | - | - |
+> | PIPE_MTE3 | 支持 | - | - | - |
+
+i.e. every edge touching PIPE_S, in both directions, plus V→V — and **none** of V↔MTE2, V↔MTE3. Note the shape of
+that coverage: the compiler takes exactly the edges a `PipeBarrier` cannot express, and leaves the ones it can. The
+`PIPE_S` side must additionally be an allowlisted API, and `GetValue`/`SetValue` are on the list (`:138-140`):
+
+> - 属于PIPE\_S的接口必须在以下接口集合内：
+>     - Tensor标量读写：LocalTensor::GetValue、LocalTensor::SetValue、LocalTensor::operator()、GlobalTensor::GetValue、GlobalTensor::operator()。
+>     - Vector归约辅助：GetReduceRepeatMaxMinSpr、GetReduceRepeatSumSpr。
+>     - 排序组合：GetMrgSortResult。
+
+and raw `__ubuf__` pointer arithmetic defeats it (`:182`): 「操作x_local的第0个元素时直接通过指针访问。此时，毕昇编译器
+无法在PIPE_MTE2（asc_copy_gm2ub）与PIPE_S之间自动插入同步」.
+
+### 58.7 The `CTRL[49]` second hazard on the same read
+
+`docs/zh/guide/programming_guide/advanced_programming/memory_model/cache_coherence.md:531`:
+
+> Scalar访问UB路径时可以`CTRL[49]`控制Scalar读取UB时是否通过DCache读取；`CTRL[49] = 1'b0`时，Scalar直接从UB读取；`CTRL[49] = 1'b1`时，Scalar读取UB数据会经过DCache。
+
+`:535` gives the default as `1'b0`, and `:598-599` the consequence:
+
+> - 如果后续消费者以Scalar DCache模式直接读取UB，关注的是DCache与UB的一致性，应使用DCCI处理旧副本，并在读取前建立生产流水到Scalar流水的同步。
+> - 如果Scalar读取UB时没有开启DCache模式，即`CTRL[49] = 1'b0`，Scalar直接从UB读取，此时通常只需要处理Scalar流水与Vector/MTE流水之间的执行顺序，不需要通过DCCI处理旧DCache副本。
+
+So on a stock kernel the 表3 event pair is the whole answer. If anything sets `CTRL[49] = 1'b1`, add a UB
+`DataCacheCleanAndInvalid` plus a `DataSyncBarrier` to wait on it (`:594`) — that, and only that, is where
+`DataSyncBarrier` belongs near a scalar read of UB.
+
+### 58.8 Event ids: 0-5, and why `FetchEventID` is not a claim
+
+`docs/zh/api/SIMD-API/basic_api/sync_control/intra_core_sync/SetFlag_WaitFlag_ISASI.md`, 约束说明, verbatim:
+
+> - SetFlag只是设置硬件标志位，不会阻塞源流水中的下一个指令。
+> - SetFlag和WaitFlag必须成对使用，且SetFlag和WaitFlag的参数必须完全一致（包括模板参数event和输入参数eventID）。如果不匹配，会引发timeout问题。例如，`SetFlag<HardEvent::S_MTE3>(1)`和`WaitFlag<HardEvent::MTE3_MTE1>(1)`并不匹配，因为其模板参数event不同。
+> - 在采用TPipe-TQue框架编程范式时，eventID需要通过AllocEventID或者FetchEventID来获取。
+> - 在采用静态Tensor编程范式时，事件的类型和事件ID由开发者自行管理，建议使用事件ID0-5，事件ID6用于系统内部规划（当前未使用），事件ID7用于TPipe编程中的自动同步功能，目前暂不建议直接使用事件ID6-7。
+
+Range on A3 is 0-7; usable by hand is 0-5. This confirms the correction already carried in `README.md` ("the
+hand-allocatable event-id range is 0-5, not 0-7").
+
+`TPipe::FetchEventID` **peeks without claiming** — `impl/basic_api/kernel_tpipe_impl.h:526-535`:
+
+```cpp
+__aicore__ inline TEventID TPipe::FetchEventID(HardEvent evt)
+{
+    auto ptr = this->g_tpipeImpl.eventPool_ + EventToIndex(evt);
+    auto lastId = sff0(ptr->eventOccupy);
+    ...
+    return lastId;
+}
+```
+
+`sff0` is first-zero-bit and, unlike `AllocEventID` (`:497-509`), there is no `sbitset1`. So a library API that
+fetches an id for a `HardEvent` the caller has been using by hand, without ever `AllocEventID`-ing it, gets the
+same id. Both must be the same `HardEvent` for this to bite: `eventPool_` is indexed by `EventToIndex(evt)`, so
+`MTE2_V` id 0 and `V_S` id 0 are different hardware flags.
+
+### 58.9 ★ `ReduceMax`'s `sharedTmpBuffer` MAY alias its source on A3 — the licence, verbatim
+
+The parameter is `sharedTmpBuffer`, not `workLocal`, in the shipped basic API —
+`include/basic_api/kernel_operator_vec_reduce_intf.h:169-172`:
+
+```cpp
+template <typename T>
+__aicore__ inline void ReduceMax(
+    const LocalTensor<T>& dst, const LocalTensor<T>& src, const LocalTensor<T>& sharedTmpBuffer, const int32_t count,
+    bool calIndex = 0);
+```
+
+`docs/zh/api/SIMD-API/basic_api/memory_vector_compute/reduction_compute/ReduceMax.md:222-223`, the NOTE closing
+关键特性说明:
+
+> [!NOTE]说明
+> 开发者为了节省地址空间，可以选择`sharedTmpBuffer`空间复用源操作数的空间。此时因为`sharedTmpBuffer`需要的最小空间一定小于源操作数的空间，所以无需关注和计算最小空间。
+
+and 约束说明, `:126-128`:
+
+> - 源操作数及`sharedTmpBuffer`的地址对齐约束请参考通用地址对齐约束，起始地址需要32字节对齐；目的操作数的起始地址对齐约束请参考ReduceRepeat-表3。
+> - 操作数地址重叠约束请参考通用地址重叠约束。
+> - 需要使用`sharedTmpBuffer`的情况下，支持`dst`与`sharedTmpBuffer`地址重叠（通常情况下`dst`比`sharedTmpBuffer`所需的空间要小），此时`sharedTmpBuffer`必须满足所需空间要求。
+
+So `sharedTmpBuffer` over `src` is explicitly sanctioned, and `dst` over `sharedTmpBuffer` as well. Two warnings
+not to transfer:
+
+- The 「可以直接传入`src`或者任意大小的`sharedTmpBuffer`」 sentence on the same page is gated `npu="950"` and does
+  **not** apply to A3 (`:165-167`).
+- The **adv_api** `ReduceMax` is a different API and forbids exactly this —
+  `docs/zh/api/SIMD-API/adv_api/reduction_operations/ReduceMax_interface/ReduceMax.md:90-91`: 「**不支持源操作数与目的
+  操作数地址重叠。** 不支持sharedTmpBuffer与源操作数和目的操作数地址重叠。」 Do not read that constraint onto the
+  basic-API form.
+
+There is no NPU-side check either way: the only guard is `#if ASCENDC_CPU_DEBUG`
+(`impl/basic_api/kernel_operator_vec_reduce_intf_impl.h:1379-1383`), and `ASCENDC_ASSERT` /
+`ASCENDC_CHECK_VALUE_RANGE` both expand to nothing on NPU (`impl/basic_api/kernel_log.h:277`, `:294`).
+
+### 58.10 ★ What the 2201 `ReduceMax` actually does to `dst` — a 4-byte scalar store, already fenced
+
+2201 is **not** the `ReduceMaxImpl` path; `impl/basic_api/kernel_operator_vec_reduce_intf_impl.h:1350-1351` gates
+that to 3510/5102/3003/3113, and 2201 falls to `ReduceImpl` + a conditional `ReduceTailCompute` (`:1388-1396`). For
+`count == 128`, `T == float`, `calIndex == false`: `elementNumPerRep = 256/4 = 64`, `repeatTime = 2`,
+`tailCount = 0`, so `ReduceTailCompute` never runs. `ReduceImplFirstStep`
+(`impl/basic_api/dav_c220/kernel_operator_vec_reduce_impl.h:426-450`) is one `vcmax` with repeat 2 writing
+`work[0..3]` ({value,index} pairs, `VREDUCE_PER_REP_OUTPUT = 2`); `ReduceImplSecondStepNoIndex` (`:748-770`) then
+reduces `work → work` in place; and `ReduceImplThirdStepNoIndex` (`:773-792`) ends with:
+
+```cpp
+    event_t eventIdVToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+    SetFlag<HardEvent::V_S>(eventIdVToS);
+    WaitFlag<HardEvent::V_S>(eventIdVToS);
+
+    *dstLocal = *sharedTmpBuffer;
+    event_t eventIdSToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
+    event_t eventIdSToMTE3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+    SetFlag<HardEvent::S_V>(eventIdSToV);
+    WaitFlag<HardEvent::S_V>(eventIdSToV);
+    SetFlag<HardEvent::S_MTE3>(eventIdSToMTE3);
+    WaitFlag<HardEvent::S_MTE3>(eventIdSToMTE3);
+```
+
+Two consequences, both load-bearing for a hand-written requantisation epilogue.
+
+1. **`dst` is written by a 4-byte scalar store, not by a 32-byte-granular vector write.** A belief that "a
+   reduction's destination is written a whole 32-byte block at a time, so each row's maximum needs its own block"
+   is false on this path, and a `TBuf` split made on that premise buys nothing. (It is true of
+   `ReduceImplFirstStep`'s writes into `sharedTmpBuffer`, which is a different buffer.)
+2. **A `GetValue` of that `dst` immediately afterwards needs no event** — it is S→S, 「Scalar流水之间的同步由硬件
+   自动保证」. The V→S edge is already closed inside the API. The general 表3 answer for "a vector write then a
+   scalar read" is still `V_S`; it just does not apply to *this* API's destination on *this* path. It does apply on
+   the `calIndex == true` path and to `ReduceTailCompute`, whose trailing `V_S` is inside `if (calIndex)`
+   (`:911-940`).
+
+### 58.11 ★ `ReduceMax` is not on §48's allowlist, and it is a 软仿 API that takes system event ids
+
+§48.1's governing sentence, re-quoted here because this is its first concrete instance:
+
+> 同时另外一些软仿实现接口内部会占用系统分配的事件ID，如果开发者手动调用`SetFlag/WaitFlag(ISASI)`插入自定义事件ID时会跟接口内部的事件ID产生冲突，所以用户自定义事件ID时，只能支持部分API。具体支持的API列表见支持的API范围。
+
+表3 of `cpp_tensor_programming_overview.md` (§48.2) lists, under 归约计算, exactly:
+「`WholeReduceMax`、`WholeReduceMin`、`WholeReduceSum`、`BlockReduceMax`、`BlockReduceMin`、`BlockReduceSum`、
+`PairReduceSum`、`RepeatReduceSum`、`GetReduceRepeatSumSpr`、`GetReduceRepeatMaxMinSpr`」. The single-`vcmax`
+primitives are allowed; the multi-pass `sharedTmpBuffer` wrapper `ReduceMax` is **not**, and §58.10 shows why — it
+is one of the 「软仿实现接口」 that takes three event ids from the live `TPipe`. `Matmul` is not on the list either
+(矩阵计算 is raw `Mmad`/`LoadData`). `Cast`, `DataCopy`, `DataCopyPad`, `SetFlag`/`WaitFlag`, `PipeBarrier` and
+`DataSyncBarrier` are all on it.
+
+A row maximum inside a hand-synchronised kernel is therefore better written as `WholeReduceMax` (one `vcmax`, no
+`sharedTmpBuffer`, no event ids, on the allowlist) than as `ReduceMax`.
+
+### 58.12 A UB→UB `DataCopy` is PIPE_V, not an MTE pipe
+
+`docs/zh/api/SIMD-API/c_api/vector_data_move/asc_copy_ub2ub.md:68-70`:
+
+> ## 流水类型
+>
+> PIPE_V
+
+and the Level-2 `DataCopy(LocalTensor, LocalTensor, …)` reaches it: `impl/basic_api/kernel_operator_data_copy_intf_impl.h:366-375`
+dispatches `srcHWPos == Hardware::UB && dstHWPos == Hardware::UB` to `DataCopyUB2UBIntf`, which on 2201 is
+`impl/basic_api/dav_c220/kernel_operator_data_copy_impl.h:1188-1191` → `DataCopyUB2UBImpl` at `:119-132` →
+`copy_ubuf_to_ubuf`. So a UB→UB stage copy is ordered against surrounding vector work by `PipeBarrier<PIPE_V>()`
+and needs **no** `MTE2_V`/`V_MTE3` pair. It is easy to misclassify this as a DMA and over-synchronise it — or, worse,
+to classify it as a DMA and then wonder why the barrier you wrote for it is on the wrong pipe.
+
+### 58.13 `ASCENDC_CUBE_ONLY` does not trigger §43.5's silent-no-op trap
+
+§43.5 established that `WaitFlagImpl`'s vector-event arms sit behind `#ifndef SPLIT_CORE_CUBE`. `SPLIT_CORE_CUBE`
+is set by the compiler's per-half pass, not by the user macro — `impl/utils/sys_macros.h:56-61`:
+
+```cpp
+#if (defined(__DAV_CUBE__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510))
+#define SPLIT_CORE_CUBE
+#endif
+
+#if (defined(__DAV_VEC__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510))
+#define SPLIT_CORE_VEC
+#endif
+```
+
+`ASCENDC_CUBE_ONLY` appears in only two places in the whole tree — `include/adv_api/matmul/matmul_intf.h:45,59,74,88,97`
+and `impl/adv_api/detail/kfc/kfc_register_obj.h:152,277,331` — i.e. it selects `MatmulImpl` directly instead of the
+KFC client, and touches nothing in the event machinery. So `#define ASCENDC_CUBE_ONLY` at the top of a `__mix__`
+kernel does **not** make the vector half's `WaitFlag`s compile away. Its real consequence is §47.4's: a
+`REGIST_CUBE_OBJ` under it expands to a bare `return` on the vector half.
+
+### 58.14 `GlobalTensor<int4b_t>::operator[]` already counts nibbles — a hand-rolled byte-pointer helper is redundant
+
+This refines §42 rather than contradicting it, and it retires a rationale that a kernel in this repository acted on
+in seven places. `impl/basic_api/kernel_tensor_impl.h:1650-1675`:
+
+```cpp
+template <typename T>
+__aicore__ inline GlobalTensor<T> GlobalTensor<T>::operator[](const uint64_t offset) const
+{
+    GlobalTensor result = *this;
+    if constexpr (IsHalfByteDataType<PrimType>()) {
+        result.address_ = result.address_ + offset / INT4_TWO;
+        result.oriAddress_ = result.oriAddress_ + offset / INT4_TWO;
+    ...
+```
+
+`address_` is a `__gm__ PrimType*` and `sizeof(int4b_t) == 1`, so `address_ + offset / INT4_TWO` advances exactly
+`offset / 2` **bytes** — which is bit-for-bit what a hand-written `(__gm__ int8_t*)base + elements / 2` produces,
+with the same silent flooring of an odd index. The two are the same expression. §42's warning stands in full on
+everything else — `sizeof` against `SizeOfBits`, `bufferSize_` not being adjusted, `DataCopy(count)` counting
+elements while `Nd2NzParams` counts bytes, `torch.int4` being unpacked — but the subscript's *unit* is not among
+the traps: it counts nibbles, correctly.
+
+The practical consequence: if an int4 store appears to land nowhere when its destination offset is non-zero and
+to land every time at offset zero, the subscript is not the variable. Look at the transfer's **length** instead.
+The one found-and-fixed instance here was a `DataCopy` given an element count where the API wanted bytes, which
+over-wrote each tile's successor and spilled exactly one tile past the region — the symptom being identical bytes
+at two offsets one span apart, which reads as "the write went somewhere else" and is in fact "the write went
+twice as far".
+
+## Relevance
+
+This section exists because a hand-written MIX kernel in this repository
+(`tests/glm52/routed_int4/routed_int4_kernel.cpp`) was 99.9% wrong in its output while its first matmul was
+bit-exact, and the whole of the disagreement is in the four stages that run on the vector half. The table in §58.2
+turns "which barrier do I need" into an enumeration, and §58.6 says who is responsible for inserting it.
+
+Three concrete lessons for every kernel in `tests/glm52/`, all of which are built by a bare `bisheng` command line:
+
+1. **There is no auto-sync.** Every edge in 表3, including `PipeBarrier<PIPE_V>` between two dependent vector
+   instructions, is the author's to write. The `PipeBarrier<PIPE_V>()` calls that look redundant in these kernels
+   are not redundant.
+2. ★ **A `SetFlag` between two `DataCopy`s does not serialise them, and the API page says so in as many words.**
+   `SetFlag_WaitFlag_ISASI.md:42`:
+
+   > SetFlag：当源流水的前序指令的所有读写操作都完成之后，当前指令开始执行，并将硬件中的对应标志位设置为1。SetFlag只是设置硬件中的对应标志位，**并不会阻塞源流水中的下一个指令**。
+
+   and again at `:72`: 「SetFlag只是设置硬件标志位，不会阻塞源流水中的下一个指令。」 (`asc_sync_notify.md:31` repeats
+   it for the C API.) The flag's *set* is deferred until the prior MTE2 work retires; the MTE2 **pipe** is not
+   stalled. So the idiom
+
+   ```cpp
+   DataCopy(staging, product[high], span);
+   SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+   Cast(into, staging, RoundMode::CAST_NONE, span);   // V reads staging
+   ...
+   DataCopy(staging, product[low], span);             // MTE2 writes staging again
+   ```
+
+   leaves **two** hazards open on `staging`, and the second load is the site of both:
+   `PIPE_MTE2`→`PIPE_MTE2` with a **100% overlapping destination**, which 58.3's third bullet says requires a
+   developer-inserted `PipeBarrier<PIPE_MTE2>()` 「保证多个DataCopy指令的串行化，防止出现异常数据」; and
+   `PIPE_V`→`PIPE_MTE2` write-after-read against the `Cast`, which 表3 answers with `V_MTE2`. The visible
+   consequence of the first is that after the *first* flag fires, `staging` can already hold 32-byte blocks of the
+   *second* transfer — a per-block mixture of two GM regions, which reads downstream as a per-column perturbation
+   of varying sign and magnitude rather than as any clean formula error.
+
+   Note the asymmetry with the style this replaced. `PipeBarrier<PIPE_ALL>()` placed *after* each load does cover
+   the MTE2/MTE2 overlap, because the barrier completes the first transfer before the second is issued; it does
+   **not** cover the V→MTE2 write-after-read, because nothing sits before the second load. Converting such a site
+   to `MTE2_V` pairs therefore closes nothing and opens the overlap. **A barrier-to-event conversion is only
+   faithful if a pair is added before every re-load, not just after every load** — and if the defect metric was
+   already saturated (ours was: 99.904% → 99.890% of values wrong), the conversion's cost will not show in it.
+
+2b. ★★★ **Why that is structural rather than a race: the flag is one bit and a lock, and nothing throttles MTE2.**
+   `intra_core_sync_overview.md:61-65` gives the mechanism, and calls it a lock in so many words
+   (「表示两个指令流水之间完成一组"锁"机制」):
+
+   > - SetFlag：当源流水的前序指令的所有读写操作都完成之后，当前指令开始执行，并将硬件中的对应标志位设置为1。
+   > - WaitFlag：当目的流水执行到该指令时，如果发现硬件中对应标志位为0，目的流水的后续指令将一直被阻塞；如果发现硬件中对应标志位为1，则将硬件中对应标志位设置为0，同时目的流水的后续指令开始执行。
+
+   A 标志位 set to 1 and cleared to 0 — one bit per (`HardEvent`, `eventID`), not a counter. Combine that with
+   「SetFlag…并不会阻塞源流水中的下一个指令」 and the consequence for a producer pipe is exact: **`WaitFlag`
+   blocks the consumer pipe and nothing in the pair ever blocks the producer pipe.** A kernel that writes only
+   `MTE2_V`, `V_MTE3` and `MTE3_V` has therefore placed stalls on `PIPE_V` and on `PIPE_MTE3` and *none* on
+   `PIPE_MTE2` — and on 2201 `CrossCoreWaitFlag`'s `pipe` template argument is discarded
+   (`dav_c220/kernel_operator_sync_impl.h:501-505`), so a cross-core wait does not stall it either. `PIPE_MTE2`
+   then runs ahead of the vector pipe, and the only thing bounding the run-ahead is the one bit: a second
+   `SetFlag` on an id still holding 1 has nowhere to put its value, so the producer advances by about one transfer
+   per event id — **and that one transfer is the one whose destination is the buffer the consumer has not read
+   yet.** The corruption is not a coin flip that sometimes lands wrong; it is the steady state. What varies run to
+   run is only how much of the buffer the overtaking transfer has replaced when the consumer finally reads it,
+   which presents as a per-32-byte-block mixture of two GM regions.
+
+   Corollary, and the cheapest audit in this whole section: **count the Set/Wait pairs that share one event id
+   inside one straight-line region.** One is safe. Three on `EVENT_ID0`, as in a three-term recombination that
+   loads one staging buffer three times, is not — the sets collapse onto one bit and the pairs are not
+   structurally guaranteed to alternate. Distinct ids per load, or distinct destinations per load, fix it; so does
+   a `PipeBarrier<PIPE_ALL>()` before each re-load, at its documented cost. And the stage in such a kernel that
+   still *works* is usually the one that happens to have an all-pipe drain at its loop boundary, which drains MTE2
+   and so deletes the run-ahead — not the one that is better synchronised.
+3. **A `GetValue` of an `MTE2`-loaded word, and a `DataCopyPad` of a `SetValue`-written word, need `MTE2_S` and
+   `S_MTE3`.** Neither has a `PipeBarrier` form. `DataSyncBarrier<MemDsbT::UB>()` is not a substitute and never was.
+
+One negative result worth banking, because it is what sent the search back to synchronisation. For that kernel's
+measured device state — intermediate codes `-9 -9 -5 -13 -2 5 -7 -9` and row quanta `0.00165845`, `0.0013341`
+against reference quanta `0.00145008`, `0.000781054` — a host-side replica of the harness's own reference
+(exact: it reproduces the printed products `8883 562 -5267` / `-16078 -16791 -3580` and both reference quanta to
+all printed digits) was used to search **7776 structured arithmetic variants**: every drop and duplication of the
+three recombination terms `16*high`, `low` and `8*sum(w)` on the gate and the up half independently, every
+gate/up per-channel scale swap, the per-token scale from every expert and applied to either or both halves, and
+the bias taken from the wrong expert. **Zero matched both row maxima to 1e-4.** The closest was −2.265%/+0.168%.
+Separately, no single quantum reproduces the device's eight codes from the reference activation — the feasible
+interval is empty — so the activation itself differs, per column, by −6% to +29% in the first eight columns while
+the row maximum moves by +14.4% and +70.8%. A per-column perturbation of varying sign and relative size that no
+deterministic formula error produces is stale or partially-arrived data, which is the signature this section is
+about.
