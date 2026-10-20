@@ -549,22 +549,26 @@ def run(args, report):
                         "counters_before": counters_before,
                         "counters_after": asdict(compilation_counter),
                         "artifacts_sha256": artifacts,
-                        "draft_do_not_compile": (None if draft is None
-                                                 else draft.model.do_not_compile),
-                        "draft_mode": str(
-                            draft.config.compilation_config.mode,
-                        ),
-                        "draft_cudagraph_mode": str(
-                            draft.config.compilation_config.cudagraph_mode,
-                        ),
-                        "separate_context": (
-                            draft.config.compilation_config
-                            .static_forward_context is not
-                            config.static_forward_context),
+                        # One block, absent together: a truncated arm has no
+                        # draft engine, and four fields each guarded
+                        # separately is four places to miss one.
+                        **({
+                            "draft_do_not_compile":
+                                draft.model.do_not_compile,
+                            "draft_mode": str(
+                                draft.config.compilation_config.mode),
+                            "draft_cudagraph_mode": str(
+                                draft.config.compilation_config
+                                .cudagraph_mode),
+                            "separate_context": (
+                                draft.config.compilation_config
+                                .static_forward_context is not
+                                config.static_forward_context),
+                        } if draft is not None else {}),
                     }
                 if args.target_graph:
                     target.enable_graph(width=args.width)
-                if args.draft_graph:
+                if args.draft_graph and draft is not None:
                     draft.enable_graph(
                         conditioned_width=(args.width
                                            if args.conditioned_graph else 0))
