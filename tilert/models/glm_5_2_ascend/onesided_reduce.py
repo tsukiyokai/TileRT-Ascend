@@ -35,8 +35,10 @@ def _bind(device):
     import torch
 
     torch.npu.set_device(device)
-    index = device.index if hasattr(device, "index") else int(
-        str(device).rsplit(":", 1)[-1])
+    # `str` has an `index` method, so `hasattr(device, "index")` is true for
+    # "npu:0" and hands back the method. The string form is what both a
+    # `torch.device` and a plain string agree on.
+    index = int(str(device).rsplit(":", 1)[-1])
     runtime = ctypes.CDLL("libascendcl.so")
     bound = runtime.aclrtSetDevice(ctypes.c_int(index))
     if bound != 0:
