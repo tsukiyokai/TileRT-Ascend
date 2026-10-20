@@ -49,7 +49,6 @@ constexpr int64_t SCALE_SPAN = ((ROWS + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
 #endif
 constexpr int64_t TILE = TILE_SPAN;
 constexpr float QUANTUM_SPAN = 127.0F;
-constexpr float NORM_EPSILON = 1e-5F;
 
 /** The address `elements` INT4 values along from `base`.
  *
@@ -325,97 +324,33 @@ __aicore__ inline void Emit(LocalTensor<half>& staging,
     AfterStore();
 }
 
-/** RMSNorm, per-token quantisation and the INT4 split, in one kernel.
- *
- * The row's quantum needs the whole row, so the data is read twice: once to
- * accumulate the sum of squares and the largest |x*w|, which share a load,
- * and once to normalise, quantise and split. Twelve kibibytes of BF16 read
- * twice is nothing against the global round trip it replaces -- the vendor
- * writes INT8 rows out of a quantisation kernel and reads them back into the
- * matmul, and that trip is what the fusion is for.
- *
- * The quantum is written out rather than taken in: nothing upstream knows it,
- * because it depends on the normalised row.
- */
-__aicore__ inline void NormaliseAndSplit(Workspace& held,
-                                         __gm__ bfloat16_t* hidden,
-                                         __gm__ bfloat16_t* norm_weight,
-                                         __gm__ int4b_t* stacked,
-                                         __gm__ int4b_t* stacked_low,
-                                         __gm__ int4b_t* witness,
-                                         __gm__ float* token_scale)
+/** Stack one expert's rows as two INT4 halves. */
+__aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
+                             __gm__ int4b_t* stacked,
+                             __gm__ int4b_t* stacked_low,
+                             __gm__ int4b_t* witness)
 {
-    LocalTensor<bfloat16_t> narrow = held.half_buffer.Get<bfloat16_t>();
-    LocalTensor<bfloat16_t> weight_narrow =
-        held.spare_half_buffer.Get<bfloat16_t>();
-
-    GlobalTensor<bfloat16_t> hidden_global;
-    GlobalTensor<bfloat16_t> weight_global;
-    GlobalTensor<float> quantum_global;
+    GlobalTensor<int8_t> rows_global;
     GlobalTensor<int4b_t> high_global;
     GlobalTensor<int4b_t> low_global;
     GlobalTensor<int4b_t> witness_global;
-    hidden_global.SetGlobalBuffer(hidden, ROWS * HIDDEN);
-    weight_global.SetGlobalBuffer(norm_weight, HIDDEN);
-    quantum_global.SetGlobalBuffer(token_scale, SCALE_SPAN);
+    rows_global.SetGlobalBuffer(rows, ROWS * HIDDEN);
     high_global.SetGlobalBuffer(stacked, ROWS * HIDDEN);
+    // The low region's base comes in already offset. Deriving it here with a
+    // cast produced a tensor whose writes never landed, while the identical
+    // write through a tensor built on a plain argument landed every time.
     low_global.SetGlobalBuffer(stacked_low, ROWS * HIDDEN);
     witness_global.SetGlobalBuffer(witness, TILE);
 
     for (int64_t row = 0; row < ROWS; ++row) {
-        float squares = 0.0F;
-        float largest = 0.0F;
         for (int64_t done = 0; done < HIDDEN; done += TILE) {
             const int64_t count = (HIDDEN - done < TILE) ? HIDDEN - done
                                                          : TILE;
-            DataCopy(narrow, hidden_global[row * HIDDEN + done], count);
-            DataCopy(weight_narrow, weight_global[done], count);
+            DataCopy(held.narrow, rows_global[row * HIDDEN + done], count);
             AfterLoad();
-            Cast(held.value, narrow, RoundMode::CAST_NONE, count);
-            Cast(held.scale, weight_narrow, RoundMode::CAST_NONE, count);
+            Cast(held.half_value, held.narrow, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
-            Mul(held.work, held.value, held.value, count);
-            PipeBarrier<PIPE_V>();
-            ReduceSum(held.rowmax[row * BLOCK_FLOATS], held.work, held.work,
-                      count);
-            PipeBarrier<PIPE_ALL>();
-            DataSyncBarrier<MemDsbT::UB>();
-            squares += held.rowmax.GetValue(row * BLOCK_FLOATS);
-            Mul(held.other, held.value, held.scale, count);
-            PipeBarrier<PIPE_V>();
-            Abs(held.other, held.other, count);
-            PipeBarrier<PIPE_V>();
-            ReduceMax(held.rowmax[row * BLOCK_FLOATS], held.other, held.other,
-                      count, false);
-            PipeBarrier<PIPE_ALL>();
-            DataSyncBarrier<MemDsbT::UB>();
-            const float tile_max = held.rowmax.GetValue(row * BLOCK_FLOATS);
-            largest = (tile_max > largest) ? tile_max : largest;
-        }
-
-        const float inverse_rms =
-            1.0F / sqrt(squares / (float)HIDDEN + NORM_EPSILON);
-        const float quantum = largest * inverse_rms / QUANTUM_SPAN;
-        held.token.SetValue(row, quantum);
-        const float reciprocal = 1.0F / quantum;
-
-        for (int64_t done = 0; done < HIDDEN; done += TILE) {
-            const int64_t count = (HIDDEN - done < TILE) ? HIDDEN - done
-                                                         : TILE;
-            BeforeLoad();
-            DataCopy(narrow, hidden_global[row * HIDDEN + done], count);
-            DataCopy(weight_narrow, weight_global[done], count);
-            AfterLoad();
-            Cast(held.value, narrow, RoundMode::CAST_NONE, count);
-            Cast(held.scale, weight_narrow, RoundMode::CAST_NONE, count);
-            PipeBarrier<PIPE_V>();
-            Mul(held.value, held.value, held.scale, count);
-            PipeBarrier<PIPE_V>();
-            Muls(held.value, held.value, inverse_rms * reciprocal, count);
-            PipeBarrier<PIPE_V>();
-            // Float to float is the one cast whose rounding lands on an
-            // integer; to half it would only round to a representable half.
-            Cast(held.value, held.value, RoundMode::CAST_RINT, count);
+            Cast(held.value, held.half_value, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
             SplitHalves(held, count);
             Emit(held.half_value, held.code, held.value, high_global,
@@ -429,12 +364,6 @@ __aicore__ inline void NormaliseAndSplit(Workspace& held,
             PipeBarrier<PIPE_ALL>();
         }
     }
-
-    BeforeStore();
-    DataCopyPad(quantum_global, held.token,
-                DataCopyExtParams{1, (uint32_t)(ROWS * sizeof(float)),
-                                  0, 0, 0});
-    AfterStore();
 }
 
 /** `silu(gate) * up`, in place in `value`. */
@@ -629,8 +558,7 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
 
 extern "C" __global__ __mix__(1, 2) __schedmode__(1)
 __aicore__ void routed_int4_fused(
-    uint64_t sync_base, __gm__ bfloat16_t* hidden,
-    __gm__ bfloat16_t* norm_weight, __gm__ int4b_t* stacked,
+    uint64_t sync_base, __gm__ int8_t* rows, __gm__ int4b_t* stacked,
     __gm__ int4b_t* stacked_low, __gm__ int4b_t* gate_up, __gm__ float* gu_bias, __gm__ float* gu_scale,
     __gm__ int4b_t* down, __gm__ float* down_bias, __gm__ float* down_scale,
     __gm__ float* token_scale,
@@ -691,12 +619,10 @@ __aicore__ void routed_int4_fused(
             // the narrow work stays on subblock zero and the row maximum
             // stays core-local.
             if (sub == 0) {
-                NormaliseAndSplit(
-                    held, hidden + expert * ROWS * HIDDEN, norm_weight,
-                    Nibbles(stacked, expert * M_TILE * HIDDEN),
-                    Nibbles(stacked_low, expert * M_TILE * HIDDEN),
-                    Nibbles(witness, expert * TILE),
-                    token_scale + expert * SCALE_SPAN);
+                Split(held, rows + expert * ROWS * HIDDEN,
+                      Nibbles(stacked, expert * M_TILE * HIDDEN),
+                      Nibbles(stacked_low, expert * M_TILE * HIDDEN),
+                      Nibbles(witness, expert * TILE));
                 Publish();
                 CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
             }
@@ -723,8 +649,7 @@ __aicore__ void routed_int4_fused(
 }
 
 void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
-                        void* hidden, void* norm_weight,
-                        void* stacked, void* stacked_low,
+                        void* rows, void* stacked, void* stacked_low,
                         void* gate_up,
                         float* gu_bias, float* gu_scale, void* down,
                         float* down_bias, float* down_scale,
@@ -734,8 +659,7 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         void* workspace, int64_t experts)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
-        sync_base, (__gm__ bfloat16_t*)hidden,
-        (__gm__ bfloat16_t*)norm_weight, (__gm__ int4b_t*)stacked,
+        sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
         (__gm__ int4b_t*)stacked_low, (__gm__ int4b_t*)gate_up, gu_bias,
         gu_scale, (__gm__ int4b_t*)down, down_bias, down_scale, token_scale,
         (__gm__ int32_t*)partial, (__gm__ int4b_t*)middle, middle_scale,
