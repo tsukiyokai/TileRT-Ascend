@@ -63,70 +63,83 @@ def narrow(weights, group_list, group_list_type):
 def install(quant_method):
     """Narrow both grouped matmuls to the touched experts; return the undo.
 
-    The engine reads its weights through `get_mlp_weights` and its group list
-    from the round's `MoEMlpComputeInput`, and the two have to agree, so the
-    filter wraps the methods that hold both: `apply_gmm1_act_quant` and
-    `apply_gmm2`. Each reads `mlp_compute_input.group_list`, which is the
-    round's own, so the subset is recomputed every round at no cost beyond the
-    nonzero scan.
+    The engine's W4A8 method reads its weights through `_get_mlp_weights`,
+    which returns four values -- `(w1, w1_scale, w2, w2_scale)` -- and builds
+    the group list from the round's `MoEMlpComputeInput`. The two have to agree
+    on which slots exist, so the filter wraps that reader and the two methods
+    that call it.
+
+    An earlier version wrapped `get_mlp_weights` with two return values, a name
+    and an arity the W4A8 class does not have. It installed without error and
+    narrowed nothing.
     """
-    original_weights = quant_method.get_mlp_weights
+    original = quant_method._get_mlp_weights
     split = {}
+    keep = [None]
 
     def splitting(layer):
-        """The bank as one tensor an expert, cached a layer.
+        """The bank as one tensor an expert, cached a layer, filtered a round.
 
         Splitting is free -- 194.71 us against the fused tensor's 195.65 in a
-        graph -- and the views have to be built once rather than a round.
+        graph -- and the views are built once rather than a round.
         """
         if id(layer) not in split:
-            first, second = original_weights(layer)
-            split[id(layer)] = (
-                [first[index] for index in range(first.shape[0])],
-                [second[index] for index in range(second.shape[0])],
-            )
-        return split[id(layer)]
+            held = original(layer)
+            split[id(layer)] = tuple(
+                [piece[index] for index in range(piece.shape[0])]
+                if hasattr(piece, "shape") and piece.dim() >= 1 else piece
+                for piece in held)
+        pieces = split[id(layer)]
+        if keep[0] is None:
+            return tuple(_rejoin(piece) for piece in pieces)
+        return tuple(_subset(piece, keep[0]) for piece in pieces)
 
-    quant_method.get_mlp_weights = splitting
-    undo = [("get_mlp_weights", original_weights)]
+    quant_method._get_mlp_weights = splitting
+    undo = [("_get_mlp_weights", original)]
 
     for name in ("apply_gmm1_act_quant", "apply_gmm2"):
-        original = getattr(quant_method, name)
+        method = getattr(quant_method, name, None)
+        if method is None:
+            continue
 
-        def filtering(mlp_compute_input, *rest, _original=original):
-            """Shrink the round's group list, then let the method run.
-
-            Both methods read `mlp_compute_input.group_list` and pass it
-            straight to the operator, and both reach their weights through
-            `get_mlp_weights`, which now returns a list. So narrowing is one
-            substitution on the input: the slots with no rows leave the group
-            list, and `splitting`'s list is indexed to match.
-            """
+        def filtering(mlp_compute_input, *rest, _method=method):
+            """Shrink the round's group list, then let the method run."""
             group_list = mlp_compute_input.group_list
             counts = expert_counts(group_list,
                                    mlp_compute_input.group_list_type)
-            keep = (counts > 0).nonzero(as_tuple=True)[0]
-            if keep.numel() == counts.numel():
-                return _original(mlp_compute_input, *rest)
-            kept = counts[keep]
+            chosen = (counts > 0).nonzero(as_tuple=True)[0]
+            if chosen.numel() == counts.numel():
+                return _method(mlp_compute_input, *rest)
+            kept = counts[chosen]
             mlp_compute_input.group_list = (
                 kept.cumsum(0) if mlp_compute_input.group_list_type == 0
                 else kept)
-            held = quant_method.get_mlp_weights
-            quant_method.get_mlp_weights = (
-                lambda layer, _keep=keep.tolist(), _held=held: tuple(
-                    [side[index] for index in _keep] for side in _held(layer)))
+            keep[0] = chosen.tolist()
             try:
-                return _original(mlp_compute_input, *rest)
+                return _method(mlp_compute_input, *rest)
             finally:
-                quant_method.get_mlp_weights = held
+                keep[0] = None
                 mlp_compute_input.group_list = group_list
 
         setattr(quant_method, name, filtering)
-        undo.append((name, original))
+        undo.append((name, method))
 
     def restore():
         for name, method in undo:
             setattr(quant_method, name, method)
 
     return restore
+
+
+def _subset(piece, chosen):
+    """The chosen experts of a split bank, or the value if it was not split."""
+    if isinstance(piece, (list, tuple)):
+        return [piece[index] for index in chosen]
+    return piece
+
+
+def _rejoin(piece):
+    """A split bank as the list the operator accepts, or the value itself."""
+    if isinstance(piece, (list, tuple)):
+        return list(piece)
+    return piece

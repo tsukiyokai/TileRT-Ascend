@@ -54,12 +54,13 @@ def check_install_narrows_a_fake_method():
             self.layer = Layer()
             self.seen = None
 
-        def get_mlp_weights(self, layer):
+        def _get_mlp_weights(self, layer):
             bank = torch.arange(5 * 2 * 2).reshape(5, 2, 2)
-            return bank, bank
+            scale = torch.arange(5)
+            return bank, scale, bank, scale
 
         def apply_gmm1_act_quant(self, compute):
-            first, _ = self.get_mlp_weights(compute.layer)
+            first, *_ = self._get_mlp_weights(compute.layer)
             self.seen = (len(first), compute.group_list.tolist())
             return "out"
 

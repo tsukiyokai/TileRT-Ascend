@@ -2032,3 +2032,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      single-row group. The first bandwidth pass divided MB per microsecond by a
      thousand once too often, read 0.00 TB/s everywhere, and inferred caching
      from the pattern.
+
+192. The bank narrowing wrapped a method the engine does not have. The W4A8
+     class reads its weights through `_get_mlp_weights` returning four values
+     -- `(w1, w1_scale, w2, w2_scale)` -- and the installer wrapped
+     `get_mlp_weights` expecting two. It installed without error, narrowed
+     nothing, and `restore()` returned normally: silent from end to end. The
+     only way to catch it was reading the class the engine actually
+     instantiates, `quantization/methods/w4a8/w4a8.py`, rather than the base
+     class whose name matched. A wrapper is only as good as the name and arity
+     it wraps, and neither shows up in a test against a stand-in built from the
+     same wrong assumption -- so the stand-in now mirrors the real signature.
