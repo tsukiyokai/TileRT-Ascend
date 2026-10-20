@@ -41,10 +41,12 @@ class MeasuredRank(CannRankEngine):
     """Retain local round states and finish prefix copies before delivery."""
 
     def __init__(self, target, draft, group, lookup_prompt=None, *,
-                 lookup_min_ngram=2, lookup_automaton=False):
+                 lookup_min_ngram=2, lookup_automaton=False,
+                 lookup_tree=False):
         super().__init__(target, draft, lookup_prompt,
                          lookup_min_ngram=lookup_min_ngram,
-                         lookup_automaton=lookup_automaton)
+                         lookup_automaton=lookup_automaton,
+                         lookup_tree=lookup_tree)
         self.group = group
         self.requests = []
         self.current = None
@@ -144,6 +146,10 @@ def arguments():
     parser.add_argument("--plain-moe-combine", action="store_true",
                         help="Add the shared and routed MoE outputs directly"
                              " instead of through the multi-tensor kernel")
+    parser.add_argument("--tree", action="store_true",
+                        help="Draft a tree rather than a chain; the round"
+                             " verifies it under a per-row attention mask and"
+                             " commits the deepest accepted path")
     parser.add_argument("--automaton", action="store_true",
                         help="Draft from a suffix automaton rather than the"
                              " hash-tuple tail lookup, matching the longest"
@@ -417,6 +423,7 @@ def run(args, report):
             target, draft, channel.group, lookup_prompt,
             lookup_min_ngram=1 if args.lookup_unigram else 2,
             lookup_automaton=args.automaton,
+            lookup_tree=args.tree,
         )
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
         with torch.inference_mode():

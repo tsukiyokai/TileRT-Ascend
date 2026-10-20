@@ -195,7 +195,8 @@ class AscendRankEngine:
     """Bind the receive prefix to the main/MTP caches on one TP rank."""
 
     def __init__(self, target, draft, lookup_prompt=None, *,
-                 lookup_min_ngram=2, lookup_automaton=False):
+                 lookup_min_ngram=2, lookup_automaton=False,
+                 lookup_tree=False):
         self.target = target
         self.draft = draft
         # The prompt's token ids, when the round is to draft by looking for
@@ -205,6 +206,7 @@ class AscendRankEngine:
         self.lookup_prompt = lookup_prompt
         self.lookup_min_ngram = lookup_min_ngram
         self.lookup_automaton = lookup_automaton
+        self.lookup_tree = lookup_tree
         self._clear_request()
 
     def _clear_request(self):
@@ -255,7 +257,11 @@ class AscendRankEngine:
             raise ValueError("First token differs from the injected prefix")
         drafter = None
         if self.lookup_prompt is not None:
-            if self.lookup_automaton:
+            if self.lookup_tree:
+                from tilert.models.glm_5_2_ascend.tree_draft import (
+                    TreeDrafter as Drafter,
+                )
+            elif self.lookup_automaton:
                 from tilert.models.glm_5_2_ascend.automaton_draft import (
                     AutomatonDrafter as Drafter,
                 )
