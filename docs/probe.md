@@ -211,3 +211,23 @@ die becomes 7.25 ms a round in the engine; whether AIV's 1.5 to 1.85x on
 standalone collectives shows up against its own negative control; whether the
 bank narrowing's 4.63 ms survives the engine's own routing; and where a round's
 50.710 ms actually goes.
+
+## 2026-10-21 two implemented switches were never enabled
+
+The best arm's own record carries `hoist_metadata: false` and
+`hoist_forward_context: false`. Both are implemented, both are flags on the
+bench, and neither has been used in any arm that produced a headline figure.
+
+What `_metadata` rebuilds every round, measured on one die as the host half
+only -- a length, a computed-tokens tensor, a positions range, the slot
+mapping, and three H2D copies:
+
+    130.62 us a round, 24.56 ms over a request's 188 rounds
+
+That excludes the vLLM objects the engine also builds every round,
+`AscendCommonAttentionMetadata` and `AscendAttentionState`, so it is a floor on
+what hoisting saves. Against a 50.710 ms round it is 0.26 percent, which is
+small on its own and free to take: the code exists and the flags are wired.
+
+Two arms added to the watcher -- `hoist` alone and `all` with everything -- so
+the composition is measured rather than assumed.
