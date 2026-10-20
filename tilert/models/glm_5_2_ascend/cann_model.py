@@ -160,7 +160,17 @@ def create_config(checkpoint, capacity=9344, gpu_memory_utilization=0.85,
         compilation_config={
             "mode": CompilationMode.VLLM_COMPILE,
             "cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
-            "cudagraph_capture_sizes": [graph_width],
+            # Several sizes, not one. Replay cost rises with the captured
+            # width while every operator in the graph is flat in the row
+            # count, cold and warm alike -- so a round that verifies six rows
+            # in a graph captured for twenty-four pays for eighteen rows of
+            # nothing. With a list, each round replays the smallest graph that
+            # covers its draft, and an adaptive drafter's proposals are mostly
+            # short. One size costs 0.66 ms a row by the round model where the
+            # operators cost between 0 and -0.02.
+            "cudagraph_capture_sizes": sorted(
+                {size for size in (2, 4, 8, 16, 24, 32, 48, 64)
+                 if size <= graph_width} | {graph_width}),
             "max_cudagraph_capture_size": graph_width,
             "custom_ops": ["all"],
         } if compile_target else {},
