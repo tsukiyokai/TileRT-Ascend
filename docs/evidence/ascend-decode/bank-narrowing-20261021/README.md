@@ -96,3 +96,51 @@ measured and stands.
 Size unknown: 0 to 8 ms a round, set by the routing concentration. One capture
 of a decode round's topk indices settles it, and that capture is the same one
 the queued arms need the machine for.
+
+## The router's own bias says routing is not clustered
+
+`mlp.gate.e_score_correction_bias` is 256 trained values added to the gate's
+scores before the top eight are taken -- the model's own load-balancing term,
+readable from the checkpoint with no machine at all.
+
+| layer | min | max | std | top8 - median |
+|---|---|---|---|---|
+| 10 | 6.8174 | 7.0632 | 0.0403 | 0.0460 |
+| 11 | 6.8044 | 7.0193 | 0.0343 | 0.0460 |
+| 13 | 6.0188 | 6.2417 | 0.0243 | 0.0200 |
+| 14 | 5.9079 | 6.1098 | 0.0271 | 0.0210 |
+| 17 | 7.5610 | 7.7459 | 0.0264 | 0.0200 |
+
+The range is 0.02 to 0.03 across 256 experts, so the bias barely distinguishes
+them: it is a near-constant term, which is what a well-trained balancing
+correction should be. Counting the experts it leaves within one standard
+deviation of the eighth-best gives 89 to 162 of 256 by layer.
+
+Priced over that contention set, five rows of eight picks each:
+
+| contending | touched | us | saved | ms a round |
+|---|---|---|---|---|
+| 89 | 2.02 | 63.3 | 105.2 | 8.21 |
+| 130 | 2.16 | 64.3 | 104.2 | 8.13 |
+| 162 | 2.22 | 64.8 | 103.8 | 8.09 |
+
+Insensitive: 8.09 to 8.21 ms across the whole range. Forty picks spread over at
+least 89 experts touch about two of a rank's sixteen however the 89 are chosen.
+
+## So the lever's size narrows from 0-to-8 to about 8
+
+To zero it, routing would have to concentrate below 32 experts, and the
+narrowest contention set the bias permits is 89.
+
+What this does not cover: the bias is one of two terms. The score itself is
+`hidden @ gate.weight`, and a token's scores across layers may correlate in a
+way the bias cannot show. So concentration is excluded on the bias side and
+unmeasured on the score side -- which needs hidden states, and the one saved
+tensor on this machine holds a single row.
+
+## A probe bug worth recording
+
+The first pricing printed 8.04 ms for every layer because its touched-expert
+expression contained `contending / GLOBAL * (1 / contending)`, which cancels
+the quantity being varied. A constant column across a swept parameter is the
+signal, and it was visible before the numbers were believed.

@@ -1533,3 +1533,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      inside a rank's own sixteen touches all of them. The mechanism is
      calibrated and the size needs one capture of a decode round's topk
      indices, which nothing saved here holds.
+
+152. The router's trained bias excludes clustered routing, from the checkpoint
+     and with no machine. `mlp.gate.e_score_correction_bias` spans 0.02 to 0.03
+     across 256 experts with a standard deviation of 0.024 to 0.040 -- a
+     near-constant balancing term, leaving 89 to 162 experts within one
+     standard deviation of the eighth-best. Priced over that set, forty picks
+     touch about two of a rank's sixteen and the saving is 8.09 to 8.21 ms a
+     round across the whole range: insensitive, where the previous estimate
+     spanned 0 to 8. Zeroing it would need routing below 32 experts and the
+     narrowest set the bias permits is 89. Unmeasured still: the score term,
+     `hidden @ gate.weight`, whose cross-layer correlation the bias cannot
+     show. And the first pricing printed a constant 8.04 for every layer
+     because its expression cancelled the swept quantity -- a constant column
+     under a swept parameter is the tell.
