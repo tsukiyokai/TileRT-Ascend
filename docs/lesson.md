@@ -1146,7 +1146,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      expecting 78 main and 21 indexer layers, our MTP guard requiring
      num_hidden_layers == 78, and vLLM's MTP completeness check demanding
      weights for a layer the checkpoint has at 78 and the truncation puts at 8.
-     Four are cleared without touching the untruncated path. The fifth needs
-     the waiver inside vLLM's speculative setup. Hard-coded depths are what
+     Five are cleared without touching the untruncated path -- the fifth was
+     the waiver, which had to go around the draft model's own load rather than
+     the target's, since a ContextVar does not reach the other object. The
+     sixth is not a literal: our own check that the official loader loaded the
+     MTP head cannot pass under truncation, because the head is the
+     checkpoint's layer 78 and a shortened model has nowhere to put it.
+     Truncation and MTP are incompatible by construction, so a truncated arm
+     needs a session without the draft engine -- which `--automaton` would
+     permit, since it only calls `target.verify`. Hard-coded depths are what
      make a model un-shrinkable, and shrinking it is what lets a shared machine
      be used at all.

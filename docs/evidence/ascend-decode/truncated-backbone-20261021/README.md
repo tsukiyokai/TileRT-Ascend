@@ -26,7 +26,33 @@ followed, in order:
    and entering it around `worker.load_model()` did not help: the draft model
    loads outside that scope, so the ContextVar does not reach it.
 
+6. **Our own check that the official loader loaded the MTP head**
+   (`cann_mtp.py:179`). Under truncation it did not, and cannot: the
+   checkpoint's MTP head is layer 78.
+
+## What the sixth constraint says about the route
+
+The sixth is not a literal to relax -- it is the route's real obstacle.
+Truncation and MTP are incompatible by construction, because the head lives at
+the checkpoint's last layer and a shortened model has no such layer to load it
+into. So a truncated arm has to run without the MTP engine at all.
+
+There is a way: `--automaton` takes `_advance_drafted`, which needs only
+`target.verify` and never touches the draft engine. A truncated session could
+be built without `CannMtp`. But that is a structural change to the session's
+construction rather than another relaxed literal, and its value -- not waiting
+for an empty machine -- is worth less than its cost while the arms are already
+queued with a sixteen-hour window.
+
 ## Where this stands
+
+Five of six constraints cleared, all committed, none of them touching the
+untruncated path: the cache bind and the MTP guard read the real depth, and
+`load_format`, the completeness waiver and the depth comparison are entered only
+below 78 layers.
+
+The sixth needs a session that omits the draft engine. Recorded rather than
+built, so the next attempt starts there instead of rediscovering the five.
 
 Four of the five are cleared and committed, and none of them changes the
 untruncated path: the cache bind and MTP guard read the real depth, which is 78
