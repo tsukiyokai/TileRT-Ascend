@@ -107,7 +107,12 @@ affordable, and with it whether 2.x ms is reachable.
 The Gloo command broadcast costs 305 us an object against 106 us for an
 equivalent integer tensor -- threefold on two ranks, and object broadcast
 pickles, sends a length, then sends bytes, so sixteen ranks will be worse.
-One a round at 55 ms is half a percent, but the fix is to broadcast a
-fixed-size tensor instead of a Python object, and the drafter is deterministic
-so each rank could recompute the draft from the same state at 0.1 us rather
-than receive it at all.
+One a round at 55 ms is half a percent on two ranks and more on sixteen. The
+fix is to broadcast a fixed-size tensor rather than a Python object.
+
+The other half of that suggestion was already the case: reading the command
+construction, the payload is scalars and fixed tuples -- `token`,
+`first_token`, `max_tokens`, `width`, `eos_tokens` -- with only `inject`
+carrying a dict, once a request. The draft tokens are not broadcast at all;
+each rank already computes them. Which is also why the Gloo measurement came
+out flat in the width.
