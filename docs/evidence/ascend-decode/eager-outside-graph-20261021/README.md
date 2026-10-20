@@ -76,3 +76,29 @@ Two ways in, both untried: capture the refresh in its own small graph replayed
 before the model's, or make the speculative builders share the MLA buffers so
 `destinations` is empty and the loop disappears. The first is ours to do; the
 second is a vLLM-Ascend builder configuration.
+
+## The pattern is capturable, 22.5x, and bit-exact
+
+One die, the refresh's shape replicated with 265 destinations -- two
+`index_select` calls writing into fixed outputs, then 530 `copy_` calls:
+
+    eager          7588.89 us
+    graph replay     336.63 us   22.54x
+    saved            7252.26 us a round
+    bit-exact after a replay at new positions: True
+
+The correctness check is the one that matters: `positions` is moved to a
+different range, the graph is replayed, the result is kept, and then the eager
+path is run at those same positions. They agree exactly -- so the capture holds
+the addresses and reads whatever the buffer contains at replay, which is the
+premise `RopeGraph` rests on.
+
+And the eager figure is higher than the estimate: 7.59 ms measured against 6.06
+ms from 532 calls at 11.386 us. So the dispatch estimate was conservative.
+
+## Which makes this the session's largest validated lever
+
+7.25 ms a round on a 50.710 ms round, mechanism measured on a die and
+bit-exact, with the engine-side implementation committed behind `--rope-graph`.
+What remains is running it in the engine, which needs the sixteen ranks the
+tenant holds.

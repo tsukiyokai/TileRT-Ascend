@@ -1829,3 +1829,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      than work to remove, and there are two ways in: a small graph for the
      refresh, or making the speculative builders share the MLA buffers so the
      loop has nothing to write.
+
+176. The rope refresh pattern captures at 22.5x and is bit-exact. One die, the
+     shape replicated with 265 destinations -- two `index_select` calls into
+     fixed outputs then 530 `copy_` calls: eager 7588.89 us, graph replay
+     336.63, saving 7.25 ms a round. The check that matters is correctness
+     across a change of contents: move `positions` to a new range, replay, keep
+     the result, then run eager at those same positions -- they agree exactly,
+     so the capture holds addresses and reads the buffer at replay. And the
+     eager figure beats the estimate, 7.59 ms measured against 6.06 from 532
+     calls at 11.386 us, so the dispatch model was conservative.
