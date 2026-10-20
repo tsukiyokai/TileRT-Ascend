@@ -92,6 +92,34 @@ def check_a_width_without_hoisted_metadata_does_nothing():
     assert built == [] and eager == []
 
 
+
+
+def check_every_flag_is_registered_before_the_parse():
+    """A flag added below `parse_args` never registers, and argparse is silent.
+
+    Four were, in this session: --rope-graph, --round-phases,
+    --ai-cpu-collectives and --narrow-bank, all rejected as unrecognized at
+    run time while present in the file. The line numbers answer it without
+    running anything.
+    """
+    import ast
+
+    source = open(f"{ROOT}/tests/glm52/bench_cann_mtp.py").read()
+    tree = ast.parse(source)
+    parse_line = min(
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse_args")
+    late = [
+        node.args[0].value for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.lineno > parse_line and node.args
+        and isinstance(node.args[0], ast.Constant)]
+    assert not late, late
+
 def main():
     checks = [value for name, value in sorted(globals().items())
               if name.startswith("check_")]

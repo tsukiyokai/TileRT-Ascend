@@ -1850,3 +1850,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      not the code, and they will keep passing if the two diverge. Written down
      in the file itself, since a limitation a reader cannot see is worse than
      the gap it describes.
+
+178. Four flags added below `parse_args` never registered, and argparse said
+     only "unrecognized arguments" at run time. --rope-graph, --round-phases,
+     --ai-cpu-collectives and --narrow-bank were all present in the file and
+     all dead, so three levers were committed with no way to turn them on. The
+     check is an AST comparison of line numbers and needs nothing run, which is
+     now `check_every_flag_is_registered_before_the_parse`. Third appearance
+     today of one shape -- code appended after the point that consumes it --
+     after a check function added below `main` and a check added below the
+     `__main__` block. All three entry blocks are now last in their files.

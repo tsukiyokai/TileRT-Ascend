@@ -94,7 +94,6 @@ def check_a_non_monotonic_list_is_rejected():
         return
     raise AssertionError("a backwards step should not pass")
 
-
 def main():
     checks = [value for name, value in sorted(globals().items())
               if name.startswith("check_")]

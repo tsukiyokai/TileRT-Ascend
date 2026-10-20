@@ -37,7 +37,6 @@ def check_time_lands_on_the_step_that_spent_it():
     assert report["slow"] > 5.0, report
     assert report["fast"] < 1.0, report
 
-
 def main():
     checks = [value for name, value in sorted(globals().items())
               if name.startswith("check_")]

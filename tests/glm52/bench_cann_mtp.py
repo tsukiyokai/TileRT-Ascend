@@ -181,6 +181,19 @@ def arguments():
                         help="Config-store endpoint, e.g."
                              " tcp://127.0.0.1:9421, replacing the TP sum"
                              " with a one-sided push")
+    parser.add_argument("--rope-graph", action="store_true",
+                        help="capture the per-round rope refresh, which runs "
+                             "530 eager copies outside the model's graph")
+    parser.add_argument("--round-phases", action="store_true",
+                        help="time each step of a round on the host")
+    parser.add_argument("--ai-cpu-collectives", action="store_true",
+                        help="expand collectives on the device AI CPU, which "
+                             "is A3's default and 1.6 to 1.9x slower at "
+                             "decode sizes")
+    parser.add_argument("--narrow-bank", action="store_true",
+                        help="hand the grouped matmul only the "
+                             "experts a round's rows touched")
+
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
@@ -203,18 +216,6 @@ def arguments():
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Memory utilization must be in (0,1]")
     return args
-    parser.add_argument("--rope-graph", action="store_true",
-                        help="capture the per-round rope refresh, which runs "
-                             "530 eager copies outside the model's graph")
-    parser.add_argument("--round-phases", action="store_true",
-                        help="time each step of a round on the host")
-    parser.add_argument("--ai-cpu-collectives", action="store_true",
-                        help="expand collectives on the device AI CPU, which "
-                             "is A3's default and 1.6 to 1.9x slower at "
-                             "decode sizes")
-    parser.add_argument("--narrow-bank", action="store_true",
-                        help="hand the grouped matmul only the "
-                             "experts a round's rows touched")
 
 def drive(backend, first, args):
     from tilert.pd_vllm.ascend_server import create_session
