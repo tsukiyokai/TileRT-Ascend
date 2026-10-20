@@ -675,3 +675,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     loading the kernel library, running the kernel, building a communication
     domain, a second resident NZ weight bank, the full two-stage vendor chain,
     and constant versus random codes.
+
+75. Compare in one process, with the arguments already built. The same two
+    implementations at the same shape gave four different answers today: 1.98x
+    faster (nothing ran), 2.33x slower (a different expert count), 25.7 percent
+    faster (clean process against mixed), and 16.6x slower (seven tensors
+    allocated inside the timed call). The surviving number is 67.336 us for
+    the vendor against 72.933 for the kernel -- 8.3 percent behind, while the
+    kernel still gives away five percent of numerical accuracy, fractal-NZ
+    weights and the fixpipe. The discipline that caught the last two was
+    refusing a cross-process comparison, which is worth more than any of the
+    four numbers.
