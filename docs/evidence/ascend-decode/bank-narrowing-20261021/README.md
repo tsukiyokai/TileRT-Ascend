@@ -144,3 +144,39 @@ The first pricing printed 8.04 ms for every layer because its touched-expert
 expression contained `contending / GLOBAL * (1 / contending)`, which cancels
 the quantity being varied. A constant column across a swept parameter is the
 signal, and it was visible before the numbers were believed.
+
+## Narrowing without a copy works, and the obvious way does not
+
+One die, 96 rows, 16 experts narrowed to 6, eager:
+
+    full bank, 16 experts                   220.36 us
+    gather of 6 experts, alone              703.35
+    grouped on the already-gathered 6       137.07
+    gather then grouped, together           779.40
+    contiguous slice of 6, no copy          153.17
+    a list of 6 per-expert tensors          149.40
+
+`bank[touched]` costs 703 us on its own -- three times the whole saving, and
+together with the matmul it is 779 against the full bank's 220. Advanced
+indexing is dead as a mechanism, and by a wide margin rather than a near miss.
+
+But `npu_grouped_matmul` accepts **a list of one tensor per expert**, at 149.40
+us against the full bank's 220.36. That is the narrowing with no bytes moved:
+the weights are held as sixteen tensors and a round passes only the ones its
+rows touched. **70.96 us a layer, 5.5 ms a round.**
+
+A contiguous slice also works, 153.17, but it needs the touched experts to be
+consecutive, which they are not.
+
+## What is settled and what is not
+
+Settled: the mechanism is linear in the bank, the bias excludes clustered
+routing, and a zero-copy narrowing exists and is accepted by the operator.
+
+Not settled: these figures are eager, so the in-graph saving is unmeasured --
+and the in-graph table put the grouped matmul's capture ratio at 0.877, so
+replay changes little for this operator specifically. And the engine holds its
+expert weights as one fused tensor per layer after
+`process_weights_after_loading` casts them to fractal NZ, so handing the
+operator sixteen separate tensors means intervening where
+`routed_expert.install_before_conversion` already does.

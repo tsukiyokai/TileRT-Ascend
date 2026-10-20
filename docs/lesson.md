@@ -1547,3 +1547,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      show. And the first pricing printed a constant 8.04 for every layer
      because its expression cancelled the swept quantity -- a constant column
      under a swept parameter is the tell.
+
+153. A zero-copy bank narrowing exists, and the obvious way to do it costs
+     three times the saving. One die, 16 experts to 6: the full bank is 220.36
+     us, `bank[touched]` alone is 703.35, the two together 779.40 -- advanced
+     indexing is dead by a wide margin. But `npu_grouped_matmul` accepts a list
+     of one tensor per expert, 149.40 us, so holding the weights as sixteen
+     tensors and passing only the touched ones is 70.96 us a layer, 5.5 ms a
+     round, with no bytes moved. A contiguous slice also works at 153.17 but
+     needs the touched experts consecutive, which they are not. Unmeasured
+     still: the in-graph version, where this operator's capture ratio is 0.877
+     so replay changes little; and the engine fuses its expert weights into one
+     tensor a layer during the fractal-NZ cast, so the sixteen-tensor form has
+     to be installed where install_before_conversion already intervenes.
