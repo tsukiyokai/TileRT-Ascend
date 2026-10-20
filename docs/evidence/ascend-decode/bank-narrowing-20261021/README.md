@@ -233,3 +233,39 @@ it away does not hold for the W4A8 path. What holds is narrower and sufficient:
 the group list arrives as cumulative counts or as counts, and an empty slot is a
 zero or a repeat of its neighbour -- never a negative step, which is now an
 assertion in `expert_counts` rather than a case silently read as empty.
+
+## The device-side price: 7.79 ms a round, and the curve is superlinear
+
+Profiled rather than timed around a synchronise, 96 sorted rows, one kernel a
+call:
+
+| experts | device us | ms a round |
+|---|---|---|
+| 1 | 19.97 | 1.56 |
+| 2 | 18.26 | 1.42 |
+| 4 | 19.27 | 1.50 |
+| 8 | 49.64 | 3.87 |
+| 16 | 118.09 | 9.21 |
+
+**Narrowing sixteen to two saves 99.83 us a layer, 7.79 ms a round** -- against
+a device-side round of 17.84 ms of compute, which is 44 percent of it.
+
+The curve is not the line the host timings fitted. One, two and four experts
+cost the same 18 to 20 us; eight jumps to 49.64 and sixteen to 118.09. That is a
+cache effect rather than a bandwidth one: a small bank fits on chip and a large
+one is re-read from HBM, which also explains why the earlier linear fit at 7.53
+us an expert worked over the range it was measured on and misses the shape.
+
+So a round touching two to five of a rank's experts sits in the flat part of the
+curve, where the bank is nearly free.
+
+## Four prices for one lever, and which to use
+
+    standalone, host-timed, in a graph     59.4 us a layer
+    standalone, host-timed, eager          70.96
+    inside a host-timed TP16 layer         91.37
+    profiled device time                   99.83
+
+The device figure is what a captured layer pays, so 7.79 ms a round is the one
+to carry. The others were all measured around a synchronise and each carried
+part of the host tax that a graph removes.
