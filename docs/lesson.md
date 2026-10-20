@@ -1569,3 +1569,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the verdict had to be equality rather than a tolerance. One of the five
      cases takes the early return and tests the bypass; naming which cases
      test what is part of the result.
+
+155. The engine already holds the touched-expert set and discards it one
+     function before the call that charges for it.
+     `moe_utils.cumsum_group_list` converts between three conventions and type
+     2 is sparse -- expert id and token count, listing only the experts with
+     rows. Converting to type 0 expands it to `expert_num` entries, filling
+     unmentioned slots with `active_num` so they equal their neighbour and
+     their first difference is zero. All three conventions therefore make the
+     empty slots visible, which is the narrowing's last unverified premise.
+     The lever is not an inference about routing: the round receives the subset
+     in sparse form and widens it to the full bank before an operator whose
+     cost is linear in that bank.

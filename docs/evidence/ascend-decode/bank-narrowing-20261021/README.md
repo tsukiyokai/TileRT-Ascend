@@ -202,3 +202,27 @@ scattered pattern of gaps, a leading gap and a trailing gap -- the three ways
 an off-by-one in the group list shows up.
 
 So the lever is semantics-preserving, not merely survivable.
+
+## The engine already knows which experts were touched, then discards it
+
+`vllm_ascend/ops/fused_moe/moe_utils.py:cumsum_group_list` converts between
+three group-list conventions, and type 2 is a **sparse** one: pairs of expert
+id and token count, listing only the experts that have rows. Converting it to
+type 0 expands that into a dense array of `expert_num` entries, filling the
+slots nobody mentioned with `active_num`:
+
+    cumsum_group_list = torch.full(size=(expert_num,), fill_value=active_num)
+    for i, (start, end) in enumerate(zip(experts[:-1], experts[1:])):
+        if end > start:
+            cumsum_group_list[start:end] = tokens[i]
+
+So an untouched slot ends up equal to its neighbour, whose first difference is
+zero -- which is what `expert_counts` reads. All three conventions make the
+empty slots visible: type 1 holds zeros directly, type 0 holds them as equal
+neighbours, type 2 omits them.
+
+And the finding is larger than the mechanism. The engine receives the touched
+set in sparse form and expands it to the full bank before handing it to an
+operator whose cost is linear in the bank. The information the narrowing needs
+is not inferred or measured -- it is already in the round and thrown away one
+function before the call that charges for it.
