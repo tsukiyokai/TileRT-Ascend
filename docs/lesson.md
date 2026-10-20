@@ -823,3 +823,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     approximation. And an absolute difference means nothing without the
     magnitude beside it: 0.125 was both the measured difference and what an
     error of one part in a hundred would have looked like.
+
+88. A fusion pass that rarely matches may be protecting you. The cast census
+    filed `norm_quant_fusion_pass` firing on 3.3 of 156 possible sites a round
+    as a defect to investigate. Measured at the decode shape,
+    `npu_add_rms_norm_quant` is 210.996 us against 43.532 for the two separate
+    operators -- making the pass match more often would cost 13 ms a round. Its
+    sibling `npu_add_rms_norm` is the opposite, 19.189 against 37.913, worth
+    1.46 ms. Fusion is not a direction, it is a per-operator measurement.
