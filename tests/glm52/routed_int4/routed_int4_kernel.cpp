@@ -565,8 +565,11 @@ __aicore__ void routed_int4_fused(
     __gm__ int32_t* partial, __gm__ int4b_t* middle,
     __gm__ float* middle_scale, __gm__ int32_t* wide, __gm__ bfloat16_t* out,
     __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling,
-    __gm__ int4b_t* witness, GM_ADDR workspace, int64_t experts,
-    int64_t blocks)
+    __gm__ int4b_t* witness, __gm__ int4b_t* shared_gate_up,
+    __gm__ float* shared_gu_bias, __gm__ float* shared_gu_scale,
+    __gm__ int4b_t* shared_down, __gm__ float* shared_down_bias,
+    __gm__ float* shared_down_scale, __gm__ bfloat16_t* shared_out,
+    GM_ADDR workspace, int64_t experts, int64_t blocks)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     InitSocState();
@@ -599,6 +602,27 @@ __aicore__ void routed_int4_fused(
                     Nibbles(down, expert * HIDDEN * HALF),
                     wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
                     down_tiling);
+            Publish();
+            CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
+        }
+        // The shared expert: the same stages over the same split activation,
+        // with the one weight bank every row visits.
+        for (int64_t step = 0; step < per_block; ++step) {
+            const int64_t expert = first + step;
+            if (expert >= experts) {
+                break;
+            }
+            CrossCoreWaitFlag<0x03, PIPE_MTE2>(SPLIT_READY);
+            Project(pipe, Nibbles(stacked, expert * M_TILE * HIDDEN),
+                    shared_gate_up,
+                    partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
+                    gu_tiling);
+            Publish();
+            CrossCoreSetFlag<0x02, PIPE_FIX>(GATE_READY);
+            CrossCoreWaitFlag<0x03, PIPE_MTE2>(MIDDLE_READY);
+            Project(pipe, Nibbles(middle, expert * M_TILE * HALF),
+                    shared_down, wide + expert * M_TILE * HIDDEN, HIDDEN,
+                    HALF, down_tiling);
             Publish();
             CrossCoreSetFlag<0x02, PIPE_FIX>(DOWN_READY);
         }
@@ -644,6 +668,32 @@ __aicore__ void routed_int4_fused(
                    middle_scale + expert * SCALE_SPAN,
                    out + expert * ROWS * HIDDEN, from, from + share);
         }
+        // The shared expert. The activation is already split, so this pass
+        // sets SPLIT_READY without redoing it: the handshake has to stay
+        // symmetric with the cube half whatever each does inside it.
+        for (int64_t step = 0; step < per_block; ++step) {
+            const int64_t expert = first + step;
+            if (expert >= experts) {
+                break;
+            }
+            if (sub == 0) {
+                CrossCoreSetFlag<0x03, PIPE_MTE3>(SPLIT_READY);
+            }
+            CrossCoreWaitFlag<0x02, PIPE_MTE2>(GATE_READY);
+            if (sub == 0) {
+                Activate(held, partial + expert * M_TILE * GATE_UP,
+                         shared_gu_bias, shared_gu_scale,
+                         token_scale + expert * SCALE_SPAN,
+                         Nibbles(middle, expert * M_TILE * HALF),
+                         middle_scale + expert * SCALE_SPAN);
+                Publish();
+                CrossCoreSetFlag<0x03, PIPE_MTE3>(MIDDLE_READY);
+            }
+            CrossCoreWaitFlag<0x02, PIPE_MTE2>(DOWN_READY);
+            Narrow(held, wide + expert * M_TILE * HIDDEN, shared_down_bias,
+                   shared_down_scale, middle_scale + expert * SCALE_SPAN,
+                   shared_out + expert * ROWS * HIDDEN, from, from + share);
+        }
     }
     PipeBarrier<PIPE_ALL>();
 }
@@ -656,7 +706,10 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         float* token_scale, void* partial, void* middle,
                         float* middle_scale, void* wide, void* out,
                         void* gu_tiling, void* down_tiling, void* witness,
-                        void* workspace, int64_t experts)
+                        void* shared_gate_up, float* shared_gu_bias,
+                        float* shared_gu_scale, void* shared_down,
+                        float* shared_down_bias, float* shared_down_scale,
+                        void* shared_out, void* workspace, int64_t experts)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
@@ -665,5 +718,8 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
         (__gm__ int32_t*)partial, (__gm__ int4b_t*)middle, middle_scale,
         (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)out,
         (__gm__ uint8_t*)gu_tiling, (__gm__ uint8_t*)down_tiling,
-        (__gm__ int4b_t*)witness, (GM_ADDR)workspace, experts, blocks);
+        (__gm__ int4b_t*)witness, (__gm__ int4b_t*)shared_gate_up,
+        shared_gu_bias, shared_gu_scale, (__gm__ int4b_t*)shared_down,
+        shared_down_bias, shared_down_scale,
+        (__gm__ bfloat16_t*)shared_out, (GM_ADDR)workspace, experts, blocks);
 }
