@@ -1465,3 +1465,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      cube time is still exposed at concurrent issue. What this does not settle
      is dependency: here the vector work is independent of the cube work, and
      in a real layer the norm feeds the projection.
+
+147. A batch-one decode layer permits exactly one overlap, and it is the MoE's.
+     Read from the reference implementation: the layer is a chain -- norm,
+     attention, residual, norm, mlp, residual -- and inside the MoE,
+     `shared_experts(residuals)` and `experts(hidden, topk, weights)` read the
+     same input and meet only at the add. So the shared expert's path can be
+     issued concurrently with the routed experts' grouped matmul, worth 21 to
+     40 us a layer against the 54.5 the target needs. The gating cannot overlap
+     the routed experts because it produces their indices. And the attention
+     side permits nothing: norm, q_a/kv_a, q_b, attention, o_proj is a strict
+     chain holding four of the six small operators, so the 43.75 us measured on
+     independent vector work is not available there. Any further overlap has to
+     come from outside the layer -- and the one axis never examined is the
+     speculative width, whose rows are independent of each other.
