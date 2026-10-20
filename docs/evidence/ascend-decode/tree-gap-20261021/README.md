@@ -39,3 +39,28 @@ are -- so this is a search-order change rather than a new index.
 Measurable on the twelve streams, machine-free, and worth up to the 31 percent
 the tree is behind the oracle: 6.649 accepted toward 9.660, which at budget 16
 and the merged fixed term is TPOT 6.12 ms toward 4.21.
+
+## The root fallback was the wrong fix, and it says what the right one is
+
+Implemented and A/B tested on twelve streams at budget 16:
+
+    suffix only              mean 5.578   min 2.169   max 6.649
+    with the root fallback   mean 5.578   min 2.169   max 6.649
+
+Identical, so the fallback never fired: `_match_state` does not return None on
+these streams. The suffix descent always finds a class with continuations.
+
+So the 29 rounds where the tree got nothing were not rounds where it found
+nothing to propose -- they were rounds where it proposed and every branch was
+wrong. The diagnosis above is corrected: the gap is in **which source the match
+picks**, not in whether a match exists.
+
+And that names the real difference. The tree ranks continuations by how often
+they follow the matched suffix; the oracle picks the occurrence whose
+continuation extends furthest. Those differ exactly where a frequent short
+continuation sits beside a rare long one -- which is what an edit creates: the
+pre-edit text is frequent, the post-edit continuation is not.
+
+The change to test is therefore ranking by extendable length rather than by
+frequency, over the same occurrence set the automaton already holds. The code
+is reverted meanwhile, since an unfired fallback is dead code.

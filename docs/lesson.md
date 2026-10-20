@@ -1355,3 +1355,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      matches by looking for the current token everywhere. That is the whole of
      the gap, and closing it is a search-order change over an index the
      automaton already holds.
+
+138. An A/B that comes out identical says the change never fired, which is its
+     own finding. The root fallback -- restart the match from the automaton's
+     root when the suffix descent yields nothing -- measured 5.578 accepted
+     with and without, on twelve streams. `_match_state` never returns None on
+     these streams, so the 29 rounds where the tree got nothing were rounds
+     where it proposed and every branch was wrong, not rounds without a match.
+     That corrects the diagnosis and names the real difference: the tree ranks
+     continuations by frequency where the oracle picks the occurrence that
+     extends furthest, and an edit is exactly where a frequent short
+     continuation sits beside a rare long one. The dead fallback is reverted.
