@@ -798,3 +798,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     changes a default belongs behind a constructor argument, with the control
     pinned explicitly. The factor sweep that found this also settled it: two is
     best, 12.01 against 12.62, 12.54 and 12.97 at 1.5, 3 and 4.
+
+86. Read the call site, not the operator's parameter list. Tree drafting was
+    recorded as blocked on the attention kernel because `atten_mask` is absent
+    from the sparse operator. But the engine calls it with
+    `layout_query="TND"`, which has no batch axis, `sparse_indices` as a
+    tensor indexed by token, and `sparse_block_size=1` -- so each query row
+    already selects its own visible set, which is what a tree mask is. The
+    blocker is host-side index construction, not the kernel. A probe written
+    against `torch_npu.npu_sparse_flash_attention` also failed on a required
+    `query_rope` that the `_C_ascend` operator the engine calls does not need:
+    two implementations behind one name, and the call site is the
+    specification.
