@@ -235,6 +235,7 @@ class CannModel:
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
         narrow_bank=False, aiv_collectives=True, rope_graph=False,
+        gather_fia_max_width=None,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
@@ -243,6 +244,10 @@ class CannModel:
         _choose_collective_engine(aiv_collectives)
         self.rope_graph = rope_graph
         self._rope_graphs = {}
+        # None keeps the bound where the measurement is bit-exact; a caller
+        # raising it accepts a bf16 unit in the last place on the attention
+        # output, which is a question about tokens rather than floats.
+        self.gather_fia_max_width = gather_fia_max_width
         if capacity < 128:
             raise ValueError("Capacity must be at least one 128-token page")
         if int(os.environ.get("WORLD_SIZE", "16")) != 16:
@@ -506,7 +511,8 @@ class CannModel:
 
             context = self.config.compilation_config.static_forward_context
             for name in attention_names:
-                install_gather_fia(context[name].impl, self.graph_width)
+                install_gather_fia(context[name].impl, self.graph_width,
+                                   max_width=self.gather_fia_max_width)
         elif self.attention_kernel == "shared_fia":
             from .cann_attention import SharedKVAttention
 

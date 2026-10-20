@@ -98,15 +98,29 @@ class SharedKVAttention:
         impl._execute_sparse_flash_attention_process = attend
 
 
+# Measured on one die against the same attention taken one query row at a
+# time: exact at widths 1, 2, 4 and 6, and differing at 8, 12 and 16 by
+# 0.000977 -- two to the minus ten, one bf16 unit in the last place. The cause
+# is the operator's internal blocking, since `actual_seq_kvlen=[2048] * width`
+# batches the queries and a different width reduces the same 2048 keys in a
+# different order. Not a logic error: a misindexed gather would disagree by
+# order-one amounts.
+#
+# Whether that matters is about tokens rather than floats. Speculative
+# verification has to accept what serial decoding would have emitted, and a
+# unit in the last place flips an argmax only when two logits are that close.
+# Settling it needs the engine, so the bound is a parameter and the default
+# stays where the measurement is exact.
 GATHER_FIA_MAX_WIDTH = 6
 
 
-def install_gather_fia(impl, width=4):
-    """Bind gather/FIA; widths above six failed serial-equivalence checks."""
-    if width > GATHER_FIA_MAX_WIDTH:
+def install_gather_fia(impl, width=4, max_width=None):
+    """Bind gather/FIA, exact up to width six and a bf16 ULP above it."""
+    bound = GATHER_FIA_MAX_WIDTH if max_width is None else max_width
+    if width > bound:
         raise ValueError(
-            f"gather_fia is unvalidated above width {GATHER_FIA_MAX_WIDTH}; "
-            "use the sfa kernel")
+            f"gather_fia is unvalidated above width {bound}; "
+            "use the sfa kernel or raise the bound")
     impl._execute_sparse_flash_attention_process = MethodType(
         gathered_fia, impl,
     )

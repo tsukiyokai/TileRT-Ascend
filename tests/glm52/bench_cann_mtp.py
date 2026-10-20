@@ -181,6 +181,9 @@ def arguments():
                         help="Config-store endpoint, e.g."
                              " tcp://127.0.0.1:9421, replacing the TP sum"
                              " with a one-sided push")
+    parser.add_argument("--gather-fia-max-width", type=int, default=None,
+                        help="raise gather_fia's width bound; exact to 6 and "
+                             "one bf16 ULP above it")
     parser.add_argument("--rope-graph", action="store_true",
                         help="capture the per-round rope refresh, which runs "
                              "530 eager copies outside the model's graph")
@@ -451,6 +454,7 @@ def run(args, report):
                        narrow_bank=args.narrow_bank,
                        aiv_collectives=not args.ai_cpu_collectives,
                        rope_graph=args.rope_graph,
+                       gather_fia_max_width=args.gather_fia_max_width,
                        mtp_tokens=args.mtp_tokens, layers=args.layers,
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
