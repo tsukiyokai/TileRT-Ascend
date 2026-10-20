@@ -457,3 +457,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     returned code; the harness costs a minute and prints them. The rule is not
     "prefer small experiments" but something sharper: a configuration that
     cannot show you the error is not a place to look for it.
+
+57. Pick the ratio that binds. I folded the shared expert in as sixteen
+    one-row matmuls over one weight bank and argued it was affordable because
+    `aic_mac_ratio` is 0.109 -- the cube is nearly idle. It cost double,
+    71.625 us against 37.193, because the kernel is not cube bound: its
+    `aic_mte2_ratio` is 0.733, and sixteen matmuls over one bank read that
+    bank sixteen times. Both numbers came from the same profile I had already
+    written down. Doing it properly needs one M=16 matmul, which needs the
+    rows contiguous and the work split along N across blocks, which needs
+    grid-wide barriers -- so the measurement settles the megakernel's
+    foundation: mixbrick's grid-barrier structure carrying routed_int4's MSD
+    path, because per-pair flags do not stretch across an N-split.
