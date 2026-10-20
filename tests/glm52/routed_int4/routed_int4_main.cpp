@@ -149,6 +149,26 @@ int main(int argc, char** argv)
     for (size_t index = 0; index < down_host.size(); ++index) {
         down_host[index] = static_cast<int8_t>((int32_t)(next() % 15) - 7);
     }
+    // K-major copies for the device, since an INT4 B operand cannot be
+    // transposed on the way in: `load_cbuf_to_cb_s4` hardcodes transpose off
+    // and drops the flag without a word.
+    const auto transpose = [](const std::vector<int8_t>& source,
+                              int64_t groups, int64_t rows, int64_t columns) {
+        std::vector<int8_t> turned(source.size());
+        for (int64_t group = 0; group < groups; ++group) {
+            for (int64_t row = 0; row < rows; ++row) {
+                for (int64_t column = 0; column < columns; ++column) {
+                    turned[(group * columns + column) * rows + row] =
+                        source[(group * rows + row) * columns + column];
+                }
+            }
+        }
+        return turned;
+    };
+    const std::vector<int8_t> gu_kmajor =
+        transpose(gu_host, experts, GATE_UP, HIDDEN);
+    const std::vector<int8_t> down_kmajor =
+        transpose(down_host, experts, HIDDEN, HALF);
     for (size_t index = 0; index < gu_scale_host.size(); ++index) {
         gu_scale_host[index] = 0.00031F + 0.0000007F * (index % 256);
     }
@@ -206,6 +226,9 @@ int main(int argc, char** argv)
     void* gu_tiling = Hold(TILING_BYTES, "gu tiling");
     void* down_tiling = Hold(TILING_BYTES, "down tiling");
     void* witness = Hold(experts * TILE_BYTES, "witness");
+    // Scratch for the Matmul library, which takes it from the system
+    // workspace. Sixteen mebibytes is far more than its tiling asks for.
+    void* workspace = Hold(16u << 20, "workspace");
 
     const auto upload = [&](void* where, const void* what, size_t bytes,
                             const char* name) {
@@ -221,8 +244,8 @@ int main(int argc, char** argv)
         }
         return packed;
     };
-    const std::vector<uint8_t> gu_packed = pack(gu_host);
-    const std::vector<uint8_t> down_packed = pack(down_host);
+    const std::vector<uint8_t> gu_packed = pack(gu_kmajor);
+    const std::vector<uint8_t> down_packed = pack(down_kmajor);
     upload(gate_up, gu_packed.data(), gu_packed.size(), "gate up");
     upload(down, down_packed.data(), down_packed.size(), "down");
     upload(gu_bias, gu_bias_host.data(),
@@ -248,7 +271,7 @@ int main(int argc, char** argv)
                        (float*)gu_bias, (float*)gu_scale, down,
                        (float*)down_bias, (float*)down_scale, (float*)token,
                        partial, middle, (float*)middle_scale, wide, out,
-                       gu_tiling, down_tiling, witness, experts);
+                       gu_tiling, down_tiling, witness, workspace, experts);
     Check(aclrtSynchronizeStream(stream), "once");
 
     std::vector<uint16_t> out_host(experts * ROWS * HIDDEN);
@@ -333,12 +356,46 @@ int main(int argc, char** argv)
         Check(aclrtMemcpy(witness_host.data(), witness_host.size(), witness,
                           witness_host.size(), ACL_MEMCPY_DEVICE_TO_HOST),
               "down witness");
+        // Identical bytes at 6144 and 12288 say the region repeats, so look
+        // at every boundary the writes could have used.
+        for (int64_t where : {0L, 1024L, 3072L, 6144L, 9216L, 12288L}) {
+            std::printf("\n  raw bytes at %5ld:", where);
+            for (int64_t at = 0; at < 6; ++at) {
+                std::printf(" %02x", stacked_host[where + at]);
+            }
+        }
         std::printf("\n  low halves through a dedicated buffer at zero:");
         for (int64_t at = 0; at < 8; ++at) {
             const uint8_t byte = witness_host[at / 2];
             const uint8_t four = (at % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
             std::printf(" %4d", (int)((four >= 8) ? (int)four - 16
                                                   : (int)four));
+        }
+        // The first projection is exact, so walk the next stage: the
+        // quantised intermediate, its per-row scale, and the down product.
+        std::vector<uint8_t> middle_host(experts * M_TILE * HALF / 2);
+        Check(aclrtMemcpy(middle_host.data(), middle_host.size(), middle,
+                          middle_host.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+              "down middle");
+        std::vector<float> middle_scale_host(experts * SCALE_STRIDE);
+        Check(aclrtMemcpy(middle_scale_host.data(),
+                          middle_scale_host.size() * sizeof(float),
+                          middle_scale, middle_scale_host.size()
+                          * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST),
+              "down middle scale");
+        {
+            const auto four = [&](int64_t index) {
+                const uint8_t byte = middle_host[index / 2];
+                const uint8_t nibble = (index % 2 == 0) ? (byte & 0x0F)
+                                                        : (byte >> 4);
+                return (int)((nibble >= 8) ? (int)nibble - 16 : (int)nibble);
+            };
+            std::printf("\n  intermediate 16*high+low, first 8:");
+            for (int64_t at = 0; at < 8; ++at) {
+                std::printf(" %4d", 16 * four(at) + four(ROWS * HALF + at));
+            }
+            std::printf("\n  its row scale: %g %g", middle_scale_host[0],
+                        middle_scale_host[1]);
         }
         std::printf("\n  product, first 4 columns: want");
         for (int64_t column = 0; column < 4; ++column) {
@@ -429,7 +486,7 @@ int main(int argc, char** argv)
                                down, (float*)down_bias, (float*)down_scale,
                                (float*)token, partial, middle,
                                (float*)middle_scale, wide, out, gu_tiling,
-                               down_tiling, witness, experts);
+                               down_tiling, witness, workspace, experts);
         }
         Check(aclrtSynchronizeStream(stream), "timing");
         clock_gettime(CLOCK_MONOTONIC, &end);

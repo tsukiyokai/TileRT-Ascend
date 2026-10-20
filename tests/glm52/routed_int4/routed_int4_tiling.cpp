@@ -22,7 +22,7 @@ extern "C" int routed_int4_build_tiling(int rows, int columns, int inner,
                     matmul_tiling::DataType::DT_INT4, false);
     tiling.SetBType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
-                    matmul_tiling::DataType::DT_INT4, true);
+                    matmul_tiling::DataType::DT_INT4, false);
     tiling.SetCType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
                     matmul_tiling::DataType::DT_INT32);

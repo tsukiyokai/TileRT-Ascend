@@ -2178,14 +2178,835 @@ This is the one mainstream implementation that already does what the multiple-oc
 
 ---
 
+### REST — retrieval from a datastore builds the Trie directly from MULTIPLE occurrences of the matched suffix, each with its own continuation; mean generated length tops out at 2.65 even on code
+
+https://arxiv.org/abs/2311.08252 · https://arxiv.org/html/2311.08252 (NAACL 2024 camera-ready, v2, revised 4 Apr 2024)
+Zhenyu He, Zexuan Zhong, Tianle Cai, Jason D. Lee, Di He (equal contribution; correspondence Di He <dihe@pku.edu.cn>). Code: https://github.com/FasterDecoding/REST
+
+Abstract, verbatim:
+
+> We introduce Retrieval-Based Speculative Decoding (REST), a novel algorithm designed to speed up language model generation. The key insight driving the development of REST is the observation that the process of text generation often includes certain common phases and patterns. Unlike previous methods that rely on a draft language model for speculative decoding, REST harnesses the power of retrieval to generate draft tokens. This method draws from the reservoir of existing knowledge, retrieving and employing relevant tokens based on the current context. Its plug-and-play nature allows for seamless integration and acceleration of any language model, all without necessitating additional training. When benchmarked on 7B and 13B language models in a single-batch setting, REST achieves a significant speedup of 1.62× to 2.36× on code or text generation. The source code of REST is available at https://github.com/FasterDecoding/REST.
+
+The mechanism, verbatim — this is the exact "multiple occurrences, each with a different continuation, verified together" construction:
+
+> To use REST, the first step is constructing the datastore. In this paper, we leverage either the pretraining data corpus or the instruction-tuning data corpus to build our datastore, which serves as the source for the draft token sequence. During each inference step, we first use previous tokens (pre-generated tokens or prompt tokens) as queries to identify exact matches in the datastore. The subsequent tokens from these exact matches are considered generation candidates. A Trie is constructed using these candidates. The nodes with the highest frequencies are selected as the draft tokens. This sequence then undergoes verification by the LLM through a single forward pass, aided by a meticulously designed attention mask known as tree attention Cai et al. (2023); Miao et al. (2023); Spector and Re (2023). As many subsequences during generation likely appear in the datastore, REST can frequently generate multiple correct tokens per step.
+
+> REST operates based on a pre-built datastore D = {(c_(i), t_(i))}, where c_(i) represents a context and t_(i) represents the corresponding continuation of the context c_(i). Given a text/code corpus, we construct the datastore D using the prefix context and the corresponding continuation at each position.
+
+> At inference, given a context s = (x₁, …, x_(t)), our objective is to construct the draft tokens which are likely the continuations of s. Different from vanilla speculative decoding that uses a small LM to construct the draft, we leverage the built datastore D and directly retrieve draft tokens from the datastore. We first use the context s to retrieve context-continuation pairs from the datastore D and construct a set of continuation candidates S:
+
+The greedy suffix-length search and its exact cutoff, verbatim (note the explicit tuned constant):
+
+> Our retrieval process is shown in Algorithm 1. We aim to find contexts in D that match the longest suffix of s. We employ a greedy strategy and start from a pre-defined match length upper limit n_(max)^(\par)^(\par) We set n_(max) as 16 in our experiments, as only few cases lead to a maximum match with more than 16 tokens.. For each suffix length n, we obtain the context s’s suffix with n tokens q (line 5), and obtain all the contexts c_(i) that match q as a suffix (line 6). If at least one context in D matches the current q (i.e., S ≠ ∅), we return the corresponding context-continuation pairs as the retrieval result; otherwise we decrease the matching length n by one and try to match a shorter suffix (line 7). We use a suffix array Manber and Myers (1993) to implement efficient exact match in datastore D for a given q. The retrieval process leads to negligible overhead ( < 6%) in our experiments (see details in Section 5).
+
+Draft construction from the retrieved set — a Trie keyed on frequency, not on a single longest match:
+
+> The retrieved result S includes possible continuations of the context s. For each t_(i) ∈ S, any prefix of t_(i) can serve as draft tokens of s in the speculative decoding and be further verified by the LLM. Note that the retrieved set of continuation candidates S can be large. It is not feasible to use all candidates as draft tokens and feed them into the LLM for verification. Here we present how we select high-quality draft tokens from the retrieved set S. A naive strategy is to sample a subset of sequences in S as the draft tokens. However, this is suboptimal as the sampling contains randomness when S is large.
+
+> We select draft tokens from the retrieved result S using a Trie. In the Trie, the unique path from a node to the root node corresponds to a prefix of t_(i) ∈ S. For each node, we assign a weight reflecting the number (frequency) of the corresponding prefix that appears in the retrieved candidates. As shown in Algorithm 2, we first construct a Trie using all sequences in S, and the node weight is updated when a candidate t_(i) is inserted into the Trie (lines 2-7). The Trie data structure allows us to prioritize tokens using the weights and select high-frequency prefixes (lines 8-15). In the practical implementation, we choose a subtree that contains the top c nodes with the highest weights, which equals to selecting the top c high-frequency prefixes as the draft sequences.
+
+Why a tree, not independent sequences — the exact reason, verbatim:
+
+> In REST, multiple draft sequences may be retrieved from the datastore. While one might initially approach the drafts independently and feed them into the LLM as distinct sequences in a batch, practical observations reveal that many drafts share common prefixes. This leads to redundant computation of Transformer layers on these shared prefixes across different sequences, resulting in a waste of computational power. To optimize the efficiency, we construct a pseudo sequence from the subtree using breadth-first search. By definition, it can be immediately obtained that each draft constitutes a sub-sequence of this pseudo sequence, and any shared prefix appears only once. To correctly execute LLM on this pseudo sequence, we implement a carefully designed attention mask in each attention layer, ensuring that the computation of each token precisely reflects its dependencies in the original draft sequence. This attention strategy is also known as tree attention (Cai et al., 2023; Miao et al., 2023; Spector and Re, 2023).
+
+The exact hyperparameters used in their main experiments, verbatim (note the explicit cross-reference to Medusa's budget):
+
+> When performing exact match in the datastore, the starting context suffix length, n_(max), is set to 16, and is progressively reduced by one until we find matching contexts in the datastore. The length of each retrieved continuation candidate denoted as m, is truncated to 10. Empirical results from Medusa (Cai et al., 2023) suggest 64 draft tokens to be an optimal computation configuration. Hence, we limit the maximum number of selected draft tokens in the constructed Trie to 64, designated as c.
+
+> Note that the Mean Generated Length (M) acts as the upper limit of the speedup that REST can achieve, ignoring the overhead for retrieving and constructing draft tokens.
+
+Datastore construction, verbatim:
+
+> For CodeLlama, we construct a datastore using a portion of the Python pretraining code from The Stack (Kocetkov et al., 2022). This dataset comprises approximately 2.7M Python code samples and results in a datastore with a size of 27GB. On the other hand, for Vicuna, we construct a datastore using data derived from UltraChat Ding et al. (2023). This dataset consists of around 774K conversations from ChatGPT^(\par)^(\par) https://chat.openai.com/, yielding a datastore with a size of 12GB.
+
+The HumanEval result table (CodeLlama 7B/13B, greedy and nucleus), reproduced verbatim from the rendered paper:
+
+`arxiv.org/html/2311.08252 (rendered table, HumanEval)` lines 239-261:
+
+````text
++---------------------+---------------+--------------------------+--------------------+------------+
+| Benchmark           | Model         | Method                   | Mean Token Time(↓) | Speedup(↑) |
++---------------------+---------------+--------------------------+--------------------+------------+
+| HumanEval (1 shot)  | CodeLlama 7B  | Autoregressive (Greedy)  | 27.89 ms/token     | 1×         |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 7B  | Speculative (Greedy)     | 15.90 ms/token     | 1.75×      |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 7B  | REST (Greedy)            | 11.82 ms/token     | 2.36×      |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 13B | Autoregressive (Greedy)  | 44.32 ms/token     | 1×         |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 13B | Speculative (Greedy)     | 19.39 ms/token     | 2.29×      |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 13B | REST (Greedy)            | 19.53 ms/token     | 2.27×      |
++---------------------+---------------+--------------------------+--------------------+------------+
+| HumanEval (10 shot) | CodeLlama 7B  | Autoregressive (Nucleus) | 27.99 ms/token     | 1×         |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 7B  | Speculative (Nucleus)    | 18.83 ms/token     | 1.49×      |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 7B  | REST (Nucleus)           | 13.18 ms/token     | 2.12×      |
+|                     +---------------+--------------------------+--------------------+------------+
+|                     | CodeLlama 13B | Autoregressive (Nucleus) | 44.46 ms/token     | 1×         |
+|                     +---------------+--------------------------+--------------------+------------+
+````
+
+The headline comparison, verbatim:
+
+> Regarding generation speed, REST demonstrates a significant speed enhancement compared to standard autoregressive decoding and speculative decoding, achieving 2.16× to 2.36× increase for CodeLlama in the HumanEval benchmark. The MT-Bench benchmark also reveals a speedup for Vicuna when using our method, with a factor ranging from 1.62× to 1.77×. These empirical results lend weight to the effectiveness of our method for speeding up the generation process of LLMs. Note that the speedup of nucleus sampling is not as good as that of greedy sampling. We speculate that this drop in performance is caused by the randomness introduced by nucleus sampling. Since speculative decoding may achieve better results with a more powerful draft LM that aligns with the LLM, we do not claim that REST can outperform speculative decoding under all circumstances. Yet, REST undoubtedly provides a potent and straightforward approach for faster inference of LLMs.
+
+> Another intriguing observation that emerges from these results is the domain-dependent nature of the speed improvements. This characteristic has also been noted in other methods like speculative decoding Chen et al. (2023) and Medusa Cai et al. (2023). Specifically, the speedup achieved with REST is significantly greater in the HumanEval benchmark than in the MT-Bench benchmark, suggesting that the effectiveness of REST may vary depending on the specific domain.
+
+Datastore-size ablation — Mean Generated Length (M, i.e. mean accepted length) as a function of corpus size, verbatim table and the accompanying text:
+
+`arxiv.org/html/2311.08252 (rendered table, datastore-size ablation)` lines 332-340:
+
+````text
+
+  ------------------ ---------------- ---------------- ------ -------------------- ------------
+  Method             Datastore Size   Retrieval Time   M      Mean Token Time(↓)   Speedup(↑)
+  Baseline(Greedy)   -                -                1      27.89 ms/token       1×
+  REST(Greedy)       0.9 GB           0.2 ms           1.96   15.28 ms/token       1.83×
+  REST(Greedy)       4.4 GB           0.5 ms           2.18   13.98 ms/token       1.99×
+  REST(Greedy)       8.7 GB           0.6 ms           2.35   13.24 ms/token       2.11×
+  REST(Greedy)       14 GB            0.6 ms           2.45   12.99 ms/token       2.15×
+  REST(Greedy)       27 GB            0.7 ms           2.65   11.82 ms/token       2.36×
+````
+
+> Increasing the size of the datastore is an effective strategy for enhancing the accuracy of retrieved draft tokens in the Trie, which in turn can significantly boost generation speed. In Table 2, we show that as the datastore size increases, both the Mean Generated Length and Mean Token Time correspondingly improve. However, it’s important to note that the speedup growth is not as pronounced as that of the Mean Generated Length. This discrepancy could be attributed to the overhead of getting draft tokens. We assume that in industry applications, there will be ample disk storage to build a large datastore and ample CPU cores for fast retrieval. We also visualize the trend of scaling the retrieval datastore size in Figure 2. From this, we can infer that there is still potential to achieve even faster speeds with a larger datastore.
+
+Trie-selection vs random-selection ablation (same total draft-token budget, 64, in both arms):
+
+`arxiv.org/html/2311.08252 (rendered table, Trie vs Random selection)` lines 349-355:
+
+````text
+  ------------------- ------ ---------------------
+  Selecting Methods   M(↑)   Mean Token Time (↓)
+  Random(Greedy)      2.51   12.80
+  Trie(Greedy)        2.65   11.82
+  Random(Nucleus)     2.44   14.19
+  Trie(Nucleus)       2.57   13.18
+  ------------------- ------ ---------------------
+````
+
+> We compare selecting draft tokens in the Trie with randomly sampling retrieved continuation candidates as draft tokens. For an equitable comparison, we employ a random sampling technique to sample at most eight sequences from all the retrieved candidates. Furthermore, each sequence is truncated to a maximum length of 8. This results in a maximum number of 64 draft tokens, corresponding to the maximum number of selected draft tokens from the Trie. The data presented in Table 3 indicates that selecting draft tokens from the Trie, as opposed to employing a random sampling approach, enhances the performance.
+
+Retrieval/Trie-construction overhead, verbatim:
+
+> Additionally, it is important to note that the average time (divided by the total number of tokens) required for retrieval (which includes the time taken to construct the Trie) is less than 1 ms. This time is very small and can, for all practical purposes, be considered negligible. This negligible retrieval time further underscores the efficiency of REST.
+
+## Relevance
+REST is the primary source the task asked for by name, and it is the cleanest existing example of "the same suffix occurs several times earlier in the context, each occurrence proposing a different continuation, verified together": the retrieved set S can contain many distinct continuations of the same matched suffix, a Trie is built over all of them with per-node frequency weights, and the top-c highest-weight nodes (c=64, chosen to match Medusa's own budget) are linearized by BFS into one pseudo-sequence verified in a single tree-attention forward pass. Three numbers matter for comparison with our 7.1: (1) the datastore-size ablation shows Mean Generated Length M saturating at only **2.65** even with a 27 GB / 2.7M-sample Python datastore and a 64-node budget — this is the clearest published curve of accepted-length-as-a-function-of-corpus-size for a multi-match trie, and it never gets remotely close to 7.1; (2) M=2.65 is on HumanEval, i.e. fresh code generation from a docstring, not code-editing — REST's own ablation (Trie 2.65 vs Random-sampling-from-the-same-candidates 2.51) shows the Trie-vs-chain gain from exploiting multiple occurrences is real but small, roughly +5.6%, which is a second, independent, code-domain data point for "how much does a multi-match tree buy over one chain at matched budget" (compare SGLang's own two policies in Section 2 and the suffix-automaton papers); (3) retrieval and Trie-construction cost is "less than 1 ms" and the mask is a device-side tree-attention mask, exactly the shape vllm-ascend and sgl-kernel-npu need. The huge gap between REST's 2.65 ceiling and our 7.1, or SuffixDecoding's 7.8 on SWE-Bench, is domain, not mechanism: REST is tested on HumanEval (write new code from a docstring, near-zero prompt/output overlap) while our workload and SuffixDecoding's SWE-Bench are agentic coding where the output IS mostly the input. See the ISSTA 2026 and vLLM-production-study entries below for figures that isolate this domain effect precisely.
+
+---
+
+### "An Empirical Study of Speculative Decoding on Software Engineering Tasks" (ISSTA 2026) — PLD and Suffix Decoding head-to-head on SWE-bench/Aider/CanItEdit/Defects4J, four model scales, and the direct warning that agentic acceptance can be inflated noise
+
+https://arxiv.org/abs/2604.26469 · https://arxiv.org/html/2604.26469 (arXiv:2604.26469v4 [cs.SE], first submitted 29 April 2026, revised 16 August 2026)
+Yijia Li (Zhejiang University), Junkai Chen (Singapore Management University), Xing Hu (Zhejiang University, corresponding author), Xin Xia (Zhejiang University / Hangzhou High-Tech Zone (Binjiang) Institute of Blockchain and Data Security). PACMSE Vol. 3, ISSTA, article 05410, DOI 10.1145/3832145.
+
+Abstract, verbatim:
+
+> Large Language Models (LLMs) have become widely used for Software Engineering (SE) tasks, spanning from function-level code generation to complex repository-level workflows. However, the high latency of autoregressive inference remains a significant bottleneck, hindering their deployment in interactive environments. While Speculative Decoding (SD) offers a promising technique for lossless acceleration, prior research on long-context repository-level tasks and complex agentic interactions remains limited. To bridge this gap, we present a systematic empirical study to evaluate the effectiveness of SD in SE tasks. We benchmark a representative spectrum of strategies, encompassing both model-based and model-free methods, across generation, editing, and repair scenarios. Our empirical results show that SD provides clear acceleration potential for SE tasks, but its realized benefits jointly vary with model architecture and task scenario. Specifically, model-based approaches are well-suited for code generation, whereas model-free methods are better adapted to repository-level repair and editing scenarios. We further observe that the repetitiveness of SE tasks improves the performance of model-free methods, while complex agentic workflows can introduce repetitive failure modes that skew acceleration measurements. In contrast to natural language tasks, the higher predictability of SE tasks allows for more aggressive hyperparameter settings. Our findings provide practical guidance for selecting, configuring, and evaluating SD methods in SE scenarios.
+
+PLD's exact formulation as this paper writes it, and its named weakness, verbatim:
+
+> Prompt Lookup Decoding (PLD) (Saxena, 2023).    As illustrated in the upper-left corner of Figure 1, PLD implements a deterministic N-gram retrieval strategy over the entire context. The method operates by matching the current context suffix with previous occurrences in the input sequence. As shown in the figure, the input sequence ends with the suffix "B C". The algorithm identifies a prior occurrence of this pattern and observes that it is followed by the token "D". Consequently, PLD retrieves "D" as the draft token. Formally, if a suffix x_(t − N : t) (where N can vary up to a maximum N_(max)) appeared previously at position k, the method assumes the sequence following that historical occurrence is a likely candidate. Upon a successful match (visualized as the dotted arrow in the figure), PLD copies a fixed number of subsequent tokens as the speculation:
+
+> PLD is primarily constrained by its static speculation budget K. This fixed budget fails to adapt to the varying confidence levels of the retrieved context; it may either be too aggressive in uncertain scenarios, leading to frequent verification rollbacks, or too conservative when the historical pattern is highly repetitive and predictable.
+
+Suffix Decoding's formulation as this paper writes it (independent restatement of Oliaro et al.'s mechanism, confirming `γ = ⌊α · L_match⌋` is the same adaptive rule reported in Section 1 above):
+
+> Suffix Decoding (Oliaro et al., ).    To overcome the fixed budget limitation of PLD, as visualized in the lower-left of Figure 1, Suffix Decoding utilizes Suffix Trees for probabilistic structural retrieval. As depicted in the schematic, the method maintains two distinct data structures: a Global Tree that indexes historical outputs from prior requests, and a Local Tree that tracks the current ongoing generation. The core mechanism involves querying these trees to retrieve frequent patterns. Nodes in the trees encode the occurrence frequency Count(s) of sub-sequences. The “Prob.” block in the figure represents the scoring phase, where the conditional probability of a next token v given a suffix context s is estimated via:
+
+`arxiv.org/html/2604.26469 (equation 3)` lines 190-192:
+
+````text
+  ----- -- ----------------------------------------------------------------------------- --
+  (3)      $$P_{\text{suffix}}(v|s)=\frac{\text{Count}(s\oplus v)}{\text{Count}(s)},$$   
+  ----- -- ----------------------------------------------------------------------------- --
+````
+
+> where ⊕ denotes the concatenation. Based on these probabilities, the method performs a greedy expansion to construct a Speculation Tree (shown as the tree-structured “Draft” in the figure). Moreover, it employs an Adaptive Speculation Strategy: the speculation budget γ (the total token count in the draft tree) is dynamically scaled proportional to the pattern match length L_(match) (γ = ⌊α ⋅ L_(match)⌋). This allows the method to perform “extreme speculation” by generating deep draft trees when historical patterns are strong, while falling back to conservative drafting for novel logic.
+
+> This approach is specifically tailored for agentic applications, particularly automated coding assistants and multi-agent workflows, where workloads exhibit high repetitiveness (Oliaro et al., ).
+
+The three metrics this paper standardizes on, verbatim — note `τ` ("Mean Acceptance Length") is exactly our "accepted tokens per round":
+
+> Following previous research (Li et al., 2025b; Oliaro et al., ; Chen et al., 2023; Saxena, 2023), we employ three key metrics to quantify the acceleration performance of SD. For all metrics listed below, higher values indicate better performance.
+>
+> - •
+>   Speedup is defined as the ratio of the generation throughput (i.e., the number of tokens produced per second) of the speculative method to that of the autoregressive baseline.
+> - •
+>   Mean Acceptance Length (τ) is the expected number of candidate tokens validated by the target model in a single verification step. This metric serves as a direct proxy for the drafting model’s quality and the semantic alignment between the drafter and the verifier.
+> - •
+>   Acceptance Rate (n − α) denotes the acceptance rate α at a specific position index n within the draft chain. It is calculated as the conditional probability that the draft token at position n is accepted, given that all preceding tokens (0…n − 1) have been verified as correct. For example, we calculate 3 − α by dividing the number of tokens accepted at position 3 by the number of tokens accepted at position 2.
+
+Configuration used for every method, verbatim — PLD here is lookup window N=4, draft length K=5; Suffix Decoding is K=32 ("the authors' recommended default settings"); note this is a MUCH narrower PLD draft width than our 32:
+
+> SD Approaches.    To ensure reproducibility and prioritize precision in code generation, we employ greedy decoding across all experiments. For detailed configurations of different methods, we conduct the experiments following their common practice: (i) For PLD, it is configured with a lookup window size N = 4 and a draft length K = 5, adhering to the default recommendations provided by the vLLM framework. (ii) For Suffix Decoding, we use a maximum draft length of K = 32, adhering to the authors’ recommended default settings (Oliaro et al., ). (iii) For Eagle-3, the speculative length is fixed at 3. We use official RedHatAI²² 2 https://huggingface.co/RedHatAI checkpoints for 8B/30B/32B models; for the 70B model, due to the unavailability of pre-trained drafter weights, we train a custom drafter via SpecForge (Li et al., 2025a) on BAAI/TACO (Li et al., 2023) and SWE-Gym/SWE-Gym (Pan et al., ) with a learning rate of 5e-5. (iv) For MLP Speculator, we employ the standard implementation with default hyperparameters, utilizing the pre-trained draft models provided by IBM AI Platform³³ 3 https://huggingface.co/ibm-ai-platform. Note that this baseline is evaluated on vLLM v0.9.2 due to specific version compatibility constraints, which restrict it to single-threaded execution.
+
+Table 1 — Speedup and τ (Mean Acceptance Length) for PLD, Suffix Decoding, Eagle-3 and MLP Speculators, across four target models and six SE benchmarks, reproduced verbatim from the rendered paper:
+
+`arxiv.org/html/2604.26469 (rendered Table 1)` lines 280-310:
+
+````text
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| Model      | Method          | LiveCodeBench     | HumanEval       | SWE-bench       | Defects4J       | Aider Polyglot    | CanItEdit       | Mean           |
+|            |                 +---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            |                 | Speedup | τ       | Speedup | τ     | Speedup | τ     | Speedup | τ     | Speedup | τ       | Speedup | τ     | Speedup | τ    |
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| Qwen3-32B  | PLD             | 1.13×   | 2.89    | 1.17×   | 2.89  | 1.05×   | 2.92  | 1.87×   | 3.40  | 1.08×   | 3.19    | 2.23×   | 4.07  | 1.42×   | 3.23 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Suffix Decoding | 1.27×   | 1.21    | 1.56×   | 1.10  | 1.66×   | 3.48  | 2.61×   | 3.33  | 1.22×   | 1.35    | 3.05×   | 4.11  | 1.90×   | 2.43 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Eagle-3         | 1.71×   | 1.87    | 1.94×   | 1.99  | 1.10×   | 1.87  | 1.21×   | 2.10  | 1.29×   | 1.81    | 2.14×   | 2.35  | 1.57×   | 2.00 |
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| Qwen3-30A3 | PLD             | 0.87×   | 2.21    | 0.99×   | 2.57  | 1.02×   | 3.25  | 1.36×   | 3.38  | 1.08×   | 3.29    | 1.55×   | 3.83  | 1.15×   | 3.09 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Suffix Decoding | 0.95×   | 1.02    | 1.03×   | 0.91  | 1.73×   | 4.78  | 1.53×   | 3.14  | 0.99×   | 1.41    | 1.83×   | 2.93  | 1.34×   | 2.37 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Eagle-3         | 0.77×   | 1.75    | 0.54×   | 1.93  | 0.41×   | 0.43  | 0.55×   | 1.57  | 1.15×   | 1.52    | 0.87×   | 2.22  | 0.72×   | 1.57 |
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| L31-8B     | PLD             | 1.07×   | 2.36    | 1.16×   | 2.81  | 1.71×   | 2.99  | 1.78×   | 3.23  | 1.30×   | 3.36    | 2.05×   | 4.01  | 1.51×   | 3.13 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Suffix Decoding | 1.58×   | 1.30    | 1.63×   | 1.13  | 3.35×   | 5.48  | 2.74×   | 3.18  | 1.82×   | 1.99    | 2.90×   | 3.54  | 2.34×   | 2.77 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Eagle-3         | 1.77×   | 1.82    | 2.19×   | 2.11  | 0.70×   | 0.64  | 1.55×   | 1.56  | 1.32×   | 1.49    | 2.12×   | 2.18  | 1.61×   | 1.63 |
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| L31-70B    | PLD             | 0.97×   | 2.39    | 0.99×   | 2.40  | 1.02×   | 2.69  | 1.67×   | 3.77  | 1.12×   | 3.40    | 1.71×   | 4.05  | 1.25×   | 3.12 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Suffix Decoding | 1.24×   | 1.08    | 1.13×   | 1.00  | 1.79×   | 3.39  | 1.70×   | 3.55  | 1.50×   | 2.72    | 1.99×   | 3.93  | 1.56×   | 2.61 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | Eagle-3         | 1.66×   | 1.74    | 1.41×   | 1.27  | 0.87×   | 1.07  | 0.83×   | 0.35  | 0.88×   | 0.48    | 1.29×   | 1.09  | 1.16×   | 1.00 |
+|            +-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|            | MLP Speculators | 0.81×   | —       | 1.22×   | —     | 0.91×   | —     | 0.88×   | —     | 1.23×   | —       | 1.03×   | —     | 1.01×   | —    |
++------------+-----------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+````
+
+The domain split, verbatim — model-free methods win on repair/editing, model-based wins on fresh generation:
+
+> For code generation, represented by LiveCodeBench and HumanEval, Eagle-3 demonstrates superior performance. As shown in Table 1, Eagle-3 achieves an average speedup of 1.50× across these two benchmarks, outperforming Suffix Decoding (1.30×) and PLD (1.04×). We attribute this advantage to the characteristic of the task, which involves translating natural language into code; since the ground-truth code does not appear in the context history, model-free methods fail to find sufficient repetitive patterns to copy. As shown in Table 1, Suffix Decoding achieves a mean τ of 1.09 on code generation benchmarks, compared to 3.79 on code repair benchmarks and 2.75 on code editing benchmarks, respectively. PLD exhibits a similar trend, recording a mean τ of 2.57 on code generation benchmarks, which is consistently lower than the 3.20 and 3.65 observed on code repair and code editing benchmarks.
+
+> In contrast, for code repair and code editing tasks, Suffix Decoding demonstrates distinct superiority. Across SWE-bench and Defects4J, Suffix Decoding achieves an average speedup of 2.14×, compared with 1.44× for PLD and 0.90× for Eagle-3. Across Aider Polyglot and CanItEdit, Suffix Decoding reaches 1.91×, compared with 1.52× for PLD and 1.38× for Eagle-3. We attribute this dominance to the higher contextual redundancy in repair and editing scenarios, which is especially pronounced in repository-level agentic workflows such as SWE-bench and also appears when models modify code around existing context. As suggested by Oliaro et al. (Oliaro et al., ), such redundancy inherently favors Suffix Decoding, which retrieves explicit repetitive patterns rather than approximating distributions.
+
+Diminishing returns in long context — τ keeps climbing but speedup does not, verbatim (this is a second, independent confirmation of the mechanism already noted in Section 3 above, now with exact numbers and a request-length measurement):
+
+> Diminishing Returns in Long-Context Tasks.    In SWE-bench, we observe a phenomenon of diminishing returns. Specifically, the increase in speedup slows down even as the mean acceptance length (τ) continues to grow. We demonstrate this by comparing representative macro-average values of speedup and τ on LiveCodeBench and SWE-bench, which correspond to code generation and repository-level repair tasks, respectively. For Suffix Decoding, as shown in Table 1, although high redundancy in the repository causes τ to increase from 1.15 to 4.28, the speedup only increases from 1.26× to 2.13×. Similarly, for Eagle-3 and PLD, we observe that the speedup decreases even when the mean acceptance length (τ) remains stable. Taking Qwen3-32B as an example, Eagle-3 maintains an identical τ of 1.87 on both benchmarks. However, the speedup drops from 1.71× to 1.10×. In the same way, for PLD, while τ stays at a high level (2.89 on LiveCodeBench and 2.92 on SWE-bench), the speedup declines from 1.13× to 1.05×. This indicates that draft quality (implied by τ) is not the only factor for acceleration in complex tasks.
+
+> We attribute this phenomenon to the extensive context windows of repository-level tasks. According to Yang et al. (Yang et al., 2025), in long-context scenarios, the inefficiencies in attention mechanisms and massive KV cache demands significantly impede verification efficiency, offsetting potential speedup offered by the high acceptance rates. Our analysis of L31-8B request logs reveals that SWE-bench tasks average 15,999 total tokens per request, substantially higher than the 817 tokens for LiveCodeBench. Here, total tokens include both prompt and generated tokens, and the average is computed over assistant model requests. This implies that in repository-level tasks, the verification process transitions into a compute-bound regime, ultimately limiting the realizable speedup.
+
+Agentic infinite loops as a confound on acceptance-length measurements — the exact warning that should be read against any very high τ or very high acceptance number, including ours:
+
+> Evaluation Noise from Agentic Infinite Loops.    In addition to model scale and architecture, agentic infinite loops can introduce additional noise into SD acceleration measurements. In SWE-bench, we observe that some models enter repetitive action loops, producing nearly identical Thought and Action sequences over multiple turns. Such loops create artificial context redundancy, which can be exploited by model-free SD methods.
+
+> The occurrence of “Infinite Loops” represents a widespread phenomenon rather than an isolated anomaly in current LLM-based agents. To investigate this further, we conducted a quantitative analysis of the execution trajectories within the SWE-bench Verified dataset. We define an infinite loop as a trajectory in which the agent produces the same output block at least five times while solving a single instance. As illustrated in Figure 3(b), the L31-8B model encounters infinite loops in 226 distinct tasks. In a similar vein, the Qwen3-32B model demonstrates this pattern in 210 tasks. Qwen3-30A3 also exhibits this behavior in 167 tasks. Conversely, L31-70B exhibits a notably lower frequency, with only 89 tasks affected by such repetitive generations. These quantitative findings suggest that repetitive agentic behavior varies substantially across target models and can become a major confounding factor in SD evaluation.
+
+Table 6 — task performance score vs. mean acceptance length (τ) for PLD / Suffix / Eagle-3, reproduced verbatim from the rendered paper, and the paper's own reading of it:
+
+`arxiv.org/html/2604.26469 (rendered Table 6)` lines 480-533:
+
+````text
++---------------------------------------+------------+-------------------+--------------------------------+
+| Benchmark                             | Model      | Performance Score | Mean Accept Length (τ)         |
++---------------------------------------+            |                   +----------+----------+----------+
+| Metrics                               |            |                   | PLD      | Suffix   | Eagle-3  |
++=======================================+============+===================+==========+==========+==========+
+| LiveCodeBench Pass@1 (%)              | Qwen3-32B  | 46.1              | 2.89     | 1.21     | 1.87     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 56.0              | 2.21     | 1.02     | 1.75     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 17.0              | 2.36     | 1.30     | 1.82     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 30.5              | 2.39     | 1.08     | 1.74     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+| HumanEval Pass@1 (%)                  | Qwen3-32B  | 83.5              | 2.89     | 1.10     | 1.99     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 96.3              | 2.57     | 0.91     | 1.93     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 68.9              | 2.81     | 1.13     | 2.11     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 72.6              | 2.40     | 1.00     | 1.27     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+| SWE-bench Resolved (%)                | Qwen3-32B  | 12.4              | 2.92     | 3.48     | 1.87     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 10.4              | 3.25     | 4.78     | 0.43     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 1.4               | 2.99     | 5.48     | 0.64     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 7.2               | 2.69     | 3.39     | 1.07     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+| Defects4J Correct (%)                 | Qwen3-32B  | 18.54             | 3.40     | 3.33     | 2.10     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 18.08             | 3.38     | 3.14     | 1.57     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 7.09              | 3.23     | 3.18     | 1.56     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 19.68             | 3.77     | 3.55     | 0.35     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+| Aider Polyglot Pass Rate 1 & 2 (%)    | Qwen3-32B  | 18.2 & 41.3       | 3.19     | 1.35     | 1.81     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 11.6 & 25.8       | 3.29     | 1.41     | 1.52     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 1.3 & 2.7         | 3.36     | 1.99     | 1.49     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 1.8 & 7.1         | 3.40     | 2.72     | 0.48     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+| CanItEdit Pass@1 (%)                  | Qwen3-32B  | 58.1              | 4.07     | 4.11     | 2.35     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | Qwen3-30A3 | 54.8              | 3.83     | 2.93     | 2.22     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-8B     | 43.3              | 4.01     | 3.54     | 2.18     |
+|                                       +------------+-------------------+----------+----------+----------+
+|                                       | L31-70B    | 53.3              | 4.05     | 3.93     | 1.09     |
++---------------------------------------+------------+-------------------+----------+----------+----------+
+
+````
+
+> Table 6 suggests that, in agentic tasks, lower task performance can coincide with higher acceptance lengths for model-free methods. This pattern is particularly clear on Aider Polyglot: Qwen3-32B achieves the best task score (18.2% and 41.3%) but has lower PLD and Suffix acceptance lengths (τ = 3.19 and τ = 1.35), while L31-70B obtains much lower task scores (1.8% and 7.1%) but higher PLD and Suffix acceptance lengths (τ = 3.40 and τ = 2.72). On SWE-bench, L31-8B has the lowest problem-solving capability (1.4% Resolved) but reaches the highest Suffix Decoding acceptance length (τ = 5.48). Similarly, Qwen3-30A3 achieves a lower task score than Qwen3-32B (10.4% vs. 12.4%) but obtains a higher PLD acceptance length (τ = 3.25 vs. 2.92). These examples suggest that model-free acceptance statistics can be inflated by repetitive or degenerate agentic traces, rather than reflecting meaningful task progress alone.
+
+Cross-domain comparison against MT-bench (natural language) — acceptance length collapses for model-free methods outside code:
+
+> The results show that acceptance lengths drop markedly on MT-bench for model-free methods than for Eagle-3. Across the four models, PLD’s average τ decreases from 3.14 on SE tasks to 2.00 on MT-bench, while Suffix Decoding decreases more sharply from 2.55 to 0.52. Such short acceptance lengths make it difficult for model-free methods to translate drafted tokens into tangible acceleration. By contrast, Eagle-3 exhibits a smaller decrease in τ, suggesting stronger robustness on natural language tasks.
+
+> Furthermore, SE tasks contain substantial text alongside code. For instance, code tokens and text tokens account for 35.17% and 64.83% of the SWE-bench dataset, respectively.⁴⁴ 4 These token proportions are computed from the Qwen3-32B SWE-bench execution traces. Despite this high proportion of text, model-free methods still achieve higher mean acceptance length on SWE-bench than on MT-bench. This suggests that the textual portions in SE tasks are more structured and reusable than natural language.
+
+SE tasks tolerate a MORE AGGRESSIVE draft width than natural-language tasks — the paper's K=3 vs K=5 sweep (method: Eagle-3, since the τ values at K=3 match Table 1's Eagle-3 row exactly), verbatim table and conclusion:
+
+`arxiv.org/html/2604.26469 (rendered Table 5, K=3 vs K=5)` lines 454-462:
+
+````text
++---------------+-------------------+-----------------+-----------------+-----------------+-------------------+-----------------+----------------+
+| Configuration | LiveCodeBench     | HumanEval       | SWE-bench       | Defects4J       | Aider Polyglot    | CanItEdit       | MT-bench       |
+|               +---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+|               | Speedup | τ       | Speedup | τ     | Speedup | τ     | Speedup | τ     | Speedup | τ       | Speedup | τ     | Speedup | τ    |
++===============+=========+=========+=========+=======+=========+=======+=========+=======+=========+=========+=========+=======+=========+======+
+| K = 3         | 1.71×   | 1.87    | 1.94×   | 1.99  | 1.10×   | 1.87  | 1.21×   | 2.10  | 1.29×   | 1.81    | 2.14×   | 2.35  | 1.69×   | 1.56 |
++---------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+| K = 5         | 1.79×   | 2.25    | 2.26×   | 2.55  | 1.53×   | 2.39  | 2.23×   | 2.83  | 1.43×   | 2.27    | 2.56×   | 3.32  | 1.76×   | 1.86 |
++---------------+---------+---------+---------+-------+---------+-------+---------+-------+---------+---------+---------+-------+---------+------+
+````
+
+> As presented in Table 5, the aggressive configuration (K = 5) yields consistent performance gains across both SE and natural language tasks. However, the improvements are more pronounced in the SE domain. Across the six SE benchmarks, the mean speedup and mean acceptance length (τ) increase by approximately 25.7% (from 1.57× to 1.97×) and 30.2% (from 2.00 to 2.60), respectively. In contrast, on the natural language task, the gains are relatively modest, with speedup and τ increasing by 4.1% (from 1.69× to 1.76×) and 19.2% (from 1.56 to 1.86), respectively. Notably, on the repository-level SWE-bench task, the speedup increases substantially from 1.10× to 1.53×, and similar gains appear on Defects4J and CanItEdit.
+
+> This observation indicates that due to the higher predictability and contextual redundancy of SE tasks compared to natural language, SD in SE tasks can accommodate more aggressive hyperparameter settings than the standard configurations used in natural language.
+
+The paper's own practical recommendation, verbatim:
+
+> Our experiments indicate that model-free methods often provide practical acceleration in SE tasks, particularly when the workload contains reusable contextual redundancy, such as in repository-level editing and repair. However, their benefits are not universal across all model-task combinations. Due to their simple deployment, zero training cost, and absence of additional GPU memory overhead for draft inference, we still recommend prioritizing these methods for resource-constrained environments, such as local IDE assistants.
+
+## Relevance
+This is the most directly comparable independent replication of SuffixDecoding's own 7.8-on-SWE-Bench headline figure (Section 1 above), and it does NOT reproduce it: at K=32, the HIGHEST Suffix Decoding τ anyone measures here is **5.48** (L31-8B on SWE-bench — note this is also the model with the WORST Resolved rate, 1.4%, which the paper explicitly flags as the infinite-loop confound, not genuine productive copying), and PLD's τ on SWE-bench ranges only 2.69-3.25 across all four models at K=5 default. That is a real, numbered contradiction worth sitting with: the same method (Suffix Decoding, same K=32 default, same benchmark family, SWE-bench) produces 7.8 in one paper and a maximum of 5.48 in another, a 30%+ gap, apparently driven by target-model choice (Llama-3.1-8B-Instruct vs. this paper's four different models) and by how much of the measured acceptance is genuine prompt-copying versus agentic-loop repetition. Three mechanisms matter for us directly: (1) the paper's own diminishing-returns finding — speedup stops tracking τ once verification becomes compute-bound in long contexts (SWE-bench averages 15,999 tokens/request vs 817 for LiveCodeBench) — which is exactly the risk in our regime if a wide draft tree makes the verify pass itself the bottleneck; (2) the explicit warning to distrust very high model-free acceptance numbers without checking for repetitive-loop inflation, which is a methodological check we should run against our own 7.1 before trusting it as "real" productive copying; (3) the K=3-vs-K=5 sweep is independent, numbered confirmation that SE/code tasks specifically tolerate a wider draft than the generic default, with τ gains of 19-30% from widening K by less than 2x — small versus our width of 32, suggesting (as in SuffixDecoding's own Fig. 2) the marginal value of extra width keeps shrinking well before 32.
+
+---
+
+### Lookahead (Ant Group) — a trie tree holding EVERY branch seen so far, hierarchical merge of shared prefixes, deployed in Alipay since April 2023
+
+https://arxiv.org/abs/2312.12728 · https://arxiv.org/html/2312.12728v3 (v3)
+Yao Zhao, Zhitian Xie, Chenyi Zhuang, Jinjie Gu (Ant Group, Hangzhou). Code: https://github.com/alipay/PainlessInferenceAcceleration
+
+Abstract, verbatim:
+
+> As Large Language Models (LLMs) have made significant advancements across various tasks, such as question answering, translation, text summarization, and dialogue systems, the need for accuracy in information becomes crucial, especially for serious financial products serving billions of users like Alipay. However, for a real-world product serving millions of users, the inference speed of LLMs becomes a critical factor compared to a mere experimental model.
+>
+> Hence, this paper presents a generic framework for accelerating the inference process, resulting in a substantial increase in speed and cost reduction for our LLM-based scenarios, with lossless generation accuracy. In the traditional inference process, each token is generated sequentially by the LLM, leading to a time consumption proportional to the number of generated tokens. To enhance this process, our framework, named lookahead, introduces a multi-branch strategy. Instead of generating a single token at a time, we propose a Trie-based retrieval and verification mechanism to be able to accept several tokens at a forward step. Our strategy offers two distinct advantages: (1) it guarantees absolute correctness of the output, avoiding any approximation algorithms, and (2) the worst-case performance of our approach is equivalent to the conventional process. We conduct extensive experiments to demonstrate the significant improvements achieved by applying our inference acceleration framework. Our framework is widely deployed in Alipay since April 2023, and obtain remarkable 2.66x to 6.26x speedup. Our code is available at https://github.com/alipay/PainlessInferenceAcceleration.
+
+The mechanism, verbatim — multiple branches retrieved from one trie, verified together, longest-correct-subsequence kept per branch:
+
+> Table 1 summarizes the acceleration techniques discussed previously. To address their limitations, we introduce Lookahead, a groundbreaking framework that incorporates a trie-tree-based retrieving strategy and a multi-branch-based parallel Verification and Accept (VA) strategy. Lookahead leverages a trie tree to record the n-gram tokens of input prompts and generated responses. The draft is retrieved based on the provided context tokens, allowing for extremely fast draft generation. The draft tokens arranged in a logical tree structure are efficiently processed in the Verification and Accept (VA) process. Furthermore, we have implemented an adaptive strategy to optimize the retrieval process, effectively striking a balance between memory and computation requirements. It shows that Lookahead proves its superior performance in accelerating LLMs’ inference, compared with the existing state-of-the-art (SOTA) acceleration method.
+
+The definition that plays the role of our "accepted tokens per round" (they call it EDL, Effective Decoding Length), and the single-branch ceiling it is built to break:
+
+> Definition 1 Following the predicted next token, only the successive validated tokens from the beginning of the branch draft are kept and accepted as the output tokens, whose length is called the effective decoding length, EDL.
+
+> Simply extending the single-branch draft’s length over EDL not only fails to promise a longer output tokens’ length per decoding step l and a higher inference speed V, but also wastes more computation. Apparently, how to achieve a longer EDL, namely the effective decoding length, is the key to further accelerate LLMs’ inference.
+
+Multi-branch and hierarchical multi-branch draft — the exact worked example of merging several branches that share a prefix into one tree before verification:
+
+> In contrast to the single-branch strategy such as (Yang et al., 2023a), which only considers one available draft without considering the existence of other drafts, the multi-branch strategy retrieves multiple drafts simultaneously. These drafts are then efficiently decoded and validated in parallel through the Verification and Accept (VA) process, progressively. The VA process then identifies the correct sub-sequence for each draft and retains the longest sub-sequence as the output tokens. Figure 2 presents the progress overview including various draft retrieving and verifying strategies.
+
+> Fortunately, through careful observation of the context, we have noticed that certain branches in the drafts have common prefix tokens. For example, in Figure 2, the branches [on, my, knee] and [on, a, table] both share the prefix token [on]. By leveraging this observation, we can compress and organize the multi-branch draft using a hierarchical structure, allowing for the inclusion of additional branches while maintaining the same token capacity. To achieve this, we recursively merge the prefix token(s) shared by multiple branches, and then append the remaining tokens of each branch. We refer to these compressed and organized drafts as hierarchical multi-branch draft.
+
+> As illustrated in Figure 2 describing the process of an inference step, through the single-branch strategy, the single draft [on, my, knee] is appended to the next token [sits] directly for the single forward process in VA, which in turn gives the output [on, a]. Being benefited from the parallel multi-branch draft, two branches [on, my, knee] and [on, a, table] are organized in parallel and appended to the next token [sits] for verifying, which outputs [on, a, chair]. By utilizing the hierarchical multi-branch draft, the shared prefix token [on] are merged, after which the token list [my, knee, a, table] are appended. By doing so, given the same decoding length, we are able to save an additional space to append one more token [chair] from another branch [on, a, chair]. Combined with the next token, we collect the token list [sits, on, my, knee, a, table, chair] for decoding through the single forward process and output [on, a, chair, and]. Therefore, compared to the single-branch strategy, our multi-branch strategy, particularly the hierarchical multi-branch draft, offers the advantage of retrieving multiple drafts, resulting in improved EDL from a statistical perspective and thus significantly enhancing LLMs’ inference speed. As illustrated in Figure 3, the position IDs and causal masks in a transformer-based model (Vaswani et al., 2017) are also merged to align with the merged token list. By doing so, we are able to accommodate more branches using hierarchical multi-branch draft, compared to parallel multi-branch draft.
+
+Trie-tree-based draft retrieval — every node is one token, root-to-leaf is one branch, and BOTH the prompt and the generated output are inserted on the fly:
+
+> To enable hierarchical multi-branch draft, we utilize a trie tree (Briandais, 1959; Ferragina et al., 2023), a data structure that is widely used for efficient retrieval and storage purposes and handles prefix matching by organizing nodes as individual characters or words. In our work, each node of the trie tree represents a token ID, and a path from the root to a leaf node represents a branch. The trie tree is initialized when a model is loaded, and it is alive until the model instance is shut down.
+
+> Prompt branch Inserting. Considering that in several typical scenarios (e.g., RAG, Summary), the output are often derived from the prompt, we thus manipulate the prompt into the branches and insert them into the trie tree.
+
+> Generated branch Inserting. Different from LLMA which only uses branches from prompts, we also reuse the branch from generated tokens. We find that, towards various prompts, there may be similar outputs, e.g., "keep exercising" in answering "how to keep healthy" and "how to be stronger". Moreover, we also find that some tokens may be repeated in a response, from example, "numbers.push_back" may occur several times in a code-generation response. To benefit from the repeat, we put the generated branches into the trie tree on-the-fly instead of the final step.
+
+> Node Pruning. To maintain the trie tree within a moderate size, in case that the oversized trie tree results in high memory consumption and slow retrieval performance, we develop a pruning strategy. To achieve this, we decay the branch frequency and remove the nodes with frequency less than 1, when the trie tree exceeds a predetermined capacity. By doing so, we are able to optimize memory consumption and improve retrieval performance in our framework.
+
+The exact multi-stage retrieval and branch-selection policy — THIS is the direct answer to "how many candidates to take per match, and how to break ties": shrink the match-length window until there are enough candidate tokens, keep ALL branches if their count is below a threshold, otherwise keep the highest-frequency ones, and amplify prompt-derived branches:
+
+> Multi-stage Retrieval. We can extract a sub tree from a trie tree by providing a prefix, which is essentially a list of tokens. The sub tree is also a trie tree and can be directly used for the hierarchical multi-branch draft. The length of the prefix influences the number and relevance of the retrieved branches. Short prefixes yield a greater number of branches, while longer prefixes result in more related branches. To strike a balance between the count and correlation of the branches, we adopt a multi-stage retrieval strategy inspired by (Yang et al., 2023a). Specifically, we begin by attempting to match a longer prefix. If the number of tokens associated with the matched branches is significantly smaller than the CDL, we reduce the length of the prefix and retry the matching process until we obtain a substantial number of tokens linked to matched branches. If the count of the matched branches falls below a predefined threshold, we utilize all of them for the VA process. However, if the count exceeds a given size, we choose the tokens with the highest frequency.
+
+> Branch Weighting. For token sorting by frequency, we employ a weighted scheme that considers both prompt and response frequencies. Intuitively, branches from an input prompt may be more related to current generation than that of other responses. To prioritize the importance of branches derived from the input prompt, we amplify their frequency by a significant factor.
+
+Main result table (tokens/s and speedup vs. transformers baseline), reproduced verbatim from the rendered paper — note the LLMA baseline is itself a single-branch n-gram/prompt-lookup method, so the lookahead column is the multi-branch gain over classic PLD at matched conditions:
+
+`arxiv.org/html/2312.12728v3 (rendered Table 2)` lines 264-280:
+
+````text
+  model        dataset       device     transformers   vLLM           LLMA           LaDe          lookahead(ours)
+  ------------ ------------- ---------- -------------- -------------- -------------- ------------- -----------------
+  AntGLM-10B   AntRAG        A100-80G   52.4           52.06(x0.99)   165.4(x3.16)   -             280.9(x5.36)
+  AntGLM-10B   AntRAG        A10        20.3           20.29(x1.00)   59.5(x2.93)    -             105.1(x5.18)
+  AntGLM-10B   AntRAG        V100-32G   27.3           27.28(x1.00)   64.3(x2.36)    -             118.9(x4.36)
+  Llama-7B     Dolly         A100-80G   50.4           91.04(x1.81)   60.7(x1.20)    66.7(x1.32)   106.8(x2.12)
+  Llama-7B     Dolly         A10        31.4           32.58(x1.04)   35.8(x1.14)    38.2(x1.22)   55.7(x1.77)
+  Llama-7B     GSM8k         A100-80G   41.4           92.09(x2.22)   69.0(x1.67)    94.3(x2.28)   111.3(x2.69)
+  Llama-7B     GSM8k         A10        31.4           32.73(x1.04)   41.1(x1.31)    48.9(x1.56)   68.1(x2.17)
+  Llama-7B     HumanEval-x   A100-80G   51.1           90.47(x1.77)   66.5(x1.30)    88.3(x1.73)   161.5(x3.16)
+  Llama-7B     HumanEval-x   A10        30.9           32.46(x1.05)   42.1(x1.36)    46.0(x1.49)   89.6(x2.90)
+  Llama-13B    Dolly         A100-80G   39.9           51.67(x1.29)   59.0(x1.48)    45.2(x1.13)   84.6(x2.12)
+  Llama-13B    Dolly         V100-32G   20.5           22.07(x1.08)   23.9(x1.17)    23.2(x1.13)   35.2(x1.72)
+  Llama-13B    GSM8k         A100-80G   42.9           52.06(x1.21)   51.8(x1.21)    64.8(x1.51)   103.4(x2.41)
+  Llama-13B    GSM8k         V100-32G   22.0           22.43(x1.02)   25.8(x1.17)    27.8(x1.26)   45.6(x2.07)
+  Llama-13B    HumanEval-x   A100-80G   35.0           51.49(x1.47)   57.7(x1.65)    66.1(x1.89)   137.3(x3.92)
+  Llama-13B    HumanEval-x   V100-32G   21.5           22.33(x1.04)   28.8(x1.34)    27.5(x1.28)   57.0(x2.65)
+````
+
+> As depicted in Table 2, our Lookahead obtain significant improvement over other methods, on various models, datasets and devices. The average inference speed of AntGLM-10B towards AntRAG is recorded at 52.4 tokens/s on A100 GPU. However, with the incorporation of LLMA, this speed is elevated to 165.4 tokens/s, resulting in a notable 3.16 times speed improvement. Our Lookahead with hierarchical multi-branch draft via trie tree propels the average inference speed even further, culminating in a 5.36 times speed-up, surpassing LLMA by 70% in terms of acceleration. Lookahead also obtains similar acceleration with AntRAG dataset on less-powerful devices, such as A10 and V100, which are widely used for deployment. Despite of RAG scenarios, Lookahead also consistently demonstrates its remarkable superiority and applicability across diverse datasets, especially with speedup of 3.92 on the HumanEval-x dataset, further emphasizing its practicality in real-world scenarios.
+
+Ablation on which trie-update procedures matter (Table 3), and on trie node capacity (Table 4) — the capacity result sets a concrete, load-bearing default: 16x the decoding length:
+
+`arxiv.org/html/2312.12728v3 (rendered Table 3)` lines 296-299:
+
+````text
+  ----------- ------------ ------------ ------------- ------------ -----------
+  Condition   W/o prompt   W/o output   W/o pruning   W/o elimin   Lookahead
+  Token/s     234.5        202.0        221.4         234.2        280.9
+  ----------- ------------ ------------ ------------- ------------ -----------
+````
+
+> Table 3 showcases the inference speeds of Lookahead, which exhibit variability depending on different procedures used for updating the trie tree. These procedures include branch inserting with prompt and/or output, branch eliminating, and node pruning. In comparison to the results obtained without a specific procedure, Lookahead attains its optimal performance when all the aforementioned procedures are applied to dynamically update the trie tree, highlighting the necessity of these procedures in updating the trie tree.
+
+`arxiv.org/html/2312.12728v3 (rendered Table 4)` lines 303-307:
+
+````text
+  Capacity       1*DL    2*DL    4*DL    8*DL    16*DL   32*DL   64*DL   128*DL
+  -------------- ------- ------- ------- ------- ------- ------- ------- --------
+  Token/s        254.5   258.7   268.8   273.3   280.7   280.8   279.5   278.3
+  Retrieve(ms)   0.81    1.35    1.22    1.46    1.02    1.29    1.75    2.38
+  Update(ms)     0.10    0.12    0.11    0.11    0.12    0.12    0.15    0.16
+````
+
+> The capacity of the trie tree has a significant impact on the acceleration performance. To determine the optimal capacity, we conduct empirical experiments, as outlined in Table 4. Instead of using a fixed value, we normalize the node capacity in relation to the decoding length, which allows us to identify a suitable hyper-parameter that performs well across different decoding lengths. Based on our findings, we conclude that node capacities of 16 and 32 times the decoding length yield the best results. Consequently, we have set the default capacity in our framework to be 16 times the decoding length. We also examine the retrieving and updating time of trie tree with different capacity, the time is negligible when compared with the forward time.
+
+Why EDL keeps growing with more branches, and where it stops paying, verbatim:
+
+> Generally speaking, it can be observed that as the decoding and branch lengths increase, there is an upward trend in the overall inference speed. As mentioned, with the single-branch strategy, LLMA is unable to further enhance the inference speed while its branch length surpasses 25. This limitation arises due to its inability to ensure a longer EDL. By implementing the multi-branch strategy, Lookahead is able to retrieve multiple branch drafts and thus guarantee a longer EDL after the VA process, as illustrated in Figure 5. Consequently, this leads to a significantly higher inference speed, while maintaining the same branch length as LLMA in Figure 4. Furthermore, the improved EDL as shown in Figure 5 also provides more headroom for increasing the branch length and thereby enhancing the upper limit of the inference speed.
+
+> In addition, Figure 5 shows that being benefited from dealing with more branch drafts, Lookahead using the hierarchical multi-branch draft promises the advantage of a longer EDL and consequently improved inference speed, compared to using the parallel multi-branch draft with the identical branch and decoding lengths. It should be noted that in Figure 5, improving the decoding length promises a longer EDL using Lookahead, however the oversized decoding length that surpasses the CDL fails to promise a higher inference speed, due to a more complex calculation logic for the tensor cores that has been introduced in the preliminary.
+
+## Relevance
+This is a second, independent production system (deployed since April 2023, "lossless" by construction) that answers the exact question the task asked: when the same context has several matching branches with different continuations, Lookahead does not pick one — it keeps all of them under a count threshold, merges their shared prefixes into one tree (`hierarchical multi-branch draft`), and verifies the whole tree in one forward pass with merged position IDs and a merged causal mask. Two numbers are directly load-bearing for a node-budget decision on our engine: the trie capacity sweep (Table 4) shows token/s is already within 0.04% of its peak at **16x the decoding length** and gains nothing moving to 32x or beyond (280.7 vs 280.8 vs 279.5 vs 278.3 tokens/s for 16/32/64/128x) — i.e. node budget, not decoding length, is the thing to cap, and 16x is already past the knee; and the branch-selection rule itself (fall back to "all branches" below a threshold, else "highest frequency") is a complete, two-line policy for exactly the "multiple occurrences, multiple continuations" case with no free parameters beyond the threshold and the prompt-frequency amplification factor. Table 2's own comparison is also a clean, isolated measurement of tree-vs-chain at matched everything-else: LLMA (single best-match chain, i.e. classic PLD) gets 3.16x speedup on AntRAG/AntGLM-10B, Lookahead (same trie, same corpus, multi-branch tree) gets 5.36x — a 1.70x further multiplier from branching alone, the largest such isolated tree-over-chain gain found anywhere in this file, though on an internal RAG-style benchmark rather than agentic code.
+
+---
+
+### vLLM-Ascend official benchmark — Suffix Decoding on 4-card Atlas 800T A2 / Qwen3-32B, with per-dataset ACCEPTANCE RATE at num_speculative_tokens=3
+
+https://docs.vllm.ai/projects/ascend/zh-cn/latest/tutorials/features/suffix_speculative_decoding.html (vLLM Ascend project, zh-cn docs, `latest` as fetched 2026-10-20; mirrored in English at the `/en/latest/...` path with identical numbers)
+
+This is the single source in this file that is both (a) official vLLM-Ascend documentation, i.e. the same project as Section 2's hard `npu_fused_infer_attention_score` ceiling, and (b) written natively in Chinese, not translated. Quoted in the original Chinese with the material numbers inline; no translation substitutes for the quote.
+
+简介, verbatim:
+
+> 后缀解码是一种基于模式匹配的推测解码优化技术。它同时从提示词和已生成内容中检索重复序列，利用频率统计来预测最可能的token延续。与传统的推测解码方法不同，后缀解码完全在CPU上运行，无需额外的GPU资源或草稿模型，从而在AI智能体和代码生成等重复性任务中实现卓越的加速效果。
+
+> 本文档提供了在Atlas A2硬件上部署和基准测试vllm-ascend支持的后缀解码推测推理技术的分步指南。该设置使用单个Atlas 800T A2节点，采用4卡部署Qwen3-32B模型实例。基准测试使用涵盖以下类别的真实开源数据集进行：
+
+> 本教程使用的基准测试工具是AISBench，它支持上述所有数据集的性能测试。本教程的最后部分展示了在满足SLO TPOT < 50ms的条件下，不同数据集和并发级别下启用与禁用后缀解码的性能对比。验证表明，启用后缀解码后，Qwen3-32B模型在各种真实数据集上的吞吐量提升了约20%到80%。
+
+The exact deployment config — note `num_speculative_tokens` is set to **3**, not anywhere near the 16-token Ascend ceiling or our width of 32, and the exact flag names:
+
+> 使用以下命令启动容器服务实例。通过--speculative-config参数启用推测推理，其中method设置为suffix。本次测试中，num_speculative_tokens统一设置为3。
+
+`vllm serve command, verbatim` lines 300-316:
+
+````bash
+# set the NPU device number:
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+# Set the operator dispatch pipeline level to 1 and disable manual memory control in ACLGraph
+export TASK_QUEUE_ENABLE=1
+# Enable the AIVector core to directly schedule ROCE communication.
+export HCCL_OP_EXPANSION_MODE="AIV"
+vllm serve /data/Qwen3-32B \
+  --served-model-name qwen3 \
+  --trust-remote-code \
+  --distributed-executor-backend mp \
+  --tensor-parallel-size 4 \
+  --max-model-len 5500 \
+  --max-num-batched-tokens 40960 \
+  --speculative-config '{"method": "suffix", "num_speculative_tokens": 3}' \
+  --gpu-memory-utilization 0.9 \
+  --additional-config '{"pa_shape_list":[48,64,72,80], "weight_prefetch_config":{"enable":true}}' \
+  --port 8011
+````
+
+The summary table and the full per-dataset results, reproduced verbatim (note the `接受率` column — "acceptance rate" — is a genuine PUBLISHED measured number on real Ascend hardware, at K=3):
+
+`测试结果 summary table, verbatim` lines 358-361:
+
+````text
+  数据集类别   典型代表         吞吐量提升 (BS=1-10)   SLO TPOT
+  ------------ ---------------- ---------------------- ----------
+  高增益       AGIEval, GSM8K   > 50%                  < 50ms
+  中低增益     ARC, ShareGPT    20% ~ 30%              < 50ms
+````
+
+> 以下是本次评估中六个开源数据集的详细测试结果。与基线相比，启用后缀解码后，在不同并发级别下TPOT和吞吐量性能的提升因数据集而异。以下是结果摘要：
+
+> 以下是原始详细测试结果：
+
+`原始详细测试结果 full table, verbatim` lines 365-390:
+
+````text
+  并发数            平均输入   平均输出   请求数   基础TPOT(毫秒)   基础吞吐量(TPS)   后缀TPOT(毫秒)   后缀吞吐量(TPS)   接受率   TPOT增益   TPS增益
+  ----------------- ---------- ---------- -------- ---------------- ----------------- ---------------- ----------------- -------- ---------- ---------
+  HumanEval                                                                                                                                  
+  1                 150        2700       100      55.1             18.1              37.9             26.3              27.0%    45.2%      45.1%
+  15                150        2700       100      61.6             233.8             45.8             318.2             27.0%    34.6%      36.1%
+  26                150        2700       100      64.7             403.8             50.9             519.2             27.0%    27.2%      28.6%
+  ARC                                                                                                                                        
+  1                 76         960        100      52.8             18.9              39.5             25.4              23.9%    33.7%      34.6%
+  8                 76         960        100      59.1             125.4             47.0             163.1             23.9%    25.7%      30.0%
+  15                76         960        100      59.8             245.8             48.9             311.7             23.9%    22.3%      26.8%
+  GSM8K                                                                                                                                      
+  1                 67         1570       100      55.5             18.0              35.7             28.5              31.1%    55.6%      58.4%
+  17                67         1570       100      61.5             279.8             45.4             403.0             31.1%    35.6%      44.0%
+  26                67         1570       100      63.9             396.4             50.0             527.6             31.1%    27.8%      33.1%
+  ShareGPT                                                                                                                                   
+  1                 666        231        327      54.1             18.3              39.2             24.1              23.9%    37.9%      31.5%
+  8                 666        231        327      58.8             125.0             46.2             153.2             23.9%    27.1%      22.5%
+  14                666        231        327      61.8             227.0             49.9             273.9             23.9%    23.8%      20.7%
+  SuperGLUE_BoolQ                                                                                                                            
+  1                 207        314        100      54.1             18.4              36.1             26.8              33.4%    49.8%      45.6%
+  16                207        314        100      60.0             229.7             43.5             303.9             33.4%    38.0%      32.3%
+  32                207        314        100      62.7             396.4             47.8             507.5             33.4%    31.3%      28.0%
+  AGIEval                                                                                                                                    
+  1                 735        1880       100      53.1             18.7              31.8             34.1              50.3%    66.8%      81.9%
+  24                735        1880       100      64.0             381.2             43.3             629.0             50.3%    47.8%      65.0%
+  34                735        1880       100      70.0             494.6             50.2             768.4             50.3%    39.4%      55.3%
+````
+
+## Relevance
+This is the only source in the whole file that measures suffix-decoding acceptance on the exact hardware family (Atlas A2 / Ascend NPU, vLLM-Ascend) our engine targets, rather than on H100/A100. Three things are directly load-bearing: (1) they run `num_speculative_tokens: 3`, i.e. a width of 3 — a full order of magnitude below our 32 and below the 16-token hardware ceiling documented in Section 2, which tells us production Ascend deployments of suffix decoding are not yet pushing width at all; (2) 接受率 (acceptance rate) at that tiny width already reaches 50.3% on AGIEval and 31.1% on GSM8K — these are rate-of-accepted-draft-tokens, not mean-accepted-length, but they establish that even K=3 captures a large fraction of available signal on structured/repetitive datasets, which is consistent with the width-saturation picture in Sections 1, D and E (most of the signal is captured by a short match, width mainly helps the long tail); (3) their own baseline TPOT (52.8-70.0 ms at BS=1-34) and suffix-decoding TPOT (31.8-50.9 ms) are both two orders of magnitude above our 2.x ms target, on a 32B dense model rather than our W4A8C8 MoE, so the comparison is suggestive of real on-Ascend gain shape but not a numeric target to match.
+
+---
+
+### Ascend tree-attention mask mechanics — `npu_fused_infer_attention_score` DOES take an arbitrary tree mask (proven by a shipped AscendC kernel), and the 16-token cap is a NODE-COUNT cap, not a chain-depth cap
+
+https://github.com/sgl-project/sgl-kernel-npu @ a5c12d19fe12dc03aca474852f63cf49f5df8eb2 (committed 2026-10-19, retrieved 2026-10-20) — `csrc/build_tree/` and `python/sgl_kernel_npu/sgl_kernel_npu/sample/verify_tree_greedy.py`
+https://github.com/vllm-project/vllm-ascend — `vllm_ascend/attention/mla_v1.py` and `vllm_ascend/attention/attention_v1.py` (as cloned 2026-10-20)
+
+This answers the question directly: SGLang's Ascend backend already runs EAGLE-style dynamic-tree speculative decoding in production through `npu_fused_infer_attention_score`/`npu_fused_infer_attention_score_v2`, by building the tree mask on-device with a dedicated AscendC kernel (`build_tree_efficient`) and walking it at verify time with a Triton kernel compiled for Ascend (`triton.language.extra.cann.extension`). The operator's `atten_mask` argument is a plain tensor; nothing in its signature restricts it to a causal/chain shape.
+
+The kernel's own README states the exact tensor shapes it produces, verbatim:
+
+`csrc/build_tree/README.md` lines 33-48:
+
+````python
+import sgl_kernel_npu
+
+torch.ops.npu.build_tree_kernel_efficient(
+    parent_list: torch.Tensor,           # int64, [batch_size, topk*(depth-1)+1]
+    selected_index: torch.Tensor,        # int64, [batch_size, draft_token_num-1]
+    verified_seq_len: torch.Tensor,      # int64, [batch_size]
+    tree_mask: torch.Tensor,             # bool,  [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] = [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token]
+    positions: torch.Tensor,             # int64, [batch_size, draft_token_num]
+    retrive_index: torch.Tensor,         # int64, [batch_size, draft_token_num]
+    retrive_next_token: torch.Tensor,    # int64, [batch_size, draft_token_num]
+    retrive_next_sibling: torch.Tensor,  # int64, [batch_size, draft_token_num]
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: int
+) -> None
+````
+
+`csrc/build_tree/README.md (parameter table excerpt)` lines 65-72:
+
+````text
+## Parameter Description | 参数说明
+
+| Parameter Name (参数名称) | DataType (数据类型) | Description                               | 说明                         |
+|:----------------------|:----------------|:------------------------------------------|:---------------------------|
+| `parent_list`         | `torch.Tensor`  | parent id of every draft token            | 每个 draft token 的父节点 id     |
+| `selected_index`      | `torch.Tensor`  | flat index of sampled token in top-k list | 采样的 token 在 top-k 列表中的扁平索引 |
+| `verified_seq_len`    | `torch.Tensor`  | length of already-verified prefix         | 当前已验证序列长度                  |
+| `topk`                | `int`           | branching factor per step                 | 每步分支数                      |
+````
+
+> | `tree_mask`            | `torch.Tensor`  | true → node must be verified       | true → 该节点需被验证     |
+
+The AscendC kernel that actually writes the tree mask bits and the first-child/next-sibling retrieval links, one query-token-per-core-thread (`tid`), verbatim (this is the device-side mask CONSTRUCTION, the thing the task asked to chase down):
+
+`csrc/build_tree/op_kernel/build_tree_kernel.cpp` lines 120-201:
+
+````cpp
+private:
+    __aicore__ inline void Compute(int32_t bid, uint32_t tid, int64_t seq_len, int64_t seq_tree_idx,
+                                   AscendC::LocalTensor<int64_t> &positions_ub,
+                                   AscendC::LocalTensor<int64_t> &retrive_index_ub,
+                                   AscendC::LocalTensor<int64_t> &retrive_next_token_ub,
+                                   AscendC::LocalTensor<int64_t> &retrive_next_sibling_ub)
+    {
+        auto bs = bs_offset + bid;
+        int token_tree_idx;
+        if (tree_mask_mode == sglang::npu_kernel::TreeMaskMode::FULL_MASK) {
+            // [seq_lens_sum * num_verify_tokens + num_verify_tokens * num_verify_tokens * bs, ]
+            token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len;
+        } else {
+            // [num_verify_tokens * bs * num_verify_tokens, ]
+            token_tree_idx = draft_token_num * draft_token_num * bs + draft_token_num * bs;
+        }
+
+        AscendC::LocalTensor<bool> tree_mask_ub = mask_queue.AllocTensor<bool>();
+        tree_mask_ub.SetValue(0, true);
+        for (int i = 1; i < draft_token_num; i++) {
+            tree_mask_ub.SetValue(i, false);
+        }
+
+        int64_t position = 0;
+        if (tid == 0) {
+            positions_ub.SetValue(0, seq_len);
+
+            int64_t retrive_index_offset = bs * draft_token_num;
+            for (int64_t i = draft_token_num - 1; i > 0; --i) {
+                int64_t current_token_idx = retrive_index_offset + i;
+                retrive_index_ub.SetValue(i, current_token_idx);
+                int64_t parent_tb_idx = selected_index_gm.GetValue(bid * (draft_token_num - 1) + i - 1) / topk;
+                int64_t parent_position = 0;
+                if (parent_tb_idx > 0) {
+                    int64_t parent_token_idx = parent_list_gm.GetValue(bid * (topk * (depth - 1) + 1) + parent_tb_idx);
+                    for (; parent_position < draft_token_num; ++parent_position) {
+                        if (selected_index_gm.GetValue(bid * (draft_token_num - 1) + parent_position) ==
+                            parent_token_idx) {
+                            ++parent_position;
+                            break;
+                        }
+                    }
+                }
+                if (parent_position == draft_token_num) {
+                    continue;
+                }
+
+                if (retrive_next_token_ub.GetValue(parent_position) == -1) {
+                    retrive_next_token_ub.SetValue(parent_position, i);
+                } else {
+                    int64_t origin_next_token = retrive_next_token_ub.GetValue(parent_position);
+                    retrive_next_token_ub.SetValue(parent_position, i);
+                    retrive_next_sibling_ub.SetValue(i, origin_next_token);
+                }
+            }
+            retrive_index_ub.SetValue(0, bs * draft_token_num);
+        } else {
+            int64_t cur_position = tid - 1;
+            while (true) {
+                position += 1;
+                tree_mask_ub.SetValue(1 + cur_position, true);
+                int64_t parent_tb_idx = selected_index_gm.GetValue(bid * (draft_token_num - 1) + cur_position) / topk;
+                if (parent_tb_idx == 0) {
+                    break;
+                }
+
+                int64_t token_idx = parent_list_gm.GetValue(bid * (topk * (depth - 1) + 1) + parent_tb_idx);
+                for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
+                    if (selected_index_gm.GetValue(bid * (draft_token_num - 1) + cur_position) == token_idx) {
+                        break;
+                    }
+                }
+            }
+            positions_ub.SetValue(tid, position + seq_len);
+        }
+
+        this->mask_queue.EnQue(tree_mask_ub);
+        AscendC::LocalTensor<bool> mask_ub = mask_queue.DeQue<bool>();
+        AscendC::DataCopyExtParams copy_params{1, static_cast<uint32_t>(this->draft_token_num * sizeof(bool)), 0, 0, 0};
+        AscendC::DataCopyPad<bool>(this->tree_mask_gm[token_tree_idx], mask_ub, copy_params);
+        mask_queue.FreeTensor(mask_ub);
+    }
+````
+
+The kernel entry point — a plain AscendC `__global__ __aicore__` function, called once per decode-verify round:
+
+`csrc/build_tree/op_kernel/build_tree_kernel.cpp` lines 257-267:
+
+````cpp
+extern "C" __global__ __aicore__ void build_tree_efficient(GM_ADDR parent_list, GM_ADDR selected_index,
+                                                           GM_ADDR verified_seq_len, GM_ADDR tree_mask,
+                                                           GM_ADDR positions, GM_ADDR retrive_index,
+                                                           GM_ADDR retrive_next_token, GM_ADDR retrive_next_sibling,
+                                                           GM_ADDR workspace_in, GM_ADDR tiling_in)
+{
+    KernalBuildTree op;
+    op.Init(parent_list, selected_index, verified_seq_len, tree_mask, positions, retrive_index, retrive_next_token,
+            retrive_next_sibling, workspace_in, tiling_in);
+    op.Process();
+}
+````
+
+Verification against that mask — the SGLang-Ascend greedy tree-verify kernel, written in Triton with an Ascend (CANN) extension rather than CUDA, but structurally identical to the CUDA `VerifyTreeGreedy` kernel quoted in Section 2 above (same `retrive_next_token` / `retrive_next_sibling` walk, same single-token-per-request `req_idx` grid):
+
+`python/sgl_kernel_npu/sgl_kernel_npu/sample/verify_tree_greedy.py` lines 1-67:
+
+````python
+import triton
+import triton.language as tl
+import triton.language.extra.cann.extension as al
+
+
+@triton.jit
+def verify_tree_greedy_kernel(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+    num_draft_tokens: tl.constexpr,
+    pad_num_draft_tokens: tl.constexpr,
+):
+    """
+    predicts: [tot_num_draft_tokens] -> ((bs * (self.spec_steps + 1))
+    accept_index: [bs, num_spec_step + 1]
+    accept_token_num: [bs]
+    candidates: [bs, num_draft_tokens]
+    retrive_index: [bs, num_draft_tokens]
+    retrive_next_token: [bs, num_draft_tokens]
+    retrive_next_sibling: [bs, num_draft_tokens]
+    target_predict: [bs, num_draft_tokens]
+    """
+    req_idx = tl.program_id(0)
+    tokens_offset = tl.arange(0, pad_num_draft_tokens)
+    cur_tokens_offset = req_idx * num_draft_tokens + tokens_offset
+    mask_draft_mask = tokens_offset < num_draft_tokens
+    cur_candidates = tl.load(
+        candidates + cur_tokens_offset, mask=mask_draft_mask, other=0
+    )
+    cur_retrive_index = tl.load(
+        retrive_index + cur_tokens_offset, mask=mask_draft_mask, other=0
+    )
+    cur_target = tl.load(
+        target_predict + cur_tokens_offset, mask=mask_draft_mask, other=0
+    )
+
+    last_accepted_idx = al.get_element(cur_retrive_index, (0,))
+    tl.store(accept_index + req_idx * num_draft_tokens, last_accepted_idx)
+    num_accepted = 0
+
+    rejected = False
+    for i in range(1, num_draft_tokens):
+        if not rejected:
+            draft_token = al.get_element(cur_candidates, (i,))
+            target_token = al.get_element(cur_target, (i - 1,))
+
+            if draft_token == target_token:
+                draft_idx = al.get_element(cur_retrive_index, (i,))
+                tl.store(predicts + last_accepted_idx, target_token)
+                num_accepted += 1
+                tl.store(
+                    accept_index + req_idx * num_draft_tokens + num_accepted, draft_idx
+                )
+                last_accepted_idx = draft_idx
+            else:
+                rejected = True
+    target_token = al.get_element(
+        cur_target, (last_accepted_idx - num_draft_tokens * req_idx,)
+    )
+    tl.store(accept_token_num + req_idx, num_accepted)
+    tl.store(predicts + last_accepted_idx, target_token)
+````
+
+Now the cap itself. vllm-ascend's own assertion, verbatim, identical in both its MLA and dense attention backends:
+
+`vllm_ascend/attention/mla_v1.py` lines 311-320:
+
+````python
+        self.speculative_config = vllm_config.speculative_config
+        self.decode_threshold = 1
+        if self.speculative_config:
+            spec_token_num = self.speculative_config.num_speculative_tokens
+            self.decode_threshold += spec_token_num
+            assert self.decode_threshold <= 16, (
+                f"decode_threshold exceeded \
+                npu_fused_infer_attention_score TND layout's limit of 16, \
+                got {self.decode_threshold}"
+            )
+````
+
+and, byte-identical in the non-MLA path:
+
+`vllm_ascend/attention/attention_v1.py` lines 274-283:
+
+````python
+        self.speculative_config = vllm_config.speculative_config
+        self.decode_threshold = 1
+        if self.speculative_config:
+            spec_token_num = self.speculative_config.num_speculative_tokens
+            self.decode_threshold += spec_token_num
+            assert self.decode_threshold <= 16, (
+                f"decode_threshold exceeded \
+                npu_fused_infer_attention_score TND layout's limit of 16, \
+                got {self.decode_threshold}"
+            )
+````
+
+## Relevance
+Two things are now settled with code, not inference. First: Ascend's `npu_fused_infer_attention_score` family DOES support an arbitrary tree mask today — not "structurally possible in principle" but actually shipped, in `sgl-kernel-npu` + SGLang's `ascend_backend.py`, for EAGLE-style dynamic-tree draft models. vllm-ascend's own `ngram`/`suffix` proposers (Section 2) only ever emit a linear chain, but that is a gap in those two proposers' Python, not a hardware or kernel limitation — the exact same attention operator, on the exact same chip family, already verifies a tree elsewhere in the same ecosystem. Porting a tree-shaped ngram/suffix draft (SGLang's own `NGRAM` tree from Section 2, or the Lookahead/REST multi-match tries above) onto vllm-ascend's `ngram`/`suffix` path is therefore an engineering port of existing Ascend plumbing, not new kernel work. Second: `decode_threshold = 1 + num_speculative_tokens <= 16` is counted from `spec_token_num = speculative_config.num_speculative_tokens`, a flat token count with no notion of tree shape anywhere in its derivation — it bounds the FIA call's `TND`-layout query length (how many Q rows this request contributes this round), which is exactly `draft_token_num` in the SGLang/REST/Lookahead formulations above, i.e. a NODE-COUNT cap. A balanced or irregular tree of 15 nodes costs the operator exactly the same as a chain of 15, which means the entire multi-match-tree machinery in Sections C, E and 2 above is usable on this hardware up to the same 15-node (16-token) ceiling already governing our chain drafts — the tree buys higher expected-accepted-length per node, not a bigger node budget.
+
+---
+
+### Cursor "Instant Apply" — speculative edits is deterministic PLD-style drafting applied to full-file rewrites, 13x over vanilla, 9x over their own prior GPT-4 deployment
+
+https://cursor.com/blog/instant-apply (Cursor, research blog)
+Aman Sanger, May 14, 2024
+
+The core idea, verbatim:
+
+> Our fast-apply model surpasses GPT-4 and GPT-4o performance and pushes the pareto frontier on the accuracy / latency curve. We achieve speeds of ~1000 tokens** (around 3500 char/s) on our 70b model using a speculative-decoding variant tailored for code-edits, called speculative edits.
+
+> This means a ~13x speedup over vanilla inference using Llama-3-70b and a ~9x speedup over our previous GPT-4 speculative edits deployment.
+
+> By default, we have language models generate the fully rewritten file conditioned on the current file, the conversation history, and the current code block.
+
+Why full-file rewrite instead of a diff — this is the reason prompt-output overlap is so high in their setting, stated directly:
+
+> In this post, we explain how we trained and evaluated our new model. We show why we rewrite the file instead of using diffs and how speculative edits give us such ridiculous speedups.
+
+The mechanism itself, verbatim — this is the "deterministic algorithm instead of a draft model" framing the whole speculative-lookup family rests on, stated independently by a production team with no citation to Saxena/PLD:
+
+> Our biggest win comes from our custom speculative decoding algorithm called "speculative edits". It is equivalent to a full-file-rewrite, while being up to 9x faster.
+>
+> With code edits, we have a strong prior on the draft tokens at any point in time, so we can speculate on future tokens using a deterministic algorithm rather than a draft model.
+
+> We've worked with Fireworks to deploy our fast-apply model with strong speculative edits support. They have a fantastic inference engine and built out api support for our custom speculation logic.
+
+> This makes the gain from speculative edits larger for Llama-3 than GPT-4, meaning a 4-5x speedup over the next fastest model.
+
+Why it is specifically a custom model, not a frontier API model, verbatim:
+
+> The claude-3-opus-diff apply model is faster and more accurate than gpt-4-turbo-spec, but is still too slow.
+
+> It is not possible to build speculative edits into any of anthropic's models, so we need to train and deploy a performant custom model.
+
+## Relevance
+This is the production speculative-edits precedent the task asked for by name, and it is architecturally the same family as PLD/suffix decoding even though Cursor does not cite that lineage: "we have a strong prior on the draft tokens at any point in time, so we can speculate on future tokens using a deterministic algorithm rather than a draft model" is exactly Saxena's PLD insight, applied to full-file-rewrite edits instead of chat completions. No per-round accepted-token-count or acceptance-rate number is published — Cursor reports only end-to-end speedup (13x vanilla, 9x their prior GPT-4 deployment, ~1000 tok/s on a 70B model) — so this cannot be compared numerically to our 7.1. The one transferable design decision is their choice of REPRESENTATION: they rewrite the whole file rather than emit a diff, explicitly because "models have seen more complete files than diffs in training" and "models struggle with line-number counting in diffs" (Morph's gloss) — i.e. they maximize prompt-output literal overlap by construction, which is the same lever our 7.1 is already riding on an agentic-coding model that "copies its input heavily." It is independent, non-academic confirmation that the industry's actual highest-leverage move for this workload is maximizing copy-the-input overlap, not a cleverer lookup policy.
+
+---
+
 ## Gaps
 
 Looked for and could not find:
 
-- **Any published acceptance-length number above ~8 tokens/round.** The maximum in the literature reviewed is SuffixDecoding's 7.8 mean accepted tokens/step on SWE-Bench (batch=1, Llama-3.1-8B, H100), with a hybrid Suffix+EAGLE-3 variant at 7.5 on AgenticSQL. Nothing reports sustained acceptance in the 10–15 range, and on Ascend `num_speculative_tokens + 1 ≤ 16` caps it regardless. So our measured 7.1 is already at the published state of the art for this workload class, and the remaining TPOT must come from round time, not from acceptance.
+- **A published acceptance-length number clearly ABOVE 7.8 on a genuinely agentic benchmark.** SuffixDecoding's own 7.8 (SWE-Bench, Llama-3.1-8B, H100) remains the ceiling among primary sources with a stated tree/corpus mechanism. The closest independent approach is the vLLM-production study's InstructCoder-specific n-gram measurement — mean τ **7.27**, median 6.57 (Table A.3) — which lands almost exactly on our 7.1, but that number's own draft-length configuration is not disambiguated in the paper (the main text's default is `num_speculative_tokens=3`, but InstructCoder is separately noted as also tested at 5; neither obviously explains a mean of 7.27, so treat this figure as real but not fully traceable to a stated K). Working against a ceiling above 7.8: the ISSTA 2026 SE-tasks study, which specifically tried to replicate Suffix Decoding's own regime (K=32, SWE-bench) across four different target models, tops out at τ=5.48 — 30% BELOW 7.8, and on the model with the worst task-resolution rate, which the paper itself flags as likely infinite-loop inflation rather than genuine copying. So the state of the art is contested, not settled: one lab's 7.8 has not been reproduced by an independent replication at the same nominal configuration, and the closest match to our own 7.1 (InstructCoder's 7.27) comes with an unresolved K. Nothing in any source reports sustained acceptance in the 10-15 range, and on Ascend `num_speculative_tokens + 1 ≤ 16` caps it regardless.
 - **GLM-5.2's own MTP head documentation.** vllm-ascend's reference GLM-5.2 config uses `"method": "deepseek_mtp"` with `num_speculative_tokens: 3` (see FILE 1), i.e. it borrows the DeepSeek MTP path rather than a GLM-specific head; no GLM-5.2 MTP architecture document or per-head acceptance measurement was found. The `dspark` dynamic method's own note says GLM support "is being added incrementally".
 - **Per-benchmark acceptance tables from SuffixDecoding's appendix.** The appendix section headings exist in the HTML ("SWE-Bench: Mean accepted tokens (tokens/step)", "SWE-Bench: Mean Acceptance Rate", "AgenticSQL: …", "Spec-Bench: …") but the figure data itself is in plotted images, not text, so the per-sub-task breakdowns could not be quoted.
 - **Measured acceptance for `dflash` / `dspark` / Block Verify / Entropy Verify.** vllm-ascend documents the mechanisms and the parameters but publishes no acceptance-length or throughput deltas for any of them.
-- **Tree-attention mask construction details for SpecInfer / Sequoia / HASS, and dynamic-draft-tree expected-accepted-length derivations.** Searched; the retrievable material was abstract-level speedup claims rather than the mask construction or the E[accepted] algebra. SuffixDecoding's `SCORE(T_spec) = Σ D(N)` is the one expected-accepted-length formula captured verbatim here.
-- **REST, Token Recycling and Lookahead-decoding primary sources.** Token Recycling appears only as a baseline inside SuffixDecoding's numbers (3.2 mean accepted tokens/step on AgenticSQL); no primary measurement was retrieved for REST or Lookahead decoding.
-- **Cursor / Continue "fast apply" speculative-edit acceptance numbers.** No published per-round acceptance figures were found for commercial fast-apply implementations.
+- **SpecInfer / Sequoia / HASS's own tree-mask construction code and the Sequoia expected-accepted-length DP algebra.** Resolved for n-gram/trie-based trees instead (REST's BFS-over-weighted-Trie, SGLang's `NGRAM` recency/frequency expansion, Lookahead's hierarchical prefix-merge, and the Ascend AscendC `build_tree_efficient` kernel that writes the mask bits directly) — all quoted verbatim above. But SpecInfer's/Sequoia's/HASS's own published code for the mask itself, and Sequoia's dynamic-programming optimal-tree-topology derivation, were not retrieved; what is on record for Sequoia here is only the qualitative claim (its own figure caption) that "Sequoia trees' average number of generated tokens after verification continues to grow with tree size, while existing tree structures asymptote" — not the DP or the mask code.
+- **Token Recycling, PLD+, Ouroboros, ANPD, SAM-Decoding primary numeric sources beyond what Section "SAM-Decoding" above already has.** Token Recycling still appears only as a baseline inside SuffixDecoding's and this file's other sources (3.2 mean accepted tokens/step on AgenticSQL per Section 1; SGLang lists it as a baseline comparator too); no primary paper with its own acceptance-vs-node-count table was retrieved. PLD+, Ouroboros and ANPD were targeted by search but returned no primary source with usable numbers this round.
+- **A genuine Zhihu or X/Twitter thread (including replies) with measured 投机解码/n-gram acceptance numbers on code tasks.** Multiple Chinese-language queries were run (`知乎 投机解码 接受率`, `投机解码 接受率 n-gram prompt lookup 代码补全`, `n-gram 投机解码`). They surfaced only mirrors/translations of the English academic and engineering sources already quoted above, plus one genuine Chinese-native primary source — vLLM-Ascend's own `zh-cn` suffix-decoding tutorial (quoted in full above, with real 接受率 numbers from an on-Ascend benchmark) — which is official documentation, not a Zhihu/X post. No independent Zhihu article or X reply thread with its own measured number was found.

@@ -23,15 +23,16 @@ ForeachAddList 1.622 / 0.018.
 | File | Covers |
 | --- | --- |
 | `megakernel-persistent-decode.md` | Hazy Research Llama-1B megakernel (full text), MPK / Mirage Persistent Kernel, FlashMoE/FlashDMoE, **CANN SuperKernel device-side source**, ThunderMLA, Event Tensor / ETC, plus a cross-system comparison table |
-| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence) |
+| `ascend-fusion-mechanics.md` | AscendC kernel programming, MIX core semantics, cross-core sync APIs, FFTS+, buffer/tiling, SuperKernel and graph-mode launch fusion — public CANN docs and GitCode source. **§31 is the A3 cube→vector GM visibility rule** (`DataCacheCleanAndInvalid` + `DataSyncBarrier<DDR>` on both sides; `CrossCoreSetFlag` alone is not a fence). **§42-§45 are the `int4b_t` and intra-core-sync block**: §42 sub-byte addressing from the shipped headers (and the hard negative on `SetGlobalBuffer`'s length), §43 the authoritative `PipeBarrier` vs `SetFlag`/`WaitFlag` rule with the per-core-half `HardEvent` split, §44 the two shipped vendor int4 kernels and the 950PR unzip tax, §45 the public found-and-fixed W4A4 erratum |
 | `ascend-launch-overhead-and-sync.md` | **Internal Wiki only — do not publish.** Measured MIX head-overhead decomposition, the CrossCoreSetFlag counter limit and MlaPrologV3's real CV pipeline, the 0–7 event-id budget, A3 buffer capacities, `blade/runtime` (an existing Ascend megakernel runtime with `aclrtLaunchMega`), an internal plan for an Ascend MPK, heterogeneous workers, Async-MoE scoreboard sync |
-| `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming. **Part 8 is grouped matmul over 256 experts inside a hand-written kernel** — `group_list_type`'s three modes, per-expert weight addressing, the 128-group TensorList cap |
+| `fused-moe-expert.md` | gate+up → SwiGLU → quant → down fusion, grouped GEMM at tiny M, W4A8 / antiquant layouts, weight streaming. **Part 8 is grouped matmul over 256 experts inside a hand-written kernel** — `group_list_type`'s three modes, per-expert weight addressing, the 128-group TensorList cap. **§B7 is arXiv 2605.13915 "Multi-Scale Dequant"** — one of four things CANN calls MSD, with the M-stacked single-GEMM form as its equation (16); read §B7.-1 first for the four-family taxonomy and the authoritative A8W4 expansion |
+| `w4a8-msd-int4-mmad.md` | The A8W4 MSD decomposition as CANN actually ships it: the four MSD families and which kernels hold each, the documented nibble split and `weightAssistMatrix` / `bias` / `yOffset` correction term, and the `Mmad` both-operands-int4 wall |
 | `mla-decode-fusion.md` | MlaPrologV3, SparseFlashAttention / DSA, FusedInferAttentionScore, FlashMLA, weight absorption |
 | `low-latency-tp-reduce.md` | one-shot allreduce, symmetric memory, reduction fused into the producing kernel, MC2, LCCL, aclshmem. **Part 7 is the in-kernel collective without a host barrier** — `aclshmem_quiet`'s implementation, epoch/magic tagging, and the A3 AMO limits |
 | `speculative-acceptance.md` | prompt lookup, SuffixDecoding, EAGLE/Medusa/tree drafts, MTP, acceptance-length measurements |
 | `tilelang-ascend.md` | **Deprioritized** (hand-written AscendC was chosen instead). Kept for the AscendC primitives it documents: pipe flag protocol, real L1/UB address maps, Cube↔Vector handoff, and the tile-ai repo inventory |
 
-## The six findings that change the plan
+## The findings that change the plan
 
 0. **A working, public, hand-written Ascend megakernel already exists, and its grid barrier is
    copy-pasteable.** `huawei-csl/megagdn-pto` fuses seven stages into one `<<< >>>` launch using
@@ -97,6 +98,35 @@ ForeachAddList 1.622 / 0.018.
    `speculative-acceptance.md`: SuffixDecoding's best reported is 7.8 mean accepted tokens/step
    on SWE-Bench against PLD's 3.2, and our measured 7.1 is at that state of the art. vllm-ascend
    also caps `num_speculative_tokens + 1 <= 16` via `npu_fused_infer_attention_score`.
+
+6. **A foreign-core `WaitFlag` is a silent no-op on dav-2201 while its `SetFlag` still fires.**
+   `ascend-fusion-mechanics.md` §43.5: `WaitFlagImpl` wraps its `MTE2_V` / `V_MTE2` / `MTE3_V` / `V_MTE3`
+   cases in `#ifndef SPLIT_CORE_CUBE`, so on the cube half of a `__mix__` kernel the wait falls through to a
+   bare `default: break;` — nothing — while `SetFlagImpl` has no such guard and `SetFlagInternal` screens per
+   core only for `__NPU_ARCH__ == 3510`. No `static_assert`, no log, no diagnostic. The operational rule:
+   every `SetFlag` / `WaitFlag` / `FetchEventID` naming a vector event must sit inside `if ASCEND_IS_AIV` and
+   every cube event inside `if ASCEND_IS_AIC`; an `__aicore__` helper shared by both halves must never name a
+   `HardEvent` unguarded. `M_V`, `V_M`, `MTE1_V`, `V_MTE1` must never be named at all on 2201 — their Waits
+   are compiled out on *both* halves. The legal set is 13 events on an AIV and 24 on an AIC, not the 35 in
+   `HardEvent`. And `PipeBarrier` is the 单流水 primitive, 「阻塞相同流水」 — it is a different instrument from
+   `SetFlag`/`WaitFlag`, not a stronger one, so `PIPE_ALL` is not defined to cover a cross-pipe hazard
+   (§43.1-§43.2). `PipeBarrier<PIPE_S>()` 「会引发硬件错误」.
+7. **`sizeof(int4b_t) == 1` but `SizeOfBits<int4b_t> == 4`, and that gap has already caused one
+   found-and-fixed W4A4 defect on this part.** `ascend-fusion-mechanics.md` §42 and §45. Tensor APIs count
+   nibbles (`operator[]` does `offset / INT4_TWO`, silently flooring an odd index and *not* adjusting
+   `bufferSize_`); raw `__gm__ int4b_t*` arithmetic counts bytes. Within one API family the Level-2
+   `DataCopy(gm, ub, count)` counts elements while `Nd2NzParams`'s `dValue`/`srcDValue` count bytes. The GM
+   contract is low nibble = even element, row *r* at byte `r*N/2`; K and N must be multiples of 64; and
+   `torch.int4` is *unpacked*, one byte per element, so anything sized or indexed from a torch view is 2× out.
+   Separately, `SetGlobalBuffer`'s length argument is **inert on NPU** — nothing on the `DataCopy` path reads
+   `bufferSize_` — and the Level-0 `DataCopy(GlobalTensor, LocalTensor, DataCopyParams)` **silently emits
+   nothing** if the source `TPosition` maps to neither UB nor L1, because that `else` arm is a debug-only check.
+8. **The A3 int4 Cube path does not exist on 950PR/950DT, and the sanctioned replacement costs the whole W4
+   win.** `ascend-fusion-mechanics.md` §44.3: the vendor's own `matmul_s4` unzips int4x2 to int8 on the vector
+   core and **writes the unpacked int8 back to GM** for the Cube to read, so the W4 bandwidth advantage is zero
+   at the point of consumption — plus two vector `Cast` passes (int4→half→int8; there is no direct int4↔int8
+   intrinsic), 4 bytes of UB per unpacked element held simultaneously, and it runs per kernel call. Any
+   layer-fusion design banking on A3 int4 needs its weight path re-derived for 950, not retuned.
 
 ## Corrections to earlier findings in this file
 

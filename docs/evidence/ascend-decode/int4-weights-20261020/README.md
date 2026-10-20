@@ -301,3 +301,62 @@ from one function, and only the one at offset zero takes.
 That is now a question for the reference work rather than for another build of
 this kernel. The INT8 form is unaffected, correct and 3.3 times the vendor, so
 it is what integration should carry.
+
+
+## The defect, found: a store with no guard on the cube half
+
+Every `CastImpl` on this part opens with `if ASCEND_IS_AIV`, so on the cube
+half of a `__mix__` kernel a cast compiles to nothing -- silently and
+correctly, an AI Core has no vector unit. But the plain
+`DataCopy(GlobalTensor, LocalTensor, DataCopyParams)` carries no
+`ASCEND_IS_AIC` guard at all, where `DataCopyPad` has one explicitly. So the
+store after those casts is still issued, on the cube half, with a `__ubuf__`
+pointer, on a core that has no Unified Buffer.
+
+Two uncoordinated writers to one global address: the vector half writing the
+right data, the cube half writing whatever that pointer resolves to, with no
+synchronisation and nothing reported on either side. That is the whole
+elimination list's residue explained -- stable nonsense 6144 bytes into
+`stacked` and the same nonsense again 6144 further on, a write that lands at
+offset zero and never at 12288, and an isolated probe that passes because it
+has one writer.
+
+Replacing every UB-to-global store with `DataCopyPad`, which returns early on
+the cube half by construction, makes the split land where it is addressed and
+the gate-and-up projection exact:
+
+```
+low                               -6  -8  -1  -8   5   6  -2   0
+low halves addressed at nibble 12288, found at 12288
+product, first 4 columns: want 8883 562 -5267 -13984
+                           got 8883 562 -5267 -13984
+```
+
+## And a transpose that is dropped without a word
+
+`load_cbuf_to_cb_s4` hardcodes transpose off and discards the `ifTranspose`
+flag, which is the mechanism behind the official line that an INT4 A matrix
+cannot be transposed. This kernel had asked for one on its weight. The weights
+are now stored K-major on the host and no transpose is requested; the exact
+product above is with that layout.
+
+## Where it stands
+
+| experts | blocks | wall, µs | INT8 form |
+|---|---|---|---|
+| 4 | 4 | 35.442 | 47.108 |
+| 8 | 8 | 36.897 | 47.755 |
+| 16 | 16 | 38.991 | 49.276 |
+| 44 | 22 | 70.342 | 91.953 |
+
+At the per-rank shape of sixteen experts on sixteen blocks that is 21% under
+the INT8 kernel, which is the halved weight traffic arriving.
+
+Not finished: 49105 of 49152 output values still deviate. The first
+projection is exact and the output store is now guarded, so the fault is in
+the stage between -- the recombination, the activation, the requantisation or
+the down projection. The quantised intermediate reads
+`-9, -9, -5, -13, -2, 5, -7, -9` with a row scale of 0.00165845, which is
+plausible but unchecked against the reference. The method that found this
+defect finds that one too: print the reference's own value for the stage and
+compare.

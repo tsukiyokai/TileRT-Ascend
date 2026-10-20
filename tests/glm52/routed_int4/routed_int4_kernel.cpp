@@ -71,7 +71,7 @@ constexpr uint16_t MIDDLE_READY = 6;
 constexpr uint16_t DOWN_READY = 7;
 
 using APacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, false>;
-using BPacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, true>;
+using BPacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, false>;
 using CProduct = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
 using BiasNone = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
 
@@ -141,11 +141,11 @@ __aicore__ inline void Project(TPipe& pipe, __gm__ int4b_t* rows,
     GlobalTensor<int4b_t> b;
     GlobalTensor<int32_t> c;
     a.SetGlobalBuffer(rows, M_TILE * inner);
-    b.SetGlobalBuffer(weight, columns * inner);
+    b.SetGlobalBuffer(weight, inner * columns);
     c.SetGlobalBuffer(product, M_TILE * columns);
     mm.SetOrgShape(STACKED, columns, inner);
     mm.SetTensorA(a);
-    mm.SetTensorB(b, true);
+    mm.SetTensorB(b, false);
     mm.IterateAll(c);
     mm.End();
 }
@@ -262,7 +262,17 @@ __aicore__ inline void Emit(LocalTensor<half>& staging,
     PipeBarrier<PIPE_V>();
     Cast(packed, staging, RoundMode::CAST_RINT, span);
     BeforeStore();
-    DataCopy(sink[at], packed, span);
+    // `DataCopyPad`, not `DataCopy`. Every `CastImpl` on this part opens with
+    // `if ASCEND_IS_AIV`, so on the cube half the two casts above compile to
+    // nothing -- while plain `DataCopy` to global memory carries no
+    // `ASCEND_IS_AIC` guard and is issued anyway, with a UB pointer, on a
+    // core that has no UB. `DataCopyPad` returns early on the cube half by
+    // construction. Two writers to one address, one of them writing whatever
+    // that pointer resolves to, is the shape of this kernel's defect: stable
+    // nonsense 6144 bytes into `stacked` and the same nonsense again 6144
+    // further on.
+    DataCopyPad(sink[at], packed,
+                DataCopyExtParams{1, (uint32_t)(span / 2), 0, 0, 0});
     // The next call's cast writes this staging while this copy is reading
     // it. `PipeBarrier<PIPE_ALL>` does not order a vector write against an
     // outstanding MTE3 read: with it, two calls in a row through one staging
@@ -433,7 +443,9 @@ __aicore__ inline void Activate(Workspace& held, __gm__ int32_t* product,
     BeforeStore();
     // The scale leaves by MTE: a scalar store to global memory from a vector
     // core does not land.
-    DataCopy(out_scale_global, token, SCALE_SPAN);
+    DataCopyPad(out_scale_global, token,
+                DataCopyExtParams{1, (uint32_t)(SCALE_SPAN * sizeof(float)),
+                                  0, 0, 0});
 }
 
 /** Recombine and scale one expert's down product into BF16. */
@@ -479,7 +491,10 @@ __aicore__ inline void Narrow(Workspace& held, __gm__ int32_t* product,
             PipeBarrier<PIPE_V>();
             Cast(narrow, held.value, RoundMode::CAST_RINT, count);
             BeforeStore();
-            DataCopy(out_global[row * HIDDEN + done], narrow, count);
+            DataCopyPad(out_global[row * HIDDEN + done], narrow,
+                        DataCopyExtParams{
+                            1, (uint32_t)(count * sizeof(bfloat16_t)), 0, 0,
+                            0});
             AfterStore();
         }
     }
@@ -496,11 +511,17 @@ __aicore__ void routed_int4_fused(
     __gm__ int32_t* partial, __gm__ int4b_t* middle,
     __gm__ float* middle_scale, __gm__ int32_t* wide, __gm__ bfloat16_t* out,
     __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling,
-    __gm__ int4b_t* witness, int64_t experts, int64_t blocks)
+    __gm__ int4b_t* witness, GM_ADDR workspace, int64_t experts,
+    int64_t blocks)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     InitSocState();
     SetSyncBaseAddr(sync_base);
+    // The `Matmul` library takes scratch from the system workspace, and this
+    // kernel never gave it one. Two regions of `stacked` held identical bytes
+    // 6144 apart, neither of them a half of the split, which is the shape of
+    // a wild write rather than of a lost one.
+    SetSysWorkspace(workspace);
 
     const int64_t per_block = (experts + blocks - 1) / blocks;
     TPipe pipe;
@@ -581,14 +602,14 @@ void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
                         float* token_scale, void* partial, void* middle,
                         float* middle_scale, void* wide, void* out,
                         void* gu_tiling, void* down_tiling, void* witness,
-                        int64_t experts)
+                        void* workspace, int64_t experts)
 {
     routed_int4_fused<<<blocks, nullptr, stream>>>(
         sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
-        (__gm__ int4b_t*)stacked_low, (__gm__ int4b_t*)gate_up, gu_bias, gu_scale, (__gm__ int4b_t*)down,
-        down_bias, down_scale, token_scale, (__gm__ int32_t*)partial,
-        (__gm__ int4b_t*)middle, middle_scale, (__gm__ int32_t*)wide,
-        (__gm__ bfloat16_t*)out, (__gm__ uint8_t*)gu_tiling,
-        (__gm__ uint8_t*)down_tiling, (__gm__ int4b_t*)witness, experts,
-        blocks);
+        (__gm__ int4b_t*)stacked_low, (__gm__ int4b_t*)gate_up, gu_bias,
+        gu_scale, (__gm__ int4b_t*)down, down_bias, down_scale, token_scale,
+        (__gm__ int32_t*)partial, (__gm__ int4b_t*)middle, middle_scale,
+        (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)out,
+        (__gm__ uint8_t*)gu_tiling, (__gm__ uint8_t*)down_tiling,
+        (__gm__ int4b_t*)witness, (GM_ADDR)workspace, experts, blocks);
 }

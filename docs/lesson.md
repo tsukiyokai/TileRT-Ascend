@@ -318,3 +318,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     `__mix__` kernel a vector-event `WaitFlag` compiles to nothing while its
     `SetFlag` still fires, so a helper that names a `HardEvent` must only be
     called from the half that owns it.
+
+46. A store can be issued on a core that cannot have produced its data. Every
+    `CastImpl` opens with `if ASCEND_IS_AIV`, so on the cube half of a
+    `__mix__` kernel a cast is silently nothing -- but plain `DataCopy` to
+    global memory carries no `ASCEND_IS_AIC` guard, while `DataCopyPad` does.
+    The store goes out anyway, with a UB pointer, on a core with no UB, and
+    two writers race on one address with nothing reported. Six rounds of
+    elimination -- the arithmetic, the write mechanism, the declared length,
+    the cross-pipe events, where the base is computed, the alignment -- and
+    the cause was a missing guard in the library, not anything in the
+    addressing. Use `DataCopyPad` for every UB-to-global store in code both
+    halves can reach, and audit the rest for the same shape: it is silent on
+    both sides.

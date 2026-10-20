@@ -18685,3 +18685,828 @@ slower», it is «W4 stops being a memory optimisation». 44.2 is the shipped te
 a `__mix__(1,2)` `ASCENDC_CUBE_ONLY` kernel in which the 2201 path is `if ASCEND_IS_AIC { ... }` with the vector
 half idle and no cross-core flag at all, which is both a confirmation of the §43 per-half guarding rule and a
 reminder that on A3 a pure-int4 matmul needs no CV handshake whatsoever.
+
+## 45. ★★★ The public `int4b_t` erratum: a found-and-fixed Ascend W4A4 defect whose root cause is `sizeof(int4b_t) == 1`, with the GM nibble-packing contract, the undocumented s4 transposing-load parameters, and three more sub-byte traps
+
+Primary source: **https://github.com/tile-ai/tilelang-ascend/pull/1731** — "[Fix] gemm_v0: fix W4A4 int4xint4
+GEMM producing wrong results (#438)" by `2Sheldonlaw`, state OPEN as of 2026-10-20, 630 additions / 23
+deletions across 7 files. Fixes **https://github.com/tile-ai/tilelang-ascend/issues/438** — "[Bug] W4A4
+int4×int4 GEMM produces incorrect results" by `Mocchibird`, opened 2026-02-05, environment "TileLang version:
+ascendc_pto / Ascend CANN version: 8.5.0 / Hardware: Ascend 910B". Validated by the PR on **Ascend910 / CANN
+9.0.0**. Read 2026-10-20 via `gh`.
+
+Secondary: https://github.com/tile-ai/tilelang/issues/3391 — "[BUG][Ascend] T.copy from an FP4 view with an
+odd source offset floors to the wrong byte"; https://github.com/tile-ai/tilelang/issues/2963 —
+"[BUG][Fuzzer][wrong-code] `T.copy` of a packed sub-byte buffer (`int4`/`uint4`/`float4_e2m1fn`) silently drops
+~half the elements via a non-atomic cross-thread byte read-modify-write" (CUDA path, included because the
+mechanism is the same); https://gitcode.com/cann/pto-isa/issues/115.
+
+This is the closest public analogue to our own int4 defect, it is on the same part, and its root cause is
+exactly the hazard §42.1 identified from the headers. The whole root-cause section is reproduced verbatim.
+
+### 45.1 The root cause, verbatim
+
+> ## 根因
+>
+> W4A4（int4×int4→int32）GEMM 结果错误的根源：整个 C++ 模板栈都用 `sizeof(AscendC::int4b_t) == 1` 推导分形几何，
+> 但 `int4b_t` 是**半字节打包类型**（每元素 4 bit，每字节装 2 个元素）。32 字节 C0 块的正确元素数是 **64 而非 32**
+> ——于是所有拷贝 stride、repeat 次数、字节计算全部 2× 偏差。三层搬运错误叠加：
+>
+> 1. **分形几何 2× 偏差**：L1→L0A/L0B 的 LoadData 参数（repeatTimes、srcStride、dstGap）由 sizeof 推导的常数
+>    计算——数据在 L0A/L0B 内堆叠到了错误的位置。
+>
+> 2. **B 的转置加载被静默丢弃**：通用 `LoadData` 路径对 zN→nZ 的 B 操作数加载设置 `ifTranspose=true`，但 s4 专用
+>    指令 `load_cbuf_to_cb_s4` **硬编码关闭转置**并静默忽略该标志——B 永远得不到 `mad_s4` 期望的 nZ 布局。正确
+>    路径是 `LoadDataWithTranspose` → `load_cbuf_to_cb_transpose_s4`，其参数语义在 CANN 头文件中**没有任何文档**，
+>    只能用探针 kernel 在设备上**实测逆向**（一次 repeat 搬运完整 64K×64N 块；正确参数：
+>    `repeatTimes=N/64, srcStride=roundUp16(K)/64, dstGap=3`）。⚠️ 通用 `LoadDataWithTranspose` 文档标注
+>    stride/repeat 单位为 512B fractal，但 s4 版本实际按 **2048B 块**工作——文档单位不适用于 s4。
+>
+> 3. **UB↔GM 字节计数 2× 偏差**：`DataCopyExtParams` 的字节长度按每元素 `sizeof(T)=1` 计算而非 0.5 → 每行拷贝
+>    长度 2× 过长，混入相邻行数据（量化 kernel 的输出）。内存规划同样按 2× 分配 buffer（浪费但安全）。
+>
+> 计算指令 `mad_s4` 本身始终正确——它忠实地把摆错的数据相乘，产生量级正常但数值完全错误的结果（issue 症状：
+> 99.6% 不匹配，输出 -501/627 而正确值是 641/1785）。
+>
+> **错误 1 和 3 同源**：`sizeof(int4b_t) == 1` 谎报了每元素 0.5 字节的真实密度——在 Cube 侧毒害分形几何（错误 1），
+> 在 Vector 侧毒害字节计数（错误 3）。错误 2 是独立的派发缺陷（s4 wrapper 静默丢弃转置标志）。
+
+### 45.2 ★ The GM int4 packing contract, stated as an interface contract and cross-checked against CANN's own A4W4
+
+Verbatim:
+
+> **GM int4 打包约定**（消费量化 kernel 输出或喂 int4 输入的接口契约）：每字节两个 nibble，**低 nibble = 偶数元素，
+> 高 nibble = 奇数元素**；(M, N) tensor 的第 r 行起始于字节 `r * N / 2`。与 CANN 自家的 A4W4 ND 格式
+> （`grouped_matmul_swiglu_quant_v2`）一致。
+
+and from the guide the PR adds, verbatim:
+
+> `int4` 为半字节打包类型（两个元素共享一个字节，低 nibble 为偶数元素），GM 上的 int4 …
+
+So: **low nibble = even element index, high nibble = odd element index, and row r of an (M, N) tensor begins at
+byte `r * N / 2`.** The PR states this agrees with CANN's own A4W4 ND layout in
+`grouped_matmul_swiglu_quant_v2`, which makes it the de facto contract for anything consuming or producing int4
+in GM on this part.
+
+### 45.3 ★ An odd contiguous dimension silently truncates — and the validator written to catch it
+
+From the PR's new `ValidateInt4BufferPacking`, verbatim from the diff:
+
+```cpp
+// int4 is nibble-packed (two elements per byte, low nibble = even element):
+// ... lengths (floor division in EleNumToBytes) silently truncate the last
+// ...
+static void ValidateInt4BufferPacking(const PrimFunc &f) {
+  ...
+          << "int4 buffer '" << name << "' has an odd contiguous dimension ("
+          ...
+          << "): int4 is nibble-packed (two elements per byte), "
+```
+
+The shape constraint the PR documents, verbatim:
+
+> 4. **形状约束**：int4 GEMM 要求 K 和 N 为 64 的倍数（一个 s4 C0 块）；example 中有断言。
+
+**K and N must be multiples of 64** — one s4 C0 block, which is the same 64 as `ONE_BLK_FP4_NUM = 64`
+(§42.5). And an odd contiguous dimension is floor-divided and silently loses the last element, with no
+diagnostic in the library.
+
+### 45.4 The bit-width-aware helpers, as written — the shape of the fix
+
+Verbatim from the diff, `src/tl_templates/ascend/common.h`:
+
+```cpp
+// ... width, NOT sizeof(): int4b_t has sizeof == 1 but only occupies 4 bits (two
+// ... fractal layouts), so any geometry derived from sizeof() is 2x off for int4.
+template <typename T> CATLASS_DEVICE constexpr uint32_t ElementSizeBits() {
+  if constexpr (std::is_same_v<T, int4b_t>) {
+  ...
+}
+
+// Elements of T that fit in one 32-byte C0 block (64 for int4b_t).
+template <typename T> CATLASS_DEVICE constexpr uint32_t EleNumPerC0() {
+  return BYTE_PER_C0 * 8 / ElementSizeBits<T>();
+}
+
+// Elements of T that fit in one 512-byte fractal (1024 for int4b_t).
+template <typename T> CATLASS_DEVICE constexpr uint32_t EleNumPerFractal() {
+  return BYTE_PER_FRCATLASSAL * 8 / ElementSizeBits<T>();
+}
+
+template <typename T>
+CATLASS_DEVICE constexpr uint64_t EleNumToBytes(uint64_t n) {
+  return n * ElementSizeBits<T>() / 8;
+}
+```
+
+and the PR's own note on why this is safe to apply everywhere, verbatim:
+
+> ① 位宽感知工具（`ElementSizeBits` / `EleNumPerC0` / `EleNumPerFractal` / `EleNumToBytes`）——**对所有非
+> sub-byte dtype 与旧 sizeof 数学数值完全一致**
+
+### 45.5 ★ A unit inconsistency inside one API family: GM→L1 Nd2Nz of int4 takes `dValue`/`srcDValue` in BYTES
+
+Verbatim from the diff comment on the `copy_gm_to_l1` int4 branch:
+
+```cpp
+  if constexpr (std::is_same_v<T, int4b_t>) {
+    // int4 GM -> L1 (Nd2Nz into the zN fractal layout), calling the AscendC
+    // ... from sizeof(T) and has no int4 support. The CCE intrinsic behind this
+    // DataCopy reinterprets int4b_t as int8_t (b8 path), so dValue /
+    // srcDValue are in BYTES ...
+```
+
+So within the same `DataCopy` family, the Level-2 `count` form is in **elements** (§42.5, divided by
+`ONE_BLK_FP4_NUM = 64`) while the `Nd2NzParams` form's `dValue`/`srcDValue` are in **bytes**, because the
+underlying CCE intrinsic reinterprets `int4b_t` as `int8_t`. There is no diagnostic for mixing them.
+
+### 45.6 ★ The reverse-engineered s4 transposing-load parameters, with the doc-unit warning
+
+Verbatim from the diff — the only public statement of these semantics, obtained by device probing because the
+CANN headers document nothing:
+
+```cpp
+    // int4 (W4A4) L1(zN) -> L0B(nZ) via the s4 transposing load, calling the
+    // AscendC intrinsic directly: the generic LoadData path dispatches to
+    // load_cbuf_to_cb_s4 which hardcodes transpose OFF and silently drops the
+    // ifTranspose flag, so B never receives the nZ layout mad_s4 expects.
+    static_assert(!transpose,
+                  "int4 (W4A4) does not support transpose_B: the s4 L1->L0B "
+                  "transposing load requires a zN source layout");
+    // s4 transposing-load semantics (measured on dav_c220 / Ascend 910B; the
+    // generic LoadDataWithTranspose documents 512B-fractal units, but the s4
+    // variant does NOT follow them):
+    //   - one repeat moves a whole 64K x 64N nibble block (2048B): it reads
+    //     the four consecutive 512B zN row-fractals of one K-64 band and
+    //     writes 64 complete nZ N-columns (16 fractals) to L0B;
+    //   - srcStride steps the source between repeats in 2048B blocks, so one
+    //     N-C0 block (64 columns) needs srcStride = roundUp16(K) / 64, where
+    //     K is the FULL L1 tile depth (template srcM) because the zN buffer
+    //     is allocated for the whole tile;
+    //   - dstGap advances the destination by (1 + dstGap) nZ N-fractals (16
+    //     columns each), so 64 columns per repeat needs dstGap = 3.
+    AscendC::LoadData2dTransposeParams loadDataParams;
+    loadDataParams.startIndex = 0;
+    loadDataParams.repeatTimes = (dstN + 63) / 64;
+    loadDataParams.srcStride = ((srcM + 15) / 16 * 16) / 64;
+    loadDataParams.dstGap = 3;
+    loadDataParams.dstFracGap = 0;
+    loadDataParams.addrMode = 0;
+    // One LoadDataWithTranspose per K-C0 block (64 K elements). Block stride:
+    // 2048B (4 fractals) in the zN source; roundUp16(N) x 64 elements in the
+    // nZ destination (64 K rows spanning the whole N extent).
+    const uint32_t kBlocks = (dstM + 63) / 64;
+    const uint32_t dstKBlockStride = ((dstN + 15) / 16 * 16) * 64;
+    const uint32_t srcKBlockStride = 4 * EleNumPerFractal<T>();
+    for (uint32_t b = 0; b < kBlocks; b++) {
+      AscendC::LoadDataWithTranspose(dstTensor[b * dstKBlockStride],
+                                     srcTensor[b * srcKBlockStride],
+                                     loadDataParams);
+    }
+```
+
+and the matching L0A `static_assert`, verbatim:
+
+```cpp
+    static_assert(!transpose,
+                  "int4 (W4A4) does not support transpose_A: the s4 L1->L0A "
+```
+
+This is the mechanism behind the official README's bare constraint
+「左矩阵A为int4数据类型时，不支持转置」 (§42.7): there is no L0A transpose mode in the s4 instruction set at all,
+and B's transposing load needs a zN source.
+
+### 45.7 ★ `torch.int4` is UNPACKED — a documented 2× host/device mismatch
+
+Verbatim from the PR's known-limitations list:
+
+> 1. **torch.int4 互操作**：`torch.int4` 是**非打包** dtype（存储中每元素 1 字节），而 tilelang kernel 使用**打包**
+>    约定（每字节 2 元素）。纯 tilelang 链路（quant→matmul）可正常工作（buffer 大 2×，仅使用前半部分）。经 torch
+>    外部输入的 int4 tensor 需要显式打包——见测试辅助函数。完整的 `adapt_torch2tvm` 打包桥接留作 follow-up。
+
+So a `torch.int4` tensor is one byte per element, while the device contract is two elements per byte. A buffer
+sized from the torch view is **2× too large and only its first half is used**. Any host-side readback or golden
+that indexes with the torch convention is off by a factor of two in where it looks.
+
+### 45.8 `pto` has no int4 instructions at all
+
+Verbatim:
+
+> **附带 bug（pto target）**：`target="pto"` 以一句裸的 `Unsupported datatype` 失败，原因是 pto-isa 缺少全部 int4
+> 指令（`mad_s4`、`vconv_f162s4`、`vconv_s42f16`）——见 [cann/pto-isa#115](https://gitcode.com/cann/pto-isa/issues/115)。
+> 这是上游限制
+
+> 3. **pto target**：在 pto-isa 添加 `mad_s4` / `vconv_f162s4` / `vconv_s42f16` 之前无法支持 int4
+>    （[cann/pto-isa#115](https://gitcode.com/cann/pto-isa/issues/115)，官方确认"在需求计划中"）。
+
+Note the instruction names: the int4 conversion intrinsics are `vconv_f162s4` and `vconv_s42f16`, i.e. the
+`Cast<int4b_t, half>` / `Cast<half, int4b_t>` pair of §44.3, and there is no int4↔float32 or int4↔int8 direct
+conversion in the list.
+
+### 45.9 The reported symptom, and the PR's test results
+
+The issue's symptom, verbatim:
+
+> NPU Kernel tensor([
+>         [ -501,    26,   627,  1182],
+>         [-1382,  1544,  -840,    78],
+>         ...
+> Reference tensor([
+>         [  641,  1785,   665,   871],
+>         [ -111,   735, -1332,  -442],
+>         ...
+
+and the reproduction's own calibration note, verbatim:
+
+```python
+    # Integer-valued fp16 in [-8, 7] (the full int4 range) so that CAST_RINT
+    # quantization is lossless and the int4 matmul is exact.
+```
+
+The PR's results table, verbatim:
+
+> | 验证项 | 结果 |
+> |---|---|
+> | Issue 复现（1024³，quant + matmul 端到端） | **通过**（0 mismatch，原为 99.6%） |
+> | 新示例 `examples/w4a4_matmul/`（默认 1024³） | 通过 |
+> | 新增 10 个 int4 回归测试 | 10/10 |
+> | 既有 gemm_v0 套件（fp16 precision/transpose、int8 kL0split、n_tiling、n_actual） | 48/48（含 int4 共 58） |
+> | 既有 l1_to_l0 + gm_to_ub + cast_on_copy | 263/263 |
+> | 既有 elementwise | 492/492 + 2 xfailed |
+
+### 45.10 Two sibling sub-byte defects, for the pattern
+
+https://github.com/tile-ai/tilelang/issues/3391 — "[BUG][Ascend] `T.copy` from an FP4 view with an **odd source
+offset** floors to the wrong byte": on the Ascend GM→L1 MTE path, copying a byte-backed FP4 view from an odd
+logical element offset addresses the **preceding** byte and selects the wrong values, because the storage-byte
+helper uses floor division on the logical offset and the GM→L1 branch emits the transfer as `int8_t` with a
+packed-byte inner extent; odd row strides are likewise rounded **up** to integer byte strides. This is the same
+`offset / 2` floor as `GlobalTensor<int4b_t>::operator[]` (§42.2), reported as a defect in a different compiler.
+
+https://github.com/tile-ai/tilelang/issues/2963 — "`T.copy` of a packed sub-byte buffer
+(`int4`/`uint4`/`float4_e2m1fn`) **silently drops ~half the elements** via a non-atomic cross-thread byte
+read-modify-write": per-logical-element stores with no sub-byte awareness lower to non-atomic byte
+read-modify-write packed stores, so concurrent writers to the two nibbles of one byte lose one of them. This is
+the CUDA path, but it is the same shape as AscendC's own `GlobalTensor<int4b_t>::SetValue`, which is a
+read-modify-write of one byte:
+
+```cpp
+    if constexpr (IsHalfByteDataType<PrimType>()) {
+        ...
+        uint8_t val = (*addr) & mask;
+        uint8_t shift = (offset % INT4_TWO == 0) ? 0 : INT4_BIT_NUM;
+        *addr = val + (value.storage << shift);
+```
+
+(`impl/basic_api/kernel_tensor_impl.h`, the 2201 arm). Two agents writing the two nibbles of one byte through
+`SetValue` lose one of them, and the official `SetValue` page's own rule compounds it, verbatim:
+
+> SetValue 首先修改每个 AI Core 内部的 Data Cache，不会立即写出到 Global Memory，后续写出以 CacheLine（64B）
+> 为单位进行。… 多核操作 GM 地址时，不同核涉及的地址（由 offset 元素参数决定）之间至少要相隔一个 CacheLine，
+> 否则会出现跨核数据随机覆盖，同时需要考虑 64B 地址对齐。
+
+(https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/82RC1alpha001/API/ascendcopapi/atlasascendc_api_07_00028.html,
+CANN 社区版 8.2.RC1.alpha001.) The forcing fix is a `DataCacheCleanAndInvalid` after the `SetValue`.
+
+## Relevance
+
+45.1 is the erratum asked for, and it is on our part: a real, reproduced, fixed W4A4 defect on Ascend 910B whose
+single root cause is the one §42.1 derived from the headers — `sizeof(int4b_t) == 1` lying about a 0.5-byte
+element, poisoning fractal geometry on the Cube side and byte counts on the Vector side with a uniform factor of
+two. The authors' own summary of the failure mode is worth memorising: 「`mad_s4` 本身始终正确——它忠实地把摆错的
+数据相乘，产生量级正常但数值完全错误的结果」. A plausible-magnitude wrong answer, not a crash, and 99.6%
+mismatch.
+
+Four items bear directly on our live defect. 45.2 gives the packing contract we must match and it is
+nibble-indexed with **low nibble = even element and row r at byte `r*N/2`**, agreeing with CANN's own A4W4 ND
+format — so if our 2048-element span is one row of a wider tensor, its byte start is `r*N/2` and not
+`r*stride`. 45.3 says K and N must be multiples of 64 and that an odd contiguous dimension is floor-divided and
+silently loses its last element with no diagnostic. 45.5 is the unit inconsistency inside one API family: the
+Level-2 `DataCopy(gm, ub, count)` form counts **elements**, while `Nd2NzParams`'s `dValue`/`srcDValue` count
+**bytes**, because the CCE intrinsic reinterprets `int4b_t` as `int8_t` — mixing them is a silent 2×. And 45.7
+is the one that is not in our elimination list at all: `torch.int4` is **unpacked**, one byte per element, so a
+buffer sized or indexed from a torch view is 2× too large and only its first half carries data. Our offset
+12288 elements is byte 6144; a host that indexes bytes where elements are meant looks at byte 12288 instead,
+which in a 49152-byte allocation is a perfectly valid, zeroed address — and the symptom of that is exactly
+«lands at offset 0, never lands at 12288», because at offset 0 the two conventions agree. **The readback is the
+one thing the elimination list does not cover, and this is a documented, known, factor-of-two way for it to be
+wrong.** Worth one print of the raw bytes at both 6144 and 12288 before anything else.
+
+45.6 matters the moment we transpose: `load_cbuf_to_cb_s4` **hardcodes transpose off and silently drops the
+`ifTranspose` flag**, so a transposed int4 B load through the generic `LoadData` path produces no error and the
+wrong layout. The sanctioned route is `LoadDataWithTranspose` → `load_cbuf_to_cb_transpose_s4`, whose parameter
+semantics are undocumented in the CANN headers and had to be measured on-device, and whose units are 2048-byte
+blocks rather than the documented 512-byte fractals. That is the mechanism behind the official README's bare
+「左矩阵A为int4数据类型时，不支持转置」 (§42.7), and it means our weight layout must be prepared so that no int4
+transpose is ever requested. 45.8 records that `pto` cannot compile int4 at all until `mad_s4`,
+`vconv_f162s4` and `vconv_s42f16` are added (cann/pto-isa#115, officially 「在需求计划中」), which closes the
+`pto` route for our W4A8 work and names the only two int4 conversion intrinsics that exist — int4↔half, with no
+direct int4↔float32 or int4↔int8.
+
+## 46. ★ The mechanical `PipeBarrier<PIPE_ALL>` → `HardEvent` conversion table, as the library itself computes it — `GetQueEvt`
+
+Source: `/home/shanshan/repo/cann/asc-devkit/impl/basic_api/kernel_event.h:540-670`. Read 2026-10-20.
+
+This exists because a `PipeBarrier<PIPE_ALL>` site is only ever standing in for a specific pipe pair, and
+AscendC already contains the function that names it. `GetQueEvt` is what `TQue`/`TQueBind` use to decide which
+`HardEvent` an `EnQue`/`DeQue` pair compiles into: `TQueConfig` holds
+`static constexpr HardEvent freeBufEvt = GetQueEvt(srcHardType, dstHardType, false, 0, 0);`
+(`impl/basic_api/kernel_tpipe_base.h:284`) and the enqueue event is the same call with `fwdDirect = true`.
+So the table below is not advice; it is the library's own choice, and converting a barrier site means reading
+off the row for the movement that site is protecting.
+
+### 46.1 The function, verbatim and complete (the arch-dependent `L0C` tail trimmed to the 2201 arm)
+
+```cpp
+__aicore__ constexpr HardEvent GetQueEvt(
+    Hardware src, Hardware dst, bool fwdDirect, bool nd2nz = false, bool nz2nd = false)
+{
+    (void)(nz2nd);
+    ASSERT(
+        (src == Hardware::GM) || (src == Hardware::UB) || (src == Hardware::L1) || (src == Hardware::L0A) ||
+        (src == Hardware::L0B) || (src == Hardware::L0C));
+    ASSERT(src != Hardware::MAX);
+    ASSERT(dst != Hardware::MAX);
+    if (src == Hardware::GM) { // MTE2
+        ASSERT(dst != Hardware::GM);
+        ASSERT(dst != Hardware::L0C);
+        ASSERT(dst != Hardware::BIAS);
+        ASSERT(dst != Hardware::FIXBUF);
+        if (dst == Hardware::UB) { // MTE3
+            return fwdDirect ? HardEvent::MTE2_V : HardEvent::V_MTE2;
+        } else if (dst == Hardware::L1) { // MTE1
+            ...
+            return fwdDirect ? HardEvent::MTE2_MTE1 : HardEvent::MTE1_MTE2;
+        } else if (dst == Hardware::L0A) {
+            return fwdDirect ? HardEvent::MTE2_M : HardEvent::M_MTE2;
+        } else if (dst == Hardware::L0B) {
+            return fwdDirect ? HardEvent::MTE2_M : HardEvent::M_MTE2;
+        }
+    } else if (src == Hardware::UB) { // MTE3
+        ASSERT(dst != Hardware::L0A);
+        ASSERT(dst != Hardware::L0B);
+        ASSERT(dst != Hardware::BIAS);
+        ASSERT(dst != Hardware::FIXBUF);
+        if (dst == Hardware::GM) {
+            return fwdDirect ? HardEvent::V_MTE3 : HardEvent::MTE3_V;
+        } else if (dst == Hardware::L1) { // MTE1
+            return fwdDirect ? HardEvent::MTE3_MTE1 : HardEvent::MTE1_MTE3;
+        } else if (dst == Hardware::L0C) {
+            return fwdDirect ? HardEvent::V_V : HardEvent::MAX; // HardEvent::M_V
+        } else if (dst == Hardware::UB) {
+            return fwdDirect ? HardEvent::MTE2_MTE3 : HardEvent::MTE3_MTE2;
+        }
+    } else if (src == Hardware::L1) { // MTE1
+        ASSERT(dst != Hardware::GM);
+        ASSERT(dst != Hardware::L1);
+        ASSERT(dst != Hardware::L0C);
+        if (dst == Hardware::UB) {
+            return fwdDirect ? HardEvent::MTE1_V : HardEvent::V_MTE1;
+        } else if (dst == Hardware::L0A) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        } else if (dst == Hardware::L0B) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        } else if (dst == Hardware::FIXBUF) {
+            return fwdDirect ? HardEvent::MTE1_FIX : HardEvent::FIX_MTE1;
+        } else if (dst == Hardware::BIAS) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        }
+    } else if (src == Hardware::L0A) {
+        ASSERT(dst == Hardware::L0C);
+        return fwdDirect ? HardEvent::M_V : HardEvent::V_M;
+    } else if (src == Hardware::L0B) {
+        ASSERT(dst == Hardware::L0C);
+        return fwdDirect ? HardEvent::M_V : HardEvent::V_M;
+#elif defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 2201) || (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102))
+    } else if (src == Hardware::L0C) {
+        ASSERT(dst == Hardware::GM);
+        return fwdDirect ? HardEvent::M_FIX : HardEvent::FIX_M;
+    }
+#endif
+    return HardEvent::MAX;
+}
+```
+
+and the `TPosition` overload, which special-cases the Matmul logical positions before delegating:
+
+```cpp
+__aicore__ constexpr HardEvent GetQueEvt(TPosition src, TPosition dst, bool fwdDirect)
+{
+    if (src == TPosition::GM) { // MTE2
+        if (dst == TPosition::A1 || dst == TPosition::A2 || dst == TPosition::B2) {
+            return fwdDirect ? HardEvent::MTE2_M : HardEvent::M_MTE2;
+        } else if (dst == TPosition::B1 || dst == TPosition::C1) {
+            return fwdDirect ? HardEvent::MTE2_MTE1 : HardEvent::MTE1_MTE2;
+        }
+    } else if (src == TPosition::A1) {
+        if (dst == TPosition::A2) {
+            return fwdDirect ? HardEvent::MTE2_M : HardEvent::M_MTE2;
+        }
+    } else if (src == TPosition::B1) {
+        if (dst == TPosition::B2) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        } else if (dst == TPosition::C2PIPE2GM) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        }
+    } else if (src == TPosition::C1) {
+        if (dst == TPosition::C2) {
+            return fwdDirect ? HardEvent::MTE1_M : HardEvent::M_MTE1;
+        }
+    }
+    return GetQueEvt(GetPhyType(src), GetPhyType(dst), fwdDirect, false, false);
+}
+```
+
+### 46.2 The table, read off the function
+
+`fwdDirect = true` is the producer→consumer direction (the `EnQue`, "data is ready"); `fwdDirect = false` is the
+consumer→producer direction (the `FreeTensor`/`DeQue`, "the buffer may be refilled"). **Both halves of a reused
+staging buffer need a row.**
+
+| Movement | ready (fwd) | buffer-free (rev) |
+| --- | --- | --- |
+| GM → UB (`DataCopy` in) | `MTE2_V` | `V_MTE2` |
+| GM → L1 | `MTE2_MTE1` | `MTE1_MTE2` |
+| GM → L0A / GM → L0B | `MTE2_M` | `M_MTE2` |
+| **UB → GM** (`DataCopy` out) | **`V_MTE3`** | **`MTE3_V`** |
+| UB → L1 | `MTE3_MTE1` | `MTE1_MTE3` |
+| UB → UB | `MTE2_MTE3` | `MTE3_MTE2` |
+| L1 → UB | `MTE1_V` | `V_MTE1` |
+| L1 → L0A / L1 → L0B / L1 → BiasTable | `MTE1_M` | `M_MTE1` |
+| L1 → FIXBUF | `MTE1_FIX` | `FIX_MTE1` |
+| L0A → L0C / L0B → L0C (`Mmad`) | `M_V` | `V_M` |
+| **L0C → GM (Fixpipe), on 2201** | **`M_FIX`** | **`FIX_M`** |
+| UB → L0C | `V_V` (a no-op) | `HardEvent::MAX` (a no-op) |
+
+### 46.3 ★ Three things the table says that are not obvious
+
+1. **`UB → GM` is `V_MTE3` forward and `MTE3_V` reverse — and the reverse row is the one a reused staging
+   buffer needs.** The forward row says "the vector writes are done, the store may start". The reverse row says
+   "the store has drained, the buffer may be overwritten". A function that `Cast`s into a staging buffer,
+   `DataCopy`s it out, and is then called again through the same buffer needs **`MTE3_V`** on entry (or
+   `V_MTE3`/`MTE3_V` as a pair around the reuse), which is precisely the idiom the vllm-ascend attention PR
+   uses: `SetFlag<HardEvent::MTE3_V>(event); WaitFlag<HardEvent::MTE3_V>(event);` placed after the
+   `DataCopyPad` out and before `outQue_.FreeTensor(out)`
+   (https://github.com/vllm-project/vllm-ascend/pull/17617, "[Feat][Kimi-K3] Migrate attention residual
+   operators to AscendC on A3").
+2. **`L0A/L0B → L0C` resolves to `M_V` / `V_M`, which §43.5 showed are compiled out of `WaitFlagImpl` on
+   2201 on *both* halves.** So on this part the library's own answer for the `Mmad`→L0C dependency is an event
+   whose Wait does nothing — consistent with the hardware handling it, and with `L0C → GM` being `M_FIX`/`FIX_M`
+   instead. Do not hand-write `M_V` expecting it to do something. Likewise `UB → L0C` returns `V_V` forward,
+   itself a documented no-op (§43.7), and `HardEvent::MAX` reverse, with the intended `M_V` sitting
+   commented out in the source.
+3. **The `L0C` arm's own `ASSERT` on 2201 is `dst == Hardware::GM`, and nothing else.** No UB, no L1 — a third
+   independent confirmation of §35.4's finding that A3 has no `L0C → UB` and no `L0C → L1` path, this time from
+   the library's internal assertion rather than from an API page's 「不支持」.
+
+### 46.4 The checker that flags the pattern, and the filed bug
+
+`PipeBarrier<PIPE_ALL>` is flagged by the Ascend static-analysis checker as rule
+**`AKA3001 "PipeBarrier(PIPE_ALL) antipattern"`, severity Warning.** The reasoning given in the Huawei Cloud
+performance guide 「Ascend C算子性能优化实用技巧05——API使用优化」
+(https://bbs.huaweicloud.com/blogs/438903) is that fine-grained event synchronization blocks only the
+dependency chain while a barrier stalls unrelated instructions on the same pipe, and that each `PipeBarrier` or
+`WaitFlag` costs a pipeline bubble.
+
+The matching filed bug is https://github.com/tile-ai/tilelang-ascend/issues/110 — "In double buffer scenarios,
+using the automatic synchronization insertion feature, the generated AscendC code does not meet expectations,
+using `AscendC::PipeBarrier<PIPE_ALL>()`" — whose stated expected behaviour is **two `set_flag`/`wait_flag`
+pairs on two distinct flag ids** rather than a full-pipe barrier. That issue also names the classic failure of
+the conversion, worth writing down before doing 66 of them: a loop-carried `WaitFlag` that is not primed before
+the loop makes iteration 0 wait on a flag only the previous iteration would raise, which is the commonest
+deadlock in double buffering; and a `SetFlag` without its `WaitFlag` (or the reverse) leaks the event slot or
+blocks permanently, with an unbalanced pair inside a loop body drifting the count once per iteration.
+
+## Relevance
+
+This is the conversion table for the 66 `PipeBarrier<PIPE_ALL>` sites, and it is the library's own, so there is
+no judgement in applying it: find the movement each barrier protects, read the row, and write the pair. Three
+rules make the conversion safe rather than mechanical-and-wrong. First, a reused staging buffer needs the
+**reverse** row, not the forward one — `MTE3_V` for a UB buffer that a store is still draining, which is the
+row the vllm-ascend attention PR uses and the row §43 showed is a silent no-op if the code also compiles into
+the cube half. Second, three rows are no-ops on 2201 and must not be relied on: `M_V`/`V_M` for `Mmad`→L0C
+(compiled out of `WaitFlagImpl` on both halves), `V_V` for UB→L0C, and `HardEvent::MAX` for its reverse. Third,
+the `L0C` arm asserts `dst == Hardware::GM` on 2201 and nothing else, so any design that wants a cube result in
+UB must route it through GM and the `M_FIX`/`FIX_M` pair.
+
+The cheaper alternative is §44.3's: let a `TQue` do it. `EnQue`/`DeQue` *is* this table applied automatically —
+`TQueConfig::freeBufEvt = GetQueEvt(srcHardType, dstHardType, false, 0, 0)` — and the vendor's own int4 sample
+says so in a comment: 「搬运/计算阶段间用 EnQue/DeQue 衔接，自动完成 MTE2->V、V->MTE3 同步」. Staging a kernel's
+phases through `TQue`s removes the hand-allocation of event ids, removes the per-half guarding question, and
+removes the unspecified-behaviour exposure that §43.2 and `AKA3001` identify — at the cost of restructuring the
+kernel around queue positions rather than raw `LocalTensor`s.
+
+## 47. ★★★ `Cast` is AIC-guarded and plain `DataCopy` to GM is NOT — a `Cast → Cast → DataCopy(GM)` function compiled into both halves of a MIX kernel has a second, uncoordinated writer
+
+Source: the shipped AscendC implementation, `/home/shanshan/repo/cann/asc-devkit/`. Read 2026-10-20.
+This is the same tree as §42-§46 and the finding is a two-line difference between two functions in it.
+
+### 47.1 Every `Cast` on 2201 is wrapped in `if ASCEND_IS_AIV` and does nothing on the cube half
+
+`impl/basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:993-1021`, the Level-2 (count-mode) `Cast`, verbatim
+and complete:
+
+```cpp
+// Cast::Level 2
+template <typename T, typename U>
+__aicore__ inline void CastImpl(__ubuf__ T* dst, __ubuf__ U* src, const RoundMode& roundMode, const uint32_t count)
+{
+    if ASCEND_IS_AIV {
+        CheckCastDatatype<T, U>();
+        set_mask_count();
+        set_vector_mask(0, count);
+        if constexpr (sizeof(T) > sizeof(U)) {
+            if constexpr (IsSameType<U, int4b_t>::value) {
+                CastIntrinsicsImpl(
+                    dst, src, roundMode, 1, {1, 1, DEFAULT_REPEAT_STRIDE, ONE_FOURTH_DEFAULT_REPEAT_STRIDE});
+            } else {
+                CastIntrinsicsImpl(dst, src, roundMode, 1, {1, 1, DEFAULT_REPEAT_STRIDE, DEFAULT_REPEAT_STRIDE / 2});
+            }
+        } else if constexpr (sizeof(T) < sizeof(U)) {
+            if constexpr (IsSameType<T, int4b_t>::value) {
+                CastIntrinsicsImpl(
+                    dst, src, roundMode, 1, {1, 1, ONE_FOURTH_DEFAULT_REPEAT_STRIDE, DEFAULT_REPEAT_STRIDE});
+            } else {
+                CastIntrinsicsImpl(dst, src, roundMode, 1, {1, 1, DEFAULT_REPEAT_STRIDE / 2, DEFAULT_REPEAT_STRIDE});
+            }
+        } else {
+            CastIntrinsicsImpl(dst, src, roundMode, 1, {1, 1, DEFAULT_REPEAT_STRIDE, DEFAULT_REPEAT_STRIDE});
+        }
+        set_mask_norm();
+        set_vector_mask(static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
+    }
+}
+```
+
+Both Level-0 forms (mask-bit and mask-count, `:1025` and `:1044`) open with the same `if ASCEND_IS_AIV {`.
+`ASCEND_IS_AIV` on an NPU build expands to `constexpr(g_coreType == AscendC::AIV)` with
+`constexpr int32_t g_coreType = AscendC::AIC;` on the cube half (`impl/utils/sys_macros.h:64-76`, §43.5), so on
+the cube half the entire body is compiled out. **A `Cast` on the cube half of a MIX kernel is a silent no-op.**
+That is correct — the AIC has no vector unit — and it is also undiagnosed.
+
+Note in passing, because it closes a false alarm worth not raising: AscendC's own Level-2 `Cast` **does** handle
+operands of different element width. It picks the repeat strides itself from `sizeof(T)` versus `sizeof(U)`,
+with a dedicated `int4b_t` arm using `ONE_FOURTH_DEFAULT_REPEAT_STRIDE` against
+`DEFAULT_REPEAT_STRIDE` (`= 8`, `impl/basic_api/utils/kernel_utils_constants.h:33`). So the four-argument
+`Cast(dst, src, roundMode, count)` is correct for `float → half` and for `half → int4b_t`, and
+https://github.com/tile-ai/tilelang-ascend/issues/269 — "cast_tl does not support int4 dtype despite
+AscendC::Cast support", closed, which reports `int8 → half` through a four-argument lowering returning
+`[16., 0., 0., 0., 0., 0., 0., 0.]` where `[-8., -4., 0., 4., 7., -1., 2., 5.]` was expected — is a defect in
+*that compiler's* lowering, not in AscendC's.
+
+### 47.2 ★★★ Plain `DataCopy` to GM has no such guard; `DataCopyPad` does
+
+`DataCopyPad(const GlobalTensor<T>&, const LocalTensor<T>&, const DataCopyParams&)`,
+`impl/basic_api/kernel_operator_data_copy_intf_impl.h:1414-1444`, verbatim:
+
+```cpp
+template <typename T, PaddingMode mode>
+__aicore__ inline __inout_pipe__(MTE3) void DataCopyPad(
+    const GlobalTensor<T>& dst, const LocalTensor<T>& src, const DataCopyParams& dataCopyParams)
+{
+    ...
+    using PrimType = PrimT<T>;
+#if defined(ASCENDC_DEBUG) || defined(ASCENDC_CPU_DEBUG)
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)
+    CheckDataCopyPadTypeSupport<T>("DataCopyPad from LocalTensor to GlobalTensor with DataCopyParams");
+    CheckDataCopyPadTensor(
+        dst, src, dataCopyParams, "DataCopyPad from LocalTensor to GlobalTensor with DataCopyParams");
+#endif
+#endif
+#if (__NPU_ARCH__ != 5102)
+    if ASCEND_IS_AIC {
+        return;
+    }
+#endif
+    ASCENDC_REPORT_OVERFLOW_MEM((CheckDataCopyPadTensorSizeOverflow(dst, src, dataCopyParams)));
+    const Hardware srcHWPos = GetPhyType((TPosition)src.GetPosition());
+    const uint8_t cacheMode = ExtractCacheMode(dst);
+    if (srcHWPos == Hardware::UB) {
+        DataCopyPadUB2GMImpl<T, mode>(
+            (__gm__ PrimType*)dst.GetPhyAddr(), (__ubuf__ PrimType*)src.GetPhyAddr(), dataCopyParams, cacheMode);
+    } else {
+        ASCENDC_CHECK_TPOSITION(
+            false, "src", "UB(VECIN/VECOUT)", "DataCopyPad from LocalTensor to GlobalTensor with DataCopyParams",
+            GetPositionDisplay(static_cast<TPosition>(src.GetPosition())));
+    }
+}
+```
+
+**`if ASCEND_IS_AIC { return; }` — an explicit, unconditional early return on the cube half.**
+
+The plain `DataCopy(const GlobalTensor<T>&, const LocalTensor<T>&, const DataCopyParams&)` at `:271-336`
+(reproduced in full in §42.4) has **no `ASCEND_IS_AIC` guard at all**. It goes from the CPU-debug block
+straight to:
+
+```cpp
+    if (srcHWPos == Hardware::UB) {
+        // ub -> gm
+        DataCopyUB2GMImpl((__gm__ PrimType*)dst.GetPhyAddr(), (__ubuf__ PrimType*)src.GetPhyAddr(), repeatParams);
+    } else if (srcHWPos == Hardware::L1) {
+```
+
+A grep for `ASCEND_IS_AIC` / `ASCEND_IS_AIV` across
+`impl/basic_api/kernel_operator_data_copy_intf_impl.h` returns eight hits, **all of them inside the
+`DataCopyPad` family** (`:1430, :1466, :1516, :1617, :1672, :1696, :1728, :1807`). None is in the plain
+`DataCopy` family. For contrast, the library does guard this case elsewhere when it matters — the
+`LocalTensor::SetValue` path at `impl/basic_api/kernel_tensor_impl.h:318-322`:
+
+```cpp
+    if ASCEND_IS_AIC {
+        if (GetPhyType(AscendC::TPosition(this->GetPosition())) == Hardware::UB) {
+            return;
+        }
+    }
+```
+
+so the omission in plain `DataCopy` is an omission, not a convention.
+
+### 47.3 What that means for a `Cast → Cast → DataCopy(GM)` function in a `__mix__(1,2)` kernel
+
+If such a function is compiled into both halves — i.e. it is an `__aicore__` function that the cube half also
+reaches, rather than one called only inside `if ASCEND_IS_AIV { ... }` — then on the cube half:
+
+1. both `Cast`es are **skipped silently** (§47.1), so nothing is produced in the staging buffer;
+2. the `DataCopy` to GM is **still issued** (§47.2), with a `__ubuf__` pointer, on a core that has no Unified
+   Buffer on this architecture (§3b: A3's UB is physically in the AIV);
+3. the destination address is the same GM address the AIV half is writing correctly.
+
+So the allocation has **two uncoordinated writers**: one producing the right data and one producing whatever an
+AIC's UB-pointer dereference resolves to, racing with no synchronisation between them. Which one lands last is
+timing-dependent, and nothing in the toolchain reports any of it — no hang, no error, no check. Swapping the
+plain `DataCopy` for `DataCopyPad` removes writer (2) by construction, because `DataCopyPad` returns on the AIC
+half; so does wrapping the function body in `if ASCEND_IS_AIV`.
+
+This also explains why an isolated probe can pass where the real kernel fails even when the probe is built
+`__mix__` and `ASCENDC_CUBE_ONLY`: a probe written with the vector half gated to one subblock has only one
+writer, and the whole effect disappears. The discriminating observation is not the offset and not the
+allocation — it is **whether the enclosing function is reachable from the cube half**.
+
+## Relevance
+
+This is the sharpest remaining candidate for the live int4 defect, and it needs no new measurement to check —
+only a reading of which half can reach the function. Our failing function is exactly
+`Cast(half, float)` → `Cast(int4b_t, half)` → `DataCopy(GM, int4b_t)` inside a `__mix__(1,2)`
+`ASCENDC_CUBE_ONLY` kernel. On the cube half the two `Cast`es compile to nothing because every `CastImpl` on
+dav_c220 opens with `if ASCEND_IS_AIV`, while the plain `DataCopy` to GM has no matching guard and issues its
+MTE3 move anyway — the guard exists only in the `DataCopyPad` family, eight occurrences, none in plain
+`DataCopy`. Two writers to one address, one of them garbage, unsynchronised and unreported.
+
+Three things follow. First, the cheap fix is `DataCopyPad` instead of `DataCopy` for every UB→GM store in code
+that both halves can reach, because `DataCopyPad` is AIC-safe by construction (`if ASCEND_IS_AIC { return; }`),
+and it is also the form that handles a non-32B-aligned tail. Second, the correct fix is the §43 rule applied one
+level up: a function containing vector work must be reachable only from `if ASCEND_IS_AIV`, and the vendor's own
+int4 sample does exactly that — `if ASCEND_IS_AIV { Unzip(...); }` / `if ASCEND_IS_AIC { RunMatmul(); }`
+(§44.2). Third, this is a general audit item for the megakernel, not a one-off: every stage that writes GM from
+UB should be checked for cube-half reachability, because the failure is silent on both sides — the `Cast` that
+should have run produces nothing and says nothing, and the `DataCopy` that should not have run executes and says
+nothing.
+
+A false alarm closed in passing, so that it is not raised later: AscendC's four-argument
+`Cast(dst, src, roundMode, count)` **is** correct across differing element widths, including `half → int4b_t`;
+it computes the repeat strides itself with a dedicated `int4b_t` arm. The contrary report at
+tilelang-ascend#269 is a defect in that compiler's own lowering, which passed four arguments where seven were
+needed, not in AscendC. And for the record from the same file, the legal round modes are asymmetric:
+`Cast<int4b_t, half>` accepts `CAST_RINT` (`vconv_f162s4r`), `CAST_FLOOR` (`vconv_f162s4f`) and `CAST_CEIL`,
+and rejects `CAST_ODD` with 「CAST_ODD from half to int4b_t is not supported on current device」, while
+`Cast<half, int4b_t>` accepts **only** `CAST_NONE` (`vconv_s42f16`) and rejects everything else with
+「only support CAST_NONE from int4b_t to half on current device」.
+
+## 48. ★ The official constraint list for hand-written ISASI kernels, and the exact API allowlist that applies once you allocate event ids yourself
+
+Source: `/home/shanshan/repo/cann/asc-devkit/docs/zh/guide/programming_guide/programming_model/ai_core_simd_programming/cpp_tensor_programming/cpp_tensor_programming_overview.md`,
+§「编程约束和限制」 (lines 388-395), §「支持的API范围」 (表1-表4) and §「使用预留UB空间的API范围」 (表5-表6).
+Read 2026-10-20. This is the chapter that governs exactly our regime: a hand-written kernel that calls
+`SetFlag`/`WaitFlag(ISASI)` and `PipeBarrier(ISASI)` directly instead of letting `TQue` do it.
+
+### 48.1 ★ The five constraints, verbatim and complete
+
+```
+## 编程约束和限制
+
+- 同步事件由开发者使用`SetFlag/WaitFlag(ISASI)`和`PipeBarrier(ISASI)`手动插入，事件的类型和事件ID由开发者自行管理，但需要注意事件ID不能使用6和7（可能与内部使用的事件ID出现冲突，进而出现未定义行为）。
+- 核函数（Kernel）入口处需要开发者手动调用InitSocState接口用来初始化全局状态寄存器。因为全局状态寄存器处于不确定状态，如果不调用该接口，可能导致算子执行过程中出现未定义行为。在TPipe框架编程中，初始化过程由TPipe完成，无需开发者关注。
+- 核函数（Kernel）结束前需要开发者手动调用PipeBarrier<PIPE_ALL>()。
+- 部分API内部通过软仿真实现，需占用Ascend C预留的UB空间，开发者使用时需关注目标API是否依赖该预留空间（针对NPU架构版本2201，Select等API内部使用了8KB的预留UB空间，用于存储中间数据；针对NPU架构版本3510，Exp等API内部使用了2KB的预留UB空间，用于指令兼容或存储中间数据）。若开启--cce-disable-asc-reserved-ubuf编译选项，在对应产品版本下调用相关API会触发编译期报错。具体API范围见使用预留UB空间的API列表。
+- 同时另外一些软仿实现接口内部会占用系统分配的事件ID，如果开发者手动调用`SetFlag/WaitFlag(ISASI)`插入自定义事件ID时会跟接口内部的事件ID产生冲突，所以用户自定义事件ID时，只能支持部分API。具体支持的API列表见支持的API范围。
+```
+
+Four of these are hard rules, and two of them cut against the reflex that a `PipeBarrier<PIPE_ALL>` is always
+an antipattern:
+
+- **Event ids 6 and 7 must not be used manually.** `QUE_MAX_EVENT` is 8 on 2201 (§43.4), so ids 0-7 exist, but
+  6 and 7 are reserved and using them is 「未定义行为」. The hand-allocatable range is **0-5**. This is the same
+  rule as the 核内同步 page's 「不能手动插入6和7的TEventID」 (§8).
+- **`InitSocState()` is mandatory at kernel entry — unless a `TPipe` is constructed.** 「因为全局状态寄存器处于
+  不确定状态，如果不调用该接口，可能导致算子执行过程中出现未定义行为。在TPipe框架编程中，初始化过程由TPipe完成」.
+  So a hand-written kernel that does *not* declare a `TPipe` and does *not* call `InitSocState` runs with the
+  global status registers in an indeterminate state, which is a run-to-run nondeterminism source by
+  construction.
+- **`PipeBarrier<PIPE_ALL>()` is mandatory before the kernel returns.** 「核函数（Kernel）结束前需要开发者手动
+  调用PipeBarrier<PIPE_ALL>()」. The `AKA3001` antipattern warning (§43.2/§46.4) is about barriers standing in
+  for a cross-pipe dependency *inside* the kernel; the one at the exit is required and must not be removed.
+- **Hand-allocating event ids restricts which APIs you may call at all.** 「另外一些软仿实现接口内部会占用系统
+  分配的事件ID … 所以用户自定义事件ID时，只能支持部分API」. The allowlist is per-product; §48.2 is the A3 one.
+
+### 48.2 ★ 表3 — the complete A3 allowlist, for kernels that allocate their own event ids
+
+Verbatim (HTML stripped), 「**表3** 针对Atlas A3 训练系列产品/Atlas A3 推理系列产品，支持的API范围」:
+
+| 接口分类 | 接口名称 | 备注 |
+| --- | --- | --- |
+| 基础API > 标量计算 | `GetBitCount`、`CountLeadingZero`、`CountBitsCntSameAsSignBit`、`GetSFFValue`、`Cast`（float转half、int32_t）、`Cast`（float转bfloat16_t）、`Cast`（多类型转float） | - |
+| 基础API > 矢量计算 > 基础算术 | `Exp`、`Ln`、`Abs`、`Reciprocal`、`Sqrt`、`Rsqrt`、`Relu`、`Add`、`Sub`、`Mul`、`Div`、`Max`、`Min`、`BilinearInterpolation`、`Adds`、`Muls`、`Maxs`、`Mins`、`LeakyRelu` | - |
+| 基础API > 矢量计算 > 逻辑计算 | `Not`、`And`、`Or`、`ShiftLeft`、`ShiftRight` | - |
+| 基础API > 矢量计算 > 复合计算 | `Axpy`、`CastDequant`、`AddRelu`、`AddReluCast`、`SubRelu`、`SubReluCast`、`MulAddDst`、`MulCast`、`FusedMulAdd`、`FusedMulAddRelu` | - |
+| 基础API > 矢量计算 > 比较与选择 | `Compare`、`Compare`（结果存入寄存器）、`Compares`、`GetCmpMask`、`SetCmpMask`、`GatherMask` | - |
+| 基础API > 矢量计算 > 类型转换 | `Cast` | - |
+| 基础API > 矢量计算 > 归约计算 | `WholeReduceMax`、`WholeReduceMin`、`WholeReduceSum`、`BlockReduceMax`、`BlockReduceMin`、`BlockReduceSum`、`PairReduceSum`、`RepeatReduceSum`、`GetReduceRepeatSumSpr`、`GetReduceRepeatMaxMinSpr` | - |
+| 基础API > 矢量计算 > 数据转换 | `Transpose`、`TransDataTo5HD` | `TransDataTo5HD`（不支持dst与src类型为uint64_t的LocalTensor的场景） |
+| 基础API > 矢量计算 > 数据填充 | `Duplicate`、`Brcb` | - |
+| 基础API > 矢量计算 > 排序组合 | `Sort32`、`MrgSort`、`GetMrgSortResult` | - |
+| 基础API > 矢量计算 > 离散与聚合 | `Gather`、`Gatherb` | - |
+| 基础API > 矢量计算 > 掩码操作 | `SetMaskCount`、`SetMaskNorm`、`SetVectorMask`、`ResetMask` | - |
+| 基础API > 矢量计算 > 量化设置 | `SetDeqScale` | - |
+| 基础API > 数据搬运 > DataCopy | 基础数据搬运 | 不支持UB（VECIN/VECCALC/VECOUT）->L1 Buffer（TSCM）通路的数据搬运。 |
+| 基础API > 数据搬运 | 增强数据搬运 / 切片数据搬运 / 随路转换ND2NZ搬运 / 随路转换NZ2ND搬运 / 随路量化激活搬运 | 增强数据搬运、随路转换ND2NZ搬运 不支持UB（VECIN/VECCALC/VECOUT）->L1 Buffer（TSCM）通路的数据搬运。 |
+| 基础API > 数据搬运 | `Copy`、`DataCopyPad`、`SetPadValue` | `DataCopyPad`不支持UB（VECIN/VECCALC/VECOUT）->L1 Buffer（TSCM）通路的数据搬运。 |
+| 基础API > 同步控制 > 核内同步 | `SetFlag/WaitFlag`、`PipeBarrier`、`DataSyncBarrier` | - |
+
+Two things to read off it. **`Cast`, `DataCopy`, `DataCopyPad`, `SetFlag`/`WaitFlag`, `PipeBarrier` and
+`DataSyncBarrier` are all on the list** — so the `Cast → Cast → DataCopy` chain of §47 is permitted alongside
+hand-allocated event ids. And **`Select` is absent from the A3 比较与选择 row**, where the 310P table (表1) has
+「`Select`、`GatherMask`」 and A3 has only 「`GatherMask`」. `AddDeqRelu` is likewise absent from A3's 复合计算
+row where the 310P table has it. Both omissions are explained by §48.3: those two are precisely the APIs that
+consume the reserved UB space on 2201.
+
+### 48.3 表5 — the APIs that consume the 8 KB reserved UB on 2201
+
+Verbatim:
+
+```
+## 使用预留UB空间的API范围
+
+以下API内部会使用Ascend C预留的UB空间。当开启--cce-disable-asc-reserved-ubuf编译选项后，在对应产品版本下调用相关API会触发编译期报错。由于同一API使用预留UB空间的情况在不同NPU架构下有差异，开启该编译选项后，需要手动调整API调用方式或替换为不依赖预留UB空间的实现，才能完成兼容性迁移。
+
+[!CAUTION]注意
+ 同一接口若提供多个重载原型，可能只有部分原型会使用UB预留空间。
+```
+
+| API类别 | API名 |
+| --- | --- |
+| 基础API | `AddDeqRelu`、`Select` |
+| 高阶API | `Digamma`、`Lgamma`、`Power`、`Sign`、`LayerNorm`、`DropOut`、`SelectWithBytesMask` |
+
+(表6 is the 3510 list, where the reserve is 2 KB and `Exp` is among the users.)
+
+### 48.4 The sanctioned `__mix__` shape, from the same chapter
+
+Verbatim, with its own comment:
+
+```cpp
+// Define CV fusion operator, marked with __mix__ to execute on Device, suitable for operators combining Cube and Vector computation
+__global__ __mix__ void mix_kernel(__gm__ float* x, __gm__ float* y, __gm__ float* z)
+{
+    if ASCEND_IS_AIV {
+        // ...
+        AscendC::Add(zLocal, xLocal, yLocal, 4096);
+        // ...
+    }
+
+    if ASCEND_IS_AIC {
+        // ...
+        AscendC::Mmad(l0c_buf, l0a_buf, l0b_buf, {BLOCK_M, BLOCK_K, BLOCK_N, 0, false, false});
+        // ...
+    }
+}
+```
+
+The whole body of a `__mix__` kernel is one source compiled for both halves, and `ASCEND_IS_AIV` /
+`ASCEND_IS_AIC` are the *only* partition — they are `constexpr(g_coreType == AscendC::AIV)` with `g_coreType` a
+per-translation-unit `constexpr` (§43.5), so anything not inside one of those two `if`s is compiled into, and
+executed by, both halves.
+
+## Relevance
+
+This is the governing constraint list for the regime we are actually in, and it qualifies two things said
+earlier in this file. **Not every `PipeBarrier<PIPE_ALL>` is an antipattern: the one before the kernel returns
+is mandatory** — 「核函数（Kernel）结束前需要开发者手动调用PipeBarrier<PIPE_ALL>()」 — so a sweep that converts
+all of them to named pairs must keep the exit barrier. And **the hand-allocatable event-id range is 0-5, not
+0-7**: 6 and 7 are reserved and using them is explicitly 「未定义行为」, which matters as soon as a
+double-buffered protocol needs more than one id per `HardEvent` (§43.4).
+
+Two items are audit work that can be done by grep, with no hardware. First, 表3 is an allowlist, not advice:
+once a kernel allocates its own event ids, calling an API outside that list conflicts with the system event ids
+those APIs consume internally. The good news is that `Cast`, `DataCopy`, `DataCopyPad`, `SetFlag`/`WaitFlag`,
+`PipeBarrier` and `DataSyncBarrier` are all on it, so §47's chain is permitted; the item to grep for is
+**`Select`**, which is on the 310P allowlist and *not* on A3's, and `AddDeqRelu` likewise — both because they
+are the two basic APIs that use the 8 KB reserved UB on 2201 (表5). Any kernel of ours that mixes `Select` with
+hand-written `SetFlag`/`WaitFlag` is outside the documented contract. Second, if any kernel of ours does not
+declare a `TPipe`, it must call `InitSocState()` at entry, because the global status registers are otherwise
+「处于不确定状态」 and the result is 「未定义行为」 — a textbook run-to-run nondeterminism source, and one that a
+`TPipe`-based kernel is immune to for free.
+
+Finally, 48.4 is the official confirmation of §47's premise: a `__mix__` kernel is one source compiled for both
+halves, and `ASCEND_IS_AIV` / `ASCEND_IS_AIC` are the only partition. Anything not inside one of those two
+guards executes on both cores — which is precisely why an ungated `DataCopy` to GM in a `Cast`-bearing function
+gives the allocation a second, uncoordinated writer.
