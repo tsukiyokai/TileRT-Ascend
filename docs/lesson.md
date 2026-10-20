@@ -1656,3 +1656,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      are now closed by measurement: smaller messages, explicit overlap, fewer
      calls, fewer ranks, and a hand-rolled primitive. What remains is a cost
      inside HCCL that is neither bandwidth nor participants nor host dispatch.
+
+162. HCCL_OP_EXPANSION_MODE=AIV makes sixteen-rank collectives 1.6 to 1.9x
+     faster at decode sizes, and it is one environment variable. A3 expands its
+     collectives on the device-side AI CPU by default; the invalid-value error
+     names the alternatives, `Atlas A3: AI_CPU | AIV`. At twelve rows of 6144
+     bf16: all_reduce 300.56 to 183.40, reduce_scatter 318.09 to 177.41,
+     all_gather 326.74 to 175.40. Three repeats with no overlap between arms --
+     lowest default 276.65 against highest AIV 178.31. The one case that barely
+     moves is the 48-row all_gather, 1.11x, the only item actually moving a
+     large payload, which confirms AIV takes the fixed cost rather than
+     transport: the same 193 us floor that two ranks pay where the bytes
+     themselves cost 37. Collectives are 374 us a layer, so this is 11 to 13.6
+     ms a round, an order of magnitude above the bank narrowing.
