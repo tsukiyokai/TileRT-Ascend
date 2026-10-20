@@ -12006,6 +12006,265 @@ A flag therefore says nothing about any tile produced by a different block's AIC
   `using namespace matmul;` and `using namespace AscendC;` collides, so names like `TPosition` must be qualified.
 
 
+---
+
+## 38. The authoritative `CrossCoreSetFlag` semantics (newer than §34/§31.7) — pairing arity, counter residue, the unsupported `PIPE_S` default, and why an unpaired wait alternates
+
+Two pages, both newer and far more detailed than the CANN 8.0 copies in §31.7 and the architecture page in §34.
+Retrieved 2026-10-20 from the static mirror described in §35.0. Where they disagree with §34, prefer these.
+
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E5%90%8C%E6%AD%A5%E6%8E%A7%E5%88%B6/%E6%A0%B8%E9%97%B4%E5%90%8C%E6%AD%A5/CrossCoreSetFlag_ISASI.html
+https://asc.gitcode.com/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E5%90%8C%E6%AD%A5%E6%8E%A7%E5%88%B6/%E6%A0%B8%E9%97%B4%E5%90%8C%E6%AD%A5/%E5%85%B3%E9%94%AE%E7%89%B9%E6%80%A7%E8%AF%B4%E6%98%8E.html
+(the second is 「核间同步 / 关键特性说明」, which the first references as 「每个模式的具体执行逻辑与细节可以参考关键特性说明」)
+
+### 38.1 What the flag actually is: a scheduling-module event, not a memory operation
+
+Verbatim:
+
+```
+在核间同步场景中，CrossCoreSetFlag接口和CrossCoreWaitFlag接口配对工作，使用时需传入核间同步的标记ID（flagId），每个ID对应一个用于控制同步的计数器。
+CrossCoreSetFlag：AI Core中的AIC/AIV在完成本核前置位的pipe流水任务后，调用该接口，向调度模块上报本核任务已完成。调度模块收集所有参与核的上报信息，作为全局完成标志。
+CrossCoreWaitFlag：用于阻塞本核后续指令的下发（已下发指令可正常执行），直至调度模块确认所有应调用CrossCoreSetFlag的核均已上报完成，随即解除阻塞，允许该核继续下发指令。
+```
+
+and the constraint that follows from it, verbatim — **if the kernel type is AIC-only or AIV-only the scheduling
+module is not even turned on**:
+
+```
+由于当Kernel类型为KERNEL_TYPE_AIC_ONLY或KERNEL_TYPE_AIV_ONLY时，硬件不会开启调度模块，也就无法正常进行核间同步，因此不同的同步模式配置Kernel类型或函数修饰符的情况如下： 在纯Vector/Cube场景下（模式0或模式1），建议设置Kernel类型为KERNEL_TYPE_MIX_AIV_1_0或KERNEL_TYPE_MIX_AIC_1_0，其它支持的Kernel类型请参考表3。
+对于Vector和Cube混合场景（模式2和模式4），需根据AI Core中AIC和AIV的比例灵活配置Kernel类型，不同模式支持的函数修饰符和Kernel类型请参照表3。
+表3 模式与支持的Kernel类型配置
+模式
+支持的函数修饰符
+支持的Kernel类型配置
+0
+__mix__(0, 1)、__mix__(1, 0)、__mix__(1, 1)、__mix__(1, 2)
+KERNEL_TYPE_MIX_AIV_1_0、KERNEL_TYPE_MIX_AIC_1_0、KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2
+1
+__mix__(1, 1)、__mix__(1, 2)
+KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2
+2
+__mix__(1, 1)、__mix__(1, 2)
+KERNEL_TYPE_MIX_AIC_1_1、KERNEL_TYPE_MIX_AIC_1_2
+4
+__mix__(1, 2)
+KERNEL_TYPE_MIX_AIC_1_2
+```
+
+### 38.2 The pairing arity of mode 2 — one Set, **M** Waits, and each AIV has its own counter
+
+This is the paragraph that matters most. Verbatim from 「关键特性说明」, 「单AI Core中AIC与AIV全核同步」:
+
+```
+单AI Core中AIC与AIV全核同步需要配套使用模式2的CrossCoreSetFlag和CrossCoreWaitFlag接口。该场景可细分为两类：
+1个AI Core中的AIC执行CrossCoreSetFlag，对应的M个AIV都执行CrossCoreWaitFlag。
+当AIC执行完CrossCoreSetFlag时，M个AIV对应flagId的计数器增加1。若AIV该flagId的计数器为非0，则解除AIV的阻塞，CrossCoreWaitFlag后的指令继续发射，该flagId的计数器减去1。
+总计AIC 1次调用CrossCoreSetFlag，对应M个AIV各1次CrossCoreWaitFlag才算配对使用。
+1个AI Core中的M个AIV都执行CrossCoreSetFlag，对应的AIC执行CrossCoreWaitFlag。
+当M个AIV全都执行完CrossCoreSetFlag时，AIC对应flagId的计数器增加1。若AIC该flagId的计数器为非0，则解除AIC的阻塞，CrossCoreWaitFlag后的指令继续发射，该flagId的计数器减去1。
+总计M个AIV各1次CrossCoreSetFlag，对应AIC 1次调用CrossCoreWaitFlag才算配对使用。
+```
+
+and the canonical code for mode 2, verbatim — note 「必须要所有AIV都执行」 and 「pipe要一致」:
+
+```cpp
+// AIC和AIV都应该有类似如下的成对调用CrossCoreSetFlag和CrossCoreWaitFlag
+// modeId必须配置为2, pipe要一致，flagId要一致
+if ASCEND_IS_AIV {
+ AscendC::CrossCoreSetFlag<2, PIPE_MTE3>(0); // 待前置PIPE_MTE3流水任务完成后，通知调度模块。必须要所有AIV都执行。
+}
+if ASCEND_IS_AIC {
+ AscendC::CrossCoreWaitFlag(0); // 直到该AI Core中的所有AIV都完成前置PIPE_MTE3流水，调度模块更新flagId=0的计数器后，AIC解除阻塞。
+}
+```
+
+The per-core counter ownership, verbatim from the `CrossCoreSetFlag` page's 约束说明:
+
+```
+flagId相关的约束：
+对于模式0、1、2，每个AIC和每个AIV都各自有16个flagId，支持的取值范围为0-15。如果flagId的值超出该范围，则会取截取最低位4bit为准。
+每个flagId都对应一个计数器，当调用CrossCoreWaitFlag时，若计数器值为0则会阻塞后续指令下发，已下发指令可正常执行；当调度模块感知到所有参与同步的核（具体包含哪些核与设置的核间同步模式有关）完成（调用了CrossCoreSetFlag）同步后，会将与设置的flagId对应的计数器的值增加1。此时，计数器值为非0，阻塞解除，并且将对应计数器的值减去1进行还原。具体执行逻辑与细节可以参考关键特性说明。每一个计数器计数范围为0-15。如果调用CrossCoreWaitFlag的次数过多，计数器的值超出该范围，则会异常报错，中断流程。
+```
+
+and the explicit statement on unpaired use, verbatim:
+
+```
+用户需要确保配套使用CrossCoreSetFlag和CrossCoreWaitFlag，否则会出现未定义行为。
+```
+```
+CrossCoreSetFlag和CrossCoreWaitFlag必须成对使用，否则可能导致算子超时问题。
+```
+
+### 38.3 `PIPE_S` and `PIPE_ALL` are **not supported** pipes for modes 0/1/2
+
+Verbatim:
+
+```
+pipe
+设置这条指令所在的流水类型。支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX，不支持PIPE_S和PIPE_ALL。不同产品对流水类型的支持情况请参见pipe支持的流水类型说明。
+```
+```
+pipe支持的流水类型说明​
+核间同步的模式为模式0、1、2时， 支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX。
+不支持的流水类型为PIPE_ALL、PIPE_S。
+针对Ascend 950PR/Ascend 950DT，核间同步的模式为模式4时， 支持的流水类型为PIPE_V、PIPE_M、PIPE_MTE1、PIPE_MTE2、PIPE_MTE3、PIPE_FIX、PIPE_S。
+不支持的流水类型为PIPE_ALL。
+```
+```
+核间同步的模式为模式0、1、2时，模板参数pipe不支持设置为PIPE_ALL，PIPE_S。
+```
+
+Set against the declared default in the public header (§1):
+
+```cpp
+template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+__aicore__ inline void CrossCoreWaitFlag(uint16_t flagId);
+```
+
+So on A3 the **default** `pipe` of `CrossCoreWaitFlag` is a value the same documentation set lists as unsupported for
+every mode A3 has. Note that this page's own mode-0/1/2 examples nevertheless use the bare form, while its mode-4
+example spells the pipe out (`CrossCoreWaitFlag<4, PIPE_FIX>(0)`), and §34 separately claims the `pipe` argument is
+inert on 2201 — the documentation set is not self-consistent here. What **is** consistent and repeated three times is
+「pipe要一致」, the pipe must match between the Set and the Wait.
+
+### 38.4 flagId range is 0-15 on A3, not 0-10; mode 4 is confirmed absent
+
+Verbatim:
+
+```
+flagId取值范围说明​
+核间同步的模式为模式0、1、2时，支持的取值范围为0-15。
+```
+```
+modeId支持的取值说明​
+不同产品对同步模式的支持情况如下：
+针对Ascend 950PR/Ascend 950DT，支持的同步模式为：模式0、模式1、模式2、模式4。
+针对如下产品，支持的同步模式为：模式0、模式1、模式2。 Atlas A3 训练系列产品/Atlas A3 推理系列产品
+Atlas A2 训练系列产品/Atlas A2 推理系列产品
+```
+
+and the occupancy list, verbatim:
+
+```
+以下接口内部实现中使用了CrossCoreSetFlag和CrossCoreWaitFlag会占用一部分flagId，开发者同时使用CrossCoreSetFlag/CrossCoreWaitFlag与以下接口时，需注意避免flagId使用冲突：
+Matmul高阶API占用的flagId范围与定义的Matmul对象数目相关，假设定义了N个Matmul对象，Matmul高阶API内部占用的flagId范围为[0, 2 * N - 1]。Matmul最多支持定义4个对象，此时flagId占用范围为[0,7]。
+SyncAll硬件同步接口占用的flagId情况请参考flagId占用情况。
+```
+
+### 38.5 Consecutive Sets from one core have no guaranteed order
+
+Verbatim — this is new and matters for a multi-stage megakernel:
+
+```
+一个核连续发出的CrossCoreSetFlag，硬件不保证执行顺序。例如AIV依次发射CrossCoreSetFlag<0, PIPE_V>(0)，CrossCoreSetFlag<0, PIPE_V>(1)，实际的执行顺序可能是flagId=1的先执行。
+```
+
+### 38.6 Reusing one flagId across modes
+
+Verbatim:
+
+```
+核间同步的模式为模式0、1、2时，同一个flagId用于不同核间同步模式的约束：
+同一核上，若同一个flagId需用于不同核间同步模式，须在模式切换前完成前一个模式的所有同步操作——即确保该flagId关联的所有CrossCoreSetFlag与配套CrossCoreWaitFlag调用均已执行完毕。
+对于不同的核，可以直接将同一flagId用于不同的核间同步模式，具体包括以下2种场景： 多个AI Core之间，使用flagId=0同步所有的AIC（模式0）；单个AI Core内，使用flagId=0同步所有AIV（模式1）。
+单个AI Core内，使用flagId=0同步所有AIV（模式1）；另一个AI Core内，使用flagId=0同步AIC与所有AIV（模式2）。
+```
+
+### 38.7 Mode 0 and 4 for completeness
+
+Mode 0, verbatim — note that the counter is raised on **every** participating core simultaneously:
+
+```
+N个AI Core中的N个AIC进行全核同步。
+当N个AIC都执行完CrossCoreSetFlag时，每个AIC对应flagId的计数器增加1。若AIC该flagId的计数器为非0，被CrossCoreWaitFlag所阻塞的所有指令才会执行下去，该flagId的计数器减去1。
+对于每个AIC，CrossCoreSetFlag和CrossCoreWaitFlag都必须配对使用。
+```
+```cpp
+// 每个核都应该有类似如下的成对调用CrossCoreSetFlag和CrossCoreWaitFlag
+// modeId必须配置为0, pipe要一致，flagId要一致
+AscendC::CrossCoreSetFlag<0, PIPE_M>(0); // 待前置PIPE_M流水任务完成后，通知调度模块
+AscendC::CrossCoreWaitFlag(0); // 直到所有AIC都完成前置PIPE_M流水，调度模块更新flagId=0的计数器后，解除阻塞。
+```
+
+Mode 4 (950 only), verbatim, for the port — note the flagId remapping that makes it a point-to-point channel:
+
+```cpp
+// AIC和AIV都应该有类似如下的成对调用CrossCoreSetFlag和CrossCoreWaitFlag 
+// modeId必须配置为4，flagId要一致 
+if ASCEND_IS_AIV { 
+ if (blockIdx % 2 == 0) { 
+ AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(0); // 待AIV0上前置PIPE_MTE3流水任务完成后，通知调度器。对于flagId，AIV0上的0-15对应AIC上的0-15。 
+ } 
+ if (blockIdx % 2 == 1) { 
+ AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(0); // 待AIV1上前置PIPE_MTE3流水任务完成后，通知调度器。对于flagId，AIV1上的0-15对应AIC上的16-31。 
+ } 
+} 
+if ASCEND_IS_AIC { 
+ AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(0); // 阻塞后续PIPE_FIX流水指令，直到该AI Core中的AIV0都完成前置PIPE_MTE3流水，调度器更新flagId=0的计数器后，AIC解除阻塞 
+ ... 
+ AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(16); // 阻塞后续PIPE_FIX流水指令，直到该AI Core中的AIV1都完成前置PIPE_MTE3流水，调度器更新flagId=16的计数器后，AIC解除阻塞 
+ ... 
+}
+```
+```
+flagId取值范围说明 ... 针对Ascend 950PR/Ascend 950DT，核间同步的模式为模式4时，支持的取值范围情况如下： AIV0发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 0-15的操作。
+AIV1发起的flagId 0-15的CrossCoreSetFlag操作对应AIC CrossCoreWaitFlag中flagId 16-31的操作。
+AIC发起的flagId 0-15的CrossCoreSetFlag操作对应AIV0 CrossCoreWaitFlag中flagId 0-15的操作。
+AIC发起的flagId 16-31的CrossCoreSetFlag操作对应AIV1 CrossCoreWaitFlag中flagId 0-31的操作。
+```
+
+## Relevance
+This is the page that explains an alternating failure, and the mechanism is arithmetic, not a race.
+- **Mode 2 AIC→AIV requires exactly M waits per set, and each AIV owns its own counter.** Verbatim:
+  「当AIC执行完CrossCoreSetFlag时，M个AIV对应flagId的计数器增加1 ... 总计AIC 1次调用CrossCoreSetFlag，对应M个AIV各
+  1次CrossCoreWaitFlag才算配对使用。」 Under `__mix__(1, 2)`, M = 2. One `CrossCoreSetFlag` from the AIC raises
+  **both** AIVs' counters by 1. If only one AIV reaches its `CrossCoreWaitFlag` — because the vector half is guarded
+  by `GetSubBlockIdx()`, because a `taskRation` skip (`if (vecCount % taskRation != subBlockIdx) continue;`, §15) or
+  an early `return` jumps over it, or because the two AIVs take different branches — then the other AIV's counter is
+  left at 1. Nothing in either page says the runtime zeroes these counters at kernel load, and unpaired use is
+  explicitly 「会出现未定义行为」. A leftover 1 makes the **next** launch's wait on that counter return immediately,
+  before the cube has written anything, which produces wrong data and consumes the residue — and then the launch
+  after that is correct again. That is a period-two alternation across launches and, if the counter is device state
+  rather than context state, across processes. It is the only mechanism found in any source that produces period two
+  rather than a random rate.
+  **Checks that distinguish it, cheapest first.** (a) Make the AIV-side `CrossCoreWaitFlag` unconditional and
+  textually outside every branch, loop, skip and early return, so both subblocks execute it exactly once per set —
+  then confirm the alternation disappears. (b) Count it: instrument both subblocks to write `GetSubBlockIdx()` to
+  distinct GM slots immediately after the wait, and check both slots are written on every run. (c) If the brick's
+  vector work is split between the two AIVs, note that the split must not gate the wait — split the *work*, never
+  the *handshake*. (d) Run the same binary twice in one process: if run 1 is wrong and run 2 right within a single
+  process, the residue is per-launch and a self-inflicted pairing bug; if the parity follows the process, it is
+  device state and every protocol in this project needs an opening drain.
+  **The documented discipline, since no reset API was found.** There is none. The sanctioned approach is exact
+  pairing plus an explicit tail drain: §31.3's PPFM kernel ends each chain with
+  `CrossCoreWaitFlag<...>(kFlagDhFree)` purely to 「把本链 dH 槽与 T2 槽的归还信用收干净」 — drain the leftover
+  credits — and counts them 「每链 AIV prime 1 次、每 chunk set 1 次、这里 wait 1 次 ⇒ 逐链平衡」. Copy that
+  bookkeeping: for every flagId, write down sets and waits per core and show they are equal.
+- **`PIPE_S` is listed as an unsupported pipe for every mode A3 has, and it is the header default.** Our brick's
+  `CrossCoreWaitFlag<0x02>(4)` takes `pipe = PIPE_S`. Combined with 「pipe要一致」 and with §31.3's measured
+  observation that a `PIPE_S` wait on A2 lets the following MTE2 issue early and read 「半新半旧」 C, the conflict
+  recorded in §34 now resolves in PPFM's favour: write the consumer as
+  `CrossCoreWaitFlag<0x02, PIPE_MTE2>(flag)`. That is the pipe the consumer actually blocks (it is about to MTE2 the
+  cube's result out of GM), it is a supported value, and it is what the one shipping A2/A3 kernel we have measured
+  evidence for uses.
+- **flagId on A3 is 0-15, not 0-10**, and each AIC and each AIV has its own 16. This supersedes README finding 3 and
+  §20/§34. Out-of-range values are silently truncated to the low 4 bits — so a hand-rolled scheme that lets an id
+  reach 16 aliases onto 0, which on A3 is inside `Matmul`'s `[0, 2N-1]`. With Matmul's N objects taking `[0, 2N-1]`
+  and `SyncAll` taking 11/12/13/14 (§35.5), one Matmul object leaves 2-10 and 15 free.
+- **Consecutive Sets from one core are unordered**: 「一个核连续发出的CrossCoreSetFlag，硬件不保证执行顺序」, with
+  the vendor's own example of `(0)` then `(1)` executing as `(1)` then `(0)`. A 78-layer kernel that raises stage
+  flags back to back cannot rely on their order; it needs one flag per stage with a wait between, or a GM counter.
+- **If the kernel type ever resolves to `KERNEL_TYPE_AIC_ONLY` or `KERNEL_TYPE_AIV_ONLY`, the hardware does not turn
+  the scheduling module on and cross-core sync silently does not work** —
+  「硬件不会开启调度模块，也就无法正常进行核间同步」. That is the one documented way every barrier in a kernel
+  becomes a no-op at once. It is worth verifying from the built binary rather than the source that the type is
+  `KERNEL_TYPE_MIX_AIC_1_2`, particularly given the measured finding that `--cce-aicore-arch=dav-c220` silently drops
+  `__schedmode__` where `--npu-arch=dav-2201` keeps it: a toolchain that drops one kernel attribute may drop another.
+- The flag is a **scheduling-module event**, not a memory operation: the Set 「向调度模块上报本核任务已完成」 and the
+  Wait blocks 「本核后续指令的下发」 until 「调度模块确认」. That is the clean statement of why it carries no memory
+  ordering, which is the §34/§35 story, and also why its state lives outside the kernel's address space.
+
+
 ## Gaps
 
 What was looked for and not found, or found only partially.

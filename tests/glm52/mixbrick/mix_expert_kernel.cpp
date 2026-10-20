@@ -68,6 +68,26 @@ namespace {
  * correct every time when downloaded, and the count of wrong rows differed on
  * every run.
  */
+/** Report what each half sees of the grid, into the first slots of a buffer.
+ *
+ * Every channel range in this kernel is derived from `GetBlockIdx` and
+ * `GetBlockNum`, and under mode 2 a cube can only raise a flag for its own
+ * two vector subblocks -- so if the two halves number the grid differently, a
+ * vector core reads a slice some other cube wrote and no barrier can help.
+ * The derivation was a guess; this measures it.
+ */
+__aicore__ inline void ReportGrid(__gm__ int32_t* buffer, int64_t slot)
+{
+    GlobalTensor<int32_t> probe;
+    probe.SetGlobalBuffer(buffer, 64);
+    probe.SetValue(slot, (int32_t)GetBlockNum());
+    probe.SetValue(slot + 1 + GetBlockIdx(),
+                   (int32_t)(100 * (1 + GetBlockIdx()) + GetSubBlockIdx()));
+    DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
+                             DcciDst::CACHELINE_OUT>(probe);
+    DataSyncBarrier<MemDsbT::DDR>();
+}
+
 /** Publish this core's global writes to the others.
  *
  * On NPU architecture 2201 the L2 cache is shared across cores, the DCache is
@@ -278,15 +298,27 @@ __aicore__ void mix_expert_fused(
     // cores, and SwiGLU needs them together; two projections of a slice each
     // keeps them on one core and needs no weight permutation.
     //
-    // `GetBlockIdx` and `GetBlockNum` do not agree across the halves: the
-    // cube sees `blocks` of them, the vector side sees two per cube block.
-    // Deriving the range from either directly gives the two halves different
-    // answers, and the columns one half wrote the other never read -- which
-    // read as zeros in exactly the slices the odd blocks owned.
-    const int64_t block = GetBlockIdx() * blocks / GetBlockNum();
+    // The two halves number the grid differently, and it is measured, not
+    // assumed: at four blocks the cube reports `GetBlockNum` 4 with
+    // `GetBlockIdx` 0 to 3, while the vector side reports `GetBlockNum` 4
+    // with `GetBlockIdx` 0 to 7 and `GetSubBlockIdx` 0 or 1. So the count
+    // cannot be used to convert between them. The vector subblocks 2i and
+    // 2i+1 belong to cube i -- and under mode 2 a cube can raise a flag only
+    // for those two -- so a vector core must take its range from
+    // `GetBlockIdx() / 2`. Taking it from `GetBlockIdx()` sent each vector
+    // core to a slice some other cube wrote, which no barrier can order.
     const int64_t channels = HALF / blocks;
-    const int64_t channel = block * channels;
+    if (stages & 64) {
+        if ASCEND_IS_AIC {
+            ReportGrid(partial, 0);
+        }
+        if ASCEND_IS_AIV {
+            ReportGrid(partial, 32);
+        }
+        return;
+    }
     if ASCEND_IS_AIC {
+        const int64_t channel = GetBlockIdx() * channels;
         TPipe cube_pipe;
         if (stages & 1) {
             // Bit 5 projects the whole axis in one call instead of two. Two
@@ -325,6 +357,7 @@ __aicore__ void mix_expert_fused(
         }
     }
     if ASCEND_IS_AIV {
+        const int64_t channel = (GetBlockIdx() / 2) * channels;
         TPipe vector_pipe;
         if (stages & 8) {
             // A bare `CrossCoreWaitFlag` resolves to mode 0 on `PIPE_S`:

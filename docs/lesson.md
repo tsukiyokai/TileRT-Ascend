@@ -219,3 +219,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     that matters for a sync bug is whether removing the sync changes anything:
     the same error distribution with and without the flag proves it was never
     ordering. [Evidence](evidence/ascend-decode/mixbrick-20261020/README.md).
+
+37. In a MIX kernel the two halves number the grid differently and the count
+    does not convert between them: at four blocks the cube reports
+    `GetBlockNum` 4 with `GetBlockIdx` 0-3, the vector side reports the same 4
+    with `GetBlockIdx` 0-7 plus `GetSubBlockIdx`. Subblocks 2i and 2i+1 belong
+    to cube i, and mode 2 lets a cube flag only those two -- so a vector core
+    whose range came from `GetBlockIdx()` reads a slice another cube wrote and
+    waits on the wrong producer, which no barrier can order. Measure the
+    numbering before deriving anything from it; three rounds of barrier-adding
+    went into a defect a four-line probe settled. The producer does need
+    `DataSyncBarrier<MemDsbT::DDR>()` -- `PipeBarrier` orders a pipe's issue,
+    not its retirement -- and on 2201 the DCache is irrelevant to a
+    cube-to-vector handoff, which runs entirely through the shared L2.
+    [Evidence](evidence/ascend-decode/mixbrick-20261020/README.md).

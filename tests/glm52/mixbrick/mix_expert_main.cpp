@@ -204,6 +204,26 @@ int main(int argc, char** argv)
     Check(aclrtMemcpy(staged_host.data(), out_bytes, staged_out, out_bytes,
                       ACL_MEMCPY_DEVICE_TO_HOST), "download staged");
 
+    if (stages & 64) {
+        std::vector<int32_t> probe(64, -1);
+        Check(aclrtMemcpy(probe.data(), 64 * sizeof(int32_t), partial,
+                          64 * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST),
+              "download probe");
+        std::printf("launched with %u blocks\n", blocks);
+        for (int half = 0; half < 2; ++half) {
+            std::printf("  %s GetBlockNum %d, per-block ",
+                        half ? "vector" : "cube", probe[half * 32]);
+            for (int slot = 1; slot < 20; ++slot) {
+                if (probe[half * 32 + slot] >= 0) {
+                    std::printf("[%d]=%d ", slot - 1,
+                                probe[half * 32 + slot]);
+                }
+            }
+            std::printf("\n");
+        }
+        return 0;
+    }
+
     // Check the INT32 product itself before the activation reads it: a
     // matmul that lands in the wrong place and a vector stage that reads the
     // wrong place look identical in the output.
