@@ -59,6 +59,38 @@ def _repack(packed, columns):
         torch.int8).contiguous()
 
 
+def prepare_layer(w13, w2, gu_scale, gu_bias, down_scale, down_bias,
+                  rank=0, world=16):
+    """One layer's weights as the kernel reads them.
+
+    The one place that knows the checkpoint's conventions, because knowing
+    them in several places has cost the same mistake twice in a day: the
+    packing is along the output axis and the shapes permit either reading, so
+    a second implementation that gets it wrong produces a reference that runs
+    and agrees with nothing.
+
+    A rank holds every expert and a slice of each one's intermediate axis, so
+    `w13`'s output axis and `w2`'s K axis are what divide.
+    """
+    import torch
+
+    intermediate = w13.shape[1] * 2 // 2  # packed bytes along N, halved N
+    per_rank = intermediate // world
+    span = slice(rank * per_rank, (rank + 1) * per_rank)
+    outputs = slice(rank * per_rank * 2, (rank + 1) * per_rank * 2)
+    held_13 = torch.cat((w13[:, span], w13[:, span]), dim=1) \
+        if w13.shape[1] == per_rank else w13[:, span]
+    down_span = slice(rank * per_rank * 2, (rank + 1) * per_rank * 2)
+    return {
+        "gate_up": _repack(held_13, held_13.shape[1] * 2),
+        "down": _repack(w2[:, :, down_span], w2.shape[1] * 2),
+        "gu_scale": gu_scale[:, outputs].reshape(gu_scale.shape[0], -1),
+        "gu_bias": gu_bias[:, outputs].reshape(gu_bias.shape[0], -1),
+        "down_scale": down_scale.reshape(down_scale.shape[0], -1),
+        "down_bias": down_bias.reshape(down_bias.shape[0], -1),
+    }
+
+
 def _load():
     """Bring in the kernel's library, before torch sees the operator.
 
