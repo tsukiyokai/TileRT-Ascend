@@ -188,3 +188,26 @@ So the route is sound in principle and unreachable at 10 percent of a device.
 It needs either the machine free or a configuration search that costs five to
 seven minutes an iteration, and the four levers waiting on it are each already
 validated on one die.
+
+## 2026-10-21 the levers are queued behind a watcher
+
+`/workspace/experiments/levers-20261021/watch_and_run.sh` runs detached in the
+container: it polls `precheck.sh` every five minutes for sixteen hours and
+starts four arms once a die has more than 48 GiB free. The parse was verified
+against the current state -- `free 6.7` reads as 6.7 and compares false -- so a
+sixteen-hour wait cannot end in a silent no-op.
+
+    baseline      the current path, with AIV on by default
+    rope          --rope-graph
+    rope-narrow   --rope-graph --narrow-bank
+    aicpu         --ai-cpu-collectives, the negative control for AIV
+
+All four carry `--round-phases`, so the first engine-side account of a round's
+steps arrives with them. Each arm skips itself if its `rank-0.json` already
+exists, so a rerun resumes rather than repeats.
+
+What the arms settle, in order of size: whether the rope graph's 22.54x on one
+die becomes 7.25 ms a round in the engine; whether AIV's 1.5 to 1.85x on
+standalone collectives shows up against its own negative control; whether the
+bank narrowing's 4.63 ms survives the engine's own routing; and where a round's
+50.710 ms actually goes.
