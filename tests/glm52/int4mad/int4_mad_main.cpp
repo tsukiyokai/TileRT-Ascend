@@ -1,5 +1,5 @@
 /**
- * Both operands are ones, so every element of the product should be K, and
+ * Both operands are INT4 ones, so every element of the product should be K, and
  * that is true in any fractal order. The second filling makes the nibbles of
  * a byte differ: 0x21 is a one and a two, so the sum over K is 96 if both
  * halves are read, 64 or 128 if only one is.
@@ -42,13 +42,14 @@ int main(int argc, char** argv)
     void* left = nullptr;
     void* right = nullptr;
     void* out = nullptr;
-    Check(aclrtMalloc(&left, ROWS * INNER, ACL_MEM_MALLOC_HUGE_FIRST), "left");
+    Check(aclrtMalloc(&left, ROWS * INNER / 2, ACL_MEM_MALLOC_HUGE_FIRST),
+          "left");
     Check(aclrtMalloc(&right, COLUMNS * INNER / 2, ACL_MEM_MALLOC_HUGE_FIRST),
           "right");
     Check(aclrtMalloc(&out, ROWS * COLUMNS * sizeof(int32_t),
                       ACL_MEM_MALLOC_HUGE_FIRST), "out");
 
-    const std::vector<int8_t> left_host(ROWS * INNER, 1);
+    const std::vector<uint8_t> left_host(ROWS * INNER / 2, 0x11);
     const std::vector<uint8_t> right_host(COLUMNS * INNER / 2, filling);
     const std::vector<int32_t> sentinel(ROWS * COLUMNS, 0x7777);
     Check(aclrtMemcpy(left, left_host.size(), left_host.data(),

@@ -106,3 +106,31 @@ peak, not mad bound, so doubling the mads costs little. The vendor pays for
 it by splitting pre, mid and post into three kernels with global memory
 between them -- which is a plain reading of why its 165.2 µs is 10% of
 bandwidth. One kernel keeps the split in UB.
+
+## The primitive, driven by hand and measured
+
+`DataCopy` global to L1, `LoadData` L1 to L0, `Mmad`, `Fixpipe` L0C to global.
+M, K and N are 16, 64 and 16, one INT4 fractal of K a side, and both operands
+are filled so that the answer does not depend on the fractal order.
+
+| right-hand filling | expected | got |
+|---|---|---|
+| `0x11`, every nibble a one | 64, which is K | 64 everywhere, nothing untouched |
+| `0x21`, nibbles of one and two | 96 | 96 everywhere |
+
+The second row is the one that settles it. If the part read one nibble a byte
+the answer would be 64 or 128; 96 is 32 ones and 32 twos, so both halves of
+every byte are separate INT4 elements. `mad_s4` consumes packed INT4
+correctly.
+
+One negative worth keeping: `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY)`
+is rejected at submission, not at run -- the queue reports `sqe_type=3(place
+holder), errType=0x20(sq sw status error), sqSwStatus=0x23` and the launch
+returns 507015 with no aicore exception anywhere in the log. The `__mix__(1, 2)`
+shape this project already runs cube code through works, with the vector half
+returning immediately.
+
+So every link is proven: INT4 from global memory to L1, L1 to L0, the mad
+itself, and the product out through the fixpipe. What remains is tiling
+K = 6144 and N = 256 by hand, and the activation split the vendor's `a8w4_msd`
+stages describe.
