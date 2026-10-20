@@ -1816,3 +1816,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      sums to 77.6 ms against a measured round of 50.710, so the streams overlap
      and device totals cannot be added into a round budget without knowing by
      how much.
+
+175. The 530 casts a round are the rope refresh, and their addresses are fixed.
+     `refresh_rope` gathers cos and sin with two `index_select` calls and then
+     copies the result into every distinct destination, and
+     `aclnnInplaceCopy_CastAiCore_Cast` is `copy_`'s kernel -- 530 a round over
+     two an entry is about 265 destinations. They are not redundant:
+     `rope_destinations` deduplicates by `data_ptr()` and a speculative builder
+     keeps independent RoPE storage. But the destinations come from hoisted
+     metadata, so the pointers are identical every round, which is the
+     condition a graph needs. So the 11.44 ms is dispatch to capture rather
+     than work to remove, and there are two ways in: a small graph for the
+     refresh, or making the speculative builders share the MLA buffers so the
+     loop has nothing to write.

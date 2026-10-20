@@ -42,3 +42,37 @@ The eager calls are the residual and they are host dispatch, not device work --
 capturable is the next question, and the names say where to look: the census's
 largest eager families were `aclnnInplaceCopy_CastAiCore_Cast` at 530 a round
 and `aclnnMuls` at 75.
+
+## Where the 530 casts a round come from
+
+`refresh_hoisted_rope` -> `refresh_rope`, in `cann_model.py`:
+
+    torch.index_select(rope._cos_cache, 0, positions, out=rope._cos_mla[:width])
+    torch.index_select(rope._sin_cache, 0, positions, out=rope._sin_mla[:width])
+    for cos, sin in destinations:
+        cos.copy_(rope._cos_mla[:width])
+        sin.copy_(rope._sin_mla[:width])
+
+`aclnnInplaceCopy_CastAiCore_Cast` is `copy_`'s kernel, and 530 a round over
+two copies an entry puts about 265 entries in `destinations`.
+
+They are not redundant. `rope_destinations` already deduplicates by
+`data_ptr()`, and its comment names the reason: a builder configured for
+speculative decoding keeps independent RoPE storage and copies the shared
+gather into it, so every distinct buffer has to be written every round.
+
+## But the addresses are fixed, so the copies are capturable
+
+The destinations come from hoisted metadata -- the addresses a replay captured
+-- so they do not change between rounds. `index_select`'s output and every
+`copy_`'s target are the same pointers every time, which is exactly the
+condition a graph needs.
+
+So the 11.44 ms is not work to remove but dispatch to capture: 1108 eager calls
+at 11.386 us against 1.064 under replay. The engine already captures the model
+forward; this is the per-round metadata refresh that sits outside it.
+
+Two ways in, both untried: capture the refresh in its own small graph replayed
+before the model's, or make the speculative builders share the MLA buffers so
+`destinations` is empty and the loop disappears. The first is ours to do; the
+second is a vLLM-Ascend builder configuration.
