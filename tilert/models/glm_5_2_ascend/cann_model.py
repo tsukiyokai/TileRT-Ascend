@@ -178,7 +178,7 @@ class CannModel:
         gpu_memory_utilization=0.85, *, compile_target=False,
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
-        index_topk=None,
+        index_topk=None, plain_moe_combine=False,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
@@ -216,10 +216,14 @@ class CannModel:
         self.graph_width = graph_width
         self.hoist_metadata = hoist_metadata
         self.fp32_head = fp32_head
-        # A config-store endpoint turns the TP sum into a one-sided push; the
-        # vendor collective's 63.5 us is rendezvous rather than transfer.
+        # A config-store endpoint turns the TP sum into a one-sided push: the
+        # vendor collective is rendezvous rather than transfer. The decode
+        # path measures 37.9 us a site over 146 sites, not the 63.5 us this
+        # once recorded, so the headroom against the push's 22.3 us is 2.28 ms
+        # a round. [critical-path-20261020]
         self.onesided_endpoint = onesided_reduce
         self._onesided = None
+        self._restore_combine = None
         self.checkpoint = str(Path(checkpoint).resolve())
         torch.npu.set_device(self.device)
         self.config = create_config(
@@ -250,6 +254,10 @@ class CannModel:
             self._bind_cache()
         self._allocate_inputs()
         self._install_tp_sum()
+        if plain_moe_combine:
+            from .moe_combine import install
+
+            self._restore_combine = install()
 
     def _install_tp_sum(self):
         from vllm.distributed import get_tp_group
@@ -288,6 +296,9 @@ class CannModel:
         if self.graph is not None:
             self.graph.close()
         self._restore_tp_sum()
+        if self._restore_combine is not None:
+            self._restore_combine()
+            self._restore_combine = None
         if self._onesided is not None:
             self._onesided.close()
             self._onesided = None

@@ -14,7 +14,10 @@ capture into four equal parts and read 22% low; 78 layers and 75 MoE layers
 are the normalisation, from `plan.md`.
 
 Profiling inflates the round from the unprofiled 53.05 ms to 62.4 ms, so the
-shares below are the result and the absolutes are not.
+shares below are the result and the absolutes are not. That inflation is also
+what the 11.48 ms of "no kernel anywhere" mostly is: 62.4 − 53.05 = 9.4 ms of
+it, leaving around 2 ms of real gap. It is not an 11 ms target, and the
+pinned-staging work already took 3.4–3.8 ms of whatever gap there was.
 
 | per round, ms | round 2 | round 3 |
 |---|---|---|
@@ -78,8 +81,19 @@ excused by name.
 The residual combine is the worst of it. Per layer: `Muls` 8.5 µs,
 `ForeachAddList` 21.4, and the cast pair 13.5 — 43.4 µs to compute
 `residual + scale * out`, feeding an `AddRmsNormBias` that costs 4.1. Ten
-times the normalisation it serves, for 98 KiB. `ForeachAddList` alone is 91x
-its bytes.
+times the normalisation it serves, for 98 KiB.
+
+`ForeachAddList` is settled by a matched pair inside this one capture, not by
+a model of it. At `1,6144;1,6144` on AI_VECTOR_CORE, plain `Add` is 1.820 µs
+and `ForeachAddList` 21.282 — 11.7x for the same arithmetic. Its cost is also
+flat in rows, 21.282 at one against 21.442 at eight, so all of it is
+structure. `fused_moe.py:236` reaches it through
+`torch._foreach_add([shared_output], [fused_output])[0]`: a multi-tensor
+kernel whose launch count does not grow with the list, called with a list of
+one. The override's own docstring retires it once a superkernel add exists,
+and `enable_super_kernel` is on. `--plain-moe-combine` substitutes the plain
+add; both are an elementwise BF16 add, so it is bit-exact. 75 MoE layers,
+about 1.4 ms a round.
 
 This is the megakernel's target stated in numbers, and it is not the boundary
 the closed brick tested. That brick fused publication with its consumer and

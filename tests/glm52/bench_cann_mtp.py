@@ -140,9 +140,13 @@ def arguments():
                         help="Rounds each broadcast command batches")
     parser.add_argument("--expert-parallel", action="store_true",
                         help="EP16 experts and the fused MC2 MoE operator")
+    parser.add_argument("--plain-moe-combine", action="store_true",
+                        help="Add the shared and routed MoE outputs directly"
+                             " instead of through the multi-tensor kernel")
     parser.add_argument("--onesided-reduce",
-                        help="Config-store endpoint, e.g. tcp://127.0.0.1:9421,"
-                             " replacing the TP sum with a one-sided push")
+                        help="Config-store endpoint, e.g."
+                             " tcp://127.0.0.1:9421, replacing the TP sum"
+                             " with a one-sided push")
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
@@ -373,6 +377,7 @@ def run(args, report):
                        index_topk=args.index_topk,
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
+                       plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
                        hoist_metadata=args.hoist_metadata,
                        hoist_forward_context=args.hoist_forward_context)
