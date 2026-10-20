@@ -1424,3 +1424,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      within the layer rather than across it -- the direction the 15.73 ms of
      merges already came from, and the one cross-layer fusion's 6.15x penalty
      does not speak to.
+
+144. The graph page's 2.98 ms used the copy oracle's acceptance. Its arithmetic
+     was right and its acceptance was 10.918, which today's saturation sweep
+     puts 2.5 times above what real drafters reach -- the tree converges to
+     4.289 with rows free and the budget at 256. At the measured ceiling the
+     same graph figure gives 3.89 ms rows-free and 7.58 with 24 rows, so the
+     page's conclusion is void. What replaces it is sharper: 2.9 ms needs 159.5
+     us a layer, which is 50 percent below eager but only 25 percent below the
+     213.9 us a captured layer replays at -- and the engine already captures.
+     The remaining gap is 54.5 us a layer, 4.25 ms a round, device-side.

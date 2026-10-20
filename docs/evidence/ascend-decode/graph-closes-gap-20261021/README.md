@@ -49,3 +49,29 @@ round model was fitted from arms that all ran with the graph on, so if their
 synthetic layer omits and the merges are the way to collect it -- which is
 what the queued arms measure. If instead the engine is somehow paying eager
 cost inside a graph, that is a separate and larger lever.
+
+## Correction: the acceptance this page used is above the measured ceiling
+
+The 2.98 ms above takes 10.918 accepted, which is the copy oracle's figure.
+Today's saturation sweep measured what real drafters converge to with the row
+cost set to zero and the budget taken to 256: the tree 4.289, the chain 3.400.
+
+At the measured ceiling the same graph figure gives
+
+    round 16.69 ms, rows free          TPOT 3.89 ms
+    round 32.53 ms with 24 rows        TPOT 7.58 ms
+
+So this page's conclusion -- that 2.x is back inside the identified mechanisms
+-- is void, on an acceptance 2.5 times the ceiling.
+
+What survives is better than what it replaces, because the graph figure is
+sourced and the comparison is now the right one:
+
+    2.9 ms at 4.289 accepted needs      159.5 us a layer
+      against eager 317.5               -50%
+      against the graph figure 213.9    -25%
+      remaining                          54.5 us a layer, 4.25 ms a round
+
+Twenty-five percent device-side, not fifty, because capture already removes the
+host boundary and the engine has `FULL_DECODE_ONLY`. That is the gap the
+within-layer fold has to close, and it is a quarter rather than a half.
