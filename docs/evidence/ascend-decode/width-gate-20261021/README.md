@@ -24,20 +24,17 @@ layers produce is decided by `impl.skip_topk`, and the checkpoint distributes
 that by `(i - 2) % 4` -- `index_skip_topk_offset` in its config.
 
 A shared selection is the design, declared by `index_share_for_mtp_iteration:
-True`. But the mask also carries the **causal** term, which depends on each
-query row's own slot. At width w the rows occupy slots p through p+w-1, so the
-causal boundary differs per row -- and a mask built by one layer at one width
-is reused by consumers whose rows sit at the same slots, which is fine.
-
-What is not obviously fine is a width that spans more than one producer's
-interval. With producers every fourth layer and a consumer chain between them,
-a wider query block changes how many rounds a given mask survives.
+True`. But the mask also carries the causal term, which depends on each query
+row's own slot: at width w the rows occupy slots p through p+w-1, so the
+boundary differs per row. A mask built at one width and reused by consumers
+whose rows sit at the same slots is fine; what is not obviously fine is a width
+that spans more than one producer's interval.
 
 ## The experiment, ready for the machine
 
-Serial against speculative at widths 4, 6, 8 and 12 with `gather_fia`, with the
-gate lifted, comparing the delivered tokens. The engine's own
-`--attention-kernel` selects it and `precision_verified` already exists in the
-record. If the divergence tracks the producer interval rather than the width
-itself, the fix is to refresh per consumer rather than per interval -- and the
-gate opens, which is worth 21.3 us a layer and the tree.
+Serial against speculative at widths 4, 6, 8 and 12 with `gather_fia` and the
+gate lifted, comparing delivered tokens. The engine's `--attention-kernel`
+selects it and the record already carries `precision_verified`. If the
+divergence tracks the producer interval rather than the width, the fix is to
+refresh per consumer rather than per interval -- and the gate opens, which is
+worth 21.3 us a layer and the tree.
