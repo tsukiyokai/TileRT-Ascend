@@ -86,6 +86,15 @@ def check_install_narrows_a_fake_method():
     assert method.seen == (5, [3, 3, 7, 7, 10]), method.seen
 
 
+def check_a_non_monotonic_list_is_rejected():
+    """A cumulative list that steps backwards is a bug, not an empty slot."""
+    try:
+        expert_counts(torch.tensor([3, 2, 7]), 0)
+    except AssertionError:
+        return
+    raise AssertionError("a backwards step should not pass")
+
+
 def main():
     checks = [value for name, value in sorted(globals().items())
               if name.startswith("check_")]

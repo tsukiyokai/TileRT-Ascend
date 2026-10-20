@@ -21,6 +21,12 @@ subset, not the split.
 
 Both the weights and the group list have to agree on which slots exist, so the
 filter belongs where a caller sees both at once.
+
+The group list arrives as cumulative counts (type 0) or counts (type 1); every
+quantisation method here calls `cumsum_group_list` with those two, and the
+sparse type 2 branch cannot run at all since no caller passes the `expert_num`
+it needs. So an empty slot is a zero or a repeat of its neighbour, and never a
+negative step.
 """
 import torch
 
@@ -29,11 +35,14 @@ def expert_counts(group_list, group_list_type):
     """Rows an expert, from either group-list convention.
 
     Type 0 is cumulative, type 1 is counts already. A slot is touched when its
-    count is positive.
+    count is positive, and a negative count means the cumulative list is not
+    monotonic -- which no path here produces, so it is an assertion rather
+    than a case to handle.
     """
-    if group_list_type == 0:
-        return torch.diff(group_list, prepend=group_list.new_zeros(1))
-    return group_list
+    counts = (torch.diff(group_list, prepend=group_list.new_zeros(1))
+              if group_list_type == 0 else group_list)
+    assert (counts >= 0).all(), counts
+    return counts
 
 
 def narrow(weights, group_list, group_list_type):

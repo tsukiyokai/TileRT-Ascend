@@ -1578,6 +1578,9 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      unmentioned slots with `active_num` so they equal their neighbour and
      their first difference is zero. All three conventions therefore make the
      empty slots visible, which is the narrowing's last unverified premise.
-     The lever is not an inference about routing: the round receives the subset
-     in sparse form and widens it to the full bank before an operator whose
-     cost is linear in that bank.
+     But the sparse branch is not ours: every call site omits `active_num` and
+     `expert_num`, so it would build a zero-length tensor and cannot run on
+     these quantisation methods. What holds is narrower and enough -- the list
+     arrives as counts or cumulative counts, an empty slot is a zero or a
+     repeat, and a negative step is now an assertion rather than a case read
+     silently as empty.

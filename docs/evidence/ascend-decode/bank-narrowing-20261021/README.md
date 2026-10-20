@@ -221,8 +221,15 @@ zero -- which is what `expert_counts` reads. All three conventions make the
 empty slots visible: type 1 holds zeros directly, type 0 holds them as equal
 neighbours, type 2 omits them.
 
-And the finding is larger than the mechanism. The engine receives the touched
-set in sparse form and expands it to the full bank before handing it to an
-operator whose cost is linear in the bank. The information the narrowing needs
-is not inferred or measured -- it is already in the round and thrown away one
-function before the call that charges for it.
+## Correction: the sparse path is not ours
+
+Every call site passes only the two conventions and omits `active_num` and
+`expert_num`, so the type 2 branch would build a zero-length tensor and cannot
+run at all on these quantisation methods. The sparse form belongs to another
+backend.
+
+So the claim that the engine receives the touched set in sparse form and throws
+it away does not hold for the W4A8 path. What holds is narrower and sufficient:
+the group list arrives as cumulative counts or as counts, and an empty slot is a
+zero or a repeat of its neighbour -- never a negative step, which is now an
+assertion in `expert_counts` rather than a case silently read as empty.
