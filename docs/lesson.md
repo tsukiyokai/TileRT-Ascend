@@ -430,3 +430,18 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
     width optimum -- 12 beats 16 and 32 because a large fixed cost wants a
     small width -- and therefore dates the tree: the tree needs budget, budget
     needs a large width, and a large width needs the fixed cost gone first.
+
+55. Fuse along the dataflow, not along the file. I absorbed the RMSNorm and
+    the per-token quantisation into the expert kernel because they sit next to
+    it in the source and because the fixed cost wants fewer operators a layer.
+    Both are upstream of the router, not of the experts:
+    `token_dispatcher.py` takes `dynamic_scale` from
+    `token_dispatch_input.routing.pertoken_scale` and `npu_moe_init_routing`
+    returns the sorted hidden states already INT8 with their scales permuted
+    alongside. So the norm feeds the gate -- the router cannot run before it --
+    and quantising inside the expert kernel would either recompute the same
+    quantum eight times a token or force the dispatch to carry BF16 at twice
+    the bytes. The kernel's original signature was right. What the expert
+    kernel can absorb is downstream of the routing: the gather the dispatch
+    materialises, and the weighted unpermuted sum the combine performs. Read
+    the caller's dataflow before deciding what is adjacent.
