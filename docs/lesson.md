@@ -1525,6 +1525,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      flat in rows. At batch one each row picks eight of 256 experts and a rank
      owns sixteen, so a round touches two to five of them: narrowing the bank to
      those is worth 82.8 to 103.1 us a layer, 6.5 to 8.0 ms a round, against
-     the 4.25 needed. Distinct from the closed lever that changed the drafter
-     to route to fewer experts -- this changes no routing and only declines to
-     read experts no row selected.
+     the 4.25 needed. But that figure assumes uniform routing, and the lever
+     is 0 to 8 ms depending on concentration: at twelve rows, routing favouring
+     32 of the 256 experts already touches a rank's full sixteen and the saving
+     is nil. The argument that a copy-heavy workload helps was wrong -- fewer
+     distinct experts globally does not imply fewer on a rank, since a cluster
+     inside a rank's own sixteen touches all of them. The mechanism is
+     calibrated and the size needs one capture of a decode round's topk
+     indices, which nothing saved here holds.

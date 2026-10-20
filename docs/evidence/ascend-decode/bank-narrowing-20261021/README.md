@@ -56,3 +56,43 @@ once at load, and whether a per-round list costs anything is unmeasured.
 And this is distinct from a lever already closed. "Narrowing the draft to touch
 fewer experts" changed the drafter to route to fewer; this changes nothing about
 routing and only declines to read experts no row selected.
+
+## The saving depends entirely on routing concentration, which is unmeasured
+
+| rows | routing | touched | us | saved | ms a round |
+|---|---|---|---|---|---|
+| 5 | uniform over 256 | 2.43 | 66.4 | 102.2 | 7.97 |
+| 5 | favouring 64 | 7.87 | 107.3 | 61.2 | 4.77 |
+| 5 | favouring 32 | 12.14 | 139.5 | 29.1 | 2.27 |
+| 5 | favouring 16 | 15.52 | 164.9 | 3.6 | 0.28 |
+| 12 | uniform over 256 | 5.02 | 85.9 | 82.7 | 6.45 |
+| 12 | favouring 32 | 15.48 | 164.6 | 3.9 | 0.30 |
+| 12 | favouring 16 | 16.00 | 168.5 | 0.0 | 0.00 |
+
+So the lever is worth between 0 and 8 ms a round depending on a quantity this
+project has never measured. At twelve rows, routing concentrated onto 32 of the
+256 experts already touches a rank's full sixteen and the saving is nil.
+
+## And the argument offered for it was wrong
+
+This page said a copy-heavy workload repeating its tokens would route them to
+the same experts, "which would help, since fewer distinct experts means a
+narrower bank". That holds globally and not per rank. Concentration means the
+touched experts cluster, and if the cluster falls inside a rank's own sixteen
+that rank touches all of them. Fewer distinct experts globally does not imply
+fewer on any given rank.
+
+So the premise cannot be argued either way. It has to be counted: the topk
+indices of a real decode round, per rank, which no saved artifact on this
+machine holds -- `moe_capture.py` exists to record exactly that and has not been
+run against a decode.
+
+## Where that leaves the lever
+
+Mechanism calibrated: cost is linear in the bank at 7.53 us an expert over a
+55.57 intercept, 896 GB/s at the full bank, flat in rows. That part is
+measured and stands.
+
+Size unknown: 0 to 8 ms a round, set by the routing concentration. One capture
+of a decode round's topk indices settles it, and that capture is the same one
+the queued arms need the machine for.
