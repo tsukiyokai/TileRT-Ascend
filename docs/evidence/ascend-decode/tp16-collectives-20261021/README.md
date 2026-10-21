@@ -359,3 +359,38 @@ and 43 is the visible remainder.
 So the day's final account attributes 83 to 90 percent of the round, and the
 collective term is 3.44 to 6.88 ms rather than the 29.64 it began as -- with
 the correction coming from measuring in a chain rather than alone.
+
+## Two reductions a layer, measured directly: 6.10 ms a round
+
+Eight layers on sixteen ranks in one graph, with the reductions placed where
+TP16 needs them -- after the attention's projection and after the MoE:
+
+| reductions a layer | us a layer | added | ms a round |
+|---|---|---|---|
+| 0 | 38.30 | 0.00 | 0.00 |
+| 1 | 82.92 | 44.62 | 3.48 |
+| 2 | 116.48 | 78.19 | **6.10** |
+
+The second reduction adds 33.57 us against the first's 44.62, so it is cheaper:
+the first aligns the ranks and the second does not pay that jitter again.
+Doubling the one-reduction figure would have overstated it by 13 percent.
+
+## The day's final account
+
+    a layer, 21 kernels, one graph replay    38.77 ms
+    two reductions a layer, in a chain        6.10
+    sum                                      44.87
+    the measured round                       50.73
+    unattributed                              5.86   88 percent attributed
+
+From 34 ms unattributed in the morning to 5.86, and the collective term from
+29.64 ms to 6.10 -- both by moving the measurement to where the cost sits
+rather than where it was convenient.
+
+## A failure worth naming
+
+The probe first died with `NPUGraph: ERROR -- capture failed: NameError: name
+'reduce' is not defined` on eleven ranks at once, which reads as a capture or
+communication fault. It was a stale parameter name after a rename. A Python
+error inside a capture is reported as a capture failure, so the first place to
+look is the traceback rather than the collective.

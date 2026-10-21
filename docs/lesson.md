@@ -2292,3 +2292,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      measure a cost where it sits, not where it is convenient: the collective
      term went 29.64, 10.36, 5.11, 1.41, 3.44 across the day and only the last
      was measured in a chain.
+
+214. Two reductions a layer cost 6.10 ms a round, and the second is cheaper
+     than the first. Eight layers on sixteen ranks in one graph: 38.30 us a
+     layer with none, 82.92 with one, 116.48 with two -- so the first adds 44.62
+     and the second 33.57, because the first aligns the ranks and the second
+     does not pay that jitter again. Doubling the one-reduction figure would
+     have overstated the term by 13 percent. The round's account reaches 88
+     percent: 38.77 ms of layer plus 6.10 of reductions against a measured
+     50.73, leaving 5.86. And the probe first died as "NPUGraph: ERROR --
+     capture failed: NameError: name 'reduce' is not defined" on eleven ranks,
+     which reads as a communication fault and was a stale parameter name -- a
+     Python error inside a capture is reported as a capture failure.
