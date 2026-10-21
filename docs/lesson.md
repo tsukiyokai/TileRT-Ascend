@@ -2114,3 +2114,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the host path is fully exposed, so inside a graph the ratio should
      compress. Saying so before the arm runs is why the prediction was written
      down.
+
+200. The traffic floor says the target is reachable, and names what it needs.
+     Every operator at batch one is bandwidth-bound, so a round costs at least
+     the bytes it reads: a layer a rank is 190.2 MB of attention weights, 9.4 of
+     KV cache at 8K, and 302 of expert bank -- or 37.8 with the bank narrowed to
+     the two experts a round touches. At the 1200 GB/s the grouped matmul
+     achieves that is 32.60 ms a round full and 15.43 narrowed, which at 5.441
+     accepted is TPOT 5.99 and **2.84**. So 2.x is the floor's own value once
+     the bank is narrowed, not a projection from a ratio. The engine's 50.73 ms
+     is 3.3 times its traffic. And with the bank narrowed the attention weights
+     are 80 percent of what remains, of which kv_b_proj is 29.4 MB in BF16
+     where every other attention weight is int8.
