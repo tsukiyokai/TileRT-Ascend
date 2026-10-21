@@ -74,3 +74,43 @@ synchronise carries the same host tax. The ratios survive -- both arms paid it
 -- but the absolute attributions do not, which is why the in-graph table was
 the one worth keeping and why the TP16 layer's 485 us of compute is an upper
 bound on what a captured layer spends.
+
+## The row sensitivity at device time: 31 us of floor plus 0.66 us a row
+
+Profiled, one die, four heads, 8192 cache rows, 9.4 MB:
+
+| rows | us | GB/s | us a row |
+|---|---|---|---|
+| 1 | 32.10 | 294 | 32.10 |
+| 4 | 33.85 | 279 | 8.46 |
+| 12 | 44.29 | 213 | 3.69 |
+| 24 | 50.37 | 187 | 2.10 |
+| 48 | 67.42 | 140 | 1.40 |
+| 96 | 94.52 | 100 | 0.98 |
+
+A fit of about **31 us of intercept and 0.66 us a row**. Ninety-six times the
+rows costs 2.9 times the time, and the cost a row falls from 32.10 to 0.98.
+
+## Which corrects two readings from today
+
+The attention is not flat in rows at device time -- 0.66 us a row is real, and
+the earlier figure of plus or minus 0.015 ms a row came from host-timed
+measurements where the host tax swamped it.
+
+And the 190 GB/s is not an inefficiency to fix. At one row the operator reaches
+294 GB/s, which is what reading this cache costs: the latent and the rope are
+two separate tensors of 512 and 64 columns, so the access is strided rather
+than contiguous. The rate falls with rows because the fixed read is amortised
+over more arithmetic, not because the operator degrades.
+
+So FIA's 50 us at twelve rows is 31 of cache-reading floor, 8 of rows, and the
+rest marginal -- and the floor is the 9.4 MB at the rate a strided read of it
+achieves.
+
+## A numerical coincidence worth naming
+
+0.66 us a row here and 0.66 ms a row in the round model are the same digits
+three orders apart. The round figure was the fit's slope across arms, which this
+session showed was the width's capture cost rather than a row's marginal cost.
+They are unrelated, and seeing the same number twice in one project is a good
+reason to check the units before connecting them.

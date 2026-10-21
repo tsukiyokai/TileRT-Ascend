@@ -2155,3 +2155,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      only slowly, so the inefficiency is inside the operator rather than
      parallelism starvation -- 50 us of a narrowed layer's 136, 3.9 ms a round,
      which no fusion addresses.
+
+203. The attention's device time is 31 us of floor plus 0.66 us a row, so it is
+     neither flat nor inefficient. Profiled at four heads over 8192 cache rows:
+     32.10 us at one row, 44.29 at twelve, 94.52 at ninety-six -- 2.9 times the
+     time for ninety-six times the rows. The earlier "flat in rows" reading came
+     from host-timed measurements where the host tax swamped 0.66 us. And the
+     190 GB/s is not an inefficiency: at one row the operator reaches 294 GB/s,
+     which is what a strided read of this cache costs, the latent and rope being
+     separate tensors of 512 and 64 columns. The rate falls with rows because
+     the fixed read amortises over more arithmetic. Also: 0.66 us a row here and
+     0.66 ms a row in the round model are the same digits three orders apart and
+     entirely unrelated -- a good reason to check units before connecting two
+     numbers that look alike.
