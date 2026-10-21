@@ -356,3 +356,22 @@ makes two.
 
 So the bank is the round's largest device item by a wide margin, and the
 narrowing is the session's largest lever -- on a 50.710 ms round, 22.2 ms.
+
+## The experts are on dim 0 of all four values
+
+`splitting` slices each of the four values `_get_mlp_weights` returns along dim
+0, which is right only if the experts are there. The checkpoint stores per
+expert -- `model.layers.10.mlp.experts.0.gate_proj.weight` at `[1024, 6144]`,
+`weight_scale` at `[2048, 1]`, `down_proj.weight` at `[3072, 2048]` -- so the
+engine fuses them at load and the experts' axis is whatever that fusion puts
+first.
+
+This project's own `routed_expert.py` already names it: it reads
+`method.w13_weight.data` and asserts `wide.shape[1] == GATE_UP`, so the layout
+is `[expert][N/2][K]`, and it takes the scale as
+`method.w13_weight_scale.data.squeeze(-1)`, so that is `[expert][N][1]`.
+Experts first in both.
+
+So slicing dim 0 is correct for the weights and the scales alike, which was the
+last silent-failure risk in the lever: a wrong axis would have produced a
+running model with the wrong experts' scales, which no shape check would catch.

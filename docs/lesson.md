@@ -2043,3 +2043,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      class whose name matched. A wrapper is only as good as the name and arity
      it wraps, and neither shows up in a test against a stand-in built from the
      same wrong assumption -- so the stand-in now mirrors the real signature.
+
+193. The experts are on dim 0 of all four values the narrowing splits, which
+     was the last silent-failure risk. The checkpoint stores per expert, so the
+     engine fuses at load, and this project's own routed_expert.py names the
+     result: `w13_weight` is `[expert][N/2][K]` by its own assertion on
+     `shape[1]`, and `w13_weight_scale` is `[expert][N][1]` by the squeeze it
+     applies. A wrong axis would have given a running model with the wrong
+     experts' scales -- no shape check catches that, only reading the layout
+     some existing code already depends on.
