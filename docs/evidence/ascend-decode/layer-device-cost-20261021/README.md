@@ -144,3 +144,39 @@ Down from 14.51. And the bubbles are attackable by the mechanism already in the
 engine: fusing adjacent operators removes the wait between them, which is what
 the super kernel does on the MoE side and does not do for attention -- the
 census found zero super kernels naming attention.
+
+## Withdrawn: the gap is not a dependency wait, so fusion does not recover it
+
+Dependent against independent kernels in one graph, same shapes:
+
+| count | dependent | independent | gap each |
+|---|---|---|---|
+| 2 | 42.63 | 27.74 | 7.45 |
+| 4 | 27.23 | 27.69 | -0.11 |
+| 8 | 32.07 | 32.10 | -0.00 |
+| 16 | 41.56 | 41.65 | -0.01 |
+| 32 | 54.92 | 55.12 | -0.01 |
+
+From four kernels up they cost the same to within a hundredth of a microsecond.
+The two-kernel row is one noisy measurement, not a trend. So **dependent
+kernels do not wait** at these shapes, and fusing adjacent operators would not
+recover the gap.
+
+The marginal cost a kernel from four to thirty-two is (54.92 - 27.23) / 28 =
+**0.99 us**, which matches the 1.064 us this project measured for a trivial
+kernel's replay issue.
+
+## Which leaves the 53.10 us unexplained rather than attributed
+
+Eight kernels at 0.99 us of issue is 7.9 us, not 53.10. So the layer chain's
+gap between 350.98 us of profiled device time and 404.09 us of replay wall is
+not the issue and not a dependency wait.
+
+What remains: the profiler's Duration may not count a kernel's full occupancy,
+or one operator in the chain may have a wall time well above its reported
+Duration. Either way the 4.14 ms a round attributed to bubbles is withdrawn,
+and the round's unattributed term returns to 15.18 ms.
+
+The mechanism claimed with it -- that fusing attention with its neighbours
+would remove the wait -- is refuted, and the census's finding that no super
+kernel names attention stands as a fact without a lever attached to it.

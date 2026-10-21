@@ -2199,6 +2199,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      350.98 rather than the 228.67 used earlier because this chain runs both
      grouped matmuls at the checkpoint's widths. The round's account becomes
      27.38 of compute, 3.03 of plumbing, 4.14 of bubbles and 5.14 of
-     collectives against 50.73, leaving 11.04 ms. And the bubbles yield to the
-     mechanism already in the engine: fusing adjacent operators removes the
-     wait, which the super kernel does on the MoE side and not for attention.
+     collectives against 50.73, leaving 11.04 ms. But the gap is not a
+     dependency wait: dependent and independent kernels in one graph cost the
+     same from four kernels up, to within a hundredth of a microsecond, and the
+     marginal cost a kernel is 0.99 us -- the replay issue this project already
+     measured. Eight kernels of issue is 7.9 us, not 53.10, so the gap is
+     neither issue nor wait, the 4.14 ms is withdrawn, the unattributed term
+     returns to 15.18, and the claim that fusing attention would recover it is
+     refuted.
