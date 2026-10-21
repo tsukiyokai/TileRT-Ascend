@@ -242,6 +242,23 @@ w4a8c8 需要另找来源或重新量化。
 所以下次有机器时的第一件事不是跑臂，是重建环境并把 checkpoint 放到宿主挂载
 点上，这样下一次容器被清不会再丢它。
 
+重建试过一次，结论如下（2026-10-21，之后按指示停手未再动环境）：
+
+- 镜像 `ai-infra-infer-1.2.1-...-cann9.1.0-...-202610122142` 里 CANN 在
+  `/usr/local/Ascend/cann-9.1.0`，不在原容器的 `/opt/ascend/cann-9.2.0`；也
+  没有 `/opt/trt-asc` 这个 venv。所以原 trt-asc 是在镜像之上另装的，镜像不是
+  它的等价物。
+- `torch_npu` 需先 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`，否则
+  `Failed to load the backend extension`。
+- 挂载配方可从兄弟容器抄：`docker inspect lan_d_d0 --format
+  "{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}"`。
+- 但新起的容器活不过一分钟：一个只 `sleep infinity` 的探针容器在 t+20s 还
+  `Up`，t+30s 就 `Exited (1)`。两次独立尝试都如此。所以这台机器上有东西在主动
+  终止非白名单容器，而不是租户偶然清理。
+
+因此在 a3-84 上的整机实验不能依赖"自己起容器"。要么用已存在的 trt-asc（现已
+不存在），要么先弄清容器被终止的机制。
+
 ## 机器
 
 a3-84 容器耐久、16 die 常被租户占；187 die 常空但容器约四分钟被回收
