@@ -2081,3 +2081,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      that list to match. Confirmed by reading the consumer, which is the check
      that the producer side could not give: a wrapper's output has to be what
      the next function accepts, not merely what the previous one returned.
+
+197. The round time has almost no variance, so there is no tail to cut. The
+     best arm's own intervals: 188 round-bearing values with p10 50.04 ms, p50
+     50.73, p90 52.88, a spread of 1.06x, one outlier at 79 in 188. No slow
+     class of round exists -- no periodic rebuild, no recurring straggler, no
+     bimodality -- so optimisation has to take something every round pays. And
+     1023 tokens over 188 rounds is exactly 5.441 accepted, identical to what
+     the offline corpus measured for the same drafter and width, so the
+     session's offline drafting work transfers without a correction factor. The
+     5.407 quoted earlier was the rounding of two reported means.
