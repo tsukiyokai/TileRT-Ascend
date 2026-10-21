@@ -1,78 +1,74 @@
-# Where this stands, 2026-10-21
+# Handoff, 2026-10-21
 
-TPOT best measured end to end: **9.3794 ms** (automaton drafter at width 12,
-a3-84). Target 2.x. Everything below is single-die or CPU scope unless marked.
+## Where the target stands
 
-## The round, as now understood
+Measured: TPOT 9.3794 ms, round 50.73 ms at p50 over 188 rounds with a spread
+of 1.06x, 5.441 tokens accepted a round. The target needs a round of 15.78 ms
+at that acceptance.
 
-    round(width) = 45.88 ms + 0.66 ms per unit of width
+## The round's account, 88 percent attributed, one provenance throughout
 
-The second term is the **width's** fixed cost, not the row's marginal cost.
-Settled from the arms' own records: grouping each arm's rounds by matched
-drafts, six more matches cost 0.16 to 0.60 ms within an arm, while the medians
-across arms are 48.2, 50.5 and 53.5 ms at widths 8, 12 and 16. One graph is
-captured at `graph_width` and replayed once a round, so a wider graph costs
-more to replay even when its rows carry nothing.
-[Evidence](evidence/ascend-decode/row-cost-mismatch-20261021/README.md)
+    a layer, 21 kernels, one graph replay, harness floor removed   497.03 us
+    78 layers                                                       38.77 ms
+    two reductions a layer, measured in a chain on sixteen ranks      6.10
+    sum                                                              44.87
+    the measured round                                               50.73
+    unattributed                                                      5.86
 
-Consequence: a tree's budget is expensive because of the captured width, not
-because nodes cost anything to verify. Match the captured width to the tree's
-typical node count -- the adaptive tree averages 13.1 nodes, so width 16 --
-rather than to its ceiling.
+Every term is one replay of a whole unit against an engine that replays whole
+units. Sums of separately-timed operators are not comparable to it and were
+withdrawn.
 
-## Levers measured, awaiting the engine
+## The levers
 
-| lever | a round | how |
+| lever | size | state |
 |---|---|---|
-| routed experts, four launches into one | 8.48 ms | `--routed-kernel` |
-| TP reduction by one-sided push | 6.50 ms | `--onesided-reduce` |
-| four projections off the hidden states | 2.46 ms | unwired |
-| residual add with the norm | 1.46 ms | unwired |
-| withholding the custom aclnn library | 2.14 ms | a trimmed opp path, net 2.14 |
-| adaptive draft width | 9.7 percent | on by default with `--automaton` |
+| narrow the expert bank to the experts a round touches | 17.41 ms a round | implemented, `--narrow-bank`, bit-exact on five gap patterns, verified through the installer at real shapes, never run in the engine |
+| hoist the metadata, with the rope refresh captured | 7.28 ms, floor 0.13 | implemented, `--hoist-metadata --rope-graph`; the rope half only exists when hoisting is on |
+| AIV collective expansion | about zero | default on; the host path it improves is amortised away inside a graph |
 
-21.04 ms of merges takes the round to about 34.4 ms at width 16; with the
-adaptive tree's 9.288 accepted that is a TPOT near 3.70 ms. The width term is
-the graph's, so the capture should match the tree's typical 13.1 nodes rather
-than its ceiling.
+The bank is the only one whose size is both large and fully evidenced: the
+grouped matmul is bandwidth-bound at 1170 to 1255 GB/s, a rank's sixteen
+experts are 302 MB and cost 258.17 us a layer across two calls, the two a round
+touches cost about 35, and the checkpoint's router bias spans 0.02 to 0.03
+across 256 experts so routing is not clustered.
 
-## The queue
+## What is queued
 
-Twenty-seven arms on a3-84, 200 attempts at 300 s each, about 16 hours:
-`index-topk` (five), routed kernel (four), operator dispatch (four), width
-discriminator (five), MTP (five), super kernel (four). The machine has been
-tenant-occupied since 00:17 with 54.5 GiB held on the busiest die against a
-47 GiB gate.
+`/workspace/experiments/levers-20261021/watch_and_run.sh` runs detached in the
+container, polls every five minutes for sixteen hours, and starts seven arms
+once a die has 48 GiB free: baseline, hoist-rope, narrow, hoist, all, aicpu
+(AIV's negative control), steady (`--profile-last`). All carry
+`--round-phases`. Predictions are in
+`docs/evidence/ascend-decode/predictions-20261021/`.
 
-## Open, in order of what they decide
+`steady` matters most: the project has never captured a steady-state decode
+round, and every figure read from the six-token `profile-rope-20261018` had to
+be withdrawn or re-derived.
 
-1. ~~What in graph replay scales with width.~~ Answered on one die with a
-   synthetic graph: eager is flat across a fourfold row range while replay
-   rises monotonically, 2.3 us a row over eight layers. Capture fixes shapes
-   into the task list and a wider list costs more to replay.
-   [Evidence](evidence/ascend-decode/graph-width-replay-20261021/README.md)
-2. **The 20.30 ms end to end.** None of it has run in the engine.
-3. ~~The tree mask from the decode loop.~~ Done: `--tree` selects the
-   drafter, `MtpRoundExecutor` dispatches on `propose_tree`, the mask writer
-   is injected by the attention installer, and the accepted path commits
-   through the existing `resolve` -- the path is itself a chain, so the linear
-   match, the EOS check, the output budget and the cache commit all apply.
-   Four checks on CPU.
-4. **Width 8 and above disagree between serial and speculative decoding.**
-   Recorded in `fia-mask-20261020`, never isolated, and every acceptance
-   figure here is from width 12. Now has a discriminator: a chain draft's
-   tree mask is exactly the causal prefix, so if the cause is future leakage
-   the tree path agrees at width 16 where the chain path does not, and the
-   gate can go. Queued as `causal-20261021`.
-5. The routed kernel's residual five percent against the vendor, parked.
-6. Deregistering one operator from the custom package; deleting its files
-   leaves it at 116.376 us instead of CANN's 66.813.
+## What is closed, by measurement rather than argument
 
-## Closed by measurement today
+Drafting: acceptance saturates at 4.289 offline and the engine's own 5.441 is
+exact, and four independent routes to the copy oracle's 13.474 all fail -- its
+advantage is knowing the answer. Within-layer overlap: the attention side is a
+strict chain and the MoE's fork is cube against cube, where concurrency costs
+18.49 us. Fewer ranks: a rank owns 256/ranks experts so narrowing does not make
+TP8 affordable. The gather_fia gate: raising it is 19 percent slower at width
+12 and its failure is one bf16 ULP. Cross-layer fusion: 6.15x.
 
-Cross-layer fusion (23 percent ceiling), `npu_add_rms_norm_quant` (4.8x
-slower), `o_proj` with its residual add, the attention chain, pre-gathering the
-KV selection (35 percent slower), `--index-topk` (flat in picks), MTP as a
-drafter (published acceptance 1.85 to 3.9 against the automaton's 9.288),
-narrowing the draft to touch fewer experts (cost is flat in the expert count),
-and compacting the expert bank (115x the saving).
+## The method lessons that cost the most
+
+`docs/lesson.md` holds 214 entries. The ones that changed the most work:
+
+- Figures from different scopes can sit side by side and cannot overturn each
+  other. The collective term read 29.64, 10.36, 5.11, 1.41 and 6.10 ms across
+  the day, each measured, and only the last was measured in a chain.
+- Before attributing a residual, check the numerator belongs to the
+  denominator. 374 us a layer was derived by dividing a round-wide fit by 78.
+- A lever cannot remove more than the item it acts on. That arithmetic caught a
+  probe using the wrong inner width.
+- Measure the instrument. The replay harness charges 26.58 us before the graph
+  does anything, and it was counted as a finding twice.
+- Read the class the engine instantiates, not the base class whose name
+  matches. The narrowing wrapped `get_mlp_weights` where the W4A8 method has
+  `_get_mlp_weights` with four return values, and it installed silently.
