@@ -2131,3 +2131,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      The first pass read 2.84 ms and made the target look like a near-miss
      against physics, and its claim that attention dominates with kv_b_proj as
      the next target went with it.
+
+201. The engine runs at 2.4 times its own traffic floor, and the fixed overhead
+     alone exceeds the target's whole round budget. Comparing a narrowed floor
+     against an unnarrowed engine gave thirteen times, which was apples to
+     oranges. Against its own floor: today 50.73 ms against 21.01, ratio 2.41;
+     narrowed 33.33 against 3.84, ratio 8.68 -- the ratio worsens while the
+     TPOT improves from 9.32 to 6.13, both true because the denominator moved.
+     The fixed overhead is 29.72 ms a round or 381 us a layer, and 2.9 ms needs
+     a round of 15.78, so the overhead is 13.94 ms over the whole budget by
+     itself. No traffic reduction reaches the target; the overhead has to go,
+     and the collectives are its largest identified part at 10.7 to 29.6 ms.

@@ -78,3 +78,38 @@ costs, collectives, and whatever the arms attribute.
 That is a better position than the previous section's 2.84 ms, which made the
 target look like a near-miss against physics. It is not. The bytes are cheap;
 the round is expensive for other reasons.
+
+## The engine against its own floor, which is the comparison that means something
+
+Comparing a narrowed floor against an unnarrowed engine gave thirteen times,
+which is apples to oranges. Against its own floor:
+
+| state | round | floor | ratio | TPOT |
+|---|---|---|---|---|
+| today, full bank | 50.73 | 21.01 | **2.41** | 9.32 |
+| narrowed | 33.33 | 3.84 | 8.68 | 6.13 |
+
+So the engine runs at 2.4 times its traffic today. Narrowing removes 17.4 ms of
+traffic and leaves the fixed overhead, which is why the ratio worsens to 8.7
+while the TPOT improves to 6.13 -- both true at once because the denominator
+moved.
+
+## And the fixed overhead alone exceeds the target's whole budget
+
+    fixed overhead      29.72 ms a round, 381 us a layer
+    2.9 ms needs        15.78 ms a round
+    the overhead is     13.94 ms over that budget by itself
+
+That is the day's sharpest statement. The bytes are 3.84 ms once the bank is
+narrowed; the target allows 15.78; and the per-call costs that are neither
+bytes nor arithmetic are 29.72. No amount of traffic reduction reaches 2.9 --
+the overhead has to go.
+
+Of that 29.72, the collectives are the largest identified part: 156 calls a
+round at the 68.5 to 190 us this session measured, which is 10.7 to 29.6 ms. The
+rest is per-operator floors -- the grouped matmul's 17 us at two experts, the
+FIA's 49.52, the projections' 11 each.
+
+So the levers divide cleanly: the bank narrowing takes traffic, AIV and graph
+amortisation take collective overhead, and nothing yet takes the per-operator
+floors, which are what a fused kernel a layer would address.
