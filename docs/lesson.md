@@ -2207,3 +2207,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      neither issue nor wait, the 4.14 ms is withdrawn, the unattributed term
      returns to 15.18, and the claim that fusing attention would recover it is
      refuted.
+
+207. The replay timing harness has a 27 us floor, and it was counted as a
+     finding twice. An empty graph replayed and synchronised costs 26.58 us, a
+     one-element multiply 27.50, a million-element one 32.39 -- so
+     perf_counter_ns around replay plus synchronise charges 27 us before the
+     graph does anything. Of the layer chain's 53.10 us gap, 27 is the harness
+     and 26 is left, which is 2.0 ms a round at the scale of one measurement's
+     noise rather than 4.14. And the two-graph test's apparent overlap -- 69.46
+     plus 59.51 against 106.03 for the pair -- disappears once the floor is
+     subtracted: 42 plus 33 against 79. Differences between replays are sound;
+     sums of separate replays are not.

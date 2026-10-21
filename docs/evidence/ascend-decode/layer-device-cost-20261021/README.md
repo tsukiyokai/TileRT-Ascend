@@ -180,3 +180,29 @@ and the round's unattributed term returns to 15.18 ms.
 The mechanism claimed with it -- that fusing attention with its neighbours
 would remove the wait -- is refuted, and the census's finding that no super
 kernel names attention stands as a fact without a lever attached to it.
+
+## The harness has a 27 us floor, which explains half the gap
+
+Timing a replay plus a synchronise, with the graph holding almost nothing:
+
+    one 8-element multiply        27.50 us
+    one 2048-element multiply     27.13
+    one 1M-element multiply       32.39
+    an empty graph                26.58
+
+So `perf_counter_ns` around `graph.replay()` and `torch.npu.synchronize()`
+costs **26.58 us** before the graph does anything. Of the layer chain's 53.10 us
+gap, 27 is the harness and about 26 is left -- 2.0 ms a round rather than 4.14,
+and at the scale of a single measurement's noise.
+
+## And it corrects an earlier reading of overlap
+
+The two-graph test read 69.46 us for the small graph, 59.51 for the large, and
+106.03 for the pair, and this page concluded the pair overlapped. Subtracting
+the floor from each: 42, 33 and 79 -- and 42 plus 33 is 75 against 79. There
+was no overlap; the apparent saving was the floor counted once in the pair and
+twice in the parts.
+
+Which is a general correction to today's method. Every replay figure measured
+this way carries 27 us, so differences between two replays are sound and sums
+of separate replays are not.
