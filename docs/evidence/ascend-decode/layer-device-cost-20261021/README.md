@@ -206,3 +206,38 @@ twice in the parts.
 Which is a general correction to today's method. Every replay figure measured
 this way carries 27 us, so differences between two replays are sound and sums
 of separate replays are not.
+
+## The collective count was assumed, and the capture counts 43 a round
+
+Every collective estimate today used 156 calls -- two a layer over 78. The
+capture's own records hold 128 collective entries over three rounds, which is
+**43 a round, 0.55 a layer**. So most layers issue no standalone collective and
+their reductions sit inside a super kernel; the census found one `sk_*` named
+`aiv_all_reduce`.
+
+| basis | calls | us each | ms a round |
+|---|---|---|---|
+| two a layer, assumed | 156 | 32.77 | 5.11 |
+| the capture's own count | 43 | 32.77 | **1.41** |
+
+## Which exposes the structural flaw in the whole account
+
+    compute, eight separate kernels   27.38 ms
+    plumbing, three more               3.03
+    collectives, counted               1.41
+    sum                               31.81
+    the measured round                50.73
+
+The gap is 18.92 ms, and the account cannot close because its terms are not
+commensurable: the engine fuses a layer into about eight super kernels and the
+sum of eight separately-launched kernels is not what it spends. Every attempt
+today to attribute the remainder -- to collectives, to bubbles, to eager
+dispatch, to host paths -- compared a measurement of separate operators against
+a fused execution.
+
+So the steady-state capture is not one arm among seven. It is the only
+measurement that can produce commensurable terms, because it reports the
+engine's own fused kernels at the engine's own width. Everything else today is
+a bound or a mechanism, and the mechanisms are what the levers rest on -- which
+is why the bank narrowing stands at 17.41 ms while the round's composition does
+not.

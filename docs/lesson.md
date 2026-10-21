@@ -2242,3 +2242,17 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      unattributed, and AIV reprices to near nothing for the second time. The
      aicpu arm now carries a prediction rather than a question: within noise of
      the baseline, and if it is 1.5x slower this reading is wrong.
+
+210. The collective count was assumed at 156 and the capture counts 43 a round,
+     which exposes why the whole account could not close. 128 collective entries
+     over three rounds is 0.55 a layer, so most layers issue none and their
+     reductions are inside a super kernel -- the census found one sk_* named
+     aiv_all_reduce. At 32.77 us each that is 1.41 ms a round, not 5.11. But the
+     deeper problem is commensurability: the engine fuses a layer into about
+     eight super kernels, and a sum of eight separately-launched kernels is not
+     what it spends. Every attribution attempted today -- collectives, bubbles,
+     eager dispatch, host paths -- set a measurement of separate operators
+     against a fused execution. So the steady capture is not one arm among
+     seven; it is the only source of commensurable terms. The mechanisms survive
+     this, which is why the bank narrowing stands at 17.41 ms while the round's
+     composition does not.
