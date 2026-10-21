@@ -211,3 +211,33 @@ profile.
 And the per-item in-graph ratios from the same kind of direct comparison. What
 does not survive is any claim about which path the engine took, from a profile
 that cannot distinguish them.
+
+## The rope lever depends on hoisting, which the baseline does not use
+
+`_hoisted[width]` is populated only under `graphed and self.hoist_metadata`,
+and `refresh_hoisted_rope` returns immediately when the entry is absent. The
+best arm carries `hoist_metadata: false`, so in the baseline the refresh never
+runs and the 530 copies it would issue do not exist.
+
+So `RopeGraph` is not an independent lever. It captures work that only happens
+when hoisting is on, and an arm passing `--rope-graph` alone measures nothing.
+The watcher's arms were rewritten accordingly:
+
+    baseline
+    hoist-rope   --hoist-metadata --rope-graph
+    narrow       --narrow-bank
+    hoist        --hoist-metadata --hoist-forward-context
+    all          all four
+    aicpu        --ai-cpu-collectives
+    steady       --profile-last
+
+Which also means the capture's 530 `aclnnInplaceCopy_CastAiCore_Cast` calls a
+round came from somewhere other than this refresh, or from a run that did
+hoist. Either way they are not attributable to the baseline's rope path.
+
+## What that leaves of the two host-side levers
+
+The hoist pair removes a per-round metadata rebuild measured at a floor of
+130.62 us. The rope graph removes the copies that hoisting then introduces,
+measured at 22.54x on one die. They are one lever in two parts, and the arms
+now measure them that way: `hoist` alone against `hoist-rope`.

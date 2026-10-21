@@ -2061,3 +2061,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      not whether the wrapper reaches the operator or changes the answer. A
      stand-in with the real signature and real shapes answers both; only the
      engine's own quant method is left, and that is what the arms run.
+
+195. The rope graph is not an independent lever: `_hoisted[width]` is populated
+     only under `graphed and self.hoist_metadata`, and `refresh_hoisted_rope`
+     returns at once when the entry is absent. The best arm carries
+     `hoist_metadata: false`, so the refresh never runs there and the 530 copies
+     do not exist -- an arm passing --rope-graph alone would measure nothing.
+     The hoist pair and the rope graph are one lever in two parts: hoisting
+     removes a per-round metadata rebuild and introduces the copies, and the
+     graph removes those. The arms were rewritten to measure hoist alone
+     against hoist with the rope graph. And the capture's 530 copies came from
+     elsewhere or from a run that hoisted, so they were never the baseline's.
