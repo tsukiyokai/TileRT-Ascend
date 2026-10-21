@@ -1,4 +1,58 @@
-# Lessons
+# The bitter lesson
+
+The entries below are a day-by-day record. What they keep teaching, in the
+order a mistake usually happens:
+
+## Before measuring
+
+- Measure the instrument first. The replay harness charges 26.58 us before the
+  graph does anything, and it was counted as a finding twice.
+- Read the class the engine instantiates, not the base class whose name
+  matches. A wrapper on `get_mlp_weights` installed silently where the W4A8
+  method has `_get_mlp_weights` with four return values.
+- Check a knob is not already in the baseline. `HCCL_OP_EXPANSION_MODE=AIV` was
+  exported by two scripts in this repository before it was "found".
+- Check a flag is registered before `parse_args`. Four were not, and argparse
+  said only "unrecognized arguments" at run time.
+
+## While measuring
+
+- Measure a cost where it sits, not where it is convenient. A reduction is
+  32.77 us alone in a graph and 44.62 in a chain, because a chain lets arrivals
+  drift.
+- Use the checkpoint's own shapes. A probe at `inner=1536` priced the expert
+  bank at half its real width and counted one call where a layer makes two.
+- Vary one thing. Two drafting "wins" came from arms that moved the budget and
+  the width together.
+- A pass criterion that cannot fail is not a criterion. Random weights with
+  random scales produce absmax 2e-17, which "finite and nonzero" accepts.
+- Name the capture a figure came from. Three readings had to be withdrawn
+  because their capture was `max_tokens: 6`.
+
+## When attributing
+
+- Figures from different scopes sit side by side and cannot overturn each
+  other. The collective term read 29.64, 10.36, 5.11, 1.41 and 6.10 ms, each
+  measured, at five different scopes.
+- Check the numerator belongs to the denominator. 374 us a layer came from
+  dividing a round-wide fit by 78.
+- A lever cannot remove more than the item it acts on. That arithmetic caught
+  the wrong-width probe without any measurement.
+- Compare like with like. A sum of separately-launched kernels is not what an
+  engine that fuses them spends.
+- A broken index reads exactly like a failed mechanism. Twice in one day.
+
+## When implementing
+
+- A Python error inside a graph capture is reported as a capture failure. Read
+  the traceback before suspecting the hardware.
+- Code appended after the point that consumes it never runs. Three times in one
+  day: a check below `main`, a check below `__main__`, flags below
+  `parse_args`.
+- `pkill -f` matches the remote shell's own argv. Write the script to a file.
+- A chained `cat >> ... && git commit` commits when the first half failed.
+
+---
 
 1. Bind an experiment to its actual loaded source, host library, device ELF,
    compiler and input hashes. Read the activated install.info; 84/187 currently
