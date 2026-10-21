@@ -2268,3 +2268,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      kernel names show GatherV3, QuantBatchMatmulV3, GroupedMatmul and
      ForeachAddList in one, and a sequence inside one kernel cannot spread
      across cores, the same shape as cross-layer fusion's 6.15x.
+
+212. Counting the router and the residual adds closes the gap to 10.55 ms, and
+     the rate says counting will not close it further. Six more kernels -- the
+     gating matmul, its correction bias, the top-k, two residual adds, the
+     output bias -- cost 36 us a layer, 2.81 ms a round, taking a 21-kernel
+     layer to 497.03 us after the floor and the round's account to 40.18 against
+     a measured 50.73. So the engine's layer does hold more kernels than
+     counted, and each six of them buys under 3 ms where 10.55 remains. The rest
+     has to be the fusion's own cost, which only the engine's fused kernels
+     show. Unattributed went from 34 ms to 10.55 across the day by aligning the
+     measurement with its object four times: real widths, omitted operators,
+     the harness floor, and one replay of a whole layer rather than a sum.

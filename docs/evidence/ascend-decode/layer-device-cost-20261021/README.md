@@ -275,3 +275,39 @@ Both are testable only against the engine's own fused kernels, which is the
 steady capture. But the gap is now 13.36 ms rather than 18.92, and it is a gap
 between two commensurable measurements rather than between a sum of parts and a
 whole.
+
+## With the router and the residual adds, the gap closes to 10.55 ms
+
+Six more kernels -- the gating matmul over the hidden size, its correction
+bias, the top-k that picks eight of 256, two residual adds, and the output
+bias:
+
+    21 kernels
+    device time, profiled        472.57 us
+    graph replay, wall           523.61 us
+    minus the 26.58 us floor     497.03 us
+    a round of 78 layers          38.77 ms
+    plus 43 collectives at 32.77  40.18 ms
+    the measured round            50.73 ms
+
+**Unattributed: 10.55 ms, 135 us a layer.** The six additions cost 36 us a
+layer, 2.81 ms a round, so the first candidate holds in part: the engine's
+layer does hold more than fifteen kernels and counting them narrows the gap.
+
+But the rate says it will not close this way. Six small kernels bought 2.81 ms;
+10.55 remains, which would need twenty more of the same. So the second
+candidate -- that the engine's fusion costs more than separate kernels -- is
+where the rest has to be, and only its own fused kernels can show it.
+
+## The account as the day ends
+
+    a layer, 21 kernels, one graph replay   497.03 us   38.77 ms a round
+    collectives, the capture's own 43        32.77 us    1.41
+    sum                                                 40.18
+    the measured round                                  50.73
+    unattributed                                        10.55   79 percent attributed
+
+From 34 ms unattributed in the morning to 10.55, by aligning the measurement
+with its object four times: the checkpoint's real widths, the omitted
+operators, the harness's floor, and one replay of a whole layer rather than a
+sum of parts.
