@@ -395,3 +395,29 @@ whether the install takes effect, and whether it changes the answer.
 
 What remains untested is only the engine's own quant method rather than a
 stand-in with its interface -- which is what the queued arms do.
+
+## The engine's own consumer already takes a list
+
+`apply_gmm1_act_quant` hands `w1` to
+`_as_gmm_dequant_situ_quant_expert_weights`, which reads:
+
+    if isinstance(tensor_or_list, list):
+        if len(tensor_or_list) == 1 and tensor_or_list[0].dim() >= 3:
+            return list(tensor_or_list[0].unbind(0))
+        return tensor_or_list
+    if tensor_or_list.dim() >= 3:
+        return list(tensor_or_list.unbind(0))
+    return [tensor_or_list]
+
+So a multi-element list passes straight through, which is exactly what the
+narrowing produces. And the unqualified path tells us more: the engine's own
+`w1` is a three-dimensional tensor it unbinds along dim 0 into one tensor an
+expert. The engine already splits per expert -- the narrowing only hands it
+fewer.
+
+`_as_gmm_dequant_situ_quant_expert_scales` takes `num_experts` explicitly, and
+the narrowing shortens the scale list to the same length, so the two agree.
+
+That is the last link: the lever's form is what the engine's hot path already
+expects, confirmed by reading the consumer rather than inferring from the
+producer.

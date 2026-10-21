@@ -2072,3 +2072,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      graph removes those. The arms were rewritten to measure hoist alone
      against hoist with the rope graph. And the capture's 530 copies came from
      elsewhere or from a run that hoisted, so they were never the baseline's.
+
+196. The engine's own consumer already takes the form the narrowing produces.
+     `_as_gmm_dequant_situ_quant_expert_weights` returns a multi-element list
+     unchanged, and for a tensor it unbinds dim 0 into one per expert -- so the
+     engine splits per expert itself and the narrowing only hands it fewer. The
+     scales helper takes `num_experts` explicitly and the narrowing shortens
+     that list to match. Confirmed by reading the consumer, which is the check
+     that the producer side could not give: a wrapper's output has to be what
+     the next function accepts, not merely what the previous one returned.
