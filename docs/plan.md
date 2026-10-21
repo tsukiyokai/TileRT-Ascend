@@ -202,6 +202,20 @@ moe_intermediate=2048 而非 1536，一个专家 18.9 MB）重测，6 行、prof
 kernel）。曲线收敛到约 33 µs，与把同样负载搬出 die 的 37 µs 同阶，所以图内
 一个集合通信基本只剩传输。
 
+## 机器上的两种被杀
+
+容器整体 `Exited (137)`：另一租户抢占，`docker start trt-asc` 可恢复，工作
+目录仍在。
+
+单个 rank `SIGKILL`（torchrun 报 exitcode -9，而外层 `timeout` 的退出码仍是
+0，所以循环会误记成成功）：宿主管道页软限。`/proc/sys/fs/pipe-user-pages-soft`
+是 16384，而 dmesg 里 `pid=... cmd=python user_bufs=16400
+too_many_pipe_buffers_soft` 正好越界——十六个 rank 各开管道，叠加其他租户的
+进程就撞上。NPU 显存此时仍空（剩 58 GiB），所以别去查显存。
+
+绕法：让每 rank 的输出不经 torchrun 的管道（`--redirects` 写各自文件），或让
+非 0 rank 静默。而循环里判成功要看记录文件是否生成，不能只看退出码。
+
 ## 机器
 
 a3-84 容器耐久、16 die 常被租户占；187 die 常空但容器约四分钟被回收
