@@ -2142,3 +2142,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      a round of 15.78, so the overhead is 13.94 ms over the whole budget by
      itself. No traffic reduction reaches the target; the overhead has to go,
      and the collectives are its largest identified part at 10.7 to 29.6 ms.
+
+202. Narrowing the bank does not make fewer ranks affordable, because it does
+     not make the bank rank-independent: a rank owns 256/ranks experts and a
+     round's ninety-six picks touch proportionally more. Priced across TP2 to
+     TP16 the round is 103.44, 70.70, 60.50 and 63.80 ms, so TP8 edges TP16 by
+     five percent -- inside the error of charging collectives their eager
+     per-call cost when a graph amortises them. TP16 stays right, as the earlier
+     pricing found, and the conclusion survives the narrowing. What the table
+     does show is that FIA's utilisation is the layer's worst: 9.4 MB in 49.52
+     us is 190 GB/s against the grouped matmul's 1250, and more heads improve it
+     only slowly, so the inefficiency is inside the operator rather than
+     parallelism starvation -- 50 us of a narrowed layer's 136, 3.9 ms a round,
+     which no fusion addresses.

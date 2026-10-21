@@ -113,3 +113,37 @@ FIA's 49.52, the projections' 11 each.
 So the levers divide cleanly: the bank narrowing takes traffic, AIV and graph
 amortisation take collective overhead, and nothing yet takes the per-operator
 floors, which are what a fused kernel a layer would address.
+
+## Narrowing does not make fewer ranks affordable
+
+The thought was that once the bank is narrowed to what a round touches, the
+rank count could fall -- buying better FIA utilisation (four heads a rank at
+TP16 reads 9.4 MB in 49.52 us, 190 GB/s, where the grouped matmul reaches 1250)
+and cheaper collectives.
+
+It does not, because narrowing does not make the bank rank-independent. A rank
+owns `256 / ranks` experts and a round's ninety-six picks touch proportionally
+more of them:
+
+| ranks | heads | FIA us | touched | bank us | attn MB | layer us | round ms | TPOT |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 32 | 135.9 | 40.1 | 631.4 | 95.1 | 897.9 | 103.44 | 19.01 |
+| 4 | 16 | 115.5 | 20.0 | 315.7 | 47.5 | 522.1 | 70.70 | 12.99 |
+| 8 | 8 | 91.5 | 10.0 | 157.9 | 23.8 | 320.4 | 60.50 | 11.12 |
+| 16 | 4 | 87.2 | 5.0 | 78.9 | 11.9 | 227.2 | 63.80 | 11.73 |
+
+TP8 edges TP16 by five percent, 60.50 ms against 63.80, which is inside the
+error of pricing collectives at their eager per-call cost when a graph
+amortises them. So the trade is flat and TP16 stays right -- the same
+conclusion the earlier pricing reached, and it survives the narrowing.
+
+## What the table does show
+
+FIA's utilisation is the worst in the layer: 9.4 MB in 49.52 us is 190 GB/s
+against the grouped matmul's 1250. More heads a rank improves it only slowly --
+87.2 us at four heads, 135.9 at thirty-two -- so the inefficiency is not
+parallelism starvation but something inside the operator.
+
+That is the per-operator floor nothing yet addresses, and it is 50 us of a
+narrowed layer's 136 -- 37 percent, 3.9 ms a round. A fused kernel would not
+fix it; whatever makes FIA read at 190 GB/s would.
