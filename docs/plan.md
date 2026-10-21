@@ -216,6 +216,13 @@ too_many_pipe_buffers_soft` 正好越界——十六个 rank 各开管道，叠�
 绕法：让每 rank 的输出不经 torchrun 的管道（`--redirects` 写各自文件），或让
 非 0 rank 静默。而循环里判成功要看记录文件是否生成，不能只看退出码。
 
+第三种：`[Set][Options]OpCompileProcessor init failed`，算子在线编译进程起不
+来。记录写出来了但 `requests` 为空、`status: error`。与旗标无关，和管道限额
+同源（编译要开子进程）。2026-10-21 三臂连续撞上三种不同失败，共同点只有一
+个：另一租户同机。
+
+判据：臂成功 = 记录里有非 warmup 请求。三种失败的退出码都是 0。
+
 ## 机器
 
 a3-84 容器耐久、16 die 常被租户占；187 die 常空但容器约四分钟被回收
