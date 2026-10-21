@@ -2181,3 +2181,13 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      that is neither -- now the largest unexplained term in the project. And it
      reprices AIV to almost nothing, since the host path it improves is already
      amortised away.
+
+205. The MoE's plumbing is 3.03 ms a round and the expert combine dominates it.
+     Three operators the synthetic layer omitted, which the capture counts once
+     a layer: the routing gather at 8.45 us, the combine at 26.98, a second
+     dynamic quant at 3.37 -- 38.80 us a layer, 3.03 ms a round. The combine is a
+     weighted scatter-add of ninety-six rows into twelve and costs three times
+     the gather that moves the same bytes the other way, which is the scatter's
+     price. The round's account is now 28.05 of compute, 3.03 of plumbing and
+     5.14 of collectives against a measured 50.73, leaving 14.51 ms -- 186 us a
+     layer, down from 17.54 and still the largest unexplained term.

@@ -78,3 +78,36 @@ The previous figure of 22.2 ms claimed more saving than the compute term
 contained, which was the tell: a lever cannot remove more than the item it acts
 on. That arithmetic check is cheaper than any measurement and was available the
 moment both numbers existed.
+
+## The MoE's plumbing, which the synthetic layer omitted
+
+The capture counts three operators once a layer that the eight-operator layer
+did not hold: `GatherV3` at 78 a round, `ForeachAddList` at 75, and a second
+`DynamicQuant`. Profiled at the decode shape -- twelve rows, eight picks each,
+ninety-six sorted rows:
+
+| operator | us | ms a round |
+|---|---|---|
+| the routing gather, 96 of 12 rows | 8.45 | 0.66 |
+| the expert combine, 96 into 12 | **26.98** | **2.10** |
+| a dynamic quant, 12 rows | 3.37 | 0.26 |
+| together | 38.80 | 3.03 |
+
+The combine is the largest: a weighted scatter-add of ninety-six rows back into
+twelve, which reads 96 x 6144 bf16 and writes 12 x 6144 with a permutation
+between. Its 26.98 us against the gather's 8.45 for the same traffic in the
+other direction is the scatter's cost.
+
+## The round's account, as far as it goes
+
+    measured device compute, eight operators   28.05 ms
+    the MoE's plumbing, three more              3.03
+    collectives in a graph at a round's scale   5.14
+    sum                                        36.22
+    the measured round                         50.73
+    unattributed                               14.51   186 us a layer
+
+Down from 17.54 and still the largest unexplained term. What is left can be
+bubbles between kernels inside the graph, operators still not enumerated, or
+synchronisation points between device and host -- and only the queued
+`--round-phases` and `steady` arms separate those.
