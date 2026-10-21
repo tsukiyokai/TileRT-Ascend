@@ -2218,3 +2218,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      plus 59.51 against 106.03 for the pair -- disappears once the floor is
      subtracted: 42 plus 33 against 79. Differences between replays are sound;
      sums of separate replays are not.
+
+208. Outside a graph a collective costs 142.84 us against 32.77 inside one, and
+     that 4.4x closes the round's account under one assumption. Sixteen ranks,
+     156 points with a matmul between: the work alone is 4454.18 us, the work
+     plus the collectives 26737.92, so each is 142.84 and a round is 22.28 ms.
+     Compute and plumbing as measured are 30.41, so with the collectives exposed
+     the sum is 52.69 against a measured 50.73 -- four percent apart -- and with
+     them amortised it is 35.52 and 15.18 ms is unattributed. So the account
+     closes if and only if the engine issues its collectives outside its graph,
+     which is one testable proposition deciding both where the 15.18 ms went and
+     whether AIV's 1.5 to 1.85x applies in full. The aicpu arm measures it.

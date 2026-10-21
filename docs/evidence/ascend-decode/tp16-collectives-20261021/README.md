@@ -266,3 +266,38 @@ AIV's 1.5 to 1.85x was measured on exposed eager calls. At 32.94 us a call in a
 graph, the host path it improves is already gone, so the arm should show little
 -- which is what the discount written before the arm ran predicted, and this
 sharpens it from "compressed" to "almost nothing".
+
+## Outside a graph, 156 sequential collectives cost 142.84 us each
+
+Sixteen ranks, 156 points with a matmul between each, issued eagerly:
+
+    the work alone                 4454.18 us
+    work plus 156 collectives     26737.92
+    the collectives cost          22283.74
+    each                            142.84
+    a round of 156                   22.28 ms
+
+Against 32.77 us each inside one graph at the same count -- **4.4 times**. So
+the amortisation a graph gives is not a small effect, and whether the engine
+gets it decides the round's largest term.
+
+## Which closes the round's account, under one assumption
+
+    compute, plumbing, as measured          30.41 ms
+    collectives outside a graph             22.28
+    sum                                     52.69
+    the measured round                       50.73
+
+Four percent apart. With the collectives inside a graph instead, the sum is
+35.52 against 50.73 and 15.18 ms is unattributed.
+
+So the account closes if the engine's collectives are issued outside its graph,
+and does not if they are inside. That is a single testable proposition, and it
+decides two things at once: where the 15.18 ms went, and whether AIV's 1.5 to
+1.85x applies in full rather than nearly not at all.
+
+The `aicpu` arm measures exactly this. If it is 1.5x slower than the baseline,
+the collectives are exposed and AIV is the round's second-largest lever. If it
+is within noise, they are amortised and the 15.18 ms is something else again.
+
+Written before the arm runs, as the fourth repricing of this term today.
