@@ -41,3 +41,40 @@ and excluded for good reasons that no longer matter much.
 Every absolute figure taken with `perf_counter_ns` around a synchronise was a
 host round trip. The ratios survived because both arms paid it; the ordering did
 not. The profiler was available all along.
+
+## Correction: a layer's MoE is two calls, 258.17 us, not one at 127.17
+
+The layer account used a single grouped matmul at `inner=1536`, which is
+neither the checkpoint's width nor the call count. A layer's MoE runs the fused
+gate-and-up bank and then the down bank:
+
+    gate_up  (16, 6144, 2048) int8
+    down     (16, 2048, 3072) int8
+    302.0 MB, 2.0 kernels, 258.17 us, 1170 GB/s
+    a round of 78: 20.14 ms
+
+So the layer's device time is 228.67 - 127.17 + 258.17 = **359.67 us**, and a
+round is **28.05 ms** rather than 17.84.
+
+## Which makes the round's account consistent
+
+    device compute          28.05 ms
+    156 collectives at 190  29.64
+    sum                     57.69
+    the measured round      50.73
+
+The sum now exceeds the round, which is what overlap looks like -- and overlap
+is what this session measured three times, where a serial pair already costs
+less than its parts. The earlier account had compute at 17.84 and summed to
+47.48 against 50.73, which looked tidy and was short a call.
+
+## And it reprices the narrowing consistently
+
+Sixteen experts cost 258.17 us a layer and two cost about 35, so the narrowing
+saves **223 us a layer, 17.4 ms a round** -- 62 percent of the 28.05 ms compute
+term it acts on.
+
+The previous figure of 22.2 ms claimed more saving than the compute term
+contained, which was the tell: a lever cannot remove more than the item it acts
+on. That arithmetic check is cheaper than any measurement and was available the
+moment both numbers existed.

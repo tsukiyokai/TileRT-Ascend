@@ -2091,3 +2091,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the offline corpus measured for the same drafter and width, so the
      session's offline drafting work transfers without a correction factor. The
      5.407 quoted earlier was the rounding of two reported means.
+
+198. A lever cannot remove more than the item it acts on, and that check caught
+     a probe-shape error. The narrowing was priced at 22.2 ms a round against a
+     compute term of 17.84 -- impossible, and the tell was arithmetic rather
+     than measurement. The layer account had used one grouped matmul at
+     inner=1536 where a layer runs two at the checkpoint's widths: gate_up
+     (16, 6144, 2048) and down (16, 2048, 3072), 302 MB, two kernels, 258.17 us
+     at 1170 GB/s. So a layer is 359.67 us and a round 28.05 ms, not 17.84, and
+     the narrowing saves 223 us a layer or 17.4 ms a round -- 62 percent of the
+     term it acts on. The round's account now sums to 57.69 against a measured
+     50.73, which is overlap rather than error.
