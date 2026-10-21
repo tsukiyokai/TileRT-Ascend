@@ -190,3 +190,35 @@ comparison rather than an absolute.
 
 What does not stand is any absolute per-round collective total. The queued arms
 measure the round directly, which is the only scope that answers it.
+
+## Collectives can be captured, and a graph amortises them
+
+Sixteen ranks, twelve rows, AIV with determinism:
+
+    eager                       183.83 us
+    captured and replayed       134.69 us   1.36x
+    four in one graph, each      68.50 us   2.68x
+
+So a collective is capturable, a single one in its own graph saves only 1.36x
+because the replay keeps its own fixed cost, and four in one graph fall to 68.50
+us each. The host overhead amortises with the number of operations a graph
+holds.
+
+Over a round's 156 calls:
+
+    eager                    28.7 ms
+    one a graph              21.0
+    four a graph             10.7
+
+## Which discounts what AIV should show
+
+The engine's graph holds about 1848 kernels a round, so its collectives are
+already inside a graph and already amortised -- which makes the 29.64 ms
+estimate, built from the torch-measured 190 us a call, an upper bound rather
+than the engine's cost.
+
+And it discounts the AIV arm's expected effect. AIV's 1.5 to 1.85x was measured
+on eager, barrier-aligned calls where the host path is fully exposed. Inside a
+graph that path is amortised, so the ratio should compress -- by how much is
+what the `aicpu` arm measures, and saying so before it runs is the point of
+having written the prediction down.

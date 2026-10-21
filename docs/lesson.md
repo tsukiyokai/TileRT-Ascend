@@ -2102,3 +2102,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      the narrowing saves 223 us a layer or 17.4 ms a round -- 62 percent of the
      term it acts on. The round's account now sums to 57.69 against a measured
      50.73, which is overlap rather than error.
+
+199. Collectives are capturable and a graph amortises them, which discounts
+     AIV's expected effect. Sixteen ranks: eager 183.83 us, one captured and
+     replayed 134.69 (1.36x), four in one graph 68.50 each (2.68x) -- the host
+     overhead falls with the number of operations a graph holds. Over a round's
+     156 calls that is 28.7 ms eager, 21.0 one a graph, 10.7 four a graph. The
+     engine's graph holds about 1848 kernels, so its collectives are already
+     amortised and the 29.64 ms built from the torch per-call figure is an upper
+     bound. AIV's 1.5 to 1.85x was measured on eager barrier-aligned calls where
+     the host path is fully exposed, so inside a graph the ratio should
+     compress. Saying so before the arm runs is why the prediction was written
+     down.
