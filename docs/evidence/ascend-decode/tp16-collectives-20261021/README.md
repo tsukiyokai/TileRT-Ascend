@@ -327,3 +327,35 @@ graph, as the four-in-a-graph and 156-in-a-graph measurements showed.
 The `aicpu` arm now has a prediction rather than a question: it should land
 within noise of the baseline. If it is 1.5x slower, this reading is wrong and
 something in the engine takes the collectives out of the graph.
+
+## In a chain, a reduction a layer costs 44.05 us -- more than measured alone
+
+Eight layers on sixteen ranks, each a matmul and a grouped matmul, captured as
+one graph and replayed, with and without a reduction a layer:
+
+    no reduction a layer      37.34 us a layer
+    one reduction a layer     81.40 us a layer
+    the reduction costs       44.05 us a layer    3.44 ms a round
+
+Against 32.77 us measured for 156 collectives alone in one graph. The
+difference is the alignment: in a chain every reduction makes each rank wait
+for the slowest arrival, and the compute between them lets the arrivals drift.
+Measured in isolation they all arrive together.
+
+## Which closes the round to 83 or 90 percent
+
+    a layer, 21 kernels, one replay          38.77 ms
+    one reduction a layer, in a chain         3.44
+    sum                                      42.21
+    the measured round                       50.73
+    unattributed                              8.52   83 percent
+
+With two reductions a layer -- after the attention and after the MoE, which is
+what TP16 needs -- it is 6.88 ms, a sum of 45.65 and 5.08 ms unattributed, 90
+percent. The capture's 43 standalone calls a round are the ones outside a super
+kernel; the super kernel absorbs the rest, so two a layer is the right count
+and 43 is the visible remainder.
+
+So the day's final account attributes 83 to 90 percent of the round, and the
+collective term is 3.44 to 6.88 ms rather than the 29.64 it began as -- with
+the correction coming from measuring in a chain rather than alone.

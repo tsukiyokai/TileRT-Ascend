@@ -2280,3 +2280,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      show. Unattributed went from 34 ms to 10.55 across the day by aligning the
      measurement with its object four times: real widths, omitted operators,
      the harness floor, and one replay of a whole layer rather than a sum.
+
+213. A reduction costs more in a chain than measured alone: 44.05 us a layer
+     against 32.77 for the same collective in isolation. Eight layers on sixteen
+     ranks, captured as one graph, with and without a reduction a layer: 37.34
+     us a layer becomes 81.40. The difference is alignment -- in a chain each
+     reduction waits for the slowest arrival and the compute between them lets
+     arrivals drift, where an isolated benchmark has everyone arrive together.
+     At one reduction a layer that is 3.44 ms a round and the account reaches 83
+     percent; at two, which is what TP16 needs, 6.88 ms and 90 percent. So
+     measure a cost where it sits, not where it is convenient: the collective
+     term went 29.64, 10.36, 5.11, 1.41, 3.44 across the day and only the last
+     was measured in a chain.
