@@ -241,3 +241,37 @@ engine's own fused kernels at the engine's own width. Everything else today is
 a bound or a mechanism, and the mechanisms are what the levers rest on -- which
 is why the bank narrowing stands at 17.41 ms while the round's composition does
 not.
+
+## A whole layer as one graph replay, which is commensurable
+
+Fifteen kernels -- the eight operators plus the three plumbing items plus the
+second quant -- captured as one graph and replayed:
+
+    device time, profiled        417.86 us
+    graph replay, wall           487.60 us
+    minus the 26.58 us floor     461.02 us
+    a round of 78 layers          35.96 ms
+    plus 43 collectives at 32.77  37.37 ms
+    the measured round            50.73 ms
+
+**Unattributed: 13.36 ms, 171 us a layer** -- and this time both sides are the
+same kind of thing, one replay of a whole layer against an engine that replays
+its layer as about eight super kernels.
+
+## The two candidates left
+
+The engine's layer holds more than fifteen kernels. Not counted here: the
+gating matmul and its top-k, the residual adds, the output projection's bias,
+the router's correction. Each is small but there are several.
+
+Or the engine's fusion costs more than separate kernels. The super kernel names
+show what it fuses -- `GatherV3`, `QuantBatchMatmulV3`, `GroupedMatmul`,
+`ForeachAddList` in one kernel -- and a sequence inside one kernel cannot
+spread across cores the way separate kernels can. This project measured the
+same shape at the cross-layer scale: eight layers nested in one launch cost
+6.15 times one.
+
+Both are testable only against the engine's own fused kernels, which is the
+steady capture. But the gap is now 13.36 ms rather than 18.92, and it is a gap
+between two commensurable measurements rather than between a sum of parts and a
+whole.

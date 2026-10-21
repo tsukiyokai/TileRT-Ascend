@@ -2256,3 +2256,15 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      seven; it is the only source of commensurable terms. The mechanisms survive
      this, which is why the bank narrowing stands at 17.41 ms while the round's
      composition does not.
+
+211. A whole layer as one graph replay gives the first commensurable figure:
+     fifteen kernels -- eight operators, three plumbing items, a second quant --
+     cost 487.60 us of replay wall, 461.02 after the harness floor, which is
+     35.96 ms over 78 layers and 37.37 with the capture's 43 collectives. The
+     measured round is 50.73, so 13.36 ms is unattributed at 171 us a layer,
+     and both sides are now the same kind of thing. Two candidates remain: the
+     engine's layer holds more than fifteen kernels (gating, top-k, residual
+     adds, biases), or its fusion costs more than separate kernels -- the super
+     kernel names show GatherV3, QuantBatchMatmulV3, GroupedMatmul and
+     ForeachAddList in one, and a sequence inside one kernel cannot spread
+     across cores, the same shape as cross-layer fusion's 6.15x.
