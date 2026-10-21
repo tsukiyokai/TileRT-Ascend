@@ -111,3 +111,36 @@ Down from 17.54 and still the largest unexplained term. What is left can be
 bubbles between kernels inside the graph, operators still not enumerated, or
 synchronisation points between device and host -- and only the queued
 `--round-phases` and `steady` arms separate those.
+
+## The graph's own bubbles: 53.10 us a layer
+
+The same eight-kernel layer chain, profiled for device time and then timed as a
+graph replay:
+
+    device time, profiled     350.98 us
+    graph replay, wall        404.09 us
+    the gap                    53.10 us    4.14 ms a round
+
+So a replay costs 15 percent more than the sum of its kernels' device time --
+about 6.6 us a kernel of gap. That is the dependency wait between consecutive
+kernels: each waits for its predecessor's output, and the device idles between
+them.
+
+Note the device sum here is 350.98 us rather than the 228.67 the earlier
+account used, because this chain runs both grouped matmuls at the checkpoint's
+widths. The two figures differ by exactly that correction.
+
+## The round, with the bubbles counted
+
+    device compute, eight kernels at real widths   27.38 ms
+    the MoE's plumbing, three more                  3.03
+    the graph's bubbles                             4.14
+    collectives in a graph at a round's scale       5.14
+    sum                                            39.69
+    the measured round                             50.73
+    unattributed                                   11.04
+
+Down from 14.51. And the bubbles are attackable by the mechanism already in the
+engine: fusing adjacent operators removes the wait between them, which is what
+the super kernel does on the MoE side and does not do for attention -- the
+census found zero super kernels naming attention.

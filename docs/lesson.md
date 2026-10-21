@@ -2191,3 +2191,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      price. The round's account is now 28.05 of compute, 3.03 of plumbing and
      5.14 of collectives against a measured 50.73, leaving 14.51 ms -- 186 us a
      layer, down from 17.54 and still the largest unexplained term.
+
+206. A graph replay costs 15 percent more than its kernels' device time, which
+     is the dependency wait between them. The same eight-kernel layer chain:
+     350.98 us of profiled device time against 404.09 us of replay wall, a gap
+     of 53.10 us -- about 6.6 us a kernel, 4.14 ms a round. The device sum is
+     350.98 rather than the 228.67 used earlier because this chain runs both
+     grouped matmuls at the checkpoint's widths. The round's account becomes
+     27.38 of compute, 3.03 of plumbing, 4.14 of bubbles and 5.14 of
+     collectives against 50.73, leaving 11.04 ms. And the bubbles yield to the
+     mechanism already in the engine: fusing adjacent operators removes the
+     wait, which the super kernel does on the MoE side and not for attention.
