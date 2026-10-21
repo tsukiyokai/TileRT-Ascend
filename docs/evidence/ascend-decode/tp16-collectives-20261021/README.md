@@ -301,3 +301,29 @@ the collectives are exposed and AIV is the round's second-largest lever. If it
 is within noise, they are amortised and the 15.18 ms is something else again.
 
 Written before the arm runs, as the fourth repricing of this term today.
+
+## The proposition is answerable by reading, and the answer is "inside"
+
+`vllm_ascend/compilation/acl_graph.py` contains no mention of hccl,
+all_reduce, collective or communication. The wrapper does not special-case
+them, so whatever the captured region issues is recorded -- including the model
+forward's reductions.
+
+And the capture's own kernel list carries both: 637 super kernel calls, 1108
+aclnn calls and 43 `AivKernel` collectives a round, all in one
+`kernel_details.csv` produced from a run whose record says `target_graph: true`
+with replays. Compute and collectives appear in the same list from the same
+replayed region.
+
+So **the engine's collectives are inside its graph**, the round's collective
+term is 5.11 ms rather than 22.28, and the previous section's claim that the
+account closes under the exposed assumption is withdrawn: the assumption is
+false.
+
+Which puts the 15.18 ms back as unattributed and reprices AIV to near nothing
+for the second time -- the host path it improves is amortised away inside the
+graph, as the four-in-a-graph and 156-in-a-graph measurements showed.
+
+The `aicpu` arm now has a prediction rather than a question: it should land
+within noise of the baseline. If it is 1.5x slower, this reading is wrong and
+something in the engine takes the collectives out of the graph.

@@ -2229,3 +2229,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      closes if and only if the engine issues its collectives outside its graph,
      which is one testable proposition deciding both where the 15.18 ms went and
      whether AIV's 1.5 to 1.85x applies in full. The aicpu arm measures it.
+
+209. The engine's collectives are inside its graph, which the code answers
+     without an experiment. `compilation/acl_graph.py` mentions no hccl,
+     all_reduce, collective or communication, so the wrapper records whatever
+     the captured region issues; and the capture's single kernel_details holds
+     637 super kernel calls, 1108 aclnn calls and 43 AivKernel collectives a
+     round from a run whose record says target_graph true with replays. So the
+     round's collective term is 5.11 ms rather than 22.28, the previous turn's
+     claim that the account closes under an exposed-collective assumption is
+     withdrawn because the assumption is false, the 15.18 ms returns to
+     unattributed, and AIV reprices to near nothing for the second time. The
+     aicpu arm now carries a prediction rather than a question: within noise of
+     the baseline, and if it is 1.5x slower this reading is wrong.
