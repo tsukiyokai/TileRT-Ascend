@@ -353,8 +353,11 @@ class CannModel:
         # One quant method may serve every layer, so the installs are
         # deduplicated by identity -- wrapping the same object twice would
         # narrow an already-narrowed group list.
+        # `layers` is a ModuleList here, which iterates its modules directly.
+        # The dict form elsewhere in this file belongs to another object, and
+        # copying its walk was the first thing the arm hit.
         methods = {}
-        for _, layer in self.model.model.layers.items():
+        for layer in self.model.model.layers:
             method = getattr(getattr(layer, "mlp", None), "quant_method", None)
             if method is not None:
                 methods.setdefault(id(method), method)
