@@ -375,3 +375,23 @@ Experts first in both.
 So slicing dim 0 is correct for the weights and the scales alike, which was the
 last silent-failure risk in the lever: a wrong axis would have produced a
 running model with the wrong experts' scales, which no shape check would catch.
+
+## Through the installer, at real shapes, with the real operator
+
+The earlier checks used a stand-in whose weights were a 5x2x2 arange. This one
+puts the engine's own `npu_grouped_matmul` at the checkpoint's widths behind the
+installed wrapper, with twelve rows scattered over sixteen slots so that three
+are touched:
+
+    the operator saw 16 experts without the install
+    the operator saw  3 experts with it
+    the round's group list was restored: True
+    bit-exact against the full bank: True
+
+So the wrapper reaches the operator, hands it the subset, preserves the result
+exactly, and leaves the round's own group list for whatever reads it next. That
+closes the two questions a stand-in built from the same assumption could not:
+whether the install takes effect, and whether it changes the answer.
+
+What remains untested is only the engine's own quant method rather than a
+stand-in with its interface -- which is what the queued arms do.

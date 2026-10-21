@@ -2052,3 +2052,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      applies. A wrong axis would have given a running model with the wrong
      experts' scales -- no shape check catches that, only reading the layout
      some existing code already depends on.
+
+194. The narrowing was verified through its installer at the real shapes with
+     the real operator: twelve rows over sixteen slots with three touched, and
+     the operator saw sixteen experts without the install and three with it,
+     bit-exact against the full bank, with the round's group list restored. The
+     earlier checks used a 5x2x2 arange stand-in, which could show the logic but
+     not whether the wrapper reaches the operator or changes the answer. A
+     stand-in with the real signature and real shapes answers both; only the
+     engine's own quant method is left, and that is what the arms run.
