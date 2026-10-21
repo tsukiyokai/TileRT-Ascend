@@ -232,6 +232,16 @@ too_many_pipe_buffers_soft` 正好越界——十六个 rank 各开管道，叠�
 不要等一批跑完；代码树从 git 重建而不是依赖容器里的副本；而守候脚本本身也
 会消失，所以它不能是唯一的调度者。
 
+而更硬的一条：**打榜用的 GLM-5.2-w4a8c8 只在那个容器里**。宿主的
+`/data/models`、`/sfs_green_wuhu_ci/models`、`/efs_guiyang`、`/mnt`、`/home`
+都搜过，只有 `GLM-5.2-w8a8c16`。镜像还在（四个 `ai-infra-infer`，CANN
+9.1.0／9.2.0），兄弟容器 `lan_d_d0` 的挂载清单给出了标准配方（`/data`
+`/home` `/tmp` 驱动 `npu-smi` `hccn.conf` `dcmi`），所以容器可重建——但
+w4a8c8 需要另找来源或重新量化。
+
+所以下次有机器时的第一件事不是跑臂，是重建环境并把 checkpoint 放到宿主挂载
+点上，这样下一次容器被清不会再丢它。
+
 ## 机器
 
 a3-84 容器耐久、16 die 常被租户占；187 die 常空但容器约四分钟被回收
