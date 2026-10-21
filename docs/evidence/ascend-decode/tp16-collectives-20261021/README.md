@@ -222,3 +222,47 @@ on eager, barrier-aligned calls where the host path is fully exposed. Inside a
 graph that path is amortised, so the ratio should compress -- by how much is
 what the `aicpu` arm measures, and saying so before it runs is the point of
 having written the prediction down.
+
+## A round's worth in one graph: 32.94 us each, 5.14 ms a round
+
+Sixteen ranks, twelve rows, AIV with determinism, N all_reduce calls captured
+in one graph and replayed:
+
+| in a graph | total us | us each | a round ms |
+|---|---|---|---|
+| 1 | 150.57 | 150.57 | 23.49 |
+| 4 | 265.62 | 66.41 | 10.36 |
+| 16 | 654.75 | 40.92 | 6.38 |
+| 64 | 2195.52 | 34.31 | 5.35 |
+| **156** | 5139.34 | **32.94** | **5.14** |
+
+The curve converges to about 33 us a call, which is the order of the 37 us this
+session measured for moving the same payload off a die. So inside a graph, at a
+round's scale, a collective costs close to its transport and nothing else.
+
+## Which overturns the round's accounting a third time
+
+The collective term was estimated at 29.64 ms from the torch per-call figure of
+190 us, then discounted to 10.7 from four-in-a-graph, and is now **5.14 ms** at
+a round's own scale. Each figure was measured; each was at a different scale;
+only the last matches what the engine does, since its graph holds about 1848
+kernels.
+
+So the round's account becomes
+
+    traffic, full bank      21.01 ms
+    collectives in a graph   5.14
+    sum                     26.15
+    the measured round      50.73
+    unattributed            24.58
+
+That 24.58 ms is neither bytes nor collectives, and it is now the largest
+unexplained term in the project. The day's earlier attributions put it in the
+collectives, which this measurement removes.
+
+## And it reprices AIV to near nothing
+
+AIV's 1.5 to 1.85x was measured on exposed eager calls. At 32.94 us a call in a
+graph, the host path it improves is already gone, so the arm should show little
+-- which is what the discount written before the arm ran predicted, and this
+sharpens it from "compressed" to "almost nothing".

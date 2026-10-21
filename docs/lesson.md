@@ -2168,3 +2168,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      0.66 ms a row in the round model are the same digits three orders apart and
      entirely unrelated -- a good reason to check units before connecting two
      numbers that look alike.
+
+204. A round's worth of collectives in one graph costs 32.94 us each, 5.14 ms a
+     round -- a sixth of the 29.64 ms estimated from the torch per-call figure.
+     Sixteen ranks: 150.57 us for one in a graph, 66.41 each for four, 40.92 for
+     sixteen, 34.31 for sixty-four, 32.94 for 156. The curve converges to the
+     order of the 37 us that moving the same payload off a die costs, so in a
+     graph at a round's scale a collective costs close to its transport. Three
+     figures, three scales, all measured, and only the last matches an engine
+     whose graph holds 1848 kernels. The round's account becomes 21.01 of
+     traffic plus 5.14 of collectives against a measured 50.73, leaving 24.58 ms
+     that is neither -- now the largest unexplained term in the project. And it
+     reprices AIV to almost nothing, since the host path it improves is already
+     amortised away.
