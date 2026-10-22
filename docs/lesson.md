@@ -64,11 +64,15 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
-- A mechanism that wins once is not a rule. Concatenating the projections that
-  share an activation saves 44.98 microseconds at the first dependency level,
-  where it removes three invocations over a reduction of 6144, and loses 2.12 at
-  the second, where it removes one over 2048. Generalising the kernel to take
-  the level made that a dictionary entry rather than a second kernel.
+- A mechanism that wins once is not a rule, and the variable may not be the one
+  you named. Concatenating projections that share an activation saves 31 
+  microseconds at a reduction of 6144 and loses 2 at 2048, both removing exactly
+  one invocation -- so depth decides, not the count.
+- Check the grouping exists before pricing it. The first reading of this stage
+  put four projections on one activation and measured 44.98 microseconds. The
+  engine cannot use it: the indexer's key reads the hidden as bf16 where Prolog
+  reads it as int8, and the router's gate is read after attention. The adoptable
+  grouping is two projections and 31.06.
 - Align a weight's row stride to 512 bytes. The concatenated front stage used
   3040 bf16 columns, 6080 bytes a row, and took 48.12 microseconds; padding to
   3072 columns and 6144 bytes took 38.43, a fifth off for 32 columns of zeros.

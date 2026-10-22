@@ -21,15 +21,16 @@ computes, so both arms write the same layout.
 
 ## Measured
 
-One die, four widths, two alternating passes a width, eight changing inputs:
-the fused arm costs 38.43 microseconds at twelve rows against the split arm's
-82.62, a saving of 44.36 a layer or 3.46 milliseconds a round. Both arms produce
-identical product digests at every input and every width. The fused arm is flat in rows -- 38.18 at one and
-38.27 at thirty-two -- while the split arm rises 4.4, because it pays the
-reduction depth four times. Its weight row stride must be 512-byte aligned,
-which the contract enforces: 3040 columns cost 48.12 microseconds and the padded
-3072 cost 38.43. See
-[the evidence](../../../docs/evidence/ascend-decode/megakernel-front-20261022/README.md).
+Three levels, one die, two alternating passes a row count, eight changing
+inputs. At twelve rows the saving from concatenating is 31.06 microseconds for
+`prolog`, the only grouping the engine can adopt, and −2.16 for `query_norm`.
+Both remove one invocation, so the reduction's depth decides: 6144 pays and 2048
+does not. Every arm's product digests match its counterpart's. See
+[the evidence](../../../docs/evidence/ascend-decode/megakernel-levels-20261022/README.md).
+
+Its weight row stride must be 512-byte aligned, which the contract enforces: the
+four-part `hidden` level costs 48.12 microseconds at 3040 columns and 38.43 at
+the padded 3072.
 
 ## Scope
 

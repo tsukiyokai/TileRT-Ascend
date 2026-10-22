@@ -1,44 +1,53 @@
-# The concatenation wins at one dependency level and loses at the next
+# What the concatenation is worth, level by level
 
-The kernel is now parameterised by the level rather than specialised to the
-first, so adding a level costs a dictionary entry. The second level says the
-mechanism is not universal.
+The kernel is parameterised by the level -- its reduction length and the
+projections that read the shared activation -- so adding one costs a dictionary
+entry. Three levels say the deciding variable is the reduction's depth, and they
+correct an earlier reading of this stage.
 
-| level | reduction | columns | rows | fused us | split us | saving us |
-| --- | ---: | ---: | ---: | --- | --- | ---: |
-| hidden | 6144 | 3040 | 1 | 40.26, 40.01 | 82.54, 83.08 | 42.82 |
-| hidden | 6144 | 3040 | 12 | 39.56, 39.92 | 84.90, 84.79 | **44.98** |
-| hidden | 6144 | 3040 | 32 | 40.65, 40.64 | 86.26, 86.45 | 45.80 |
-| query_norm | 2048 | 5120 | 1 | 29.71, 30.22 | 28.65, 28.60 | −1.57 |
-| query_norm | 2048 | 5120 | 12 | 31.87, 31.42 | 29.04, 29.75 | **−2.12** |
-| query_norm | 2048 | 5120 | 32 | 32.31, 32.70 | 30.78, 30.80 | −1.90 |
+| level | reduction | columns | parts | rows | fused us | split us | saving us |
+| --- | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| prolog | 6144 | 2624 | 2 | 1 | 24.74, 24.35 | 55.29, 55.21 | 30.55 |
+| prolog | 6144 | 2624 | 2 | 12 | 24.86, 25.58 | 56.64, 55.65 | **31.06** |
+| prolog | 6144 | 2624 | 2 | 32 | 27.09, 26.12 | 56.88, 57.13 | 30.04 |
+| hidden | 6144 | 3040 | 4 | 12 | 40.31, 40.86 | 83.74, 83.76 | 42.90 |
+| query_norm | 2048 | 5120 | 2 | 12 | 31.59, 31.59 | 29.43, 29.36 | −2.16 |
 
-Two alternating passes a row count, eight changing inputs each, one die. The
-arms' product digests are identical in every case; the levels sit within
-6.1e-4 and 2.1e-4 of a float reference against magnitudes of 376 and 230.
+Two alternating passes a row count, eight changing inputs each, one die. Every
+arm's product digests are identical to its counterpart's in every case.
 
-## What separates them
+## Only `prolog` is a grouping the engine can adopt
 
-The first level concatenates four projections of the normalized hidden -- query
-latent 2048, kv latent and rope 576, indexer key 160, router gate 256 -- and so
-removes three invocations over a reduction of 6144. The second concatenates two
-projections of the query norm -- query up 1024 and indexer query 4096 -- and so
-removes one over a reduction of 2048.
+The engine's first level does not hold four projections of one activation. Read
+from the native sources: Prolog takes `token_x` as int8 and projects
+`weight_dq` and `weight_dkv_kr` from it, so those two share an activation; the
+indexer's key takes `args.hidden` as **bf16**, a different dtype that cannot
+join them; the indexer's query and the query up-projection read the query norm,
+which is the second level; and the router's gate is read inside
+`ffn_bridge::Forward`, after attention entirely.
 
-One invocation removed at a short depth does not pay for the wider per-core
-slice it forces. The second level's 5120 columns are already 512-byte aligned at
-10240 bytes a row, so alignment is not the difference. The fused arm is selected
-for the first level and the split arm for the second.
+So `prolog` is the adoptable grouping and its saving is 31.06 microseconds a
+layer, or 2.42 milliseconds a round. The `hidden` row keeps all four to show
+what the mechanism does with three invocations removed rather than one; it is
+not a figure the engine can take.
+
+## Depth decides, not the invocation count
+
+Both two-part levels remove exactly one invocation. At a reduction of 6144 that
+is worth 31 microseconds; at 2048 it costs 2. The fused arm at the short depth
+is slower than two invocations -- 31.59 against 29.43 -- so a single wide slice
+is not simply better. One invocation at depth 6144 costs about 25 microseconds,
+which is the same order as the 18.5 measured at the Torch level.
+
+The fused arm is selected at `prolog` and the split arm at `query_norm`.
 
 ## The limit on reading these numbers
 
 The operands are bf16 and the product float, which isolates the invocation count
-from the quantization contract but makes the first level read 37.36 MB where the
-deployed W4A8 projections read roughly a quarter of that. Both arms shrink with
-the bytes, and the saving need not shrink in proportion -- it is a count of
-invocations, not of bytes -- but nothing here establishes the figure for the
-engine's weights. That measurement is the next step, not a restatement of this
-one.
+from the quantization contract. Prolog's real activation is int8 with a token
+scale and its weights are W4A8 with channel scales, so it reads a fraction of
+these bytes. The saving counts invocations rather than bytes, but the engine's
+figure needs its own measurement at its own dtypes.
 
 [`run.sh`](run.sh) is the alternating runner; the JSON files are its output, one
 a level an arm a row count a pass.

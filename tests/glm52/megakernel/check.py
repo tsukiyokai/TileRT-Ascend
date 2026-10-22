@@ -20,7 +20,17 @@ SYSTEM_BYTES = 16 << 20
 
 # Each level's shared activation width and the projections that read it, per
 # rank at TP16.
+# Each level's shared activation and the projections that read it, per rank at
+# TP16. `prolog` is the grouping the engine can actually use: Prolog's two
+# down-projections both read the int8 `token_x`, while the indexer's key reads
+# the bf16 hidden and cannot join them, and the router's gate belongs after
+# attention. `hidden` keeps all four to show what the mechanism does when it
+# removes three invocations instead of one.
 LEVELS = {
+    'prolog': {
+        'reduction': 6144,
+        'parts': {'query_latent': 2048, 'kv_latent_rope': 576},
+    },
     'hidden': {
         'reduction': 6144,
         'parts': {'query_latent': 2048, 'kv_latent_rope': 576,
