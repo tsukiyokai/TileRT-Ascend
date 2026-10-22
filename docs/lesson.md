@@ -73,6 +73,12 @@ order a mistake usually happens:
   `OpCompileProcessor init failed`, which this project had recorded as an
   environment fault in its own right. Read the Python traceback, not the Ascend
   log's tail: the real line was `No module named 'tbe'`.
+- The cost is a pass over the data, in a kernel or out of one. A Torch sum over
+  98304 floats takes 11.82 microseconds, a topk 18.59, and an in-kernel AscendC
+  pass over 73728 takes 12.46 -- and the increment survives graph capture, so it
+  is device time. Fusing operator calls buys nothing by itself; fusing *passes*
+  is the whole lever, which is why one reduction walk instead of four paid 26.87
+  and rescheduling the same passes paid 2.94.
 - Price an operation's floor before replacing it. Selecting 2048 of 8192 over
   twelve rows costs 17.93 microseconds, a full sort of the same data 17.86, and
   a threshold count 21.09. The algorithm does not enter: 393 KB in 18
