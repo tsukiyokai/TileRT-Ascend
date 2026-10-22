@@ -2498,3 +2498,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   and every value still looks plausible. `tree_draft_eval.py` labelled thirteen
   columns over twelve values for a day; the automaton's acceptance was being
   read as a long chain's.
+- Do not overwrite a driver script while it runs. Bash reads a script
+  incrementally, so the old driver carried on with a half-replaced view and a
+  second driver started beside it; two sixteen-rank arms then contended for the
+  same dies and the same HCCL port range. Copy to a fresh path and launch that.
+- A killed rank that is reading the checkpoint sits in `D` state until its NFS
+  read returns, so `pgrep` still counts it after SIGKILL. Drain to zero before
+  relaunching, or the next arm collides with a corpse that still holds a device
+  context -- the HBM figure is already back to idle and says nothing.
+- `npu_sparse_flash_attention` lives in the compiled `vllm_ascend_C`. No tree
+  on a fresh host carries it and the only built copy nearby is
+  cpython-312/torch-2.10 against this stack's 3.11/2.12, so `--attention-kernel
+  sfa` cannot run and the recorded 9.3794 ms cannot be reproduced there.
+  `vllm-ascend-8237/csrc` on a3-194 is what a build would start from.
