@@ -23,9 +23,17 @@ capture=${CAPTURE:?}
 utilisation=${UTILISATION:-0.78}
 
 source /opt/ascend/cann-9.2.0/set_env.sh
-# Append: set_env.sh puts CANN's `tbe` on PYTHONPATH and GE imports it, so
-# assigning the variable turns that into `OpCompileProcessor init failed`.
-export PYTHONPATH="$tree${PYTHONPATH:+:$PYTHONPATH}"
+# The engine stack comes from the pinned trees under RUNTIME, because the
+# omniinfer image ships `omni_npu` rather than `vllm_ascend` and the unified
+# image carries only vllm's dist-info -- its version string ends in `.empty`,
+# which `importlib.metadata.version` reports happily and `import` does not.
+#
+# Append, never assign: set_env.sh puts CANN's `tbe` on PYTHONPATH and GE
+# imports it, so assigning turns that into `OpCompileProcessor init failed`.
+runtime=${RUNTIME:?}
+export PYTHONPATH="$tree:$runtime/vendor-hook-pinned/vllm-a982-py311-compatible:$runtime/vendor-hook-pinned/ascend-python-build:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
+# Only the ascend plugin: the image's own omni_npu registers against vllm 0.30's
+# entrypoint layout and the pinned vllm is 0.25.1.
 export VLLM_PLUGINS=ascend
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export HCCL_OP_EXPANSION_MODE=AIV HCCL_DETERMINISTIC=true
