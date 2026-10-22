@@ -341,7 +341,11 @@ The asset NFS is the schedule, not the compile. Under the engine's own prefetch
 (sixteen ranks, eight threads each) the checkpoint streams into page cache at a
 measured **79 MB/s**, which is the same ceiling this project recorded for that
 export, so a cold 404 GB load is about 85 minutes. The host has 2258 GB of RAM,
-so it only happens once: every later arm reads from cache. Order a session
-accordingly -- start the first arm before anything else and spend its load on
-work that needs no device. `/mnt/sfs_turbo` has 724 TB free if a copy is ever
-worth staging for a host that reboots.
+so it only happens once: every later arm reads from cache. That default was wrong. The same host mounts
+`/mnt/sfs_turbo_new`, measured single-stream with direct I/O at **321 MB/s
+writing and 686 MB/s reading** -- 8.8 times the asset export. Staging the
+checkpoint there turns a cold load into about ten minutes, and the staging copy
+itself is nearly free once a first load has the checkpoint in page cache, since
+it then runs at the write ceiling rather than the slow read's. So: load once
+from the asset export, stage to `sfs_turbo_new` out of page cache, and point
+every later arm at the staged copy.
