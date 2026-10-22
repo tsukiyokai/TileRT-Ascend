@@ -80,6 +80,10 @@ order a mistake usually happens:
   the width. The unaligned kernel also looked 20 percent worse than the vendor's
   matmul on the same shape, which is what sent the search to tiling and core
   counts first.
+- A define that selects types must reach every translation unit. The dtype flag
+  went only to the kernel compile, so a bf16 device half was linked against an
+  int8 host half; the launch faulted on the core with EE9999 and the only visible
+  clue was `element_bytes` reporting 1 from a library named bf16.
 - A broken kernel keeps the clock. The packed weight variant produced NaN and
   errors of 464 against magnitudes of 331, and timed within noise of the correct
   arm at every width. Only the digest comparison caught it.

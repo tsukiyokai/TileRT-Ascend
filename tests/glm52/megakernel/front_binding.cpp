@@ -23,13 +23,24 @@ int64_t SyncBase()
     return static_cast<int64_t>(address);
 }
 
+#ifdef MEGAKERNEL_FRONT_BF16
+constexpr at::ScalarType kElement = at::kBFloat16;
+constexpr at::ScalarType kAccumulator = at::kFloat;
+constexpr int64_t kElementBytes = 2;
+#else
+constexpr at::ScalarType kElement = at::kChar;
+constexpr at::ScalarType kAccumulator = at::kInt;
+constexpr int64_t kElementBytes = 1;
+#endif
+
 Config Describe(int64_t rows, int64_t blocks, int64_t reduction,
                 at::IntArrayRef parts, int64_t weight_stride)
 {
     TORCH_CHECK(parts.size() >= 1 && parts.size() <= kMaxParts,
                 "a level holds 1 to ", kMaxParts, " projections");
     Config config{rows, blocks, reduction,
-                  static_cast<int64_t>(parts.size()), {}, weight_stride};
+                  static_cast<int64_t>(parts.size()), {}, weight_stride,
+                  kElementBytes};
     for (size_t part = 0; part < parts.size(); ++part) {
         config.part_columns[part] = parts[part];
     }
@@ -38,7 +49,7 @@ Config Describe(int64_t rows, int64_t blocks, int64_t reduction,
 
 int64_t AlignedWidth(int64_t columns)
 {
-    return AlignedColumns(columns);
+    return AlignedColumns(columns, kElementBytes);
 }
 
 at::Tensor BuildTiling(int64_t rows, int64_t blocks, int64_t reduction,
@@ -76,10 +87,11 @@ void Forward(const at::Tensor& activation, const at::Tensor& weight,
                 "product must match the weight's row stride");
     TORCH_CHECK(weight.size(1) >= columns,
                 "weight needs at least ", columns, " columns");
-    TORCH_CHECK(activation.scalar_type() == at::kBFloat16
-                && weight.scalar_type() == at::kBFloat16
-                && product.scalar_type() == at::kFloat,
-                "bf16 operands and a float product");
+    TORCH_CHECK(activation.scalar_type() == kElement
+                && weight.scalar_type() == kElement
+                && product.scalar_type() == kAccumulator,
+                "this build takes ", kElement, " operands and a ",
+                kAccumulator, " product");
     for (const at::Tensor& owner : {activation, weight, product, tiling,
                                     system}) {
         TORCH_CHECK(owner.is_contiguous() && owner.device().is_privateuseone(),
@@ -105,6 +117,7 @@ TORCH_LIBRARY_FRAGMENT(megakernel_front, m)
 {
     m.def("sync_base() -> int");
     m.def("aligned_width(int columns) -> int");
+    m.def("element_bytes() -> int");
     m.def("build_tiling(int rows, int blocks, int reduction, int[] parts, "
           "int weight_stride, int base_m, int base_n, int base_k) -> Tensor");
     m.def("forward(Tensor activation, Tensor weight, Tensor product, "
@@ -116,6 +129,7 @@ TORCH_LIBRARY_IMPL(megakernel_front, CompositeExplicitAutograd, m)
 {
     m.impl("sync_base", TORCH_FN(SyncBase));
     m.impl("aligned_width", TORCH_FN(AlignedWidth));
+    m.impl("element_bytes", [] { return kElementBytes; });
     m.impl("build_tiling", TORCH_FN(BuildTiling));
 }
 

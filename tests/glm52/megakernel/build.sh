@@ -14,7 +14,14 @@ if [[ ${MEGAKERNEL_FRONT_SPLIT:-0} == 1 ]]; then
   variant_flags=(-DMEGAKERNEL_FRONT_SPLIT)
   arm=split
 fi
-out=${1:-$root/build-$arm}
+# int8 operands match Prolog's; MEGAKERNEL_FRONT_BF16=1 keeps the earlier
+# comparison available.
+dtype=int8
+if [[ ${MEGAKERNEL_FRONT_BF16:-0} == 1 ]]; then
+  variant_flags+=(-DMEGAKERNEL_FRONT_BF16)
+  dtype=bf16
+fi
+out=${1:-$root/build-$dtype-$arm}
 
 python_bin=${PYTHON_BIN:-python3}
 site=${SITE_PACKAGES:-$("$python_bin" -c \
@@ -30,11 +37,11 @@ routed_compile "$out/kernel.log" "$routed_bisheng" \
   "${routed_device_flags[@]}" -I "$here" "${routed_device_includes[@]}" \
   "${variant_flags[@]}" -c "$here/front_kernel.cpp" -o "$out/kernel.o"
 routed_compile "$out/tiling.log" "$routed_cxx" -std=c++17 -O2 -fPIC \
-  -I "$here" "${routed_host_includes[@]}" \
+  -I "$here" "${routed_host_includes[@]}" "${variant_flags[@]}" \
   -c "$here/front_tiling.cpp" -o "$out/tiling.o"
 routed_compile "$out/binding.log" "$routed_cxx" -std=c++17 -O2 -fPIC \
   "-D_GLIBCXX_USE_CXX11_ABI=$abi" "${torch_includes[@]}" \
-  -I "$here" "${routed_host_includes[@]}" \
+  -I "$here" "${routed_host_includes[@]}" "${variant_flags[@]}" \
   -c "$here/front_binding.cpp" -o "$out/binding.o"
 routed_compile "$out/link.log" "$routed_cxx" -shared \
   "$out/kernel.o" "$out/tiling.o" "$out/binding.o" \

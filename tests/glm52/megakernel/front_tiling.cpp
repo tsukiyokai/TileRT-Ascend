@@ -16,16 +16,20 @@ extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
                                              int base_n, int base_k,
                                              void* buffer)
 {
+#ifdef MEGAKERNEL_FRONT_BF16
+    constexpr auto element = matmul_tiling::DataType::DT_BF16;
+    constexpr auto accumulator = matmul_tiling::DataType::DT_FLOAT;
+#else
+    constexpr auto element = matmul_tiling::DataType::DT_INT8;
+    constexpr auto accumulator = matmul_tiling::DataType::DT_INT32;
+#endif
     matmul_tiling::MatmulApiTiling tiling;
     tiling.SetAType(matmul_tiling::TPosition::GM,
-                    matmul_tiling::CubeFormat::ND,
-                    matmul_tiling::DataType::DT_BF16, false);
+                    matmul_tiling::CubeFormat::ND, element, false);
     tiling.SetBType(matmul_tiling::TPosition::GM,
-                    matmul_tiling::CubeFormat::ND,
-                    matmul_tiling::DataType::DT_BF16, false);
+                    matmul_tiling::CubeFormat::ND, element, false);
     tiling.SetCType(matmul_tiling::TPosition::GM,
-                    matmul_tiling::CubeFormat::ND,
-                    matmul_tiling::DataType::DT_FLOAT);
+                    matmul_tiling::CubeFormat::ND, accumulator);
     tiling.SetShape(rows, columns, reduction);
     tiling.SetOrgShape(rows, width, reduction);
     tiling.SetBias(false);

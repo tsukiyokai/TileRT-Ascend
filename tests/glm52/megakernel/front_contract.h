@@ -26,11 +26,10 @@ constexpr int64_t kStrideBytes = 512;
 constexpr uint64_t kTilingStride = 512;
 constexpr uint64_t kSystemBytes = 16ULL << 20;
 
-constexpr int64_t AlignedColumns(int64_t columns)
+constexpr int64_t AlignedColumns(int64_t columns, int64_t element_bytes)
 {
-    constexpr int64_t element = 2;  // bf16
-    return (columns * element + kStrideBytes - 1) / kStrideBytes
-        * kStrideBytes / element;
+    return (columns * element_bytes + kStrideBytes - 1) / kStrideBytes
+        * kStrideBytes / element_bytes;
 }
 
 // Every core's slice has the same aligned stride.
@@ -68,6 +67,8 @@ struct Config {
     int64_t part_count;
     int64_t part_columns[kMaxParts];
     int64_t weight_stride;
+    // The operand's width in bytes, which fixes the row-stride alignment.
+    int64_t element_bytes;
 };
 
 MEGAKERNEL_FRONT_DEVICE constexpr int64_t TotalColumns(const Config& config)
@@ -101,7 +102,7 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
         || config.blocks < 1 || config.blocks > kMaxBlocks
         || config.reduction < 1
         || config.part_count < 1 || config.part_count > kMaxParts
-        || config.weight_stride * 2 % kStrideBytes != 0) {
+        || config.weight_stride * config.element_bytes % kStrideBytes != 0) {
         return false;
     }
     int64_t columns = 0;

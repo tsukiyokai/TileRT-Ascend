@@ -48,14 +48,22 @@ def load(library):
     return torch.ops.megakernel_front
 
 
-def operands(level, rows, stride, device, generator):
+DTYPES = {1: (torch.int8, torch.int32), 2: (torch.bfloat16, torch.float)}
+
+
+def sample(shape, dtype, device, generator):
+    if dtype is torch.int8:
+        return torch.randint(-127, 128, shape, dtype=dtype, device=device,
+                             generator=generator)
+    return torch.randn(shape, dtype=dtype, device=device, generator=generator)
+
+
+def operands(level, rows, stride, element, device, generator):
     return {
-        'activation': torch.randn(rows, level['reduction'],
-                                  dtype=torch.bfloat16, device=device,
-                                  generator=generator),
-        'weight': torch.randn(level['reduction'], stride,
-                              dtype=torch.bfloat16, device=device,
-                              generator=generator),
+        'activation': sample((rows, level['reduction']), element, device,
+                             generator),
+        'weight': sample((level['reduction'], stride), element, device,
+                         generator),
     }
 
 
@@ -98,6 +106,7 @@ def main():
     level = LEVELS[args.level]
     parts = list(level['parts'].values())
     columns = sum(parts)
+    element, accumulator = DTYPES[front.element_bytes()]
     stride = args.stride or front.aligned_width(columns)
     sync = front.sync_base()
     tiling = front.build_tiling(args.rows, args.blocks, level['reduction'],
@@ -108,25 +117,29 @@ def main():
     generator = torch.Generator(device=args.device).manual_seed(20261022)
     cases = []
     for index in range(args.inputs):
-        held = operands(level, args.rows, stride, args.device, generator)
-        product = torch.zeros(args.rows, stride, dtype=torch.float,
+        held = operands(level, args.rows, stride, element, args.device,
+                        generator)
+        product = torch.zeros(args.rows, stride, dtype=accumulator,
                               device=args.device)
         submit(front, held, parts, args.blocks, sync, tiling, system, product)
         torch.npu.synchronize()
         computed = product[:, :columns]
         reference = (held['activation'].float()
                      @ held['weight'][:, :columns].float())
+        if accumulator is torch.int32:
+            reference = reference.round()
         cases.append({
             'input': index,
             'product_sha256': torch.sum(
                 computed.cpu().contiguous().view(torch.int32).long()).item(),
-            'max_absolute_difference': (computed - reference).abs().max().item(),
+            'max_absolute_difference':
+                (computed.float() - reference).abs().max().item(),
             'reference_magnitude': reference.abs().max().item(),
             'finite': bool(torch.isfinite(computed).all()),
         })
 
-    held = operands(level, args.rows, stride, args.device, generator)
-    product = torch.zeros(args.rows, stride, dtype=torch.float,
+    held = operands(level, args.rows, stride, element, args.device, generator)
+    product = torch.zeros(args.rows, stride, dtype=accumulator,
                           device=args.device)
     samples = [timed(lambda: submit(front, held, parts, args.blocks, sync,
                                     tiling, system, product), args.iterations)
@@ -136,6 +149,7 @@ def main():
         'library': str(args.library), 'level': args.level,
         'reduction': level['reduction'], 'parts': level['parts'],
         'columns': columns, 'weight_stride': stride,
+        'element_bytes': front.element_bytes(),
         'rows': args.rows, 'blocks': args.blocks,
         'base': [args.base_m, args.base_n, args.base_k],
         'cases': cases,

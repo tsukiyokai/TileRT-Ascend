@@ -10,9 +10,20 @@
 namespace megakernel_front {
 using namespace AscendC;
 
-using Activation = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, false>;
-using Weight = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, false>;
-using Product = MatmulType<TPosition::GM, CubeFormat::ND, float>;
+// Prolog's own operands: int8 activations and weights with an int32 product,
+// as `indexer_front`'s `Project<int8_t, int32_t>` uses. The bf16 build keeps
+// the earlier comparison available.
+#ifdef MEGAKERNEL_FRONT_BF16
+using Element = bfloat16_t;
+using Accumulator = float;
+#else
+using Element = int8_t;
+using Accumulator = int32_t;
+#endif
+
+using Activation = MatmulType<TPosition::GM, CubeFormat::ND, Element, false>;
+using Weight = MatmulType<TPosition::GM, CubeFormat::ND, Element, false>;
+using Product = MatmulType<TPosition::GM, CubeFormat::ND, Accumulator>;
 using Projection = Matmul<Activation, Weight, Product, Product>;
 
 __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* bytes)
@@ -36,13 +47,13 @@ __aicore__ inline void Project(Projection& mm, const Config& config,
         return;
     }
     const int64_t stride = config.weight_stride;
-    GlobalTensor<bfloat16_t> a, b;
-    GlobalTensor<float> c;
-    a.SetGlobalBuffer((__gm__ bfloat16_t*)addresses.activation,
+    GlobalTensor<Element> a, b;
+    GlobalTensor<Accumulator> c;
+    a.SetGlobalBuffer((__gm__ Element*)addresses.activation,
                       config.rows * config.reduction);
-    b.SetGlobalBuffer((__gm__ bfloat16_t*)addresses.weight + column,
+    b.SetGlobalBuffer((__gm__ Element*)addresses.weight + column,
                       (config.reduction - 1) * stride + slice.width);
-    c.SetGlobalBuffer((__gm__ float*)addresses.product + column,
+    c.SetGlobalBuffer((__gm__ Accumulator*)addresses.product + column,
                       (config.rows - 1) * stride + slice.width);
     mm.SetOrgShape(config.rows, stride, config.reduction, config.reduction,
                    stride);
