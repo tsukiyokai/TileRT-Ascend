@@ -2520,3 +2520,14 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
 - A saturating curve is a property of the instrument until you have changed the
   instrument. Acceptance looked sublinear in width, so the width optimum looked
   pinned at 32; with a cursor drafter it is near linear and widening pays.
+- A truncated model is not a slower model, it is a broken one. `--layers 10`
+  emitted token 1170 and then 255 zeros -- two distinct tokens in 256 -- so a
+  drafter that indexes its own output accepted the entire width every round:
+  the automaton read 23.273 at width 32 and TPOT read 1.71 ms. Both are the
+  degenerate-repetition artefact, not a measurement. "The arm produced
+  non-warmup requests" is not enough; the output has to be more than one token
+  wide, which `distinct_output_tokens` now records and gates.
+- Two of three drafters agreeing is not a check when they share the defect. On
+  that degenerate stream lookup gave 1.969, the automaton 23.273 and the cursor
+  1.000 -- and the cursor was the only one that was right, because 255 zeros
+  occur nowhere in the prompt and there is nothing to copy.

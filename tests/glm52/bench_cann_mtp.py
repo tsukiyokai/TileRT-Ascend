@@ -379,6 +379,12 @@ def validate_delivery(requests, histories, args):
     for number, (request, history) in enumerate(zip(requests, histories)):
         tokens, clocks = request["tokens"], request["timestamps_ns"]
         stats, rounds = request["session"], history["rounds"]
+        # A truncated model emits one token forever -- `--layers 10` gave
+        # 1170 then 255 zeros -- and a drafter that indexes its own output
+        # then accepts the whole width every round, so both the acceptance
+        # and the TPOT read as a result. Record the width of the output so
+        # that cannot be mistaken for one.
+        request["distinct_output_tokens"] = len(set(tokens))
         operations = request["operations"]
         # The session drives rounds through advance_mtp_n, so an expectation
         # written against advance_mtp never matched and rank 0 raised on every
@@ -395,6 +401,7 @@ def validate_delivery(requests, histories, args):
                 or token_metrics(tokens, clocks)["tpot_ms"]
                 != request["tpot_ms"]
                 or [op["operation"] for op in operations] != expected_ops
+                or request["distinct_output_tokens"] < 2
                 or stats["round_calls"] != stats["completed_rounds"]
                 or stats["round_calls"] != len(rounds)
                 or len(stats["accepted_spans"]) != len(rounds)
@@ -514,6 +521,7 @@ def run(args, report):
             lookup_tree=args.tree,
         )
         prefix = FullRankPrefix(main, mtp, parent.to(target.device), 8192)
+        opening = first
         with torch.inference_mode():
             if args.target_graph or args.draft_graph:
                 counters_before = asdict(compilation_counter)
@@ -523,7 +531,8 @@ def run(args, report):
                 # against -- so the arm uses the token the injection itself
                 # computed. The guarantee is untouched: start_mtp still
                 # compares against what inject produced.
-                opening = (engine.first_token_id if args.layers else first)
+                if args.layers:
+                    opening = engine.first_token_id
                 if args.round_phases:
                     from tilert.models.glm_5_2_ascend.round_phases import (
                         RoundPhases)
@@ -640,7 +649,7 @@ def run(args, report):
                                     lambda request, _rank: prefix)
             if rank == 0:
                 backend = CoordinatedBackend(executor, channel)
-                report["requests"] = drive(backend, first, args)
+                report["requests"] = drive(backend, opening, args)
                 report["profiled"] = any(
                     item["profiled"] for item in report["requests"])
             else:
