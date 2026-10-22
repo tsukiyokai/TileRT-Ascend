@@ -2531,3 +2531,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   that degenerate stream lookup gave 1.969, the automaton 23.273 and the cursor
   1.000 -- and the cursor was the only one that was right, because 255 zeros
   occur nowhere in the prompt and there is nothing to copy.
+- More readers on a slow shared mount is less throughput. Sixteen ranks each
+  read 3 MB/s and block in `__lock_page_killable` on each other's pages, for
+  about 48 MB/s against a single stream's 79. Two arms died of this before the
+  worker's `wchan` was read; the progress log said "10% (1/6)" for forty
+  minutes and said nothing about why.
