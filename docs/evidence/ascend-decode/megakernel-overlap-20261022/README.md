@@ -56,13 +56,48 @@ other and the check failed intermittently. One cache line a core resolved it;
 seven of the eight points above verify exactly, and the two-pass point remains a
 residual flake in the gate rather than in the timing, which follows the trend.
 
+## Per-tile publication on the row axis cannot pay here
+
+The AMD design this follows hands work between resident workgroups through
+memory with a sequence tag, so a consumer starts on the part of its input that
+is ready. On the row axis at batch one that cannot pay, and the arithmetic is
+already on this page.
+
+A matmul invocation cannot begin on partial input: `IterateAll` consumes the
+whole A it was given. So starting the cube early means splitting it into one
+invocation a row group, and an invocation at a reduction of 6144 costs about 25
+microseconds -- the difference between 23.91 fused and 51.07 split for Prolog's
+two projections. What early starting saves is the producer's duration, and the
+producer here writes 12 by 6144 int8, 73 KB in and out, a fraction of one 12.46
+microsecond pass.
+
+So two row groups would buy a few microseconds of earlier start for 25 of extra
+invocation. The trade is decided by the ratio, not by the protocol, and it is
+decided against.
+
+A protocol was built to measure it anyway and is not kept. A cross-half
+`SyncAll` in the producer deadlocks against a consumer spinning on a flag,
+because the barrier counts both halves; replacing it with an atomic counter per
+group still hung at every group count, including one. The code is reverted
+rather than left half-working, since the measurement it would produce is already
+implied by the two figures above.
+
 ## What it implies for the layer
 
 The layer's vector work -- the two norms, the dynamic quantizations, RoPE, the
 Hadamard, the top-k selection, the expert combine -- is substantial, and the
 whole-layer kernel currently pays all of it in series with the cube. If each
 cube stage covers roughly 40 percent of its own duration in vector work, the
-barriers are leaving tens of microseconds a layer unclaimed. Replacing them with
-per-tile publication is the next build, and this is its measured basis.
+barriers are leaving tens of microseconds a layer unclaimed.
+
+But claiming it means finding vector work that is *independent* of the cube work
+it would hide under, not splitting a dependent producer into tiles. The layer's
+large vector items -- the two norms, the dynamic quantizations, the expert
+combine -- all sit on the dependency chain, so what remains to schedule under a
+cube stage is the work that does not depend on the current token: the indexer's
+Hadamard matrices and sine-cosine gathers, the page-map conversions, the top-k
+workspace. Those are small. The capacity is 10.5 microseconds a stage; how much
+of it a real layer can fill is the open question, and it is a question about the
+schedule rather than about the protocol.
 
 [`run.sh`](run.sh) is the sweep; the JSON files are its output, one a load.

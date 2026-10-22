@@ -84,6 +84,13 @@ order a mistake usually happens:
   went only to the kernel compile, so a bf16 device half was linked against an
   int8 host half; the launch faulted on the core with EE9999 and the only visible
   clue was `element_bytes` reporting 1 from a library named bf16.
+- A cross-half barrier deadlocks against a spin-wait. `SyncAll` counts the cube
+  and vector halves together, so a producer that barriers while the consumer
+  spins on its flag hangs the core for ten seconds and reports `aicore timeout`.
+- Decide a trade by its ratio before building the protocol for it. Row-axis
+  pipelining buys the producer's duration and costs one matmul invocation a
+  group; at a reduction of 6144 that is 25 microseconds against a producer of
+  under one, so no handoff protocol could have made it pay.
 - Work with no observable result is not work. A vector stage that computed in
   unified buffer and published nothing reported under one microsecond at every
   load up to 64 passes; publishing its total and checking the arithmetic turned
