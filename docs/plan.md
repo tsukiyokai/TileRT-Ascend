@@ -64,14 +64,25 @@ capture）：
 `cann_graph.py:49` 本就按精确宽度捕获、白名单 `(4,6,8,12,16,24,32)`，`:92` 拒收
 `num_actual_tokens` 不符的元数据，所以原定的"12 对 13"判别法根本跑不起来。
 
-**剩下的只有被上一次单 die 测量漏掉的三个宽度相关阶段**：SFA 7.0、norm 5.5、
-路由 12.1 ms/轮。那次只计了 norm、融合输入投影、q_b、o_proj、共享下投影、动态量化
-与 grouped matmul，没有计 SFA、indexer 与路由——而每多一行草稿就是多一个 query
-去打 8K 的 cache。下一步是单 die 扫 `bench_sfa_shape_scaling.py --width`
-（`--heads 4 --top-k 2048` 是 TP16 的每卡形状）。
+**注意力拿走 0.356 的 38–44%，而它整项可被一次共享读消掉**。单 die、TP16 每卡形状
+（4 头、top-k 2048、8K、bf16），12→32 的斜率换成每轮每行：逐行散读 0.307、散读加稠密
+注意力 0.356、**整份 cache 读一次加逐行掩码 −0.074（即平的）**。斜率的 86% 是读而不是
+算术，因为每多一行就自带 2048 个位置、2.36 MB／层；而共享读的字节恒为 9.44 MB，所以
+宽度越大越赚：w12 便宜 1.31×、w32 2.63×、w64 2.93×。引擎已有这条路
+（`cann_attention.py:shared_kv_fia`，M16 筛选曾测 −44.19 µs/层）。
 
-若这笔钱可被结构性地摊薄（共享 FIA 的 union+mask 已测为整矩形的 45.60%），固定预算
-树的 14.510 接受才成为最优配置：
+顺带两个修正：台阶在 gather 的 tiling 里——12→13 一行要 13.7 µs，16→32 只要 2.53
+µs/行，所以 0.814 这个线性项是在一条分段曲线上的平滑，脱离宽度引用它不可比。而路由
+那 12.1 ms/轮几乎与宽度无关：`route_metadata` 的缓冲区是 `MAX_ROUTES = 32×8` 定容、
+argsort 只在 M×8 上做，全是小张量，这一项由下发次数主导，属固定项。
+
+**剩下约 0.44 ms/行没有归宿，最可能是专家并集**：行数越多被激活的专家越多，每个各读
+一份权重分片。教师路由实测 M8/16/32 的平均并集是 44.35/68.07/99.36，即约 2.29
+专家/行。下一步用 `bench_gmm_shape_scaling.py --experts` 测每专家的边际代价，与这条
+并集曲线相乘。
+
+而 64 行这条路还卡在两个硬上限：`route_metadata` 的 `MAX_TOKENS = 32` 越界即报错，
+图捕获白名单也只到 32。固定预算树的 14.510 接受要先抬这两处：
 
     边界合并后固定项   25.58 ms
     64 节点 × 0.026     1.66 ms
@@ -80,6 +91,7 @@ capture）：
     TPOT                1.88 ms   ← 落进目标
 
 [规约](evidence/ascend-decode/row-cost-collective-20261022/README.md)
+[注意力](evidence/ascend-decode/row-cost-attention-20261022/README.md)
 [错配](evidence/ascend-decode/row-cost-mismatch-20261021/README.md)
 
 ## 已排除的杠杆：checkpoint 自带的 MTP 层

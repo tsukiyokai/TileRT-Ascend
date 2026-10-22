@@ -128,8 +128,54 @@ def gather_fia_call(case, heads):
     return call
 
 
-KERNELS = {"sfa": sfa_call, "gather": gather_call,
-           "gather_fia": gather_fia_call}
+def shared_fia_call(case, heads):
+    """Time one shared read of the whole cache under a per-row mask.
+
+    The gather kernels read `top_k` rows for every query, so their bytes grow
+    with the verify width; this reads the cache once and excludes the
+    unselected columns instead, so they do not. The mask is built outside the
+    timed call because the engine refreshes it on index producers only and the
+    consumer layers reuse it (`cann_attention.py:SharedKVAttention`).
+    """
+    import torch_npu
+
+    width = case["query"].shape[0]
+    latent = case["key"].view(1, SEQUENCE_LENGTH, 1, LATENT_DIM)
+    rope = case["key_rope"].view(1, SEQUENCE_LENGTH, 1, ROPE_DIM)
+    query = case["query"].view(1, width, heads, LATENT_DIM)
+    query_rope = case["query_rope"].view(1, width, heads, ROPE_DIM)
+    bitmap = torch.ones((width, SEQUENCE_LENGTH), dtype=torch.uint8,
+                        device=latent.device)
+    bitmap.scatter_(1, case["sparse_indices"].reshape(width, -1).long(), 0)
+    mask = bitmap.view(torch.bool).view(1, 1, width, SEQUENCE_LENGTH)
+
+    def call():
+        output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query, latent, latent, query_rope=query_rope, key_rope=rope,
+            atten_mask=mask, num_query_heads=heads, num_key_value_heads=1,
+            softmax_scale=SCALE, input_layout="BSND", sparse_mode=0,
+            block_table=None, block_size=0,
+            actual_seq_qlen=[width], actual_seq_kvlen=[SEQUENCE_LENGTH],
+        )
+        return output
+
+    return call
+
+
+def per_row_read(width, top_k):
+    """Every query reads its own selected rows."""
+    return width * top_k * (LATENT_DIM + ROPE_DIM) * 2
+
+
+def whole_cache_read(width, top_k):
+    """One shared read, so the bytes do not grow with the width."""
+    return SEQUENCE_LENGTH * (LATENT_DIM + ROPE_DIM) * 2
+
+
+KERNELS = {"sfa": (sfa_call, per_row_read),
+           "gather": (gather_call, per_row_read),
+           "gather_fia": (gather_fia_call, per_row_read),
+           "shared_fia": (shared_fia_call, whole_cache_read)}
 
 
 def batch_mean_ms(call, calls):
@@ -149,7 +195,8 @@ def measure(args, report):
     generator = torch.Generator().manual_seed(args.seed)
     case = build_case(args.heads, args.top_k, args.width, generator)
     case = {key: value.to(device) for key, value in case.items()}
-    call = KERNELS[args.kernel](case, args.heads)
+    factory, read_model = KERNELS[args.kernel]
+    call = factory(case, args.heads)
 
     for _ in range(args.warmup):
         call()
@@ -157,7 +204,7 @@ def measure(args, report):
                      for _ in range(args.batches))
 
     median = statistics.median(samples)
-    read = args.width * args.top_k * (LATENT_DIM + ROPE_DIM) * 2
+    read = read_model(args.width, args.top_k)
     report.update({
         "status": "pass", "kv_bytes": read,
         "median_us": median * 1e3,

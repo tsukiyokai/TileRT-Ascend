@@ -48,6 +48,13 @@ order a mistake usually happens:
 - Check that the discriminator is runnable in the code before planning a run
   for it. "Width 12 against 13" was the headline next step for a day, and 13 is
   not in `cann_graph.py`'s capture whitelist.
+- A per-row figure without its width is not comparable. The gather's marginal
+  row costs 13.70 us at width 12 and 2.53 at 32, so one linear term smooths a
+  curve with regimes and any single slope inherits the span it was fitted on.
+- Ask what grows with the parameter before blaming a stage for it. Routing is
+  12.1 ms a round and looked like the biggest row-cost suspect; its buffers are
+  fixed at `MAX_ROUTES = 32 x 8` and its tensors are tiny, so it is launch
+  count, not rows.
 - Compare like with like. A sum of separately-launched kernels is not what an
   engine that fuses them spends.
 - A broken index reads exactly like a failed mechanism. Twice in one day.
