@@ -1,3 +1,10 @@
+> Superseded 2026-10-22. The narrowing is 164.39 us a layer and 12.82 ms a
+> round, not 223 and 17.41: the 258.17 it was built on was profiled at
+> `inner` 1536 rather than the checkpoint's 1024 and 2048, and a round
+> touches 5.07 of a rank's sixteen experts rather than two. Width 32 is
+> null rather than the last step, because more rows touch more experts.
+> See [`road-to-2ms-20261022`](../road-to-2ms-20261022/README.md).
+
 # The road to 2.x ms, from today's measured quantities
 
 ## The budget is arithmetic, not a target

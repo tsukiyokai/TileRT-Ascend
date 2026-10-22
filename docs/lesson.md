@@ -41,6 +41,13 @@ order a mistake usually happens:
 - Compare like with like. A sum of separately-launched kernels is not what an
   engine that fuses them spends.
 - A broken index reads exactly like a failed mechanism. Twice in one day.
+- Derive a count that a distribution already fixes. "A round touches two of a
+  rank's sixteen experts" was an assumption; eight distinct picks of 256 over
+  twelve rows gives 5.07, and the fixture's own 81 of 256 confirms it. The
+  lever was overstated by 4.59 ms a round.
+- A lever that depends on a quantity another step changes is not additive.
+  Narrowing the bank is worth 164 us a layer at twelve rows and 87 at
+  thirty-two, so the width-32 acceptance gain cancels against it exactly.
 
 ## When implementing
 
