@@ -202,6 +202,37 @@ moe_intermediate=2048 而非 1536，一个专家 18.9 MB）重测，6 行、prof
 kernel）。曲线收敛到约 33 µs，与把同样负载搬出 die 的 37 µs 同阶，所以图内
 一个集合通信基本只剩传输。
 
+## 2026-10-22 注意力才是剩下的全部,但它的 trace 在这台机上建不了
+
+FFN 侧已封顶:窗口 136.40 = cube 关键路径 85.59 + 向量 23.40 + 锁死的不均衡
+27.4,可得约 23,已拿 2.94。注意力是它的四倍且几乎未封顶:
+
+    相位              窗口      其中 cube    依据
+    prolog            42.38     —            厂商融合算子,两半混合
+    indexer front     70.37     约 17        两遍走查(K=2048/N=4096、K=6144/N=160)
+    selector/top-k    54.84     0            本阶段无矩阵乘
+    SFA               76.97     约 26        实测 gather 28.31 MB @ 1094 GB/s
+    projection tail   56.55     13.02        该相位自己的 per-core trace
+    合计             ~301       约 98
+
+所以约 98 µs cube、199 µs vector,完美共置落点 `max(98,199)=199`,**可得 98 µs**
+——FFN 的四倍,是层里最大的已识别项。
+
+而注意力自己的读取只有 11.9 MB 权重加 28.31 MB gather 的 KV = 40.2 MB,
+按 1607 GB/s 是 25 µs。所以它跑在自身流量的约 12 倍上,而 FFN 只有 1.9 倍。
+差别是结构性的:FFN 的 cube 工作**就是**它的读取(专家权重大),而注意力权重
+小、时间花在 selector、RoPE、Hadamard 与 norm 上。
+
+这同时给注意力的重叠定了限:向量只能藏在 cube 底下,而注意力是 98 cube 对
+199 vector,所以完美调度之后仍剩 199。**注意力的向量工作必须变便宜,不是调度
+问题**,而其中最大一项是 selector 的 top-k 54.84 µs(每行扫 8192 个位置)。
+
+卡点:建带instrument的注意力库需要那份"录下来的" ops-transformer 快照——
+`optiling::MlaPrologBaseParams` 要有 `mm1NGroup`/`mm1KGroup`/`mm2NGroup`/`mm2KGroup`,
+而 CANN 9.2.0 装的树里没有,a3-194 上两个 CANN 树 `grep -rl mm1NGroup` 都为空。
+构建的另两步是通的(vendor root 只作 `-I`;源码期望 `ascendc` 上一级,所以用
+`attention -> ascendc` 的符号链接影子树可满足全部 include),配方已落证据页。
+
 ## 2026-10-22 倾斜已移植进 routed 核,且上界要第三次更正
 
 `ROUTED_EXPERT_SKEW=n` 把专家索引切成 n 块,步 s 的 gate_up 与步 s−1 的
