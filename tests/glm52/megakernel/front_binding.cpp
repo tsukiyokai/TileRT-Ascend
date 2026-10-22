@@ -36,13 +36,15 @@ constexpr int64_t kElementBytes = 1;
 Config Describe(int64_t rows, int64_t blocks, int64_t reduction,
                 at::IntArrayRef parts, int64_t weight_stride,
                 int64_t vector_passes, int64_t barriers,
-                int64_t skew_steps)
+                int64_t skew_steps, int64_t vector_ops,
+                int64_t fused_ops)
 {
     TORCH_CHECK(parts.size() >= 1 && parts.size() <= kMaxParts,
                 "a level holds 1 to ", kMaxParts, " projections");
     Config config{rows, blocks, reduction,
                   static_cast<int64_t>(parts.size()), {}, weight_stride,
-                  kElementBytes, vector_passes, barriers, skew_steps};
+                  kElementBytes, vector_passes, barriers, vector_ops,
+                  fused_ops, skew_steps};
     for (size_t part = 0; part < parts.size(); ++part) {
         config.part_columns[part] = parts[part];
     }
@@ -59,7 +61,7 @@ at::Tensor BuildTiling(int64_t rows, int64_t blocks, int64_t reduction,
                        int64_t base_m, int64_t base_n, int64_t base_k)
 {
     const Config config = Describe(rows, blocks, reduction, parts,
-                                   weight_stride, 0, 0, 0);
+                                   weight_stride, 0, 0, 0, 1, 1);
     const Slice widest = SliceFor(TotalColumns(config), blocks, 0);
     auto host = at::empty({static_cast<int64_t>(kTilingStride)},
                           at::dtype(at::kByte));
@@ -76,13 +78,15 @@ void Forward(const at::Tensor& activation, const at::Tensor& weight,
              const at::Tensor& product, const at::Tensor& tiling,
              const at::Tensor& system, const at::Tensor& witness,
              int64_t blocks, at::IntArrayRef parts, int64_t vector_passes,
-             int64_t barriers, int64_t skew_steps, int64_t sync_base)
+             int64_t barriers, int64_t skew_steps, int64_t vector_ops,
+             int64_t fused_ops, int64_t sync_base)
 {
     TORCH_CHECK(activation.dim() == 2 && weight.dim() == 2
                 && product.dim() == 2, "two-dimensional operands");
     const Config config = Describe(activation.size(0), blocks,
                                    activation.size(1), parts, weight.size(1),
-                                   vector_passes, barriers, skew_steps);
+                                   vector_passes, barriers, skew_steps,
+                                   vector_ops, fused_ops);
     const int64_t columns = TotalColumns(config);
     TORCH_CHECK(weight.size(0) == config.reduction,
                 "weight must reduce over ", config.reduction, " rows");
@@ -134,7 +138,7 @@ TORCH_LIBRARY_FRAGMENT(megakernel_front, m)
     m.def("forward(Tensor activation, Tensor weight, Tensor product, "
           "Tensor tiling, Tensor system, Tensor witness, int blocks, "
           "int[] parts, int vector_passes, int barriers, int skew_steps, "
-          "int sync_base) -> ()");
+          "int vector_ops, int fused_ops, int sync_base) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(megakernel_front, CompositeExplicitAutograd, m)

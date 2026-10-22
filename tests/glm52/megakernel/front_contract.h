@@ -32,6 +32,7 @@ constexpr int64_t kWitnessStride = kStrideBytes / sizeof(float) / 16;  // 8
 constexpr int64_t kMaxWitness = kMaxBlocks * 2 * kWitnessStride;
 constexpr int64_t kVectorChunks = 72;
 constexpr int64_t kMaxSkewSteps = 16;
+constexpr int64_t kMaxVectorOps = 16;
 
 constexpr int64_t AlignedColumns(int64_t columns, int64_t element_bytes)
 {
@@ -102,6 +103,11 @@ struct Config {
     // Grid barriers to issue around the work. A skewed pipeline pays one a
     // step, so this prices the step.
     int64_t barriers;
+    // Vector operations applied to each chunk. `fused_ops` applies them all to
+    // one load; otherwise each operation loads and stores the chunk itself, so
+    // the same arithmetic costs that many passes.
+    int64_t vector_ops;
+    int64_t fused_ops;
     // Steps the work is cut into. Zero runs the cube and the vector halves one
     // after the other, which is what a phase barrier gives. More than one
     // interleaves step s of the cube with step s-1 of the vector, so the two
@@ -142,7 +148,8 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
         || config.part_count < 1 || config.part_count > kMaxParts
         || config.weight_stride * config.element_bytes % kStrideBytes != 0
         || config.vector_passes < 0 || config.barriers < 0
-        || config.skew_steps < 0 || config.skew_steps > kMaxSkewSteps) {
+        || config.skew_steps < 0 || config.skew_steps > kMaxSkewSteps
+        || config.vector_ops < 1 || config.vector_ops > kMaxVectorOps) {
         return false;
     }
     int64_t columns = 0;

@@ -85,15 +85,35 @@ __aicore__ inline void Reduce(TPipe& pipe, const Config& config,
 
     const int64_t index = GetBlockIdx();
     float total = 0.0f;
+    // `fused_ops` keeps the chunk in unified buffer across every operation, so
+    // the data is loaded once. Otherwise each operation loads and sums the
+    // chunk itself, which is the same arithmetic over that many passes.
+    const int64_t ops = config.vector_ops;
     for (int64_t pass = first_pass; pass < last_pass; ++pass) {
-        for (int64_t chunk = 0; chunk < kVectorChunks; ++chunk) {
-            Duplicate(held, static_cast<float>(pass + 1), kChunk);
-            PipeBarrier<PIPE_V>();
-            Abs(held, held, kChunk);
-            PipeBarrier<PIPE_V>();
-            ReduceSum(work, held, work, kChunk);
-            PipeBarrier<PIPE_ALL>();
-            total += work.GetValue(0);
+        if (config.fused_ops != 0) {
+            for (int64_t chunk = 0; chunk < kVectorChunks; ++chunk) {
+                Duplicate(held, static_cast<float>(pass + 1), kChunk);
+                for (int64_t op = 0; op < ops; ++op) {
+                    PipeBarrier<PIPE_V>();
+                    Abs(held, held, kChunk);
+                }
+                PipeBarrier<PIPE_V>();
+                ReduceSum(work, held, work, kChunk);
+                PipeBarrier<PIPE_ALL>();
+                total += work.GetValue(0);
+            }
+        } else {
+            for (int64_t op = 0; op < ops; ++op) {
+                for (int64_t chunk = 0; chunk < kVectorChunks; ++chunk) {
+                    Duplicate(held, static_cast<float>(pass + 1), kChunk);
+                    PipeBarrier<PIPE_V>();
+                    Abs(held, held, kChunk);
+                    PipeBarrier<PIPE_V>();
+                    ReduceSum(work, held, work, kChunk);
+                    PipeBarrier<PIPE_ALL>();
+                    total += work.GetValue(0) / static_cast<float>(ops);
+                }
+            }
         }
     }
     const int64_t slot = index * kWitnessStride;
