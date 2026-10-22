@@ -2550,3 +2550,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   `tree_attention.install` has no caller, so `mtp_round.tree_mask` stays None
   and off-path nodes attend to the indexer's selection instead of their own
   ancestors. A ladder of seven arms was about to measure that.
+- Assign the property, not the field behind it. `sfa_v1`'s `skip_topk` setter
+  also recomputes `skip_indexer_pre_process`, which `runtime_has_indexer`
+  reads, so `tree_attention.install` writing `_skip_topk` left the indexer
+  running under the mask that was supposed to replace it. The vendor's own
+  `set_skip_topk` assigns the property; the copy in this repository did not.

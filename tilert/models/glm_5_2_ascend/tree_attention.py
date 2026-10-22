@@ -22,9 +22,13 @@ def install(layers, picks):
     """
     import torch
 
+    # Assign the property, not `_skip_topk` behind it: its setter also
+    # recomputes `skip_indexer_pre_process`, and `runtime_has_indexer` reads
+    # that, so writing the field leaves the indexer running under a mask that
+    # was supposed to replace it.
     held = []
     for layer in layers:
-        held.append((layer, layer._skip_topk, layer.topk_indices_buffer))
+        held.append((layer, layer.skip_topk, layer.topk_indices_buffer))
 
     buffer = None
 
@@ -36,7 +40,7 @@ def install(layers, picks):
         if buffer is None or buffer.shape != wanted.shape:
             buffer = wanted
             for layer, _, _ in held:
-                layer._skip_topk = True
+                layer.skip_topk = True
                 layer.topk_indices_buffer = buffer
         else:
             buffer.copy_(wanted)
@@ -44,7 +48,7 @@ def install(layers, picks):
 
     def restore():
         for layer, skip, original in held:
-            layer._skip_topk = skip
+            layer.skip_topk = skip
             layer.topk_indices_buffer = original
 
     return write, restore
