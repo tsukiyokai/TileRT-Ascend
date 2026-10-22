@@ -28,7 +28,11 @@ source /opt/ascend/cann-9.2.0/set_env.sh
 # `_register_atb_extensions()` unconditionally and dies on `libatb.so` when the
 # image carries no NNAL. The omniinfer images do not; the ascend vllm image
 # does, and its tree is mounted here.
+# Its own set_env.sh reads `$ZSH_VERSION` unguarded, so `set -u` aborts the
+# source before it exports anything and the failure is still `libatb.so`.
+set +u
 source /usr/local/Ascend/nnal/atb/set_env.sh
+set -u
 # The engine stack comes from the pinned trees under RUNTIME, because the
 # omniinfer image ships `omni_npu` rather than `vllm_ascend` and the unified
 # image carries only vllm's dist-info -- its version string ends in `.empty`,
