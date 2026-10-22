@@ -49,6 +49,26 @@ This also sizes the capacity measured separately. A cube stage hides about 10.5
 microseconds of vector work for nothing, and the FFN's whole vector half is
 23.40 -- so two cube stages' worth of capacity covers all of it.
 
+## The cube half is already at bandwidth, so this is the FFN's last lever
+
+The same trace's `measured_routing` corrects a count used elsewhere in this
+project. Its array holds 256 entries with 81 active, so a rank carries **all**
+256 experts -- tensor parallelism shards each expert along its intermediate
+dimension rather than giving ranks different experts -- and a round at twelve
+rows touches 81 of them, not five of sixteen.
+
+At 302 MB a rank for the whole bank that is 95.6 MB read a layer, and the cube
+half's 71.25 microseconds covers it at 1341 GB/s, or 83 percent of the 1607 the
+spread arm measured on this die. The cube work is bandwidth-bound and cannot be
+made shorter without reading fewer bytes.
+
+So 71.25 is the FFN body's floor, today's window is 136.40, and the 61
+microseconds between them is the last mechanism on this side. It also moves the
+layer's traffic floor: 11.9 MB of attention weights, 9.4 of KV cache and 95.6 of
+touched experts is 116.9 MB a rank, or 81 microseconds at 1442 GB/s, against a
+235 microsecond budget for 2.9 milliseconds. The ratio is 2.9, not the 5.7 this
+project recorded from the wrong expert count.
+
 [`decompose.py`](decompose.py) reads the trace; [`width12.txt`](width12.txt) and
 [`width32.txt`](width32.txt) are its output. The trace is
 `megakernel-device-20261021/a3-84/routed-stage-profile.json`, taken with the

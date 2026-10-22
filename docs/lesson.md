@@ -49,6 +49,10 @@ order a mistake usually happens:
 - Before pricing a lever, check the vendor has not already taken it. Five CANN
   grouped-matmul kernels skip an empty group with one `continue`, and this
   repository already anchored that line in a test nobody read.
+- Tensor parallelism shards each expert; it does not deal experts out. A rank
+  carries all 256 and a round touches 81, which the trace's own routing array
+  says plainly. Carrying an expert-parallel intuition across moved the layer's
+  traffic floor from 81 microseconds to 41 and the headroom from 2.9x to 5.7x.
 - Derive a count that a distribution fixes rather than assuming it. "A round
   touches two of a rank's sixteen experts" was an assumption; eight distinct
   picks of 256 over twelve rows gives 5.07, and the routed fixture's own 81
