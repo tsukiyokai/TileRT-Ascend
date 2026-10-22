@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import hashlib
+import importlib
 from pathlib import Path
 
 from .ascend_layout import (
@@ -9,6 +10,18 @@ from .ascend_layout import (
     validate_parent_hidden_metadata, validate_prompt_token_ids,
 )
 
+
+# One name selects the host drafter. `aligned` keeps a cursor into the prompt
+# rather than searching prompt plus output for its anchor, which is worth
+# 1.88x the automaton at width 32 on a constructed edit stream.
+DRAFTERS = {
+    "lookup": ("tilert.models.glm_5_2_ascend.lookup_draft", "LookupDrafter"),
+    "automaton": ("tilert.models.glm_5_2_ascend.automaton_draft",
+                  "AutomatonDrafter"),
+    "tree": ("tilert.models.glm_5_2_ascend.tree_draft", "TreeDrafter"),
+    "aligned": ("tilert.models.glm_5_2_ascend.aligned_draft",
+                "AlignedDrafter"),
+}
 
 CHECKPOINT_FILES = (
     "config.json", "quant_model_description.json",
@@ -195,8 +208,7 @@ class AscendRankEngine:
     """Bind the receive prefix to the main/MTP caches on one TP rank."""
 
     def __init__(self, target, draft, lookup_prompt=None, *,
-                 lookup_min_ngram=2, lookup_automaton=False,
-                 lookup_tree=False):
+                 lookup_min_ngram=2, drafter="lookup"):
         self.target = target
         self.draft = draft
         # The prompt's token ids, when the round is to draft by looking for
@@ -209,8 +221,9 @@ class AscendRankEngine:
         # 50.7 ms where its super kernels account for 16.4, and the record had
         # no account of the rest.
         self.round_phases = None
-        self.lookup_automaton = lookup_automaton
-        self.lookup_tree = lookup_tree
+        if drafter not in DRAFTERS:
+            raise ValueError(f"Unknown drafter {drafter!r}")
+        self.drafter_name = drafter
         self._clear_request()
 
     def _clear_request(self):
@@ -263,19 +276,8 @@ class AscendRankEngine:
             raise ValueError("First token differs from the injected prefix")
         drafter = None
         if self.lookup_prompt is not None:
-            if self.lookup_tree:
-                from tilert.models.glm_5_2_ascend.tree_draft import (
-                    TreeDrafter as Drafter,
-                )
-            elif self.lookup_automaton:
-                from tilert.models.glm_5_2_ascend.automaton_draft import (
-                    AutomatonDrafter as Drafter,
-                )
-            else:
-                from tilert.models.glm_5_2_ascend.lookup_draft import (
-                    LookupDrafter as Drafter,
-                )
-
+            module, name = DRAFTERS[self.drafter_name]
+            Drafter = getattr(importlib.import_module(module), name)
             drafter = Drafter(self.lookup_prompt,
                               shortest=self.lookup_min_ngram)
             drafter.commit((first_token,))
