@@ -2555,3 +2555,16 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   reads, so `tree_attention.install` writing `_skip_topk` left the indexer
   running under the mask that was supposed to replace it. The vendor's own
   `set_skip_topk` assigns the property; the copy in this repository did not.
+- Locate a patch by the traceback's frames, not by the file whose name fits.
+  The strict loader that rejected `rot.weight` is vllm's `deepseek_v2.py`,
+  which is what GLM-5.2's target class actually is; the first patch went into
+  `vllm_ascend/models/glm5next/model.py` and changed nothing.
+- The pinned pair had never run end to end -- `plan.md` verified it as far as
+  `--help` -- so its offsets against `cann_mtp.py` come out one per launch:
+  `rot.weight` has no owner, `has_own_lm_head` is gone, `lm_head` is now
+  `head` and deferred. Each fix moved the failure one layer deeper, which is
+  how you know the direction is right; none of them is a measurement.
+- A container that vanishes from `docker ps -a` was removed, not reaped. A
+  `sleep infinity` probe on the same host lived through five samples over two
+  minutes, so the name was the problem: `trt-asc` collides with someone
+  else's cleanup, and `shanshan-trt` does not.

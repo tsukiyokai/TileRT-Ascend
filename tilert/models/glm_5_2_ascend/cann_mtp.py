@@ -175,14 +175,29 @@ class CannMtp:
                 allow_patterns_overrides=["rot.safetensors"],
             )]
             loader.load_weights(model, model_config)
-            if model.has_own_lm_head is not True:
+            # `has_own_lm_head` is gone from this vllm's `DeepSeekMTP`,
+            # which says the same thing with `defer_lm_head`. What the check
+            # is for is that the MTP head was built at all, so ask for its own
+            # parameters by name: the two norms and the projection.
+            names = {name for name, _ in model.named_parameters()}
+            own = {"enorm.weight", "hnorm.weight", "eh_proj.weight"}
+            if not all(any(name.endswith(suffix) for name in names)
+                       for suffix in own):
                 raise ValueError("Official loader did not load the MTP head")
             process_weights_after_loading(model, model_config, self.device)
         model.model.embed_tokens = self.target.model.model.embed_tokens
+        # This vllm defers the MTP's output head and calls it `head`, to be
+        # filled from the target's -- `eagle/utils.py` does `sh.head =
+        # target_lm_head`. The engine shares the embedding the same way, so
+        # share the head too rather than reach for a `lm_head` that the
+        # deferred predictor does not have.
+        head = self.target.model.lm_head
+        for layer in model.model.layers.values():
+            layer.head = head
         if self.target.fp32_head:
             from .cann_head import install_fp32_head
 
-            install_fp32_head(model.lm_head, model.model.logits_processor)
+            install_fp32_head(head, model.model.logits_processor)
         if self.shard_projections:
             from .cann_mtp_projection import shard_mtp_projections
 
