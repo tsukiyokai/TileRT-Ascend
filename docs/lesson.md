@@ -2511,3 +2511,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   cpython-312/torch-2.10 against this stack's 3.11/2.12, so `--attention-kernel
   sfa` cannot run and the recorded 9.3794 ms cannot be reproduced there.
   `vllm-ascend-8237/csrc` on a3-194 is what a build would start from.
+- Read the drafter before blaming its budget. Four separate figures pointed at
+  "the proposal is too short" -- 3.400 accepted at budget 256, 128 to 256
+  buying 1.3 percent, a 13.474 oracle, an external probe reaching 9.65 at
+  budget 20 -- and `propose` was already returning the whole remaining span.
+  The defect was the anchor: an index over prompt plus output makes the
+  drafter's own output the most recent occurrence of everything.
+- A saturating curve is a property of the instrument until you have changed the
+  instrument. Acceptance looked sublinear in width, so the width optimum looked
+  pinned at 32; with a cursor drafter it is near linear and widening pays.

@@ -26,6 +26,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[2]))
 
+from tilert.models.glm_5_2_ascend.aligned_draft import AlignedDrafter
 from tilert.models.glm_5_2_ascend.automaton_draft import AutomatonDrafter
 from tilert.models.glm_5_2_ascend.lookup_draft import LookupDrafter
 from tilert.models.glm_5_2_ascend.tree_draft import TreeDrafter
@@ -103,7 +104,10 @@ def run(stream, prompt_length, width, budget, branches, longest):
                                  adaptive=False)
     tree = TreeDrafter(prompt, longest=longest, budget=budget,
                        branches=branches)
+    # A cursor into the prompt rather than a search over prompt plus output.
+    aligned = AlignedDrafter(prompt, longest=longest, shortest=2)
     chain_accepted = []
+    aligned_accepted = []
     long_accepted = []
     automaton_accepted = []
     adaptive_accepted = []
@@ -118,6 +122,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
         matched = accepted_by_chain(linear, truth)
         longer = accepted_by_chain(long_chain.propose(width), truth)
         walked = accepted_by_chain(automaton.propose(width), truth)
+        placed = accepted_by_chain(aligned.propose(width), truth)
 
         tokens, parents = tree.propose()
         through_tree = accepted_by_tree(tokens, parents, truth)
@@ -126,6 +131,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
         chain_accepted.append(matched + 1)
         long_accepted.append(longer + 1)
         automaton_accepted.append(walked + 1)
+        aligned_accepted.append(placed + 1)
 
         tree_accepted.append(through_tree + 1)
         step = min(max(matched, longer, walked, through_tree) + 1,
@@ -133,6 +139,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
         chain.commit(stream[at:at + step])
         long_chain.commit(stream[at:at + step])
         automaton.commit(stream[at:at + step])
+        aligned.commit(stream[at:at + step])
         tree.commit(stream[at:at + step])
         at += step
     import os
@@ -173,7 +180,7 @@ def run(stream, prompt_length, width, budget, branches, longest):
 
     return (chain_accepted, long_accepted, automaton_accepted,
             adaptive_accepted, adaptive_cost, tree_accepted,
-            tree_adaptive_accepted, tree_adaptive_cost)
+            tree_adaptive_accepted, tree_adaptive_cost, aligned_accepted)
 
 
 def main():
@@ -197,7 +204,8 @@ def main():
     print(f"{'edit rate':>10}  {'chain8':>7}  {'chainL':>7}  "
           f"{'automaton':>9}  {'adaptive':>8}  {'adp rows':>8}  "
           f"{'tree':>7}  {'tpot@aut':>8}  {'tpot@adp':>8}  "
-          f"{'grove':>7}  {'grv rows':>8}  {'tpot@grv':>8}  {'rounds':>7}")
+          f"{'grove':>7}  {'grv rows':>8}  {'tpot@grv':>8}  "
+          f"{'aligned':>8}  {'tpot@aln':>8}  {'rounds':>7}")
     for rate in [float(piece) for piece in arguments.rates.split(",")]:
         generator = random.Random(arguments.seed)
         chain_total = []
@@ -207,6 +215,7 @@ def main():
         adaptive_width = []
         grove_total = []
         grove_width = []
+        aligned_total = []
         tree_total = []
         for body in bodies:
             if len(body) < 64:
@@ -218,7 +227,8 @@ def main():
                           arguments.longest)
             (chain_accepted, long_accepted, automaton_accepted,
              adaptive_accepted, adaptive_cost, tree_accepted,
-             grove_accepted, grove_cost) = columns
+             grove_accepted, grove_cost, aligned_accepted) = columns
+            aligned_total.extend(aligned_accepted)
             grove_total.extend(grove_accepted)
             grove_width.extend(grove_cost)
             adaptive_total.extend(adaptive_accepted)
@@ -236,6 +246,8 @@ def main():
         adaptive_mean = sum(adaptive_total) / len(adaptive_total)
         width_mean = sum(adaptive_width) / len(adaptive_width)
         grove_mean = sum(grove_total) / len(grove_total)
+        aligned_mean = sum(aligned_total) / len(aligned_total)
+        aligned_tpot = (45.88 + 0.814 * arguments.width) / aligned_mean
         grove_rows = sum(grove_width) / len(grove_width)
         grove_tpot = (45.88 + 0.814 * grove_rows) / grove_mean
         fixed_tpot = (45.88 + 0.814 * arguments.width) / walked_mean
@@ -245,7 +257,8 @@ def main():
               f"{width_mean:>8.1f}  {tree_mean:>7.3f}  "
               f"{fixed_tpot:>8.2f}  {adaptive_tpot:>8.2f}  "
               f"{grove_mean:>7.3f}  {grove_rows:>8.1f}  "
-              f"{grove_tpot:>8.2f}  {len(chain_total):>7}")
+              f"{grove_tpot:>8.2f}  {aligned_mean:>8.3f}  "
+              f"{aligned_tpot:>8.2f}  {len(chain_total):>7}")
 
 
 if __name__ == "__main__":

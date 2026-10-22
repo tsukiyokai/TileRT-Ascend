@@ -53,6 +53,14 @@ export PYTHONPATH="$tree:$runtime/vendor-hook-pinned/vllm-a982-py311-compatible:
 # `libcust_opapi.so` needs GLIBCXX_3.4.29, which neither the image's
 # libstdc++ 6.0.28 nor the host's has; the image's gcc-toolset-12 does.
 export LD_LIBRARY_PATH="/opt/openEuler/gcc-toolset-12/root/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# `custom_transformer` is not optional. This project had recorded that the
+# custom OPP packages need not be rebuilt, because CANN's native grouped
+# matmul is the fastest of the four at decode shapes -- but that was about
+# speed, not about existence: `aclnnScatterNdUpdateSk` is in this overlay's
+# `libcust_opapi.so` and in no `libopapi.so`, so the KV scatter faults without
+# it.
+export ASCEND_CUSTOM_OPP_PATH="/opt/kernel-overlay/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 # Only the ascend plugin: the image's own omni_npu registers against vllm 0.30's
 # entrypoint layout and the pinned vllm is 0.25.1.
 export VLLM_PLUGINS=ascend
