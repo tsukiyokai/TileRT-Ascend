@@ -42,6 +42,32 @@ stage's 26.87 microseconds came from walking the reduction once for four
 concatenated projections rather than four times. Load once, compute several
 things, store once -- on either half of the machine.
 
+## The FFN's clearest instance, and why it is blocked
+
+`StoreRoutes` writes each route's output to `routes[(source * kTopK + slot) *
+kHidden + column]`, a scatter into a `[tokens, topK, hidden]` buffer, and
+`CombineTokens` reads that buffer back and sums over `topK` into the final
+output. For twelve rows at top-8 that is 96 rows of 6144 bf16, 1.18 MB written
+and 1.18 MB read -- a full round trip through global memory between two
+operations, which is exactly what this measurement prices.
+
+The two stages cost 9.87 and 2.12 microseconds. Folding them -- having
+`StoreRoutes` add atomically into the output and dropping `CombineTokens` --
+would remove the round trip.
+
+It is blocked by the numerical contract rather than by the hardware.
+`SetAtomicAdd<T>` is a template and this project already uses it for `float` and
+`int32_t`. But summing eight bf16 values a token in a different order gives a
+different result, because bf16 addition is not associative, and the routed
+body's acceptance gate is four changing-route replays matching the stock CANN
+chain **bitwise**, with the original-slot combine order named as part of the
+contract. So the fusion is visible in the output and cannot be taken without a
+new numerical contract for that stage.
+
+That is worth stating precisely because it is the shape of the remaining work:
+the mechanism is confirmed and large, and the instances that remain are blocked
+by contracts and by environment rather than by not knowing what to do.
+
 ## Scope
 
 One die, synthetic vector work, the front stage's own data size. The 24.30

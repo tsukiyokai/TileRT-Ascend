@@ -73,6 +73,11 @@ order a mistake usually happens:
   `OpCompileProcessor init failed`, which this project had recorded as an
   environment fault in its own right. Read the Python traceback, not the Ascend
   log's tail: the real line was `No module named 'tbe'`.
+- A fusion that changes accumulation order changes the answer. The FFN's
+  clearest shared-load instance -- StoreRoutes scattering 1.18 MB that
+  CombineTokens reads back and sums -- is blocked because summing eight bf16
+  values in a different order is visible, and the stage's gate is bitwise
+  against the stock chain. The hardware allows it; the contract does not.
 - The cost is a pass over the data, in a kernel or out of one. A Torch sum over
   98304 floats takes 11.82 microseconds, a topk 18.59, and an in-kernel AscendC
   pass over 73728 takes 12.46 -- and the increment survives graph capture, so it
