@@ -323,6 +323,7 @@ class CannModel:
         self.tree_mask = None
         self._restore_tree_mask = None
         self._attention_names = ()
+        self._shared_attention = None
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
                 self.config, local_rank=self.device.index, rank=rank,
@@ -826,21 +827,39 @@ class CannModel:
             )
 
     def install_tree_mask(self):
-        """Own the per-row index buffer so a draft tree can be verified.
+        """Give a draft tree the visibility its branches need.
 
-        Installing takes `skip_topk` and the buffer from every attention
-        layer, which replaces the indexer's selection with the tree's -- so it
-        happens when a tree drafter asks for it and not before. Idempotent:
-        the round executor asks once a request.
+        `shared_fia` already composes the indexer's selection with a causal
+        mask, so a tree only has to replace the causal half -- the indexer
+        keeps choosing the prefix at the width the checkpoint sets. The other
+        kernels take `sparse_indices` instead, where the tree has to name
+        every position a row may see, which means the whole prefix has to fit
+        in `index_topk`.
+
+        Idempotent: the round executor asks once a request.
         """
         if self.tree_mask is None:
-            from .tree_attention import install
+            if self._shared_attention is not None:
+                from .tree_mask import ancestor_bitmap
 
-            context = self.config.compilation_config.static_forward_context
-            self.tree_mask, self._restore_tree_mask = install(
-                [context[name].impl for name in self._attention_names],
-                self.index_picks,
-            )
+                capacity = self.layout["capacity_tokens"]
+                shared = self._shared_attention
+
+                def write(parents, prefix_length, device):
+                    shared.visibility = ancestor_bitmap(
+                        parents, prefix_length, capacity, device,
+                    )
+                    return shared.visibility
+
+                self.tree_mask = write
+            else:
+                from .tree_attention import install
+
+                context = self.config.compilation_config.static_forward_context
+                self.tree_mask, self._restore_tree_mask = install(
+                    [context[name].impl for name in self._attention_names],
+                    self.index_picks,
+                )
         return self.tree_mask
 
     def indexer_buffers(self):

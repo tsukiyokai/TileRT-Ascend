@@ -687,13 +687,16 @@ def run(args, report):
                             for key, entry in graph.wrapper
                             .concrete_aclgraph_entries.items()]},
         )
-        path = args.output / f"rank-{rank}.json"
-        atomic_json(path, report)
+        # Validate before saving: the checks are what add the output's digest
+        # and its distinct-token count, and a record written ahead of them
+        # keeps no account of the gate it passed or failed.
         errors, histories = [], None
         try:
             histories = validate_local(report, args)
         except Exception as error:
             errors.append(f"{type(error).__name__}: {error}")
+        path = args.output / f"rank-{rank}.json"
+        atomic_json(path, report)
         receipts = [None] * 16
         distributed.all_gather_object(receipts, {
             "rank": rank, "report_sha256": digest(path), "errors": errors,

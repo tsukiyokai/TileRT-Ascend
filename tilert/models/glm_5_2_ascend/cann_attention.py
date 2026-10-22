@@ -73,6 +73,10 @@ class SharedKVAttention:
             capacity, dtype=torch.int32, device=device,
         ).view(1, capacity)
         self.mask = None
+        # A tree's rows are not causal in each other: a node sees its own
+        # ancestors and no other branch. Set by the round that proposes one,
+        # and None for a chain, whose order is its ancestry.
+        self.visibility = None
 
     def bind(self, impl):
         original = impl._execute_sparse_flash_attention_process
@@ -89,8 +93,12 @@ class SharedKVAttention:
                 )
             if not impl.skip_topk:
                 # This backend's contiguous slots are logical token positions.
-                causal = self.columns > attn_metadata.slot_mapping.view(-1, 1)
-                self.mask = selection_mask(topk_indices, causal)
+                excluded = self.visibility
+                if excluded is None:
+                    excluded = self.columns > attn_metadata.slot_mapping.view(
+                        -1, 1,
+                    )
+                self.mask = selection_mask(topk_indices, excluded)
             return shared_kv_fia(
                 ql_nope, q_pe, kv_cache, self.mask, impl.scale,
             )

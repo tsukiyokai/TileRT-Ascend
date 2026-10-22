@@ -109,12 +109,19 @@ def ancestor_bitmap(parents, prefix_length, capacity, device=None):
     """
     import torch
 
-    width = len(parents)
-    bitmap = torch.ones((width, capacity), dtype=torch.uint8, device=device)
+    lines = ancestry(parents)
+    deepest = max(len(line) for line in lines)
+    bitmap = torch.ones(
+        (len(parents), capacity), dtype=torch.uint8, device=device,
+    )
     bitmap[:, :prefix_length] = 0
-    for node in range(width):
-        walk = node
-        while walk >= 0:
-            bitmap[node, prefix_length + walk] = 0
-            walk = parents[walk]
+    # One scatter rather than a write for every edge. A short line repeats its
+    # own last column to fill the row, which zeroes an already zero slot.
+    columns = torch.tensor(
+        [[prefix_length + node for node in line]
+         + [prefix_length + line[-1]] * (deepest - len(line))
+         for line in lines],
+        dtype=torch.int64, device=device,
+    )
+    bitmap.scatter_(1, columns, 0)
     return bitmap.view(torch.bool)
