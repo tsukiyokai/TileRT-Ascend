@@ -21,6 +21,7 @@ out=$out_root/$tag
 model=${MODEL:?}
 capture=${CAPTURE:?}
 utilisation=${UTILISATION:-0.78}
+attention=${ATTENTION:-sfa}
 
 source /opt/ascend/cann-9.2.0/set_env.sh
 # The engine stack comes from the pinned trees under RUNTIME, because the
@@ -62,7 +63,7 @@ timeout "${ARM_TIMEOUT:-14400}" torchrun --nproc-per-node 16 \
   --width "$width" --output "$out" \
   --gpu-memory-utilization "$utilisation" \
   --target-graph --compile-target \
-  --super-kernel --attention-kernel sfa --fp32-head "$@" \
+  --super-kernel --attention-kernel "$attention" --fp32-head "$@" \
   > "$out/launch.log" 2>&1
 status=$?
 echo "=== $tag exit $status $(date -Is)"
