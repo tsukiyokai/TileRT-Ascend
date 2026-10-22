@@ -78,3 +78,43 @@ untested. `EfficientEdit` (arXiv 2506.02780) is where the mechanism comes from:
 "there is no need to determine an optimal draft length for reuse, as a single
 forward pass can verify a long sequence of tokens", and rejection "implicitly
 identifies the potential starting position".
+
+## Retracted on the engine's own streams, the same evening
+
+The cursor loses by 2.6x where it matters. Replayed against the three measured
+requests of two recorded 78-layer runs (`lever-20261020/tail32` and `tail8`,
+width 32, lookup drafter, TPOT 11.164 and 10.922, 1024 output tokens each),
+with the same 8192-token capture prompt:
+
+| stream | distinct tokens | width | lookup | automaton | aligned |
+|---|---|---|---|---|---|
+| tail32 | 54 | 12 | 4.571 | 4.995 | 1.932 |
+| tail32 | 54 | 32 | 5.224 | 5.953 | 1.936 |
+| tail32 | 54 | 64 | 5.306 | 6.206 | 1.936 |
+| tail8 | 53 | 12 | 4.395 | 5.044 | 1.879 |
+| tail8 | 53 | 32 | 5.020 | 6.024 | 1.882 |
+| tail8 | 53 | 64 | 5.069 | 6.321 | 1.882 |
+
+The constructed corpus is a single monotone copy -- the prompt file again with
+a share of its positions replaced -- which is exactly what a cursor tracks
+perfectly and what a tail search has to re-find every round. The engine's
+recorded output is not that: 53 distinct tokens over 1024 means it repeats its
+own recent output far more than it reproduces the prompt in order. So indexing
+prompt plus output, which this file called the defect, is on that distribution
+the whole advantage, and the cursor's flat 1.93 is what a drafter gets when it
+can only copy a source the output is not following.
+
+Two things survive. The replay harness is cross-validated: lookup takes 5.224
+and the automaton 5.953 at width 32 here, against the project's recorded 5.441
+engine-measured and the real-stream study's 5.689 and 6.872. And widening
+really is spent on these streams -- lookup 4.571, 5.224, 5.306 and automaton
+4.995, 5.953, 6.206 across widths 12, 32 and 64 -- so the earlier
+width-saturation finding stands and it was this file that was wrong to
+overturn it.
+
+What is now the decisive unknown: the two candidate workload models disagree
+by 2.6x in opposite directions, and neither fixture is an agentic coding edit.
+These streams come from a capture-prefix prompt and are highly repetitive; the
+constructed corpus is a verbatim file copy. A real agentic-edit trace -- prompt
+and output from a session that rewrites code it was shown -- would settle which
+mechanism the target distribution rewards, and the project does not have one.

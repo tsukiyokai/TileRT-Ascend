@@ -2536,3 +2536,12 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   about 48 MB/s against a single stream's 79. Two arms died of this before the
   worker's `wchan` was read; the progress log said "10% (1/6)" for forty
   minutes and said nothing about why.
+- A constructed stream can be the mechanism under test wearing a disguise. The
+  perturbed-file corpus is one monotone copy of the prompt, which is precisely
+  what a cursor drafter tracks and what a tail search must re-find every round,
+  so it paid the cursor 1.88x. On the engine's own streams the cursor loses
+  2.6x, because real output repeats itself rather than reproducing the prompt
+  in order -- and indexing prompt plus output, which looked like the defect, is
+  the whole advantage there. Validate a drafter on the target's own output
+  before building on the number, and keep both distributions when they
+  disagree: the disagreement is the finding.

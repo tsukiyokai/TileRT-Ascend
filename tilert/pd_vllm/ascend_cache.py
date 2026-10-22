@@ -11,16 +11,12 @@ from .ascend_layout import (
 )
 
 
-# One name selects the host drafter. `aligned` keeps a cursor into the prompt
-# rather than searching prompt plus output for its anchor, which is worth
-# 1.88x the automaton at width 32 on a constructed edit stream.
+# One name selects the host drafter.
 DRAFTERS = {
     "lookup": ("tilert.models.glm_5_2_ascend.lookup_draft", "LookupDrafter"),
     "automaton": ("tilert.models.glm_5_2_ascend.automaton_draft",
                   "AutomatonDrafter"),
     "tree": ("tilert.models.glm_5_2_ascend.tree_draft", "TreeDrafter"),
-    "aligned": ("tilert.models.glm_5_2_ascend.aligned_draft",
-                "AlignedDrafter"),
 }
 
 CHECKPOINT_FILES = (
