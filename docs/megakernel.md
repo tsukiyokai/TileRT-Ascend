@@ -1,5 +1,29 @@
 # AscendC decode fusion
 
+> **What fusing a layer is worth, measured 2026-10-22.** The whole layer in one
+> launch saves 10 microseconds a layer against three native launches, and the
+> native layer at 574 microseconds ties the vendor engine's 575. Fusing launches
+> is not the lever, because the cost is a **pass over the data** and a pass
+> costs the same inside a kernel as outside it: a Torch reduction over 98304
+> floats takes 11.82 microseconds and an in-kernel AscendC pass over 73728 takes
+> 12.46, with the increment surviving graph capture.
+>
+> What pays is several operations sharing **one load**. An extra operation folded
+> into an existing load costs 2.35 microseconds; one that brings its own load
+> costs 24.30 -- a factor of 10.3. The cube obeys the same rule: an extra matmul
+> invocation's whole cost is one more walk of its reduction, 4.41 microseconds
+> per thousand of K, and a walk is the weight's read. That is where the front
+> stage's 26.87 microseconds comes from -- four concatenated projections walking
+> K once instead of four times.
+>
+> A layer makes about 48 passes over its data and reads 116.9 MB a rank, so
+> `layer = 12 us * passes + 72.7 us`. The 2.9 millisecond target allows about
+> eleven passes. Six are accounted for. The evidence is under
+> `evidence/ascend-decode/`: `cost-is-per-pass-20261022`,
+> `shared-load-20261022`, `pass-budget-20261022`,
+> `invocation-has-no-fixed-cost-20261022`.
+
+
 The implementation provides native stages and a one-launch layer for GLM-5.2
 W4A8C8 with TP16 shard dimensions, EP disabled, and 1–32 verification rows.
 The local layer passes single-die comparisons; the entry containing both TP
