@@ -202,6 +202,37 @@ moe_intermediate=2048 而非 1536，一个专家 18.9 MB）重测，6 行、prof
 kernel）。曲线收敛到约 33 µs，与把同样负载搬出 die 的 37 µs 同阶，所以图内
 一个集合通信基本只剩传输。
 
+## 2026-10-22 megakernel 实测可叠加的部分
+
+每一项都在设备上测过,且都确认过厂商没有先拿走:
+
+    整层一次下发 对 三次 native 下发    10.00 µs/层   另一代理, 60/60 全胜
+    两次规约进同一下发                  11.50         今日图回放关已过, 60/60
+    Prolog 两投影拼成一次调用(int8)     26.87         今日已建, 精确相等
+    合计                                48.37 µs/层 = 3.77 ms/轮
+
+    轮 50.73 → 46.96    tpot 9.324 → 8.63
+
+拼接那一项的边界也量清了。决定性的变量是**归约深度而非调用次数**:
+
+    K=6144 省一次调用(Prolog, int8)    +26.87 µs   fused 23.91 对 split 51.07
+    K=6144 省三次调用(四件分组, bf16)   +42.90      但引擎用不上, 见下
+    K=2048 省一次调用(query_norm, int8) −1.19       fused 28.03 对 split 27.10
+
+引擎用不上四件分组的原因是读源码读出来的:Prolog 从 int8 的 `token_x` projects
+`weight_dq` 与 `weight_dkv_kr`(这两个可拼),而 indexer 的 key 读 **bf16** 的
+`hidden`、dtype 不同拼不进去;indexer 的 query 与 q_b 读 `query_norm` 属第二级;
+router gate 在 `ffn_bridge::Forward` 里、在 attention 之后。
+
+而厂商没拿走这一项,也是读源码读出来的:
+`mla_prolog/op_kernel/arch22/kernel_mla_prolog_split_n_arch22.h` 的 796 与 804
+行是两次独立矩阵乘,各带独立的 `mmCqParam_` / `mmCkvKrParam_` 与各自的
+`needSetOrgShape`,而两者读同一个 `tokenXGm_[tokenXOffset]`。
+
+还有一个白得的:权重行跨步必须按 512 字节对齐。四件分组 3040 列(6080 字节/行)
+是 48.12 µs,补到 3072(6144 字节)是 38.43——补 32 列零省五分之一,而 38.43
+正好追平 `torch.matmul` 同形状的 39.12。
+
 ## 2026-10-22 收盘：路径剩下什么
 
 今天撤销了两个最大项，其中一个是路径上唯一"已测"的首步。剩下的全部兑现后：
