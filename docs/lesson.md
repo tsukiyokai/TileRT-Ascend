@@ -73,6 +73,11 @@ order a mistake usually happens:
   `OpCompileProcessor init failed`, which this project had recorded as an
   environment fault in its own right. Read the Python traceback, not the Ascend
   log's tail: the real line was `No module named 'tbe'`.
+- Price an operation's floor before replacing it. Selecting 2048 of 8192 over
+  twelve rows costs 17.93 microseconds, a full sort of the same data 17.86, and
+  a threshold count 21.09. The algorithm does not enter: 393 KB in 18
+  microseconds is 22 GB/s, so the cost is the operator call. The selector's
+  54.84 is about three calls, not an expensive algorithm.
 - Separate waiting on the other half from waiting on your own. The FFN's cube
   waits 67.52 microseconds, of which 39.77 is for the vector stages -- which
   skewing can take, up to the 23.40 of vector work that exists -- and 27.75 is
