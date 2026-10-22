@@ -51,3 +51,26 @@ exclusive as they stand.
 width 8. Its own namespace table keys the active variant to 24 blocks and
 width 12, which is the shape the accepted library was validated at, so the
 measurement moves to width 12 where the engine reads 22.135 ms on `sfa`.
+
+## The routed/shared fusion faults in the AI core, at both widths
+
+With the libraries built, the candidate made optional in both `library_paths`
+and `namespace_name`, and the vendor hook applied, `--routed-shared-kernel`
+reaches the device and faults there:
+
+    dumpScene=aic_err_brief_dump, exceptionType=2(aicore),
+    kernelName=_Z25routed_shar...   streamId=47, taskId=4209
+
+Every rank reports it at the same task, at width 8 after graph compilation and
+at width 12 after four minutes of decoding. So the obstacle is no longer the
+environment: the kernel itself does not run against this engine's shapes.
+
+Its own width-12 baseline, measured in the same session and on the same
+patched vendor tree, reads TPOT 22.283 with verify 3.755 and host_tokens
+52.974 -- which is the third independent confirmation that the round is device
+time, the host holding 7 percent of it.
+
+Where to resume: the exception dump names the kernel and a task id, and
+`/root/ascend/log/debug/plog` on a3-180 holds the brief dump. The fusion is
+worth 4.63 ms a round by the single-die fit, so it stays the largest measured
+device-side lever that has never run.

@@ -31,16 +31,20 @@ ACTIVE_LIBRARY_DIR = Path(os.environ.get(
 ))
 
 
+def candidate_built():
+    """Whether the active-list variant is there to be compared against."""
+    return (ACTIVE_LIBRARY_DIR / "routed_int4_torch.so").exists()
+
+
 def library_paths():
     """The accepted library, and the candidate once it has been built.
 
-    `namespace_name` reaches the candidate only at 24 blocks and width 12, so
-    an arm at any other width has no call to it and must not fail to start
-    because a comparison candidate is absent.
+    The candidate is a comparison, not a dependency: an arm must neither fail
+    to start without it nor name a namespace it never loaded.
     """
-    candidate = ACTIVE_LIBRARY_DIR / "routed_int4_torch.so"
     return ([LIBRARY_DIR / "routed_int4_torch.so"]
-            + ([candidate] if candidate.exists() else []))
+            + ([ACTIVE_LIBRARY_DIR / "routed_int4_torch.so"]
+               if candidate_built() else []))
 
 
 def pack_shared_weights(gate_up, down):
@@ -66,7 +70,7 @@ class WorkspacePool(_WorkspacePool):
     def namespace_name(self, width):
         if not self.input_front:
             return "tilert_pipeline"
-        if self.blocks == 24 and width == 12:
+        if self.blocks == 24 and width == 12 and candidate_built():
             return "tilert_pipeline_front_active"
         return "tilert_pipeline_front"
 
