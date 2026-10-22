@@ -9,7 +9,11 @@
 #include "front_contract.h"
 #include "lib/matmul/matmul_tiling.h"
 
+// `base_m`, `base_n` and `base_k` fix the cube's tile; -1 leaves the choice to
+// the tiling API. At twelve rows the output tile is small and the time goes to
+// streaming the reduction, so the reduction's tile is the one worth setting.
 extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
+                                             int base_m, int base_n, int base_k,
                                              void* buffer)
 {
     matmul_tiling::MatmulApiTiling tiling;
@@ -26,6 +30,9 @@ extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
     tiling.SetOrgShape(rows, width, megakernel_front::kHidden);
     tiling.SetBias(false);
     tiling.SetBufferSpace(-1, -1, -1);
+    if (base_m > 0 && base_n > 0 && base_k > 0) {
+        tiling.SetFixSplit(base_m, base_n, base_k);
+    }
 
     AscendC::tiling::TCubeTiling cube;
     static_assert(sizeof(cube) <= megakernel_front::kTilingStride,

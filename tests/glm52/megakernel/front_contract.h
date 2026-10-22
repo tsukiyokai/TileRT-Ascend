@@ -25,6 +25,12 @@ constexpr int64_t kColumns =
     kQueryLatent + kKeyValueLatent + kIndexerKey + kRouterGate;
 
 constexpr int64_t kColumnGranularity = 32;
+// A weight row must start on a 512-byte boundary or every core's column window
+// straddles one. Padding the 3040 columns to 3072 takes the stage from 48.12 to
+// 38.43 microseconds; see megakernel-front-20261022.
+constexpr int64_t kStrideBytes = 512;
+constexpr int64_t kAlignedColumns =
+    (kColumns * 2 + kStrideBytes - 1) / kStrideBytes * kStrideBytes / 2;
 constexpr int64_t kMaxRows = 32;
 constexpr int64_t kMaxBlocks = 24;
 constexpr uint64_t kTilingStride = 512;
@@ -71,6 +77,10 @@ MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns, int64_t blocks
 
 struct Config {
     int64_t rows, blocks;
+    // The weight's row stride. `kColumns` packs the projections adjacently; a
+    // larger value spaces them out, which prices the strided read each core
+    // makes when it takes a column window of a wide matrix.
+    int64_t weight_stride;
 };
 
 struct Addresses {
@@ -81,6 +91,8 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
 {
     return config.rows >= 1 && config.rows <= kMaxRows
         && config.blocks >= 1 && config.blocks <= kMaxBlocks
+        && config.weight_stride >= kColumns
+        && config.weight_stride * 2 % kStrideBytes == 0
         && addresses.hidden != 0 && addresses.weight != 0
         && addresses.product != 0 && addresses.tiling != 0
         && addresses.system != 0;
@@ -93,6 +105,7 @@ extern "C" int megakernel_front_launch(void* stream, uint64_t sync,
     const megakernel_front::Addresses* addresses);
 
 extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
+                                             int base_m, int base_n, int base_k,
                                              void* buffer);
 
 #endif

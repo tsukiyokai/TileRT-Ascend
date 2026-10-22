@@ -22,14 +22,16 @@ int64_t SyncBase()
     return static_cast<int64_t>(address);
 }
 
-at::Tensor BuildTiling(int64_t rows, int64_t blocks)
+at::Tensor BuildTiling(int64_t rows, int64_t blocks, int64_t base_m,
+                       int64_t base_n, int64_t base_k)
 {
     const Slice widest = SliceFor(kColumns, blocks, 0);
     auto host = at::empty({static_cast<int64_t>(kTilingStride)},
                           at::dtype(at::kByte));
     const int status = megakernel_front_build_tiling(
         static_cast<int>(rows), static_cast<int>(widest.width),
-        static_cast<int>(kColumns), host.data_ptr());
+        static_cast<int>(kColumns), static_cast<int>(base_m),
+        static_cast<int>(base_n), static_cast<int>(base_k), host.data_ptr());
     TORCH_CHECK(status == 0, "megakernel_front_build_tiling failed: ", status);
     return host;
 }
@@ -40,8 +42,9 @@ void Forward(const at::Tensor& hidden, const at::Tensor& weight,
 {
     TORCH_CHECK(hidden.dim() == 2 && hidden.size(1) == kHidden,
                 "hidden must be [rows, ", kHidden, "]");
-    TORCH_CHECK(weight.sizes() == at::IntArrayRef({kHidden, kColumns}),
-                "weight must be [", kHidden, ", ", kColumns, "]");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == kHidden
+                && weight.size(1) >= kColumns,
+                "weight must be [", kHidden, ", at least ", kColumns, "]");
     TORCH_CHECK(product.sizes() == at::IntArrayRef({hidden.size(0), kColumns}),
                 "product must be [rows, ", kColumns, "]");
     TORCH_CHECK(hidden.scalar_type() == at::kBFloat16
@@ -53,7 +56,7 @@ void Forward(const at::Tensor& hidden, const at::Tensor& weight,
                     "every owner must be contiguous and on the device");
     }
 
-    const Config config{hidden.size(0), blocks};
+    const Config config{hidden.size(0), blocks, weight.size(1)};
     const Addresses addresses{
         reinterpret_cast<uint64_t>(hidden.data_ptr()),
         reinterpret_cast<uint64_t>(weight.data_ptr()),
@@ -72,7 +75,7 @@ void Forward(const at::Tensor& hidden, const at::Tensor& weight,
 TORCH_LIBRARY_FRAGMENT(megakernel_front, m)
 {
     m.def("sync_base() -> int");
-    m.def("build_tiling(int rows, int blocks) -> Tensor");
+    m.def("build_tiling(int rows, int blocks, int base_m, int base_n, int base_k) -> Tensor");
     m.def("forward(Tensor hidden, Tensor weight, Tensor product, "
           "Tensor tiling, Tensor system, int blocks, int sync_base) -> ()");
 }

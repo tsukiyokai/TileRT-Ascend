@@ -20,6 +20,8 @@ HIDDEN = 6144
 PARTS = {'query_latent': 2048, 'kv_latent_rope': 576,
          'indexer_key': 160, 'router_gate': 256}
 COLUMNS = sum(PARTS.values())
+STRIDE_BYTES = 512
+ALIGNED = -(-COLUMNS * 2 // STRIDE_BYTES) * STRIDE_BYTES // 2
 SYSTEM_BYTES = 16 << 20
 
 
@@ -28,12 +30,14 @@ def load(library):
     return torch.ops.megakernel_front
 
 
-def operands(rows, device, generator):
+def operands(rows, device, generator, stride):
+    weight = torch.randn(HIDDEN, stride, dtype=torch.bfloat16, device=device,
+                         generator=generator)
     return {
         'hidden': torch.randn(rows, HIDDEN, dtype=torch.bfloat16,
                               device=device, generator=generator),
-        'weight': torch.randn(HIDDEN, COLUMNS, dtype=torch.bfloat16,
-                              device=device, generator=generator),
+        'weight': weight,
+        'used': weight[:, :COLUMNS],
     }
 
 
@@ -70,19 +74,24 @@ def main():
     parser.add_argument('--inputs', type=int, default=4)
     parser.add_argument('--iterations', type=int, default=50)
     parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--stride', type=int, default=ALIGNED)
+    parser.add_argument('--base-m', type=int, default=-1)
+    parser.add_argument('--base-n', type=int, default=-1)
+    parser.add_argument('--base-k', type=int, default=-1)
     args = parser.parse_args()
     torch.npu.set_device(args.device)
     front = load(args.library)
     sync = front.sync_base()
-    tiling = front.build_tiling(args.rows, args.blocks).to(args.device)
+    tiling = front.build_tiling(args.rows, args.blocks, args.base_m,
+                                args.base_n, args.base_k).to(args.device)
     system = torch.zeros(SYSTEM_BYTES, dtype=torch.uint8, device=args.device)
 
     generator = torch.Generator(device=args.device).manual_seed(20261022)
     cases = []
     for index in range(args.inputs):
-        held = operands(args.rows, args.device, generator)
+        held = operands(args.rows, args.device, generator, args.stride)
         product = run(front, held, args.rows, args.blocks, sync, tiling, system)
-        reference = held['hidden'].float() @ held['weight'].float()
+        reference = held['hidden'].float() @ held['used'].float()
         cases.append({
             'input': index,
             'product_sha256': torch.sum(product.cpu().view(torch.int32).long()).item(),
@@ -91,7 +100,7 @@ def main():
             'finite': bool(torch.isfinite(product).all()),
         })
 
-    held = operands(args.rows, args.device, generator)
+    held = operands(args.rows, args.device, generator, args.stride)
     product = torch.zeros(args.rows, COLUMNS, dtype=torch.float,
                           device=args.device)
     samples = [timed(front, held, product, tiling, system, args.blocks, sync,
@@ -99,6 +108,8 @@ def main():
 
     print(json.dumps({
         'library': str(args.library), 'rows': args.rows, 'blocks': args.blocks,
+        'base': [args.base_m, args.base_n, args.base_k],
+        'weight_stride': args.stride,
         'columns': COLUMNS, 'parts': PARTS,
         'cases': cases,
         'median_us': round(sorted(samples)[len(samples) // 2], 2),

@@ -64,6 +64,13 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
+- Align a weight's row stride to 512 bytes. The concatenated front stage used
+  3040 bf16 columns, 6080 bytes a row, and took 48.12 microseconds; padding to
+  3072 columns and 6144 bytes took 38.43, a fifth off for 32 columns of zeros.
+  Every stride from 3072 to 8192 costs the same, so it is the alignment and not
+  the width. The unaligned kernel also looked 20 percent worse than the vendor's
+  matmul on the same shape, which is what sent the search to tiling and core
+  counts first.
 - A broken kernel keeps the clock. The packed weight variant produced NaN and
   errors of 464 against magnitudes of 331, and timed within noise of the correct
   arm at every width. Only the digest comparison caught it.

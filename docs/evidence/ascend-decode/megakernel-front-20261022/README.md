@@ -67,6 +67,44 @@ core-count problem. It is a tiling one: `torch.matmul` computes the same
 1600 GB/s would be 23. So the stage as built sits at 768 GB/s against the
 vendor's 955 and a bandwidth ceiling of 1600.
 
+## The row stride has to be 512-byte aligned
+
+Widening the weight's row stride while computing the same 3040 columns is
+faster, not slower:
+
+| stride | bytes a row | us |
+| ---: | ---: | ---: |
+| 3040 | 6080 | 48.12 |
+| 3072 | 6144 | 38.43 |
+| 4096 | 8192 | 37.79 |
+| 6080 | 12160 | 38.61 |
+| 8192 | 16384 | 38.71 |
+
+Every stride from 3072 up costs the same, so it is the alignment: 6080 bytes is
+not a multiple of 512 and 6144 is, so each core's column window straddles a
+boundary on every row. Padding the concatenation to 3072 columns -- 32 columns
+of zeros -- takes a fifth off, and 38.43 matches `torch.matmul`'s 39.12 on the
+same shape, so the stage reaches vendor parity once aligned. The alignment is
+now part of the contract rather than a caller's choice.
+
+With it, both arms at the aligned stride:
+
+| rows | fused us | split us | saving us |
+| ---: | --- | --- | ---: |
+| 1 | 38.18, 38.13 | 80.84, 80.94 | 42.76 |
+| 12 | 38.43, 38.49 | 82.62, 82.85 | 44.36 |
+| 32 | 38.27, 38.63 | 85.31, 84.80 | 46.68 |
+
+The alignment helps only the fused arm; the split arm's windows are 96, 32, 32
+and 32 columns and move by less than 0.5 microseconds. The fused arm is now flat
+in rows -- 38.18, 38.43, 38.27 -- which is the reduction-depth model stated
+plainly. Digests remain identical between the arms in every case.
+
+The cube tile is not a further lever: at twelve rows the tiling API's own choice
+costs 47.99 microseconds against 48.10 for an explicit 16/128/128 and 50.9 to
+51.4 for any 64-wide output tile, with 512-deep reduction tiles rejected
+outright.
+
 ## An open hypothesis, and why it is not recorded as a result
 
 Each core reads 128 columns out of a 3040-column row, so 256 contiguous bytes

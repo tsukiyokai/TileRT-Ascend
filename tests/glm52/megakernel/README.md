@@ -22,11 +22,13 @@ computes, so both arms write the same layout.
 ## Measured
 
 One die, four widths, two alternating passes a width, eight changing inputs:
-the fused arm costs 48.37 microseconds at twelve rows against the split arm's
-82.40, a saving of 33.88 a layer or 2.64 milliseconds a round. Both arms produce
-identical product digests at every input and every width. The fused arm rises
-1.6 microseconds from one row to thirty-two while the split arm rises 4.3,
-because it pays the reduction depth four times. See
+the fused arm costs 38.43 microseconds at twelve rows against the split arm's
+82.62, a saving of 44.36 a layer or 3.46 milliseconds a round. Both arms produce
+identical product digests at every input and every width. The fused arm is flat in rows -- 38.18 at one and
+38.27 at thirty-two -- while the split arm rises 4.4, because it pays the
+reduction depth four times. Its weight row stride must be 512-byte aligned,
+which the contract enforces: 3040 columns cost 48.12 microseconds and the padded
+3072 cost 38.43. See
 [the evidence](../../../docs/evidence/ascend-decode/megakernel-front-20261022/README.md).
 
 ## Scope

@@ -74,13 +74,14 @@ void Kernel(uint64_t sync, Config config, Addresses addresses)
             const int64_t column = PartOffset(part) + slice.offset;
             Project(mm, config, (GM_ADDR)addresses.hidden,
                     (GM_ADDR)addresses.weight, (GM_ADDR)addresses.product,
-                    slice, column, kColumns, column, kColumns);
+                    slice, column, config.weight_stride, column, kColumns);
         }
 #else
         const Slice slice = SliceFor(kColumns, config.blocks, index);
         Project(mm, config, (GM_ADDR)addresses.hidden,
                 (GM_ADDR)addresses.weight, (GM_ADDR)addresses.product,
-                slice, slice.offset, kColumns, slice.offset, kColumns);
+                slice, slice.offset, config.weight_stride, slice.offset,
+                kColumns);
 #endif
     }
     PipeBarrier<PIPE_ALL>();
