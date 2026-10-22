@@ -313,6 +313,12 @@ class CannModel:
             expert_parallel=expert_parallel, graph_width=graph_width,
             index_topk=index_topk, mtp_tokens=mtp_tokens, layers=layers,
         )
+        # A tree's rows need a per-row index set, and the operator's selection
+        # width is what the checkpoint's `index_topk` sets.
+        self.index_picks = index_topk
+        self.tree_mask = None
+        self._restore_tree_mask = None
+        self._attention_names = ()
         with set_current_vllm_config(self.config):
             self.worker = NPUWorker(
                 self.config, local_rank=self.device.index, rank=rank,
@@ -575,6 +581,7 @@ class CannModel:
             )
             for name in attention_names:
                 self._shared_attention.bind(context[name].impl)
+        self._attention_names = tuple(attention_names)
         if self._mla_tail_enabled:
             from .mla_tail import WorkspacePool, install, load
 
@@ -801,6 +808,24 @@ class CannModel:
             return CannStep(
                 logits if full_logits else None, hidden, token_ids,
             )
+
+    def install_tree_mask(self):
+        """Own the per-row index buffer so a draft tree can be verified.
+
+        Installing takes `skip_topk` and the buffer from every attention
+        layer, which replaces the indexer's selection with the tree's -- so it
+        happens when a tree drafter asks for it and not before. Idempotent:
+        the round executor asks once a request.
+        """
+        if self.tree_mask is None:
+            from .tree_attention import install
+
+            context = self.config.compilation_config.static_forward_context
+            self.tree_mask, self._restore_tree_mask = install(
+                [context[name].impl for name in self._attention_names],
+                self.index_picks,
+            )
+        return self.tree_mask
 
     def indexer_buffers(self):
         """The selected positions each indexer layer last wrote.

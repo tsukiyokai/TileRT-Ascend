@@ -281,6 +281,10 @@ class AscendRankEngine:
             self.target, self.draft, width, max_tokens, eos_tokens, drafter,
             phases=self.round_phases,
         )
+        # A tree's off-path node must see its own ancestors rather than the
+        # indexer's selection, so the mask is installed when a tree asks.
+        if hasattr(drafter, "propose_tree"):
+            rounds.tree_mask = self.target.install_tree_mask()
         rounds.start(first_token, self.parent_hidden)
         if rounds.state.finish_reason is not None:
             raise ValueError("MTP start requires another output token")
