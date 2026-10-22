@@ -68,6 +68,11 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
+- Append to `PYTHONPATH`, never assign it. `set_env.sh` puts CANN's `tbe` there
+  and GE imports it; overwriting the variable turns that into
+  `OpCompileProcessor init failed`, which this project had recorded as an
+  environment fault in its own right. Read the Python traceback, not the Ascend
+  log's tail: the real line was `No module named 'tbe'`.
 - A pipeline step on the cube costs a reduction walk. Cutting the front stage
   into eight steps to interleave the vector half added 70 microseconds of walks
   to hide 25 of vector work. Skewing pays only where the cube is already divided
