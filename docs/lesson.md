@@ -56,6 +56,12 @@ order a mistake usually happens:
 - Two independent paths agreeing is evidence only if they are independent. The
   native layer's 574.15 us and the vendor layer's 575.22 looked like a
   cross-validation until both turned out to skip the empty expert the same way.
+- A figure measured at one row does not price the engine's twelve. The KV read's
+  294 GB/s was a one-row latency bound; at twelve rows the gather does 1094 and
+  the layout step it justified does not exist.
+- A regression someone else measured is a finding, not noise. The packed-KV
+  candidate lost 240 of 240 paired comparisons, which said there was nothing to
+  win before any mechanism was proposed for why.
 
 ## When implementing
 

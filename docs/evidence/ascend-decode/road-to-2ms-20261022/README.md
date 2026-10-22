@@ -1,7 +1,10 @@
 > Retracted 2026-10-22, the same day. The narrowing row is void, not
 > smaller: the vendor kernel skips an empty expert, so the engine is
 > already at the narrowed point. The remaining rows are unaffected but
-> the path no longer has a measured first step.
+> the path no longer has a measured first step. The fourth step, making
+> the latent and rope contiguous, is void too: the gather runs at
+> 1094 GB/s and is flat in run length, see
+> [`gather-runs-20261022`](../gather-runs-20261022/README.md).
 > See [`bank-skip-20261022`](../bank-skip-20261022/README.md).
 
 # The road recomputed at the real distinct-expert count
