@@ -104,8 +104,12 @@ __aicore__ inline void Reduce(TPipe& pipe, const Config& config,
         DcciDst::CACHELINE_OUT>(witness[slot]);
 }
 
-// One step's share of this core's columns, so the cube can be cut the same way
-// the vector half is.
+// One step of the cube's work. The split build's natural division is its parts,
+// one invocation each because their weights differ, so a step takes one part
+// and the step count should match. The fused build has one invocation by
+// design, so a step takes a share of its columns -- and cutting it that way
+// buys another walk of the reduction, which is why the fused build loses the
+// skew and the split build does not.
 __aicore__ inline void Cube(TPipe& pipe, const Config& config,
                             const Addresses& addresses, int64_t step,
                             int64_t steps)
@@ -116,12 +120,11 @@ __aicore__ inline void Cube(TPipe& pipe, const Config& config,
     mm.Init(&cube, &pipe);
     const int64_t index = GetBlockIdx();
 #ifdef MEGAKERNEL_FRONT_SPLIT
-    for (int64_t part = 0; part < config.part_count; ++part) {
-        const Slice whole = SliceFor(config.part_columns[part], config.blocks,
+    for (int64_t part = step; part < config.part_count; part += steps) {
+        const Slice slice = SliceFor(config.part_columns[part], config.blocks,
                                      index);
-        const Slice share = StepShare(whole, step, steps);
-        Project(mm, config, addresses, share,
-                PartOffset(config, part) + share.offset);
+        Project(mm, config, addresses, slice,
+                PartOffset(config, part) + slice.offset);
     }
 #else
     const Slice whole = SliceFor(TotalColumns(config), config.blocks, index);

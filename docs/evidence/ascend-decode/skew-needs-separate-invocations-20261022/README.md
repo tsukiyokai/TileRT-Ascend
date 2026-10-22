@@ -43,6 +43,38 @@ the projections. And the earlier upper bound of 1.4 to 2.0 milliseconds, which
 assumed the whole layer could be skewed, holds only for the part of the layer
 whose cube work is already divided.
 
+## The other side of the criterion, measured
+
+The split build makes one cube invocation a part -- their weights differ, so the
+invocations are needed either way -- and skewing the vector half between them
+changes the schedule without changing the invocation count. The `hidden` level,
+four parts, twelve rows:
+
+| vector passes | serial us | 2 steps | 4 steps |
+| ---: | ---: | ---: | ---: |
+| 2 | 105.82 | 99.63 (−6.19) | 111.13 (+5.31) |
+| 4 | 130.74 | 111.98 (**−18.76**) | 112.84 (−17.90) |
+| 8 | 181.17 | 156.92 (−24.25) | 141.08 (**−40.09**) |
+
+Now it wins, and by more as the vector half grows. The cube product is exact at
+every point.
+
+How much of the available overlap it captures: at eight passes the serial arm is
+181.17 and perfect overlap would be `max(cube 83, vector 100)` or 100, so 40.09
+of the 81.17 available is 49 percent. At four passes it is 18.76 of 47.74, or 39.
+
+So the same kernel and the same vector work loses 70 microseconds when the cube
+is one invocation and wins 40 when it is four. That is the criterion from both
+sides.
+
+## What it gives the FFN
+
+The routed body spends 71.25 microseconds of cube work and 23.40 of vector in a
+136.40 window, so 65.15 is available. At the 40 to 50 percent capture measured
+here that is 26 to 33 microseconds a layer, or 2.0 to 2.6 milliseconds a round
+-- below the 42 estimated from perfect overlap less barriers, and with a
+measurement behind it.
+
 ## Scope
 
 The cube's product is exact at every depth, maximum difference zero against an
