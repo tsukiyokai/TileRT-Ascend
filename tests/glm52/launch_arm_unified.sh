@@ -32,7 +32,18 @@ source /opt/ascend/cann-9.2.0/set_env.sh
 # Append, never assign: set_env.sh puts CANN's `tbe` on PYTHONPATH and GE
 # imports it, so assigning turns that into `OpCompileProcessor init failed`.
 runtime=${RUNTIME:?}
-export PYTHONPATH="$tree:$runtime/vendor-hook-pinned/vllm-a982-py311-compatible:$runtime/vendor-hook-pinned/ascend-python-build:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
+# `vendor-metadata` carries vllm_ascend's egg-info, and the egg-info is the only
+# thing that declares `ascend = vllm_ascend:register` under
+# `vllm.platform_plugins`. Without it `VLLM_PLUGINS=ascend` selects nothing, no
+# platform registers, and the engine dies in `DeviceConfig` on an empty device
+# string rather than on anything to do with devices.
+export PYTHONPATH="$tree:$runtime/vendor-hook-pinned/vllm-a982-py311-compatible:$runtime/vendor-hook-pinned/ascend-python-build:$runtime/vendor-hook-pinned/vendor-metadata:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
+
+# `fla_npu` cannot be dropped even though its kernels are not wanted here:
+# `vllm_ascend/ops/gdn.py` imports it unconditionally for Qwen3.5. Its
+# `libcust_opapi.so` needs GLIBCXX_3.4.29, which neither the image's
+# libstdc++ 6.0.28 nor the host's has; the image's gcc-toolset-12 does.
+export LD_LIBRARY_PATH="/opt/openEuler/gcc-toolset-12/root/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Only the ascend plugin: the image's own omni_npu registers against vllm 0.30's
 # entrypoint layout and the pinned vllm is 0.25.1.
 export VLLM_PLUGINS=ascend

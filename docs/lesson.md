@@ -85,6 +85,24 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
+- Four launch-path defects on a fresh host, each wearing another's clothes.
+  The engine stack is not portable by copying its trees; what it imports has to
+  be checked one import at a time.
+  - `vllm_ascend.egg-info` under `vendor-metadata` is the only declaration of
+    `ascend = vllm_ascend:register`, so leaving that directory off `PYTHONPATH`
+    makes `VLLM_PLUGINS=ascend` select nothing and the engine die on an empty
+    device string inside `DeviceConfig` -- a device message with no device in it.
+  - No pinned vllm lists `indexer_kv_dtype="int8"`, which `cann_model.py:131`
+    hardcodes for the W4A8C8 checkpoint, so it faults in pydantic before any
+    device work. The literal is a validation list; `patches/vllm/` carries it.
+  - The image's `triton` is two wheels on top of each other, 3.5.0's files over
+    triton_ascend 3.2.2, and vllm imports `triton.experimental.gluon`
+    unconditionally when `find_spec("triton")` succeeds. There is no env
+    override for `HAS_TRITON`, so removing the package is the switch.
+  - `fla_npu` can be neither kept nor dropped: `vllm_ascend/ops/gdn.py` imports
+    it for Qwen3.5, and its `libcust_opapi.so` wants GLIBCXX_3.4.29 while the
+    image and the host both ship libstdc++ 6.0.28. The same image's
+    gcc-toolset-12 has 6.0.30.
 - Append to `PYTHONPATH`, never assign it. `set_env.sh` puts CANN's `tbe` there
   and GE imports it; overwriting the variable turns that into
   `OpCompileProcessor init failed`, which this project had recorded as an
