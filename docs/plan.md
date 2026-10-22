@@ -202,6 +202,42 @@ moe_intermediate=2048 而非 1536，一个专家 18.9 MB）重测，6 行、prof
 kernel）。曲线收敛到约 33 µs，与把同样负载搬出 die 的 37 µs 同阶，所以图内
 一个集合通信基本只剩传输。
 
+## 2026-10-22 引擎环境可重建，但端到端卡在 NAS 带宽
+
+交接里把"引擎环境随容器被删"列为最硬的阻塞。它已解除：`bench_cann_mtp.py --help`
+在重建的环境里正常跑起来（a3-194，单 die，无 checkpoint）。配方是
+
+    镜像      sha256:1910b1ac…（torch 2.12 / torch_npu 2.12）
+    CANN      宿主 /home/shanshan/megamoe-mask-only-20261021/sdk/cann-9.2.0
+              → /opt/ascend/cann-9.2.0:ro，容器内 source set_env.sh
+    PYTHONPATH 仓库树 + vendor-hook-runtime212 的
+              vendor-hook-pinned/{vllm-a982-py311-compatible,ascend-python-build}
+              + vendor-hook-deps/{transformers519,python}
+    OPP       vendor-hook-deps/python/fla_npu/opp{,/vendors/fla_npu_transformer}
+    env       VLLM_PLUGINS=ascend HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+              HCCL_OP_EXPANSION_MODE=AIV HCCL_DETERMINISTIC=true
+              env -u ASCEND_DOCKER_RUNTIME -u ASCEND_RT_VISIBLE_DEVICES
+
+镜像自带的 omniinfer 会在插件注册时抛一个 vllm.config 循环导入的 traceback，
+非致命，三个包都正常导入。`/workspace/environment/activate.sh` 不需要重建——
+它设的 ASCEND_CUSTOM_OPP_PATH 把两个自定义包排在 CANN 前面，而启动器自己的注释
+说 CANN 原生 grouped matmul 在 decode 形状上是四个实现里最快的（66.813 µs 对
+97.362／104.929／123.985），所以不装它们等于一直开着 STOCK_OPP。
+
+而 checkpoint 这条仍堵着：`GLM-5.2-w4a8c8` 只在 NAS `7.242.104.142:/model/` 上，
+107 个文件无 `.partial`，**755 GB**。实测该链路单流 45.3 MB/s，16 并流 82 MB/s
+（瓶颈在链路不在流数），所以一遍要 2.5 小时；而 a3-194 根分区只剩 41 GB、
+a3-162 剩 94 GB，落不下。只读 NFS 卷的配方可用：
+
+    docker volume create --driver local --opt type=nfs \
+      --opt o=addr=7.242.104.142,ro,nfsvers=3,soft,timeo=50,retrans=1,nolock,nosuid,nodev,noexec \
+      --opt device=:/ <name>
+
+8K 前缀快照已落宿主：`checkpoint-owned/prefix8k-v3/case-00`，12 GB、
+`status: capture_complete`、seq_len 8192、16 rank。
+
+所以端到端臂的阻塞从"环境没了"变成"755 GB 过 82 MB/s 的链路且无处缓存"。
+
 ## 2026-10-22 撤销：专家库收窄这个杠杆不存在
 
 厂商 grouped matmul 对一个 count 为零的专家不收费。同一张 16 专家权重张量，
