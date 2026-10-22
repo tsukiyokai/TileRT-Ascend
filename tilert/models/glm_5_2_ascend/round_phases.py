@@ -16,6 +16,15 @@ class RoundPhases:
     """Accumulate per-step nanoseconds across rounds."""
 
     def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Forget what earlier rounds charged.
+
+        A request is the unit worth reading: the graph warmup's rounds pay for
+        capture and compilation, and averaged in with the measured ones they
+        put the steps' sum above the round they are meant to divide.
+        """
         self.totals = {}
         self.counts = {}
         self.rounds = 0
@@ -35,10 +44,17 @@ class RoundPhases:
         self._last = now
 
     def report(self):
-        """Milliseconds a round, by step, with what the marks did not cover."""
+        """Milliseconds a round, by step, and how often each was marked.
+
+        The mark counts are what make the milliseconds readable: a step
+        charged more than once a round has a mean that does not belong in a
+        sum with the others, and without the count a reader cannot tell.
+        """
         if not self.rounds:
             return {}
         held = {step: nanoseconds / self.rounds / 1e6
                 for step, nanoseconds in self.totals.items()}
+        held["marks_a_round"] = {step: count / self.rounds
+                                 for step, count in self.counts.items()}
         held["rounds"] = self.rounds
         return held

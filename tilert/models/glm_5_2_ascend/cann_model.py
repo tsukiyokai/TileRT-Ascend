@@ -314,8 +314,12 @@ class CannModel:
             index_topk=index_topk, mtp_tokens=mtp_tokens, layers=layers,
         )
         # A tree's rows need a per-row index set, and the operator's selection
-        # width is what the checkpoint's `index_topk` sets.
-        self.index_picks = index_topk
+        # width is what the checkpoint's `index_topk` sets -- the argument only
+        # overrides it, so the effective value is the one in the config.
+        self.index_picks = (
+            index_topk
+            or self.config.model_config.hf_config.index_topk
+        )
         self.tree_mask = None
         self._restore_tree_mask = None
         self._attention_names = ()

@@ -1,5 +1,6 @@
 """Rank-local HIXL receive memory and CANN prefix injection."""
 
+from collections import namedtuple
 from dataclasses import dataclass
 import hashlib
 import importlib
@@ -11,12 +12,18 @@ from .ascend_layout import (
 )
 
 
-# One name selects the host drafter.
+DrafterSpec = namedtuple("DrafterSpec", "module name tail_keyword")
+
+# One name selects the host drafter. `tail_keyword` is how that drafter names
+# its shortest matched tail, and None where it has no such bound: the tree's
+# expansion is governed by its budget and its branching, not by a tail length.
 DRAFTERS = {
-    "lookup": ("tilert.models.glm_5_2_ascend.lookup_draft", "LookupDrafter"),
-    "automaton": ("tilert.models.glm_5_2_ascend.automaton_draft",
-                  "AutomatonDrafter"),
-    "tree": ("tilert.models.glm_5_2_ascend.tree_draft", "TreeDrafter"),
+    "lookup": DrafterSpec("tilert.models.glm_5_2_ascend.lookup_draft",
+                          "LookupDrafter", "shortest"),
+    "automaton": DrafterSpec("tilert.models.glm_5_2_ascend.automaton_draft",
+                             "AutomatonDrafter", "shortest"),
+    "tree": DrafterSpec("tilert.models.glm_5_2_ascend.tree_draft",
+                        "TreeDrafter", None),
 }
 
 CHECKPOINT_FILES = (
@@ -272,11 +279,14 @@ class AscendRankEngine:
             raise ValueError("First token differs from the injected prefix")
         drafter = None
         if self.lookup_prompt is not None:
-            module, name = DRAFTERS[self.drafter_name]
-            Drafter = getattr(importlib.import_module(module), name)
-            drafter = Drafter(self.lookup_prompt,
-                              shortest=self.lookup_min_ngram)
+            spec = DRAFTERS[self.drafter_name]
+            Drafter = getattr(importlib.import_module(spec.module), spec.name)
+            bounds = ({spec.tail_keyword: self.lookup_min_ngram}
+                      if spec.tail_keyword else {})
+            drafter = Drafter(self.lookup_prompt, **bounds)
             drafter.commit((first_token,))
+        if self.round_phases is not None:
+            self.round_phases.reset()
         rounds = MtpRoundExecutor(
             self.target, self.draft, width, max_tokens, eos_tokens, drafter,
             phases=self.round_phases,

@@ -299,9 +299,11 @@ def timing_requests(requests):
 def validate_local(report, args):
     """Check saved local state, then return the rank-independent history."""
     histories = []
-    reset_positions = [0, None if args.lookup else 0]
+    # A draft engine is absent only when the backbone is truncated, which is
+    # what `--layers` does; a host drafter leaves it in place and unused.
+    reset_positions = [0, None if args.layers else 0]
     injected_positions = [PREFIX_LENGTH,
-                          None if args.lookup else PREFIX_LENGTH - 1]
+                          None if args.layers else PREFIX_LENGTH - 1]
     if (report["final_positions"] != reset_positions or not report["closed"]
             or len(report["rank_requests"]) != args.warmup + args.requests):
         raise ValueError("The rank did not reset and close every request")
