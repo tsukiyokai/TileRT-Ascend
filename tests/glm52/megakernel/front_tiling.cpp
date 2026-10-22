@@ -10,10 +10,10 @@
 #include "lib/matmul/matmul_tiling.h"
 
 // `base_m`, `base_n` and `base_k` fix the cube's tile; -1 leaves the choice to
-// the tiling API. At twelve rows the output tile is small and the time goes to
-// streaming the reduction, so the reduction's tile is the one worth setting.
+// the tiling API, which at twelve rows beats every explicit tile measured.
 extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
-                                             int base_m, int base_n, int base_k,
+                                             int reduction, int base_m,
+                                             int base_n, int base_k,
                                              void* buffer)
 {
     matmul_tiling::MatmulApiTiling tiling;
@@ -26,8 +26,8 @@ extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
     tiling.SetCType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
                     matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetShape(rows, columns, megakernel_front::kHidden);
-    tiling.SetOrgShape(rows, width, megakernel_front::kHidden);
+    tiling.SetShape(rows, columns, reduction);
+    tiling.SetOrgShape(rows, width, reduction);
     tiling.SetBias(false);
     tiling.SetBufferSpace(-1, -1, -1);
     if (base_m > 0 && base_n > 0 && base_k > 0) {

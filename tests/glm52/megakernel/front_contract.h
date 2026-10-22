@@ -3,10 +3,10 @@
 
 #include <cstdint>
 
-// The layer's first dependency level: every projection that reads the
-// normalized hidden. A decode matmul's cost follows its reduction length, paid
-// once an invocation, while its output axis is spread across cores for free --
-// so these four belong in one invocation over their concatenated output.
+// One dependency level of a layer. A decode matmul's cost follows its reduction
+// length, paid once an invocation, while its output axis is spread across cores
+// for free -- so every projection that reads the same activation belongs in one
+// invocation over their concatenated output.
 namespace megakernel_front {
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
@@ -15,38 +15,22 @@ namespace megakernel_front {
 #define MEGAKERNEL_FRONT_DEVICE
 #endif
 
-constexpr int64_t kHidden = 6144;
-constexpr int64_t kQueryLatent = 2048;
-constexpr int64_t kKeyValueLatent = 576;   // 512 latent and 64 rope
-constexpr int64_t kIndexerKey = 160;       // kDim 128 and kHeads 32
-constexpr int64_t kRouterGate = 256;       // one column an expert
-constexpr int64_t kParts = 4;
-constexpr int64_t kColumns =
-    kQueryLatent + kKeyValueLatent + kIndexerKey + kRouterGate;
-
-constexpr int64_t kColumnGranularity = 32;
-// A weight row must start on a 512-byte boundary or every core's column window
-// straddles one. Padding the 3040 columns to 3072 takes the stage from 48.12 to
-// 38.43 microseconds; see megakernel-front-20261022.
-constexpr int64_t kStrideBytes = 512;
-constexpr int64_t kAlignedColumns =
-    (kColumns * 2 + kStrideBytes - 1) / kStrideBytes * kStrideBytes / 2;
+constexpr int64_t kMaxParts = 8;
 constexpr int64_t kMaxRows = 32;
 constexpr int64_t kMaxBlocks = 24;
+constexpr int64_t kColumnGranularity = 32;
+// A weight row must start on a 512-byte boundary or every core's column window
+// straddles one. Padding the first level's 3040 columns to 3072 takes it from
+// 48.12 to 38.43 microseconds; see megakernel-front-20261022.
+constexpr int64_t kStrideBytes = 512;
 constexpr uint64_t kTilingStride = 512;
-constexpr uint64_t kTilingBytes = (kParts + 1) * kTilingStride;
 constexpr uint64_t kSystemBytes = 16ULL << 20;
 
-constexpr int64_t kPartColumns[kParts] = {
-    kQueryLatent, kKeyValueLatent, kIndexerKey, kRouterGate};
-
-MEGAKERNEL_FRONT_DEVICE constexpr int64_t PartOffset(int64_t part)
+constexpr int64_t AlignedColumns(int64_t columns)
 {
-    int64_t offset = 0;
-    for (int64_t earlier = 0; earlier < part; ++earlier) {
-        offset += kPartColumns[earlier];
-    }
-    return offset;
+    constexpr int64_t element = 2;  // bf16
+    return (columns * element + kStrideBytes - 1) / kStrideBytes
+        * kStrideBytes / element;
 }
 
 // Every core's slice has the same aligned stride.
@@ -64,7 +48,8 @@ struct Slice {
     int64_t offset, width;
 };
 
-MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns, int64_t blocks, int64_t index)
+MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns,
+                                                 int64_t blocks, int64_t index)
 {
     const int64_t stride = SliceStride(columns, blocks);
     const int64_t offset = index * stride;
@@ -77,23 +62,57 @@ MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns, int64_t blocks
 
 struct Config {
     int64_t rows, blocks;
-    // The weight's row stride. `kColumns` packs the projections adjacently; a
-    // larger value spaces them out, which prices the strided read each core
-    // makes when it takes a column window of a wide matrix.
+    // The shared activation's width, which is this level's reduction length.
+    int64_t reduction;
+    // The projections reading it, and the row stride of their concatenation.
+    int64_t part_count;
+    int64_t part_columns[kMaxParts];
     int64_t weight_stride;
 };
 
+MEGAKERNEL_FRONT_DEVICE constexpr int64_t TotalColumns(const Config& config)
+{
+    int64_t total = 0;
+    for (int64_t part = 0; part < config.part_count; ++part) {
+        total += config.part_columns[part];
+    }
+    return total;
+}
+
+MEGAKERNEL_FRONT_DEVICE constexpr int64_t PartOffset(const Config& config,
+                                                     int64_t part)
+{
+    int64_t offset = 0;
+    for (int64_t earlier = 0; earlier < part; ++earlier) {
+        offset += config.part_columns[earlier];
+    }
+    return offset;
+}
+
 struct Addresses {
-    uint64_t hidden, weight, product, tiling, system;
+    uint64_t activation, weight, product, tiling, system;
 };
 
+// Host-side validation before a launch. It sums the parts itself rather than
+// sharing the device helper, which bisheng would not let it call.
 constexpr bool Valid(const Config& config, const Addresses& addresses)
 {
-    return config.rows >= 1 && config.rows <= kMaxRows
-        && config.blocks >= 1 && config.blocks <= kMaxBlocks
-        && config.weight_stride >= kColumns
-        && config.weight_stride * 2 % kStrideBytes == 0
-        && addresses.hidden != 0 && addresses.weight != 0
+    if (config.rows < 1 || config.rows > kMaxRows
+        || config.blocks < 1 || config.blocks > kMaxBlocks
+        || config.reduction < 1
+        || config.part_count < 1 || config.part_count > kMaxParts
+        || config.weight_stride * 2 % kStrideBytes != 0) {
+        return false;
+    }
+    int64_t columns = 0;
+    for (int64_t part = 0; part < config.part_count; ++part) {
+        if (config.part_columns[part] < 1) {
+            return false;
+        }
+        columns += config.part_columns[part];
+    }
+    return config.weight_stride >= columns
+        && addresses.activation != 0 && addresses.weight != 0
         && addresses.product != 0 && addresses.tiling != 0
         && addresses.system != 0;
 }
@@ -105,7 +124,8 @@ extern "C" int megakernel_front_launch(void* stream, uint64_t sync,
     const megakernel_front::Addresses* addresses);
 
 extern "C" int megakernel_front_build_tiling(int rows, int columns, int width,
-                                             int base_m, int base_n, int base_k,
+                                             int reduction, int base_m,
+                                             int base_n, int base_k,
                                              void* buffer);
 
 #endif

@@ -1,10 +1,11 @@
-/** Torch entry for the layer's first dependency level. */
+/** Torch entry for one dependency level of a layer. */
 #include <ATen/ATen.h>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include <cstdint>
+#include <vector>
 
 #include "front_contract.h"
 
@@ -22,50 +23,78 @@ int64_t SyncBase()
     return static_cast<int64_t>(address);
 }
 
-at::Tensor BuildTiling(int64_t rows, int64_t blocks, int64_t base_m,
-                       int64_t base_n, int64_t base_k)
+Config Describe(int64_t rows, int64_t blocks, int64_t reduction,
+                at::IntArrayRef parts, int64_t weight_stride)
 {
-    const Slice widest = SliceFor(kColumns, blocks, 0);
+    TORCH_CHECK(parts.size() >= 1 && parts.size() <= kMaxParts,
+                "a level holds 1 to ", kMaxParts, " projections");
+    Config config{rows, blocks, reduction,
+                  static_cast<int64_t>(parts.size()), {}, weight_stride};
+    for (size_t part = 0; part < parts.size(); ++part) {
+        config.part_columns[part] = parts[part];
+    }
+    return config;
+}
+
+int64_t AlignedWidth(int64_t columns)
+{
+    return AlignedColumns(columns);
+}
+
+at::Tensor BuildTiling(int64_t rows, int64_t blocks, int64_t reduction,
+                       at::IntArrayRef parts, int64_t weight_stride,
+                       int64_t base_m, int64_t base_n, int64_t base_k)
+{
+    const Config config = Describe(rows, blocks, reduction, parts,
+                                   weight_stride);
+    const Slice widest = SliceFor(TotalColumns(config), blocks, 0);
     auto host = at::empty({static_cast<int64_t>(kTilingStride)},
                           at::dtype(at::kByte));
     const int status = megakernel_front_build_tiling(
         static_cast<int>(rows), static_cast<int>(widest.width),
-        static_cast<int>(kColumns), static_cast<int>(base_m),
-        static_cast<int>(base_n), static_cast<int>(base_k), host.data_ptr());
+        static_cast<int>(weight_stride), static_cast<int>(reduction),
+        static_cast<int>(base_m), static_cast<int>(base_n),
+        static_cast<int>(base_k), host.data_ptr());
     TORCH_CHECK(status == 0, "megakernel_front_build_tiling failed: ", status);
     return host;
 }
 
-void Forward(const at::Tensor& hidden, const at::Tensor& weight,
+void Forward(const at::Tensor& activation, const at::Tensor& weight,
              const at::Tensor& product, const at::Tensor& tiling,
-             const at::Tensor& system, int64_t blocks, int64_t sync_base)
+             const at::Tensor& system, int64_t blocks, at::IntArrayRef parts,
+             int64_t sync_base)
 {
-    TORCH_CHECK(hidden.dim() == 2 && hidden.size(1) == kHidden,
-                "hidden must be [rows, ", kHidden, "]");
-    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == kHidden
-                && weight.size(1) >= kColumns,
-                "weight must be [", kHidden, ", at least ", kColumns, "]");
-    TORCH_CHECK(product.sizes() == at::IntArrayRef({hidden.size(0), kColumns}),
-                "product must be [rows, ", kColumns, "]");
-    TORCH_CHECK(hidden.scalar_type() == at::kBFloat16
+    TORCH_CHECK(activation.dim() == 2 && weight.dim() == 2
+                && product.dim() == 2, "two-dimensional operands");
+    const Config config = Describe(activation.size(0), blocks,
+                                   activation.size(1), parts, weight.size(1));
+    const int64_t columns = TotalColumns(config);
+    TORCH_CHECK(weight.size(0) == config.reduction,
+                "weight must reduce over ", config.reduction, " rows");
+    TORCH_CHECK(product.size(0) == config.rows
+                && product.size(1) == weight.size(1),
+                "product must match the weight's row stride");
+    TORCH_CHECK(weight.size(1) >= columns,
+                "weight needs at least ", columns, " columns");
+    TORCH_CHECK(activation.scalar_type() == at::kBFloat16
                 && weight.scalar_type() == at::kBFloat16
                 && product.scalar_type() == at::kFloat,
                 "bf16 operands and a float product");
-    for (const at::Tensor& owner : {hidden, weight, product, tiling, system}) {
+    for (const at::Tensor& owner : {activation, weight, product, tiling,
+                                    system}) {
         TORCH_CHECK(owner.is_contiguous() && owner.device().is_privateuseone(),
                     "every owner must be contiguous and on the device");
     }
 
-    const Config config{hidden.size(0), blocks, weight.size(1)};
     const Addresses addresses{
-        reinterpret_cast<uint64_t>(hidden.data_ptr()),
+        reinterpret_cast<uint64_t>(activation.data_ptr()),
         reinterpret_cast<uint64_t>(weight.data_ptr()),
         reinterpret_cast<uint64_t>(product.data_ptr()),
         reinterpret_cast<uint64_t>(tiling.data_ptr()),
         reinterpret_cast<uint64_t>(system.data_ptr())};
-    TORCH_CHECK(Valid(config, addresses), "invalid configuration or addresses");
+    TORCH_CHECK(Valid(config, addresses), "invalid level or addresses");
 
-    const c10::DeviceGuard guard(hidden.device());
+    const c10::DeviceGuard guard(activation.device());
     const int status = megakernel_front_launch(
         c10_npu::getCurrentNPUStream().stream(),
         static_cast<uint64_t>(sync_base), &config, &addresses);
@@ -75,14 +104,18 @@ void Forward(const at::Tensor& hidden, const at::Tensor& weight,
 TORCH_LIBRARY_FRAGMENT(megakernel_front, m)
 {
     m.def("sync_base() -> int");
-    m.def("build_tiling(int rows, int blocks, int base_m, int base_n, int base_k) -> Tensor");
-    m.def("forward(Tensor hidden, Tensor weight, Tensor product, "
-          "Tensor tiling, Tensor system, int blocks, int sync_base) -> ()");
+    m.def("aligned_width(int columns) -> int");
+    m.def("build_tiling(int rows, int blocks, int reduction, int[] parts, "
+          "int weight_stride, int base_m, int base_n, int base_k) -> Tensor");
+    m.def("forward(Tensor activation, Tensor weight, Tensor product, "
+          "Tensor tiling, Tensor system, int blocks, int[] parts, "
+          "int sync_base) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(megakernel_front, CompositeExplicitAutograd, m)
 {
     m.impl("sync_base", TORCH_FN(SyncBase));
+    m.impl("aligned_width", TORCH_FN(AlignedWidth));
     m.impl("build_tiling", TORCH_FN(BuildTiling));
 }
 

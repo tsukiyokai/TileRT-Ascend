@@ -5,13 +5,16 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$here/../routed_int4/build_common.sh"
 
+# Outputs live under MEGAKERNEL_BUILD_ROOT so a read-only or synchronised
+# source tree never holds them.
+root=${MEGAKERNEL_BUILD_ROOT:-$here}
 variant_flags=()
-default_out=$here/build-fused
+arm=fused
 if [[ ${MEGAKERNEL_FRONT_SPLIT:-0} == 1 ]]; then
   variant_flags=(-DMEGAKERNEL_FRONT_SPLIT)
-  default_out=$here/build-split
+  arm=split
 fi
-out=${1:-$default_out}
+out=${1:-$root/build-$arm}
 
 python_bin=${PYTHON_BIN:-python3}
 site=${SITE_PACKAGES:-$("$python_bin" -c \
