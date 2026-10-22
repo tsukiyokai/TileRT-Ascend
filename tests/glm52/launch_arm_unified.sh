@@ -24,6 +24,11 @@ utilisation=${UTILISATION:-0.78}
 attention=${ATTENTION:-sfa}
 
 source /opt/ascend/cann-9.2.0/set_env.sh
+# A3's hardware profile reports ATB_EXTENSIONS, so `NPUWorker.__init__` calls
+# `_register_atb_extensions()` unconditionally and dies on `libatb.so` when the
+# image carries no NNAL. The omniinfer images do not; the ascend vllm image
+# does, and its tree is mounted here.
+source /usr/local/Ascend/nnal/atb/set_env.sh
 # The engine stack comes from the pinned trees under RUNTIME, because the
 # omniinfer image ships `omni_npu` rather than `vllm_ascend` and the unified
 # image carries only vllm's dist-info -- its version string ends in `.empty`,

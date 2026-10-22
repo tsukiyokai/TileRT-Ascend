@@ -313,3 +313,26 @@ And read what the launcher already passes before claiming a flag is off.
 --attention-kernel sfa --fp32-head` itself, so the seven `store_true` flags
 being off in the bench's own defaults does not mean they are off in a run.
 Two of the largest were already on in every number this project has recorded.
+
+## Bringing the engine up on a fresh A3, 2026-10-22
+
+Five assets, none of them in the image, and the arm fails on a different one
+each time until all five are present. On a3-180:
+
+| asset | where it came from | mounted at |
+|---|---|---|
+| CANN 9.2.0 SDK | a3-194 `megamoe-mask-only-20261021/sdk` | `/opt/ascend/cann-9.2.0` |
+| pinned runtime 212, with `patches/vllm/indexer-int8-literal.patch` applied to a copy | a3-194 `tilert-megakernel-20261021` | `/runtime` |
+| NNAL/ATB 9.1.0 | `docker cp` out of `quay.io/ascend/vllm-ascend:deepseek-v4.1-flash-a3` | `/usr/local/Ascend/nnal` |
+| 8K prefix capture | a3-194 `checkpoint-owned/prefix8k-v3` | `/capture` |
+| checkpoint | NFS, already mounted on the host | `/nas` |
+
+The transfers are two minutes over 7.150.x, so the cost of a fresh host is the
+four launch failures, not the bytes. The container also needs the image's
+clobbered `triton` moved aside, because vllm imports
+`triton.experimental.gluon` whenever `find_spec("triton")` succeeds and
+`HAS_TRITON` has no override.
+
+a3-180 is the best machine the project has had: sixteen idle dies, 291 GB free
+on `/`, and the checkpoint NAS mounted at `/sfs-asset-inference-ci`, so the
+755 GB over 82 MB/s problem that shaped the previous days does not exist there.
