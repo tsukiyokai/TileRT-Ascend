@@ -341,7 +341,14 @@ The asset NFS is the schedule, not the compile. Under the engine's own prefetch
 (sixteen ranks, eight threads each) the checkpoint streams into page cache at a
 measured **79 MB/s**, which is the same ceiling this project recorded for that
 export, so a cold 404 GB load is about 85 minutes. The host has 2258 GB of RAM,
-so it only happens once: every later arm reads from cache. That default was wrong. The same host mounts
+so it should only happen once -- except that it does not: a worker reads 3 MB/s
+from that export and blocks in `__lock_page_killable`, because all sixteen
+ranks want the same pages, one fetches at the mount's rate and the rest wait on
+its page lock. The aggregate is about 48 MB/s, *below* a single stream's 79, so
+a 404 GB load is over two hours an arm and the cache never gets ahead. Two arms
+died of this before the worker's `wchan` was read.
+
+That default was wrong. The same host mounts
 `/mnt/sfs_turbo_new`, measured single-stream with direct I/O at **321 MB/s
 writing and 686 MB/s reading** -- 8.8 times the asset export. Staging the
 checkpoint there turns a cold load into about ten minutes, and the staging copy
