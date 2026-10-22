@@ -64,6 +64,43 @@ __aicore__ inline void Project(Projection& mm, const Config& config,
     mm.End();
 }
 
+// Vector work on the AIV half with no barrier against the cube, so its cost
+// appears only once the cube stops covering it. Each pass sums a chunk and the
+// total is published, which both makes the work observable and keeps the
+// compiler from eliding it.
+__aicore__ inline void Reduce(TPipe& pipe, const Config& config,
+                              const Addresses& addresses)
+{
+    if (config.vector_passes == 0) {
+        return;
+    }
+    constexpr int64_t kChunk = 1024;
+    TBuf<TPosition::VECCALC> buffer;
+    pipe.InitBuffer(buffer, 2 * kChunk * sizeof(float));
+    LocalTensor<float> held = buffer.Get<float>();
+    LocalTensor<float> work = held[kChunk];
+    GlobalTensor<float> witness;
+    witness.SetGlobalBuffer((__gm__ float*)addresses.witness, kMaxWitness);
+
+    const int64_t index = GetBlockIdx();
+    float total = 0.0f;
+    for (int64_t pass = 0; pass < config.vector_passes; ++pass) {
+        for (int64_t chunk = 0; chunk < kVectorChunks; ++chunk) {
+            Duplicate(held, static_cast<float>(pass + 1), kChunk);
+            PipeBarrier<PIPE_V>();
+            Abs(held, held, kChunk);
+            PipeBarrier<PIPE_V>();
+            ReduceSum(work, held, work, kChunk);
+            PipeBarrier<PIPE_ALL>();
+            total += work.GetValue(0);
+        }
+    }
+    const int64_t slot = index * kWitnessStride;
+    witness.SetValue(slot, total);
+    DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE,
+        DcciDst::CACHELINE_OUT>(witness[slot]);
+}
+
 __global__ __mix__(1, 2) __schedmode__(1) __aicore__
 void Kernel(uint64_t sync, Config config, Addresses addresses)
 {
@@ -90,6 +127,9 @@ void Kernel(uint64_t sync, Config config, Addresses addresses)
                                      index);
         Project(mm, config, addresses, slice, slice.offset);
 #endif
+    }
+    if ASCEND_IS_AIV {
+        Reduce(pipe, config, addresses);
     }
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::DDR>();

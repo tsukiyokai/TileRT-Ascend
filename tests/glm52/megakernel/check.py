@@ -67,9 +67,10 @@ def operands(level, rows, stride, element, device, generator):
     }
 
 
-def submit(front, held, parts, blocks, sync, tiling, system, product):
+def submit(front, held, parts, blocks, sync, tiling, system, witness, product,
+           vector_passes):
     front.forward(held['activation'], held['weight'], product, tiling, system,
-                  blocks, parts, sync)
+                  witness, blocks, parts, vector_passes, sync)
 
 
 def timed(submit_once, iterations):
@@ -96,6 +97,7 @@ def main():
     parser.add_argument('--iterations', type=int, default=50)
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--stride', type=int, default=0)
+    parser.add_argument('--vector-passes', type=int, default=0)
     parser.add_argument('--base-m', type=int, default=-1)
     parser.add_argument('--base-n', type=int, default=-1)
     parser.add_argument('--base-k', type=int, default=-1)
@@ -113,6 +115,8 @@ def main():
                                 parts, stride, args.base_m, args.base_n,
                                 args.base_k).to(args.device)
     system = torch.zeros(SYSTEM_BYTES, dtype=torch.uint8, device=args.device)
+    witness = torch.zeros(front.witness_floats(), dtype=torch.float,
+                          device=args.device)
 
     generator = torch.Generator(device=args.device).manual_seed(20261022)
     cases = []
@@ -121,7 +125,9 @@ def main():
                         generator)
         product = torch.zeros(args.rows, stride, dtype=accumulator,
                               device=args.device)
-        submit(front, held, parts, args.blocks, sync, tiling, system, product)
+        witness.zero_()
+        submit(front, held, parts, args.blocks, sync, tiling, system, witness,
+               product, args.vector_passes)
         torch.npu.synchronize()
         computed = product[:, :columns]
         reference = (held['activation'].float()
@@ -138,11 +144,21 @@ def main():
             'finite': bool(torch.isfinite(computed).all()),
         })
 
+    # Each core sums kVectorChunks chunks of 1024 copies of `pass + 1`, over
+    # `vector_passes` passes, so the published total is fixed arithmetic. A
+    # mismatch means the vector stage did not run.
+    chunks = front.vector_chunks()
+    expected = sum(1024.0 * (step + 1) for step in range(args.vector_passes))
+    expected *= chunks
+    witness_stride = front.witness_stride()
+    published = witness.cpu()[:args.blocks * witness_stride:witness_stride]
+
     held = operands(level, args.rows, stride, element, args.device, generator)
     product = torch.zeros(args.rows, stride, dtype=accumulator,
                           device=args.device)
     samples = [timed(lambda: submit(front, held, parts, args.blocks, sync,
-                                    tiling, system, product), args.iterations)
+                                    tiling, system, witness, product,
+                                    args.vector_passes), args.iterations)
                for _ in range(args.repeats)]
 
     print(json.dumps({
@@ -150,6 +166,12 @@ def main():
         'reduction': level['reduction'], 'parts': level['parts'],
         'columns': columns, 'weight_stride': stride,
         'element_bytes': front.element_bytes(),
+        'vector_passes': args.vector_passes,
+        'vector_expected': expected,
+        'vector_published_min': published.min().item(),
+        'vector_published_max': published.max().item(),
+        'vector_ran': bool(args.vector_passes == 0
+                           or (published == expected).all()),
         'rows': args.rows, 'blocks': args.blocks,
         'base': [args.base_m, args.base_n, args.base_k],
         'cases': cases,

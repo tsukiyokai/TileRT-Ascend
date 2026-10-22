@@ -25,6 +25,12 @@ constexpr int64_t kColumnGranularity = 32;
 constexpr int64_t kStrideBytes = 512;
 constexpr uint64_t kTilingStride = 512;
 constexpr uint64_t kSystemBytes = 16ULL << 20;
+// The vector stage's published total and the chunks it sums a pass; each chunk
+// is 1024 elements, so a pass is kVectorChunks * 1024. One cache line a core,
+// because a flush writes the whole line and neighbours lose each other's value.
+constexpr int64_t kWitnessStride = kStrideBytes / sizeof(float) / 16;  // 8
+constexpr int64_t kMaxWitness = kMaxBlocks * 2 * kWitnessStride;
+constexpr int64_t kVectorChunks = 72;
 
 constexpr int64_t AlignedColumns(int64_t columns, int64_t element_bytes)
 {
@@ -69,6 +75,9 @@ struct Config {
     int64_t weight_stride;
     // The operand's width in bytes, which fixes the row-stride alignment.
     int64_t element_bytes;
+    // Vector passes over the activation, run on the AIV half while the cube
+    // works. Sweeping this says how much vector work the cube hides for free.
+    int64_t vector_passes;
 };
 
 MEGAKERNEL_FRONT_DEVICE constexpr int64_t TotalColumns(const Config& config)
@@ -91,7 +100,7 @@ MEGAKERNEL_FRONT_DEVICE constexpr int64_t PartOffset(const Config& config,
 }
 
 struct Addresses {
-    uint64_t activation, weight, product, tiling, system;
+    uint64_t activation, weight, product, tiling, system, witness;
 };
 
 // Host-side validation before a launch. It sums the parts itself rather than
@@ -102,7 +111,8 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
         || config.blocks < 1 || config.blocks > kMaxBlocks
         || config.reduction < 1
         || config.part_count < 1 || config.part_count > kMaxParts
-        || config.weight_stride * config.element_bytes % kStrideBytes != 0) {
+        || config.weight_stride * config.element_bytes % kStrideBytes != 0
+        || config.vector_passes < 0) {
         return false;
     }
     int64_t columns = 0;

@@ -84,6 +84,12 @@ order a mistake usually happens:
   went only to the kernel compile, so a bf16 device half was linked against an
   int8 host half; the launch faulted on the core with EE9999 and the only visible
   clue was `element_bytes` reporting 1 from a library named bf16.
+- Work with no observable result is not work. A vector stage that computed in
+  unified buffer and published nothing reported under one microsecond at every
+  load up to 64 passes; publishing its total and checking the arithmetic turned
+  that into 12.46 microseconds a pass. The compiler had removed the loop.
+- One float a core shares a cache line with seven others, and a flush writes the
+  whole line. The witness failed intermittently until each core got its own line.
 - A broken kernel keeps the clock. The packed weight variant produced NaN and
   errors of 464 against magnitudes of 331, and timed within noise of the correct
   arm at every width. Only the digest comparison caught it.
