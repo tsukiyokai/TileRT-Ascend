@@ -31,6 +31,7 @@ constexpr uint64_t kSystemBytes = 16ULL << 20;
 constexpr int64_t kWitnessStride = kStrideBytes / sizeof(float) / 16;  // 8
 constexpr int64_t kMaxWitness = kMaxBlocks * 2 * kWitnessStride;
 constexpr int64_t kVectorChunks = 72;
+constexpr int64_t kMaxSkewSteps = 16;
 
 constexpr int64_t AlignedColumns(int64_t columns, int64_t element_bytes)
 {
@@ -65,6 +66,26 @@ MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns,
     return {offset, remaining < stride ? remaining : stride};
 }
 
+// A step's share of a core's slice, aligned so the cube still sees whole
+// fractal blocks. The last step takes the remainder.
+MEGAKERNEL_FRONT_DEVICE constexpr Slice StepShare(const Slice& whole,
+                                                  int64_t step, int64_t steps)
+{
+    if (whole.width == 0 || steps < 1) {
+        return {whole.offset, 0};
+    }
+    const int64_t even = (whole.width + steps - 1) / steps;
+    const int64_t aligned =
+        (even + kColumnGranularity - 1) / kColumnGranularity
+        * kColumnGranularity;
+    const int64_t start = step * aligned;
+    if (start >= whole.width) {
+        return {whole.offset + whole.width, 0};
+    }
+    const int64_t remaining = whole.width - start;
+    return {whole.offset + start, remaining < aligned ? remaining : aligned};
+}
+
 struct Config {
     int64_t rows, blocks;
     // The shared activation's width, which is this level's reduction length.
@@ -81,6 +102,11 @@ struct Config {
     // Grid barriers to issue around the work. A skewed pipeline pays one a
     // step, so this prices the step.
     int64_t barriers;
+    // Steps the work is cut into. Zero runs the cube and the vector halves one
+    // after the other, which is what a phase barrier gives. More than one
+    // interleaves step s of the cube with step s-1 of the vector, so the two
+    // halves run together with one barrier a step.
+    int64_t skew_steps;
 };
 
 MEGAKERNEL_FRONT_DEVICE constexpr int64_t TotalColumns(const Config& config)
@@ -115,7 +141,8 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
         || config.reduction < 1
         || config.part_count < 1 || config.part_count > kMaxParts
         || config.weight_stride * config.element_bytes % kStrideBytes != 0
-        || config.vector_passes < 0 || config.barriers < 0) {
+        || config.vector_passes < 0 || config.barriers < 0
+        || config.skew_steps < 0 || config.skew_steps > kMaxSkewSteps) {
         return false;
     }
     int64_t columns = 0;

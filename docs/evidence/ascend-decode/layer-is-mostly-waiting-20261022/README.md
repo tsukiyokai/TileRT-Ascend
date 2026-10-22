@@ -41,8 +41,16 @@ a comparable amount of vector -- and the remaining 500 is barrier and idle.
 
 ## What this does and does not establish
 
-It is an upper bound on what skewing can give, not a plan that has been run.
-Three gaps:
+It is an upper bound on what skewing can give, not a plan that has been run,
+and one of its assumptions has since been measured false: the cube's work cannot
+be cut into pipeline steps for free, because each step is another invocation and
+each invocation walks the reduction again. Cutting the front stage eight ways
+added 70 microseconds of walks to hide 25 of vector work. So the bound holds
+only for the part of the layer whose cube work is **already** divided into
+invocations -- the FFN's expert loop and the tail's head loop. See
+[`skew-needs-separate-invocations-20261022`](../skew-needs-separate-invocations-20261022/README.md).
+
+Three further gaps:
 
 The stage traces are a native FFN body and a standalone MLA tail, taken with
 instrumented libraries; the 650 microseconds a layer is the vendor round divided

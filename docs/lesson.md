@@ -68,6 +68,11 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
+- A pipeline step on the cube costs a reduction walk. Cutting the front stage
+  into eight steps to interleave the vector half added 70 microseconds of walks
+  to hide 25 of vector work. Skewing pays only where the cube is already divided
+  into independent invocations -- the expert loop, the head loop -- not where one
+  invocation was the point.
 - Fit the increment, not the total. Fitting invocation cost against K gave
   `11.6 + 0.000985 K` and the 11.6 was read as a per-invocation fixed cost; it
   is the kernel's, paid once. Fitting the *extra* invocation gave an intercept

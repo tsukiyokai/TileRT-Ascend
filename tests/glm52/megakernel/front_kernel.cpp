@@ -69,9 +69,10 @@ __aicore__ inline void Project(Projection& mm, const Config& config,
 // total is published, which both makes the work observable and keeps the
 // compiler from eliding it.
 __aicore__ inline void Reduce(TPipe& pipe, const Config& config,
-                              const Addresses& addresses)
+                              const Addresses& addresses, int64_t first_pass,
+                              int64_t last_pass)
 {
-    if (config.vector_passes == 0) {
+    if (last_pass <= first_pass) {
         return;
     }
     constexpr int64_t kChunk = 1024;
@@ -84,7 +85,7 @@ __aicore__ inline void Reduce(TPipe& pipe, const Config& config,
 
     const int64_t index = GetBlockIdx();
     float total = 0.0f;
-    for (int64_t pass = 0; pass < config.vector_passes; ++pass) {
+    for (int64_t pass = first_pass; pass < last_pass; ++pass) {
         for (int64_t chunk = 0; chunk < kVectorChunks; ++chunk) {
             Duplicate(held, static_cast<float>(pass + 1), kChunk);
             PipeBarrier<PIPE_V>();
@@ -96,9 +97,37 @@ __aicore__ inline void Reduce(TPipe& pipe, const Config& config,
         }
     }
     const int64_t slot = index * kWitnessStride;
+    SetAtomicAdd<float>();
     witness.SetValue(slot, total);
+    SetAtomicNone();
     DataCacheCleanAndInvalid<float, CacheLine::SINGLE_CACHE_LINE,
         DcciDst::CACHELINE_OUT>(witness[slot]);
+}
+
+// One step's share of this core's columns, so the cube can be cut the same way
+// the vector half is.
+__aicore__ inline void Cube(TPipe& pipe, const Config& config,
+                            const Addresses& addresses, int64_t step,
+                            int64_t steps)
+{
+    TCubeTiling cube;
+    LoadTiling(cube, (__gm__ uint8_t*)addresses.tiling);
+    Projection mm;
+    mm.Init(&cube, &pipe);
+    const int64_t index = GetBlockIdx();
+#ifdef MEGAKERNEL_FRONT_SPLIT
+    for (int64_t part = 0; part < config.part_count; ++part) {
+        const Slice whole = SliceFor(config.part_columns[part], config.blocks,
+                                     index);
+        const Slice share = StepShare(whole, step, steps);
+        Project(mm, config, addresses, share,
+                PartOffset(config, part) + share.offset);
+    }
+#else
+    const Slice whole = SliceFor(TotalColumns(config), config.blocks, index);
+    const Slice share = StepShare(whole, step, steps);
+    Project(mm, config, addresses, share, share.offset);
+#endif
 }
 
 __global__ __mix__(1, 2) __schedmode__(1) __aicore__
@@ -109,27 +138,36 @@ void Kernel(uint64_t sync, Config config, Addresses addresses)
     SetSyncBaseAddr(sync);
     SetSysWorkspace((GM_ADDR)addresses.system);
     TPipe pipe;
-    if ASCEND_IS_AIC {
-        TCubeTiling cube;
-        LoadTiling(cube, (__gm__ uint8_t*)addresses.tiling);
-        Projection mm;
-        mm.Init(&cube, &pipe);
-        const int64_t index = GetBlockIdx();
-#ifdef MEGAKERNEL_FRONT_SPLIT
-        for (int64_t part = 0; part < config.part_count; ++part) {
-            const Slice slice = SliceFor(config.part_columns[part],
-                                         config.blocks, index);
-            Project(mm, config, addresses, slice,
-                    PartOffset(config, part) + slice.offset);
+    // Zero steps runs the halves one after the other with a barrier between,
+    // which is what a phase boundary gives. More than one interleaves the
+    // cube's step s with the vector's step s-1, so both halves run inside the
+    // same barrier region and the barrier is the handoff.
+    const int64_t steps = config.skew_steps;
+    if (steps == 0) {
+        if ASCEND_IS_AIC {
+            Cube(pipe, config, addresses, 0, 1);
         }
-#else
-        const Slice slice = SliceFor(TotalColumns(config), config.blocks,
-                                     index);
-        Project(mm, config, addresses, slice, slice.offset);
-#endif
-    }
-    if ASCEND_IS_AIV {
-        Reduce(pipe, config, addresses);
+        SyncAll<false>();
+        if ASCEND_IS_AIV {
+            Reduce(pipe, config, addresses, 0, config.vector_passes);
+        }
+        SyncAll<false>();
+    } else {
+        for (int64_t step = 0; step <= steps; ++step) {
+            if ASCEND_IS_AIC {
+                if (step < steps) {
+                    Cube(pipe, config, addresses, step, steps);
+                }
+            }
+            if ASCEND_IS_AIV {
+                if (step > 0) {
+                    const int64_t share = config.vector_passes;
+                    Reduce(pipe, config, addresses,
+                           (step - 1) * share / steps, step * share / steps);
+                }
+            }
+            SyncAll<false>();
+        }
     }
     // A skewed pipeline pays one grid barrier a step, so these price the step
     // against the work they would let overlap.

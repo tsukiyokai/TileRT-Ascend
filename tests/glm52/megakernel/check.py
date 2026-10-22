@@ -76,9 +76,10 @@ def operands(level, rows, stride, element, device, generator):
 
 
 def submit(front, held, parts, blocks, sync, tiling, system, witness, product,
-           vector_passes, barriers):
+           vector_passes, barriers, skew_steps):
     front.forward(held['activation'], held['weight'], product, tiling, system,
-                  witness, blocks, parts, vector_passes, barriers, sync)
+                  witness, blocks, parts, vector_passes, barriers,
+                  skew_steps, sync)
 
 
 def timed(submit_once, iterations):
@@ -107,6 +108,7 @@ def main():
     parser.add_argument('--stride', type=int, default=0)
     parser.add_argument('--vector-passes', type=int, default=0)
     parser.add_argument('--barriers', type=int, default=0)
+    parser.add_argument('--skew-steps', type=int, default=0)
     parser.add_argument('--base-m', type=int, default=-1)
     parser.add_argument('--base-n', type=int, default=-1)
     parser.add_argument('--base-k', type=int, default=-1)
@@ -136,7 +138,8 @@ def main():
                               device=args.device)
         witness.zero_()
         submit(front, held, parts, args.blocks, sync, tiling, system, witness,
-               product, args.vector_passes, args.barriers)
+               product, args.vector_passes, args.barriers,
+               args.skew_steps)
         torch.npu.synchronize()
         computed = product[:, :columns]
         reference = (held['activation'].float()
@@ -168,7 +171,8 @@ def main():
     samples = [timed(lambda: submit(front, held, parts, args.blocks, sync,
                                     tiling, system, witness, product,
                                     args.vector_passes,
-                                    args.barriers), args.iterations)
+                                    args.barriers,
+                                    args.skew_steps), args.iterations)
                for _ in range(args.repeats)]
 
     print(json.dumps({
@@ -178,6 +182,7 @@ def main():
         'element_bytes': front.element_bytes(),
         'vector_passes': args.vector_passes,
         'barriers': args.barriers,
+        'skew_steps': args.skew_steps,
         'vector_expected': expected,
         'vector_published_min': published.min().item(),
         'vector_published_max': published.max().item(),
