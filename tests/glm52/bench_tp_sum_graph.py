@@ -11,6 +11,11 @@ import time
 
 from bench_tp_sum import CALLS, ELEMENTS, SAMPLES, WARMUP, save, statistics_us
 
+# A layer reduces one row of this width per token, twice, over 78 layers, so a
+# 156-call chain at `rows` is the whole round's collective term at that verify
+# width. Sweeping rows prices the round model's per-row term against it.
+HIDDEN = 6144
+
 
 def measure(torch, distributed, graph, stream, control):
     start = torch.npu.Event(enable_timing=True)
@@ -62,7 +67,8 @@ def summarize(reports):
               else "fail", "cases": []}
     for index, case in enumerate(reports[0]["cases"]):
         row = {k: case[k] for k in
-               ("dtype", "elements", "payload_bytes", "calls", "scope")}
+               ("dtype", "elements", "rows", "payload_bytes", "calls",
+                "scope")}
         for field in ("event_total_us", "wall_total_us"):
             maxima = [max(r["cases"][index][field][sample] for r in reports)
                       for sample in range(SAMPLES)]
@@ -79,6 +85,8 @@ def summarize(reports):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rows", type=int, nargs="+", metavar="ROWS",
+                        help="Verify widths to price; payload is ROWS x 6144")
     parser.add_argument("--profile-output", type=Path,
                         help="Capture two FP32 96 KiB chain replays separately")
     args = parser.parse_args()
@@ -104,8 +112,10 @@ def main():
     stream = torch.npu.Stream(device=device)
     args.output.mkdir(parents=True, exist_ok=True)
     cases, checks, diagnostic = [], [], None
+    payloads = ([row * HIDDEN for row in args.rows] if args.rows
+                else list(ELEMENTS))
     for dtype in (torch.bfloat16, torch.float32):
-        for elements in ELEMENTS:
+        for elements in payloads:
             with torch.npu.stream(stream):
                 buffer = torch.zeros(elements, dtype=dtype,
                                      device=f"npu:{device}")
@@ -131,6 +141,7 @@ def main():
                 zero = bool((buffer.cpu() == 0).all().item())
                 cases.append({
                     "dtype": str(dtype), "elements": elements, "calls": calls,
+                    "rows": elements / HIDDEN,
                     "payload_bytes": elements * buffer.element_size(),
                     "buffer_ptr": buffer.data_ptr(),
                     "scope": f"graph_replay_{calls}_dependent_inplace_sums",

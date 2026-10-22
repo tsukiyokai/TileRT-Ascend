@@ -38,6 +38,16 @@ order a mistake usually happens:
   dividing a round-wide fit by 78.
 - A lever cannot remove more than the item it acts on. That arithmetic caught
   the wrong-width probe without any measurement.
+- A suspect cannot supply more than its own total. The round model's row term
+  is 9.77 ms at width 12 and the whole collective chain is 5.125, so blaming
+  the collective was arithmetically impossible before the sweep that then
+  measured its share at 2.3 percent.
+- A residual names only what the probe covered. The 0.026 ms a row that looked
+  31 times too small excluded SFA, the indexer and routing -- 24.6 ms of the
+  round, and the only width-dependent stages left once the collective fell.
+- Check that the discriminator is runnable in the code before planning a run
+  for it. "Width 12 against 13" was the headline next step for a day, and 13 is
+  not in `cann_graph.py`'s capture whitelist.
 - Compare like with like. A sum of separately-launched kernels is not what an
   engine that fuses them spends.
 - A broken index reads exactly like a failed mechanism. Twice in one day.
