@@ -44,3 +44,34 @@ into one call, which is exactly the 9.57 ms this entry isolates. It is one rung
 of the staged megakernel ladder, it has passed byte-exact gates, and it has
 never been measured as TPOT. That is now the measurement with the most behind
 it, not the pass count.
+
+## The fixed charge is per call and already whole at one expert
+
+The entry above assumed the 9.57 ms could go to zero. Measured at one, two,
+four and eight experts, with the bank count pinned at 4 because the probe's
+own rotation asks for more memory than a tenant leaves:
+
+| experts | gate_up | down |
+|---|---|---|
+| 1 | 66.85 us | 60.74 |
+| 2 | 66.10 | 60.28 |
+| 4 | 73.52 | 62.28 |
+| 8 | 61.71 | 70.60 |
+
+Flat from one expert to eight, so the ~60 us is a call's own tiling and setup,
+whole at a single group. It is not launch latency either -- every figure here
+is the mean of twenty back-to-back calls.
+
+So fusing `gate_up` and `down` into one call removes **one** of the two
+charges, not both: 4.63 ms a round of the 9.57, leaving 4.94.
+
+    floor = bytes 6.83 + collective 5.125 + remaining fixed 4.94 = 16.90 ms
+
+| accepted a round | TPOT |
+|---|---|
+| 6.966, tree at budget 32 | **2.43 ms** |
+| 5.989, tree at budget 16 | 2.82 |
+| 5.441, recorded | 3.11 |
+
+Still 2.x at the tree's measured acceptance, but the entry above overstated the
+removable part twofold, and that is corrected here rather than carried.
