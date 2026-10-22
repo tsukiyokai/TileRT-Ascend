@@ -678,7 +678,7 @@ class CannModel:
                     destination[:length].copy_(source[name])
         self.position = length
 
-    def _metadata(self, width=1, *, graphed=False):
+    def _metadata(self, width=1, *, graphed=False, depths=None):
         import torch
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
         from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -690,15 +690,22 @@ class CannModel:
         length_cpu = self._lengths[slot:slot + 1]
         length_cpu[0] = self.position + width
         computed_cpu = torch.tensor([self.position], dtype=torch.int32)
-        positions_cpu = torch.arange(
+        slots_cpu = torch.arange(
             self.position, self.position + width, dtype=torch.long,
+        )
+        # A row's slot is where its key is stored and a row's position is what
+        # rope sees, and a tree is the first thing that tells them apart: node
+        # i lives in slot i, so the mask can name it, but it stands at the
+        # depth of its own branch.
+        positions_cpu = slots_cpu if depths is None else torch.tensor(
+            [self.position + depth for depth in depths], dtype=torch.long,
         )
         self.seq_lens.copy_(length_cpu, non_blocking=True)
         if width == 1:
             self.slots.fill_(self.position)
             self.positions.fill_(self.position)
         else:
-            self.slots.copy_(positions_cpu)
+            self.slots.copy_(slots_cpu)
             self.positions.copy_(positions_cpu)
         hoisted = self._hoisted.get(width) if graphed else None
         if hoisted is not None:
@@ -771,8 +778,13 @@ class CannModel:
         elif self.graph.width != width:
             raise ValueError("The model already captures another width")
 
-    def verify(self, tokens, *, full_logits=True):
-        """Consume M causal rows and return M next-token predictions."""
+    def verify(self, tokens, *, full_logits=True, depths=None):
+        """Consume M rows and return M next-token predictions.
+
+        The rows are causal in their own order unless `depths` says otherwise,
+        which is how a tree's branches get the positions their own ancestry
+        gives them rather than the ones their storage order would.
+        """
         import torch
         from vllm.config import set_current_vllm_config
         from vllm_ascend.ascend_forward_context import (
@@ -794,7 +806,7 @@ class CannModel:
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            metadata = self._metadata(width, graphed=use_graph)
+            metadata = self._metadata(width, graphed=use_graph, depths=depths)
             if use_graph:
                 self.refresh_hoisted_rope(width, self.positions)
             self.input_ids.copy_(tokens)
@@ -886,6 +898,34 @@ class CannModel:
             logits = self.model.compute_logits(normalized_parent)
             return CannStep(logits if full_logits else None, normalized_parent,
                             logits.argmax(dim=-1))
+
+    def compact(self, start, rows):
+        """Gather written rows `start + rows[j]` into `start + j`.
+
+        A chain's accepted prefix is already the rows it occupies, so nothing
+        needed this until a tree: there the accepted path is scattered across
+        the verification rows, and the cache the next round attends to has to
+        hold those tokens contiguously.
+
+        `rows[j] >= j` because a tree's parents precede its children, so a
+        node at depth `j` cannot sit before row `j` -- which makes the gather
+        safe to do in place and in order. The drafter expands best-first, so
+        the likeliest path usually is `0, 1, 2, ...` and this does nothing.
+        """
+        import torch
+
+        if rows != sorted(rows) or any(row < j for j, row in enumerate(rows)):
+            raise ValueError("A path's rows must rise and not precede depth")
+        if rows == list(range(len(rows))):
+            return
+        with torch.npu.device(self.device), torch.inference_mode():
+            index = torch.tensor([start + row for row in rows],
+                                 dtype=torch.long, device=self.device)
+            for layer in self.cache:
+                for destination in layer.values():
+                    destination[start:start + len(rows)] = (
+                        destination.index_select(0, index)
+                    )
 
     def truncate(self, length):
         """Retain written rows [0, length); later writes replace the tail."""

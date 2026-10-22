@@ -9,7 +9,7 @@ then delivers the proposals and predictions that committing requires.
 
 from dataclasses import dataclass
 
-from .mtp_state import MtpState
+from .mtp_state import VOCAB_SIZE, MtpState
 
 
 @dataclass(frozen=True)
@@ -152,6 +152,7 @@ class MtpRoundExecutor:
         the right index set, which is the committed prefix plus a node's own
         ancestors. `write` owns the buffer every layer reads from.
         """
+        from .tree_mask import branch_depths
         from .tree_resolve import accepted_path
 
         tokens, parents = propose_tree(plan.width - 1)
@@ -161,7 +162,8 @@ class MtpRoundExecutor:
         lineage += [0] * (plan.width - len(lineage))
         if self.tree_mask is not None:
             self.tree_mask(lineage, plan.main_start, self.target.device)
-        verified = self.target.verify(nodes, full_logits=False)
+        verified = self.target.verify(nodes, full_logits=False,
+                                      depths=branch_depths(lineage))
         proposals, predictions = self.target.host_tokens(
             nodes, verified.token_ids,
         )
@@ -173,9 +175,19 @@ class MtpRoundExecutor:
         path = accepted_path(nodes, lineage, predictions)
         along = [nodes[node] for node in path]
         predicted = [predictions[node] for node in path]
-        along += [plan.pending_token] * (plan.width - len(along))
-        predicted += [predictions[path[-1]]] * (plan.width - len(predicted))
+        # The chain pads with the pending token and lets a pad that happens to
+        # match earn a real token. A tree cannot: a padding row is off the
+        # accepted path, so its key was never moved into place, and crediting
+        # it would commit a token whose cache row belongs to another branch.
+        # Padding with a token the last prediction is not stops `resolve` at
+        # the path's end by construction rather than by luck.
+        bonus = predictions[path[-1]]
+        along += [(bonus + 1) % VOCAB_SIZE] * (plan.width - len(along))
+        predicted += [bonus] * (plan.width - len(predicted))
         commit = self.state.resolve(plan, along, predicted)
+        # `resolve` committed the path as the chain it reordered, so the cache
+        # has to agree: the path's rows become the rows it was told about.
+        self.target.compact(plan.main_start, path)
         self.target.truncate(commit.main.retained)
         self.drafter.commit(commit.accepted_tokens)
         return ExecutedRound(proposals, predictions, commit)

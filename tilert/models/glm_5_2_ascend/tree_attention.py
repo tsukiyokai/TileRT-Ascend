@@ -11,7 +11,7 @@ plus a node's own ancestors -- so the wiring is to own that buffer and write
 the tree into it each round. `tree_mask.ancestor_rows` builds the rows and
 `-1` is the operator's own sentinel for an unused slot.
 """
-from .tree_mask import ancestor_rows
+from .tree_mask import EMPTY, ancestry, prefix_room
 
 
 def install(layers, picks):
@@ -33,17 +33,33 @@ def install(layers, picks):
     buffer = None
 
     def write(parents, prefix_length, device):
-        """Put this round's tree in the buffer every layer reads."""
+        """Put this round's tree in the buffer every layer reads.
+
+        Every row carries the same prefix and differs only in its own line of
+        descent, so the prefix is written on the device and only the lines --
+        at most a row's depth each -- are carried over from the host. Building
+        a row at a time instead meant a quarter of a million Python integers
+        and a megabyte of transfer every round.
+        """
         nonlocal buffer
-        rows = ancestor_rows(parents, prefix_length, picks)
-        wanted = torch.tensor(rows, dtype=torch.int32, device=device)
-        if buffer is None or buffer.shape != wanted.shape:
-            buffer = wanted
+        prefix_room(len(parents), prefix_length, picks)
+        if buffer is None or buffer.shape != (len(parents), picks):
+            buffer = torch.empty((len(parents), picks), dtype=torch.int32,
+                                 device=device)
             for layer, _, _ in held:
                 layer.skip_topk = True
                 layer.topk_indices_buffer = buffer
-        else:
-            buffer.copy_(wanted)
+        lines = ancestry(parents)
+        deepest = max(len(line) for line in lines)
+        buffer[:, :prefix_length] = torch.arange(
+            prefix_length, dtype=torch.int32, device=device,
+        )
+        buffer[:, prefix_length + deepest:] = EMPTY
+        buffer[:, prefix_length:prefix_length + deepest] = torch.tensor(
+            [[prefix_length + node for node in line]
+             + [EMPTY] * (deepest - len(line)) for line in lines],
+            dtype=torch.int32, device=device,
+        )
         return buffer
 
     def restore():

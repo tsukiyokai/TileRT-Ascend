@@ -28,6 +28,7 @@ from tilert.models.glm_5_2_ascend.session import PrefixRequest
 from tilert.pd_vllm.ascend_cache import (
     CannRankEngine, FullRankPrefix, checkpoint_fingerprint,
 )
+from tilert.pd_vllm.prefix_capture import prompt_digest
 from tilert.pd_vllm.decode_timing import (
     TimedBackend, atomic_json, token_metrics,
 )
@@ -379,12 +380,18 @@ def validate_delivery(requests, histories, args):
     for number, (request, history) in enumerate(zip(requests, histories)):
         tokens, clocks = request["tokens"], request["timestamps_ns"]
         stats, rounds = request["session"], history["rounds"]
-        # A truncated model emits one token forever -- `--layers 10` gave
-        # 1170 then 255 zeros -- and a drafter that indexes its own output
-        # then accepts the whole width every round, so both the acceptance
-        # and the TPOT read as a result. Record the width of the output so
-        # that cannot be mistaken for one.
+        # A collapsed output makes a drafter look good: it indexes its own
+        # echo and accepts the whole width every round, so the acceptance and
+        # the TPOT both read as a result. `--layers 10` gave 1170 then 255
+        # zeros, and a tree under a wrong mask gave 17 distinct tokens of 1024
+        # at 9.3 accepted a round.
+        #
+        # The output is also the model's, not the drafter's -- greedy decoding
+        # from one prompt has one answer -- so its digest is what makes two
+        # arms comparable, and a drafter that changes it has changed the
+        # target's own predictions.
         request["distinct_output_tokens"] = len(set(tokens))
+        request["output_sha256"] = prompt_digest(tokens)
         operations = request["operations"]
         # The session drives rounds through advance_mtp_n, so an expectation
         # written against advance_mtp never matched and rank 0 raised on every
@@ -401,7 +408,7 @@ def validate_delivery(requests, histories, args):
                 or token_metrics(tokens, clocks)["tpot_ms"]
                 != request["tpot_ms"]
                 or [op["operation"] for op in operations] != expected_ops
-                or request["distinct_output_tokens"] < 2
+                or request["distinct_output_tokens"] <= args.width
                 or stats["round_calls"] != stats["completed_rounds"]
                 or stats["round_calls"] != len(rounds)
                 or len(stats["accepted_spans"]) != len(rounds)

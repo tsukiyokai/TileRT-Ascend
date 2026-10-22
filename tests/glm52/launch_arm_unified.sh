@@ -33,6 +33,18 @@ source /opt/ascend/cann-9.2.0/set_env.sh
 set +u
 source /usr/local/Ascend/nnal/atb/set_env.sh
 set -u
+# VLLM_TREE and VLLM_ASCEND_TREE override where vllm and `vllm_ascend` come
+# from, and they have to move together: `vllm-ascend-unified` reads
+# `PassConfig.enable_sp`, which only `vllm-unified` and `vllm-35a49` have.
+#
+# VLLM_ASCEND_TREE overrides where `vllm_ascend` comes from. The pinned
+# `ascend-python-build` cannot serve this checkpoint: its GLM class has no
+# `rot` parameter while the checkpoint's index declares `rot.weight` and its
+# description says `is_rot_used: True`, so the loader raises "no module or
+# parameter named 'rot'". `vllm-ascend-unified` builds `self.rot` from
+# `is_rot_weight_used`, and it is also the source the working
+# `vllm_ascend_C` was compiled from.
+#
 # The engine stack comes from the pinned trees under RUNTIME, because the
 # omniinfer image ships `omni_npu` rather than `vllm_ascend` and the unified
 # image carries only vllm's dist-info -- its version string ends in `.empty`,
@@ -46,7 +58,7 @@ runtime=${RUNTIME:?}
 # `vllm.platform_plugins`. Without it `VLLM_PLUGINS=ascend` selects nothing, no
 # platform registers, and the engine dies in `DeviceConfig` on an empty device
 # string rather than on anything to do with devices.
-export PYTHONPATH="$tree:$runtime/vendor-hook-pinned/vllm-a982-py311-compatible:$runtime/vendor-hook-pinned/ascend-python-build:$runtime/vendor-hook-pinned/vendor-metadata:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$tree:${VLLM_TREE:-$runtime/vendor-hook-pinned/vllm-a982-py311-compatible}:${VLLM_ASCEND_TREE:-$runtime/vendor-hook-pinned/ascend-python-build}:$runtime/vendor-hook-pinned/vendor-metadata:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # `fla_npu` cannot be dropped even though its kernels are not wanted here:
 # `vllm_ascend/ops/gdn.py` imports it unconditionally for Qwen3.5. Its

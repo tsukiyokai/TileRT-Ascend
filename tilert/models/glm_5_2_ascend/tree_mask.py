@@ -14,6 +14,49 @@ relies on when it sorts the selections.
 EMPTY = -1
 
 
+def prefix_room(rows, prefix_length, picks):
+    """How much prefix each row carries, refusing to carry less than all.
+
+    Keeping only the prefix's recent end is not a weaker mask but a different
+    model: the indexer picks by relevance, and silently swapping that for
+    recency changed the target's own predictions in three arms before this
+    refused.
+    """
+    room = picks - rows
+    if room < prefix_length:
+        raise ValueError(
+            f"A tree of {rows} rows under {picks} picks leaves "
+            f"{max(0, room)} for a prefix of {prefix_length}; raise "
+            "index_topk or pass the indexer's own selection"
+        )
+    return room
+
+
+def ancestry(parents):
+    """Each node's own line of descent, root first, as tree row indices.
+
+    Parents precede children, so a node's line is its parent's line and
+    itself -- one pass, and no node's chain is walked twice.
+    """
+    lines = []
+    for node, parent in enumerate(parents):
+        lines.append(([] if parent < 0 else lines[parent]) + [node])
+    return lines
+
+
+def branch_depths(parents):
+    """How far each node stands from the committed prefix.
+
+    A chain's row index is its depth, so nothing needed saying until now; in a
+    tree the two part company, and it is the depth that rope must see.
+    Parents precede children, so one pass suffices.
+    """
+    depths = []
+    for node, parent in enumerate(parents):
+        depths.append(0 if parent < 0 else depths[parent] + 1)
+    return depths
+
+
 def ancestor_rows(parents, prefix_length, picks, prefix_picks=None):
     """One row of key positions a draft token may attend to.
 
@@ -25,20 +68,19 @@ def ancestor_rows(parents, prefix_length, picks, prefix_picks=None):
     `prefix_picks` caps how much of the committed prefix each row carries,
     which is what makes the row fit `picks`: the prefix is shared by every row
     and the engine already selects it sparsely, so the caller passes the
-    selection it would have made anyway.
+    selection it would have made anyway. With none supplied the whole prefix
+    has to fit -- see `prefix_room`.
+
+    This is the rule in one place and in plain Python, which is what the
+    checks read; the engine's own writer puts the same rule in the buffer
+    without building a row at a time.
     """
     if prefix_picks is None:
-        prefix_picks = max(0, picks - len(parents))
+        prefix_picks = prefix_room(len(parents), prefix_length, picks)
     shared = list(range(max(0, prefix_length - prefix_picks), prefix_length))
     rows = []
-    for node in range(len(parents)):
-        chain = []
-        walk = node
-        while walk >= 0:
-            chain.append(prefix_length + walk)
-            walk = parents[walk]
-        chain.reverse()
-        row = shared + chain
+    for line in ancestry(parents):
+        row = shared + [prefix_length + node for node in line]
         if len(row) > picks:
             # The ancestors are what correctness needs; the prefix is already
             # a selection, so it is the prefix that gives way.
