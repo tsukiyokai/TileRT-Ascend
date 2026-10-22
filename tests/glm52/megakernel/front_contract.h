@@ -43,6 +43,15 @@ MEGAKERNEL_FRONT_DEVICE constexpr int64_t PartOffset(int64_t part)
     return offset;
 }
 
+// Every core's slice has the same aligned stride.
+MEGAKERNEL_FRONT_DEVICE constexpr int64_t SliceStride(int64_t columns,
+                                                      int64_t blocks)
+{
+    const int64_t even = (columns + blocks - 1) / blocks;
+    return (even + kColumnGranularity - 1) / kColumnGranularity
+        * kColumnGranularity;
+}
+
 // A core's contiguous share of `columns`, aligned so the cube sees whole
 // fractal blocks. Cores past the end receive no work.
 struct Slice {
@@ -51,15 +60,13 @@ struct Slice {
 
 MEGAKERNEL_FRONT_DEVICE constexpr Slice SliceFor(int64_t columns, int64_t blocks, int64_t index)
 {
-    const int64_t even = (columns + blocks - 1) / blocks;
-    const int64_t aligned =
-        (even + kColumnGranularity - 1) / kColumnGranularity * kColumnGranularity;
-    const int64_t offset = index * aligned;
+    const int64_t stride = SliceStride(columns, blocks);
+    const int64_t offset = index * stride;
     if (offset >= columns) {
         return {columns, 0};
     }
     const int64_t remaining = columns - offset;
-    return {offset, remaining < aligned ? remaining : aligned};
+    return {offset, remaining < stride ? remaining : stride};
 }
 
 struct Config {

@@ -25,11 +25,15 @@ __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* bytes)
     }
 }
 
-// One invocation over `slice` of the concatenated output. `orgKc` keeps the
-// product's row stride at the full width whatever this core computes.
+// One invocation over `slice`. `SetOrgShape`'s `N` is the weight's row stride
+// and `Kc` the product's, so each tensor keeps its own layout: a column window
+// of the wide matrix writing the concatenated product, or a core's contiguous
+// matrix writing its own product block.
 __aicore__ inline void Project(Projection& mm, const Config& config,
                                GM_ADDR hidden, GM_ADDR weight, GM_ADDR product,
-                               const Slice& slice, int64_t column)
+                               const Slice& slice,
+                               int64_t weight_offset, int64_t weight_stride,
+                               int64_t product_offset, int64_t product_stride)
 {
     if (slice.width == 0) {
         return;
@@ -37,11 +41,11 @@ __aicore__ inline void Project(Projection& mm, const Config& config,
     GlobalTensor<bfloat16_t> a, b;
     GlobalTensor<float> c;
     a.SetGlobalBuffer((__gm__ bfloat16_t*)hidden, config.rows * kHidden);
-    b.SetGlobalBuffer((__gm__ bfloat16_t*)weight + column + slice.offset,
-                      (kHidden - 1) * kColumns + slice.width);
-    c.SetGlobalBuffer((__gm__ float*)product + column + slice.offset,
-                      (config.rows - 1) * kColumns + slice.width);
-    mm.SetOrgShape(config.rows, kColumns, kHidden, kColumns, kColumns);
+    b.SetGlobalBuffer((__gm__ bfloat16_t*)weight + weight_offset,
+                      (kHidden - 1) * weight_stride + slice.width);
+    c.SetGlobalBuffer((__gm__ float*)product + product_offset,
+                      (config.rows - 1) * product_stride + slice.width);
+    mm.SetOrgShape(config.rows, weight_stride, kHidden, kHidden, product_stride);
     mm.SetSingleShape(config.rows, slice.width, kHidden);
     mm.SetTensorA(a);
     mm.SetTensorB(b, false);
@@ -65,15 +69,18 @@ void Kernel(uint64_t sync, Config config, Addresses addresses)
         const int64_t index = GetBlockIdx();
 #ifdef MEGAKERNEL_FRONT_SPLIT
         for (int64_t part = 0; part < kParts; ++part) {
+            const Slice slice = SliceFor(kPartColumns[part], config.blocks,
+                                         index);
+            const int64_t column = PartOffset(part) + slice.offset;
             Project(mm, config, (GM_ADDR)addresses.hidden,
                     (GM_ADDR)addresses.weight, (GM_ADDR)addresses.product,
-                    SliceFor(kPartColumns[part], config.blocks, index),
-                    PartOffset(part));
+                    slice, column, kColumns, column, kColumns);
         }
 #else
+        const Slice slice = SliceFor(kColumns, config.blocks, index);
         Project(mm, config, (GM_ADDR)addresses.hidden,
                 (GM_ADDR)addresses.weight, (GM_ADDR)addresses.product,
-                SliceFor(kColumns, config.blocks, index), 0);
+                slice, slice.offset, kColumns, slice.offset, kColumns);
 #endif
     }
     PipeBarrier<PIPE_ALL>();

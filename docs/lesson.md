@@ -64,7 +64,13 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
-
+- A broken kernel keeps the clock. The packed weight variant produced NaN and
+  errors of 464 against magnitudes of 331, and timed within noise of the correct
+  arm at every width. Only the digest comparison caught it.
+- Read the API's meaning from a working call in the same repository, not from the
+  parameter's name. In `SetOrgShape(M, N, Ka, Kb, Kc)` the weight's row stride is
+  `N` and `Kb` is the reduction length; putting the stride in `Kb` compiles, runs,
+  and is silently wrong when the layout actually differs.
 - A Python error inside a graph capture is reported as a capture failure. Read
   the traceback before suspecting the hardware.
 - Code appended after the point that consumes it never runs. Three times in one

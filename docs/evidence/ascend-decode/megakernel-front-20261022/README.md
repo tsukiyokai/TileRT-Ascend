@@ -47,3 +47,34 @@ here. One die, no tensor-parallel reduction, no model.
 
 [`run.sh`](run.sh) is the alternating runner and the JSON files are its output,
 one a width a pass an arm.
+
+## The core count, and where the kernel still loses
+
+Sweeping the cores at twelve rows, both arms numerically correct to 6.4e-4:
+
+| blocks | fused us | split us | saving us |
+| ---: | ---: | ---: | ---: |
+| 4 | 152.69 | 214.65 | 61.96 |
+| 8 | 97.07 | 134.23 | 37.16 |
+| 12 | 63.75 | 132.69 | 68.94 |
+| 16 | 65.68 | 118.27 | 52.59 |
+| 20 | 59.36 | 103.83 | 44.47 |
+| 24 | 48.64 | 82.50 | 33.86 |
+
+Twenty-four cores is best for both, so the fused arm's 48 microseconds is not a
+core-count problem. It is a tiling one: `torch.matmul` computes the same
+`[12, 6144] x [6144, 3040]` in 39.12 microseconds, and 37.36 MB at the die's
+1600 GB/s would be 23. So the stage as built sits at 768 GB/s against the
+vendor's 955 and a bandwidth ceiling of 1600.
+
+## An open hypothesis, and why it is not recorded as a result
+
+Each core reads 128 columns out of a 3040-column row, so 256 contiguous bytes
+every 6080. A weight arranged as one contiguous matrix a core would remove that
+stride, and three attempts to build it -- correcting `SetOrgShape`'s weight
+stride, giving the product its own per-core block, and matching the host tiling's
+org width to the kernel's -- all produced errors near 500 against magnitudes
+near 330. The variant is removed rather than kept: its timings were within noise
+of the correct arm at every width while it returned NaN, so they establish
+nothing. The hypothesis stands, and the gap it would address is the 48 against
+23 microseconds above.

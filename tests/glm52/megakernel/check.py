@@ -38,7 +38,8 @@ def operands(rows, device, generator):
 
 
 def run(front, held, rows, blocks, sync, tiling, system):
-    product = torch.zeros(rows, COLUMNS, dtype=torch.float, device=held['hidden'].device)
+    product = torch.zeros(rows, COLUMNS, dtype=torch.float,
+                          device=held['hidden'].device)
     front.forward(held['hidden'], held['weight'], product, tiling, system,
                   blocks, sync)
     torch.npu.synchronize()
@@ -81,7 +82,7 @@ def main():
     for index in range(args.inputs):
         held = operands(args.rows, args.device, generator)
         product = run(front, held, args.rows, args.blocks, sync, tiling, system)
-        reference = (held['hidden'].float() @ held['weight'].float())
+        reference = held['hidden'].float() @ held['weight'].float()
         cases.append({
             'input': index,
             'product_sha256': torch.sum(product.cpu().view(torch.int32).long()).item(),
