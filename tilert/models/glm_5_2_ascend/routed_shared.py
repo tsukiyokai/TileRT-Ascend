@@ -32,8 +32,15 @@ ACTIVE_LIBRARY_DIR = Path(os.environ.get(
 
 
 def library_paths():
-    return [directory / "routed_int4_torch.so"
-            for directory in (LIBRARY_DIR, ACTIVE_LIBRARY_DIR)]
+    """The accepted library, and the candidate once it has been built.
+
+    `namespace_name` reaches the candidate only at 24 blocks and width 12, so
+    an arm at any other width has no call to it and must not fail to start
+    because a comparison candidate is absent.
+    """
+    candidate = ACTIVE_LIBRARY_DIR / "routed_int4_torch.so"
+    return ([LIBRARY_DIR / "routed_int4_torch.so"]
+            + ([candidate] if candidate.exists() else []))
 
 
 def pack_shared_weights(gate_up, down):
