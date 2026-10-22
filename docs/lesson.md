@@ -73,6 +73,12 @@ order a mistake usually happens:
   `OpCompileProcessor init failed`, which this project had recorded as an
   environment fault in its own right. Read the Python traceback, not the Ascend
   log's tail: the real line was `No module named 'tbe'`.
+- Separate waiting on the other half from waiting on your own. The FFN's cube
+  waits 67.52 microseconds, of which 39.77 is for the vector stages -- which
+  skewing can take, up to the 23.40 of vector work that exists -- and 27.75 is
+  for other cube cores. The second is 81 experts not dividing by 24 cores, and
+  levelling it means splitting an expert across cores, which buys another
+  reduction walk. Not all idle time is recoverable.
 - A pipeline step on the cube costs a reduction walk. Cutting the front stage
   into eight steps to interleave the vector half added 70 microseconds of walks
   to hide 25 of vector work. Skewing pays only where the cube is already divided

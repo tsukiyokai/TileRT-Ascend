@@ -41,6 +41,40 @@ precede `gate_up` respectively, so a complete pipeline has to skew all five
 stages, not the pair coupled here. That is what the remaining seven of the ten
 microseconds would come from.
 
+## The FFN's floor, and why the imbalance cannot be fixed
+
+Per cube core at twelve rows, from the same trace:
+
+| stage | work min | median | max | spread | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| gate_up_matmul | 38.28 | 40.36 | 50.28 | 1.31x | 43.16 |
+| down_matmul | 28.32 | 29.65 | 35.31 | 1.25x | 30.89 |
+
+A stage ends when its slowest core does, so the cube's critical path is
+50.28 + 35.31 = 85.59 microseconds. The 1.31 spread is exactly 4/3: 81 active
+experts over 24 cores gives nine cores four experts and fifteen three, and the
+cube's cost is per expert -- about 12.8 microseconds, the reduction walk --
+rather than per row.
+
+That imbalance is not fixable. Levelling it means splitting one expert's rows
+across two cores, which is another invocation and so another walk of a 6144
+reduction, about 13 microseconds each. Twenty-four such splits would cost three
+hundred.
+
+So the body's window decomposes as
+
+    136.40 = 85.59 cube critical path
+           + 23.40 vector work, none of it hidden today
+           + 27.4 residue, the cube waiting on the cube
+
+and a complete skew removes the middle term only, landing near 113. The whole
+FFN side is worth about 23 microseconds, of which this entry takes 2.94.
+
+It also qualifies a framing from earlier today. The layer's roughly 500
+microseconds of waiting is not all recoverable: waiting on the other half is,
+bounded by the vector work there is to hide, while waiting on one's own half is
+locked by the walk cost of dividing the work more finely.
+
 ## Scope
 
 Synthetic routing, two banks, one die, no tensor-parallel reduction. The
