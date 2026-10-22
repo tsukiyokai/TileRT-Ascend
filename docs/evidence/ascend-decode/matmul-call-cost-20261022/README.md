@@ -67,3 +67,27 @@ today.
 [`call_cost_graph.py`](call_cost_graph.py) is the controlled measurement,
 [`call_cost.py`](call_cost.py) the two-size sweep, and the JSON files record
 both along with the projection and weight-size sweeps.
+
+## Where the lever is still untaken
+
+The 18.5 microseconds is the cost of a separate vendor operator invocation. It
+is not the cost of an `IterateAll` inside an AscendC kernel, which is a loop
+rather than a launch, and the native sources already hoist `Matmul::Init` out of
+their tile loops. Partitioning the indexer front's two projections across core
+groups so each core pays one `Init` instead of two saved 7.16 microseconds at
+M=12 with C8 caches, so the in-kernel figure is about 7, not 18.5.
+
+That resolves an apparent contradiction. The native FFN beats the stock CANN
+chain 161 against 310 microseconds, which is roughly eight operator prologues,
+and yet the native whole layer at 574.15 matches the vendor whole layer at
+575.22. The reference the native FFN beats is not what the engine runs: the
+engine's own SuperKernel already fuses GatherV3, QuantBatchMatmulV3,
+GroupedMatmul, ForeachAddList and DynamicQuant. A kernel census of a round found
+about eight `sk_*` a layer and **zero** whose name mentions attention.
+
+So the FFN's prologue cost is taken twice over -- by the engine's SuperKernel and
+by the native body -- while attention's is taken by neither. Attention's two
+projection phases measure 99 microseconds against 8.3 of weight bytes, and the
+composed native attention entry beats separate stages by only 11.6. The
+remaining 91 microseconds a layer, 7.1 milliseconds a round, is the one place
+where a megakernel has something that neither path has already claimed.
