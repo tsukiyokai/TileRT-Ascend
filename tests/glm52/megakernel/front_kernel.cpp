@@ -131,6 +131,11 @@ void Kernel(uint64_t sync, Config config, Addresses addresses)
     if ASCEND_IS_AIV {
         Reduce(pipe, config, addresses);
     }
+    // A skewed pipeline pays one grid barrier a step, so these price the step
+    // against the work they would let overlap.
+    for (int64_t step = 0; step < config.barriers; ++step) {
+        SyncAll<false>();
+    }
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::DDR>();
 }

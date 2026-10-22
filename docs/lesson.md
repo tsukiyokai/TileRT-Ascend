@@ -68,6 +68,11 @@ order a mistake usually happens:
   win before any mechanism was proposed for why.
 
 ## When implementing
+- Fit the increment, not the total. Fitting invocation cost against K gave
+  `11.6 + 0.000985 K` and the 11.6 was read as a per-invocation fixed cost; it
+  is the kernel's, paid once. Fitting the *extra* invocation gave an intercept
+  of -1.58 and settled it. The wrong reading had already produced a conclusion
+  that 2 ms needs model-structural change.
 - A mechanism that wins once is not a rule, and the variable may not be the one
   you named. Concatenating projections that share an activation saves 31 
   microseconds at a reduction of 6144 and loses 2 at 2048, both removing exactly

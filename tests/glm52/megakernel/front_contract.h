@@ -78,6 +78,9 @@ struct Config {
     // Vector passes over the activation, run on the AIV half while the cube
     // works. Sweeping this says how much vector work the cube hides for free.
     int64_t vector_passes;
+    // Grid barriers to issue around the work. A skewed pipeline pays one a
+    // step, so this prices the step.
+    int64_t barriers;
 };
 
 MEGAKERNEL_FRONT_DEVICE constexpr int64_t TotalColumns(const Config& config)
@@ -112,7 +115,7 @@ constexpr bool Valid(const Config& config, const Addresses& addresses)
         || config.reduction < 1
         || config.part_count < 1 || config.part_count > kMaxParts
         || config.weight_stride * config.element_bytes % kStrideBytes != 0
-        || config.vector_passes < 0) {
+        || config.vector_passes < 0 || config.barriers < 0) {
         return false;
     }
     int64_t columns = 0;

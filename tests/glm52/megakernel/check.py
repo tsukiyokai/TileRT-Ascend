@@ -42,6 +42,14 @@ LEVELS = {
     },
 }
 
+# Prolog's columns against a shrinking reduction, to separate a matmul call's
+# fixed cost from the cost of walking its reduction.
+for _depth in (256, 512, 1024, 2048, 4096, 6144):
+    LEVELS[f'depth{_depth}'] = {
+        'reduction': _depth,
+        'parts': {'query_latent': 2048, 'kv_latent_rope': 576},
+    }
+
 
 def load(library):
     ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
@@ -68,9 +76,9 @@ def operands(level, rows, stride, element, device, generator):
 
 
 def submit(front, held, parts, blocks, sync, tiling, system, witness, product,
-           vector_passes):
+           vector_passes, barriers):
     front.forward(held['activation'], held['weight'], product, tiling, system,
-                  witness, blocks, parts, vector_passes, sync)
+                  witness, blocks, parts, vector_passes, barriers, sync)
 
 
 def timed(submit_once, iterations):
@@ -98,6 +106,7 @@ def main():
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--stride', type=int, default=0)
     parser.add_argument('--vector-passes', type=int, default=0)
+    parser.add_argument('--barriers', type=int, default=0)
     parser.add_argument('--base-m', type=int, default=-1)
     parser.add_argument('--base-n', type=int, default=-1)
     parser.add_argument('--base-k', type=int, default=-1)
@@ -127,7 +136,7 @@ def main():
                               device=args.device)
         witness.zero_()
         submit(front, held, parts, args.blocks, sync, tiling, system, witness,
-               product, args.vector_passes)
+               product, args.vector_passes, args.barriers)
         torch.npu.synchronize()
         computed = product[:, :columns]
         reference = (held['activation'].float()
@@ -158,7 +167,8 @@ def main():
                           device=args.device)
     samples = [timed(lambda: submit(front, held, parts, args.blocks, sync,
                                     tiling, system, witness, product,
-                                    args.vector_passes), args.iterations)
+                                    args.vector_passes,
+                                    args.barriers), args.iterations)
                for _ in range(args.repeats)]
 
     print(json.dumps({
@@ -167,6 +177,7 @@ def main():
         'columns': columns, 'weight_stride': stride,
         'element_bytes': front.element_bytes(),
         'vector_passes': args.vector_passes,
+        'barriers': args.barriers,
         'vector_expected': expected,
         'vector_published_min': published.min().item(),
         'vector_published_max': published.max().item(),
