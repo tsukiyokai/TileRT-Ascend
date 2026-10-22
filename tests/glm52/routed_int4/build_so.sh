@@ -1,56 +1,126 @@
 #!/usr/bin/env bash
-# Build the kernel as a torch extension the graph can call.
-#
-# Three objects: the kernel through `bisheng`, the host tiling, and the torch
-# binding. The only difference from `build.sh` is `-fPIC` and the torch link
-# line. ABI 1 is what this box's torch reports, and an operator project would
-# force ABI 0 through its own cmake, so the two worlds cannot share an object.
 set -euo pipefail
-out=${1:-/tmp/int4-so}
-# The kernel's rows an expert is a compile-time constant and the binding reads
-# the same define, so both objects must be given it.
-capacity=${CAPACITY:+-DROWS_PER_EXPERT=$CAPACITY}
-here=$(cd "$(dirname "$0")" && pwd)
-H=/opt/ascend/cann-9.2.0/aarch64-linux
-SP=${SITE_PACKAGES:-/opt/trt-asc/venv/lib/python3.11/site-packages}
-
-mkdir -p "$out"
-device_incs=""
-for d in asc/impl/adv_api asc/impl/basic_api asc/impl/c_api \
-         asc/impl/basic_api/reg_compute asc/impl/simt_api asc/impl/utils asc \
-         asc/include asc/include/adv_api asc/include/basic_api \
-         asc/include/c_api asc/include/basic_api/reg_compute \
-         asc/include/simt_api asc/include/utils tikcpp/tikcfw \
-         tikcpp/tikcfw/impl tikcpp/tikcfw/interface tikcpp/tikcfw/lib; do
-  device_incs="$device_incs -I $H/$d"
+source "$(dirname -- "${BASH_SOURCE[0]}")/build_common.sh"
+routed_variant_flags=()
+case ${ROUTED_PARTIALS:-int32} in
+  int32) routed_default_out=$routed_here/build ;;
+  fp16)
+    routed_variant_flags=(-DROUTED_FIXPIPE_HALF)
+    routed_default_out=$routed_here/build-fixpipe
+    ;;
+  *) echo 'ROUTED_PARTIALS must be int32 or fp16' >&2; exit 2 ;;
+esac
+if [[ ${ROUTED_CONTROL:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 ]]; then
+    echo 'ROUTED_CONTROL requires INT32 partials' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_CONTROL)
+  routed_default_out=$routed_here/build-control
+fi
+if [[ ${ROUTED_ROW_BALANCED:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 ]]; then
+    echo 'ROUTED_ROW_BALANCED requires INT32 partials and no control variant' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_ROW_BALANCED)
+  if [[ ${ROUTED_BALANCED_NAMESPACE:-1} == 1 ]]; then
+    routed_variant_flags+=(-DROUTED_BALANCED_NAMESPACE)
+    routed_default_out=$routed_here/build-balanced
+  else
+    routed_default_out=$routed_here/build-balanced-promoted
+  fi
+fi
+if [[ ${ROUTED_SHARED_PIPELINE:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 \
+        || ${ROUTED_ROW_BALANCED:-0} != 1 ]]; then
+    echo 'ROUTED_SHARED_PIPELINE requires the balanced INT32 schedule' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_SHARED_PIPELINE -DSHARED_W8_GROUPED_QUANT=1)
+  routed_default_out=$routed_here/build-pipeline
+fi
+if [[ ${ROUTED_GU_MDL:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 \
+        || ${ROUTED_ROW_BALANCED:-0} != 1 \
+        || ${ROUTED_SHARED_PIPELINE:-0} != 0 ]]; then
+    echo 'ROUTED_GU_MDL requires the separate balanced INT32 kernel' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_GU_MDL)
+  routed_default_out=$routed_here/build-gu-mdl
+fi
+if [[ ${ROUTED_GU_PAD16:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 \
+        || ${ROUTED_ROW_BALANCED:-0} != 1 \
+        || ${ROUTED_SHARED_PIPELINE:-0} != 0 || ${ROUTED_GU_MDL:-0} != 0 ]]; then
+    echo 'ROUTED_GU_PAD16 requires the separate balanced INT32 Norm kernel' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_GU_PAD16)
+  routed_default_out=$routed_here/build-gu-pad16
+fi
+if [[ ${ROUTED_INPUT_FRONT:-0} == 1 ]]; then
+  if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 \
+        || ${ROUTED_ROW_BALANCED:-0} != 1 \
+        || ${ROUTED_GU_MDL:-0} != 0 \
+        || ${ROUTED_GU_PAD16:-0} != 0 ]]; then
+    echo 'ROUTED_INPUT_FRONT requires the balanced INT32 Norm kernel' >&2
+    exit 2
+  fi
+  routed_variant_flags+=(-DROUTED_INPUT_FRONT)
+  routed_default_out=$routed_here/build-input-front
+  if [[ ${ROUTED_SHARED_PIPELINE:-0} == 1 ]]; then
+    routed_default_out=$routed_here/build-pipeline-front
+  fi
+fi
+routed_out=${1:-$routed_default_out}
+routed_python=${PYTHON_BIN:-python3}
+routed_site=${SITE_PACKAGES:-}
+if [[ -z "$routed_site" ]]; then
+  routed_site=$("$routed_python" -c \
+    'import pathlib, torch; print(pathlib.Path(torch.__file__).parent.parent)')
+fi
+routed_abi=${TORCH_CXX11_ABI:-}
+if [[ -z "$routed_abi" ]]; then
+  routed_abi=$("$routed_python" -c \
+    'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')
+fi
+for required in "$routed_site/torch/include" "$routed_site/torch_npu/include"; do
+  if [[ ! -d "$required" ]]; then
+    echo "Torch extension headers not found: $required" >&2
+    exit 2
+  fi
 done
-device_incs="$device_incs -I /opt/ascend/cann-9.2.0/include -I $here"
-host_incs="-I $H/tikcpp/tikcfw -I $H/tikcpp/tikcfw/lib -I $H/tikcpp/tikcfw/impl"
-host_incs="$host_incs -I /opt/ascend/cann-9.2.0/include -I $here"
-torch_incs="-I $SP/torch/include -I $SP/torch/include/torch/csrc/api/include"
-torch_incs="$torch_incs -I $SP/torch_npu/include"
-
-/opt/ascend/cann-9.2.0/bin/bisheng -xcce --npu-arch=dav-2201 -std=c++17 -O2 \
-  -fPIC $capacity $device_incs -c "$here/routed_int4_kernel.cpp" \
-  -o "$out/kernel.o" > "$out/kernel.log" 2>&1
-g++ -std=c++17 -O2 -fPIC $host_incs -c "$here/routed_int4_tiling.cpp" \
-  -o "$out/tiling.o" > "$out/tiling.log" 2>&1
-g++ -std=c++17 -O2 -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 \
-  $capacity $torch_incs $host_incs -c "$here/routed_int4_binding.cpp" \
-  -o "$out/binding.o" > "$out/binding.log" 2>&1
-g++ -shared "$out/kernel.o" "$out/tiling.o" "$out/binding.o" \
-  -o "$out/routed_int4_torch.so" \
-  -L"$H/lib64" -L/opt/ascend/cann-9.2.0/lib64 \
-  -L"$SP/torch/lib" -L"$SP/torch_npu/lib" \
-  -ltiling_api -lplatform -lascendcl -lruntime -lunified_dlog -lc_sec \
-  -lregister -lprofapi -ltorch -ltorch_cpu -lc10 -ltorch_npu \
-  > "$out/link.log" 2>&1
-
-[ -f "$out/routed_int4_torch.so" ] && echo "built $out/routed_int4_torch.so" || {
-  echo "build failed"
-  for log in kernel tiling binding link; do
-    printf -- "--- %s\n" "$log"
-    tail -5 "$out/$log.log" 2>/dev/null
-  done
-  exit 1
-}
+routed_torch_includes=(-I "$routed_site/torch/include"
+  -I "$routed_site/torch/include/torch/csrc/api/include"
+  -I "$routed_site/torch_npu/include")
+mkdir -p "$routed_out"
+routed_compile "$routed_out/kernel.log" "$routed_bisheng" \
+  "${routed_device_flags[@]}" "${routed_device_includes[@]}" \
+  "${routed_variant_flags[@]}" \
+  -c "$routed_here/routed_int4_kernel.cpp" -o "$routed_out/kernel.o"
+routed_compile "$routed_out/tiling.log" "$routed_cxx" -std=c++17 -O2 -fPIC \
+  "${routed_host_includes[@]}" "${routed_variant_flags[@]}" \
+  -c "$routed_here/routed_int4_tiling.cpp" \
+  -o "$routed_out/tiling.o"
+routed_extra_objects=()
+if [[ ${ROUTED_SHARED_PIPELINE:-0} == 1 ]]; then
+  routed_compile "$routed_out/shared_tiling.log" "$routed_cxx" -std=c++17 -O2 -fPIC \
+    "${routed_host_includes[@]}" "${routed_variant_flags[@]}" \
+    -c "$routed_here/routed_int4_pipeline_tiling.cpp" \
+    -o "$routed_out/shared_tiling.o"
+  routed_extra_objects+=("$routed_out/shared_tiling.o")
+fi
+routed_compile "$routed_out/binding.log" "$routed_cxx" -std=c++17 -O2 -fPIC \
+  "-D_GLIBCXX_USE_CXX11_ABI=$routed_abi" "${routed_torch_includes[@]}" \
+  "${routed_host_includes[@]}" "${routed_variant_flags[@]}" \
+  -c "$routed_here/routed_int4_binding.cpp" \
+  -o "$routed_out/binding.o"
+routed_compile "$routed_out/link.log" "$routed_cxx" -shared \
+  "$routed_out/kernel.o" "$routed_out/tiling.o" "$routed_out/binding.o" \
+  "${routed_extra_objects[@]}" \
+  -o "$routed_out/routed_int4_torch.so" "${routed_libs[@]}" \
+  -L "$routed_site/torch/lib" -L "$routed_site/torch_npu/lib" \
+  -ltorch -ltorch_cpu -lc10 -ltorch_npu
+printf 'Built %s\n' "$routed_out/routed_int4_torch.so"

@@ -8,35 +8,41 @@
  */
 #include <cstring>
 
+#include "routed_int4_kernel.h"
 #include "lib/matmul/matmul_tiling.h"
 
 extern "C" int routed_int4_build_tiling(int rows, int columns, int inner,
-                                   int width, void* buffer)
+                                   int width, void* buffer, int64_t weight_layout)
 {
+    if (!routed_int4::IsWeightLayout(weight_layout)) {
+        return -1;
+    }
     matmul_tiling::MatmulApiTiling tiling;
-    // Both operands are INT4, which is the only pair the cube's `mad_s4`
-    // takes and the only one the library will pass: it rejects a mixed pair
-    // because it plans to widen INT4 to INT8 entering L1.
+    // All dimensions count INT4 elements, including NZ's 64-element C0.
     tiling.SetAType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
                     matmul_tiling::DataType::DT_INT4, false);
     tiling.SetBType(matmul_tiling::TPosition::GM,
-                    matmul_tiling::CubeFormat::ND,
+                    weight_layout == routed_int4::kWeightNZ
+                        ? matmul_tiling::CubeFormat::NZ
+                        : matmul_tiling::CubeFormat::ND,
                     matmul_tiling::DataType::DT_INT4, false);
     tiling.SetCType(matmul_tiling::TPosition::GM,
                     matmul_tiling::CubeFormat::ND,
+#ifdef ROUTED_FIXPIPE_HALF
+                    matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetDequantType(matmul_tiling::DequantType::TENSOR);
+#else
                     matmul_tiling::DataType::DT_INT32);
+#endif
     tiling.SetShape(rows, columns, inner);
     tiling.SetOrgShape(rows, width, inner);
     tiling.SetBias(false);
-    // No fixed split here. The 128 by 512 corner that is worth 16% on the
-    // INT8 kernel costs this one a factor of two: swept at sixteen experts
-    // on sixteen blocks, the library's own choice gives 39.480 µs against
-    // 80.243 at 128 by 512, 79.756 at 128 by 1024 and 39.276 at 256 by 512.
-    // The lever does not transfer across the operand width.
     tiling.SetBufferSpace(-1, -1, -1);
 
     AscendC::tiling::TCubeTiling cube;
+    static_assert(sizeof(cube) <= routed_int4::kTilingBytes,
+                  "Increase the shared tiling allocation for this CANN version");
     const int64_t status = tiling.GetTiling(cube);
     if (status != 0) {
         return static_cast<int>(status);

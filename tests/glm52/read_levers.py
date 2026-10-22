@@ -27,7 +27,7 @@ def read(directory):
     """One arm's round time, acceptance and phase breakdown."""
     record = json.loads((directory / "rank-0.json").read_text())
     requests = [item for item in record.get("requests", [])
-                if not item.get("warmup")]
+                if not item.get("warmup") and not item.get("profiled")]
     if not requests:
         return None
     rounds = []

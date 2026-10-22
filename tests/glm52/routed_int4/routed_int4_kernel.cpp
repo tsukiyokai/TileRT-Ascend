@@ -1,308 +1,216 @@
-/**
- * The routed experts with INT4 weights, which halves the dominant term.
+/** TP16 W4A8 routed experts with explicit scratch and deterministic combine.
  *
- * The INT8 form of this kernel is weight-streaming bound at 66% of the die's
- * bandwidth, and the model is W4A8, so it carries twice the bytes it needs
- * to. The cube's only INT4 instruction is `mad_s4`, which wants both operands
- * INT4, and the `Matmul` library passes a homogeneous INT4 pair while
- * rejecting a mixed one. So the INT8 activation becomes two INT4 halves --
- * the technique CANN's own `a8w4_msd` stages use -- and the halves stack
- * along M rather than taking a matmul each, so the weight is still read once:
- *
- *     x = 16 * high + low,  C[r] = 16 * C'[r] + C'[STRIDE + r]
- *
- * Two signed INT4 reach [-136, 119], so an INT8 of 120 or more has no exact
- * pair. Rather than carry a correction term, the quantisation divides by 119.
- * That is 0.56 dB of range against 4-bit weights, and it makes every stage
- * exact.
- *
- * [int4-weights-20261020](../../../docs/evidence/ascend-decode/int4-weights-20261020/README.md)
+ * Numerical order: FP16(s_trunc * high_dot), FP16(s_trunc * low_dot),
+ * FP32(16 * high + low + scaled_correction), activation scale. Gate/up stay
+ * FP32 through SwiGLU and row quantization. Down results become BF16 before
+ * top-k probabilities are multiplied and accumulated in FP32 slot order.
  */
 #define ASCENDC_CUBE_ONLY
 
 #include "routed_int4_kernel.h"
+#include "routed_int4_dispatch.h"
+#include "routed_int4_trace.h"
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
+#ifdef ROUTED_DOWN_STRIPED
+#include "routed_int4_down_stripes.h"
+#endif
+#ifdef ROUTED_INPUT_FRONT
+#include "routed_int4_front.h"
+#endif
+
+#ifdef ROUTED_SHARED_PIPELINE
+#include "routed_int4_pipeline_native.h"
+#ifdef ROUTED_INPUT_FRONT
+#define routed_int4_fused routed_shared_front_fused
+#else
+#define routed_int4_fused routed_shared_fused
+#endif
+#elif defined(ROUTED_CONTROL)
+#define routed_int4_fused routed_int4_control_fused
+#elif defined(ROUTED_INPUT_FRONT)
+#define routed_int4_fused routed_int4_front_fused
+#elif defined(ROUTED_GU_MDL)
+#define routed_int4_fused routed_int4_mdl_fused
+#elif defined(ROUTED_GU_PAD16)
+#define routed_int4_fused routed_int4_pad16_fused
+#elif defined(ROUTED_BALANCED_NAMESPACE)
+#define routed_int4_fused routed_int4_balanced_fused
+#endif
 
 using namespace AscendC;
+using namespace routed_int4;
 
-constexpr int64_t HIDDEN = 6144;
-constexpr int64_t HALF = 128;
-constexpr int64_t GATE_UP = 2 * HALF;
-#ifndef ROWS_PER_EXPERT
-#define ROWS_PER_EXPERT 2
-#endif
-constexpr int64_t ROWS = ROWS_PER_EXPERT;
-// The cube works in sixteen-row tiles and the `Matmul` library reads and
-// writes the whole tile whatever M says, so every buffer along M carries one.
-// Without it the sanitizer reported reads of 928 and writes of 992 bytes off
-// the ends of `stacked`, `middle`, `partial` and `wide`.
-constexpr int64_t M_TILE = 16;
-// Where the low INT4 half starts in the M-stacked activation. Fixed at half a
-// cube tile, so one tiling serves every row count: the cube reads a whole
-// sixteen-row tile whatever M says, and the vector stages read only the rows
-// an expert actually has.
-constexpr int64_t STRIDE = M_TILE / 2;
-// Every routed expert a rank holds; the group list carries one count each.
-constexpr int64_t MAX_EXPERTS = 256;
-// The widest round, and every (expert, row) assignment in it: a draft of
-// thirty-two at top eight.
-constexpr int64_t MAX_TOKENS = 32;
-constexpr int64_t MAX_TAKEN = MAX_TOKENS * 8;
-// The two INT4 halves of the activation, stacked.
-constexpr int64_t STACKED = 2 * STRIDE;
-constexpr int64_t SLACK = 64;
-constexpr int64_t BLOCK_FLOATS = 8;
-constexpr int64_t SCALE_SPAN = ((STRIDE + BLOCK_FLOATS - 1) / BLOCK_FLOATS)
-                               * BLOCK_FLOATS;
-#ifndef TILE_SPAN
-#define TILE_SPAN 2048
-#endif
-constexpr int64_t TILE = TILE_SPAN;
-constexpr float QUANTUM_SPAN = 127.0F;
+namespace {
 
-/** The address `elements` INT4 values along from `base`.
- *
- * `int4b_t` is a struct, so neither its `sizeof` nor a `GlobalTensor`
- * subscript can be trusted to mean a nibble: a write addressed through
- * either landed nowhere in the allocation, while the same write at offset
- * zero landed every time, and the stale bytes it should have overwritten
- * read identically across completely different input data. So the arithmetic
- * goes through a byte pointer, where the unit is not in doubt.
- */
+constexpr int64_t kSlack = 64;
+constexpr int64_t kBlockFloats = 8;
+using APacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, false>;
+#ifdef ROUTED_FIXPIPE_HALF
+using RoutedProduct = half;
+#else
+using RoutedProduct = int32_t;
+#endif
+using CProduct = MatmulType<TPosition::GM, CubeFormat::ND, RoutedProduct>;
+using BiasNone = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
+template <CubeFormat format>
+using Projection = Matmul<APacked,
+    MatmulType<TPosition::GM, format, int4b_t, false>, CProduct, BiasNone>;
+#ifdef ROUTED_GU_MDL
+template <CubeFormat format>
+using GateProjection = Matmul<APacked,
+    MatmulType<TPosition::GM, format, int4b_t, false>, CProduct, BiasNone,
+    CFG_MDL>;
+#else
+template <CubeFormat format>
+using GateProjection = Projection<format>;
+#endif
+
+// int4b_t is a storage wrapper; physical pointer arithmetic uses bytes.
 __aicore__ inline __gm__ int4b_t* Nibbles(__gm__ int4b_t* base,
-                                          int64_t elements)
+                                         int64_t elements)
 {
     return (__gm__ int4b_t*)((__gm__ int8_t*)base + elements / 2);
 }
 
-constexpr uint16_t SPLIT_READY = 4;
-constexpr uint16_t GATE_READY = 5;
-constexpr uint16_t MIDDLE_READY = 6;
-constexpr uint16_t DOWN_READY = 7;
-
-using APacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, false>;
-using BPacked = MatmulType<TPosition::GM, CubeFormat::ND, int4b_t, false>;
-using CProduct = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
-using BiasNone = MatmulType<TPosition::GM, CubeFormat::ND, int32_t>;
-
-namespace {
+template <HardEvent event>
+__aicore__ inline void Fence()
+{
+    SetFlag<event>(EVENT_ID0);
+    WaitFlag<event>(EVENT_ID0);
+}
 
 __aicore__ inline void Publish()
 {
     DataSyncBarrier<MemDsbT::DDR>();
 }
 
-/* `PipeBarrier` is the single-pipe primitive -- it orders instructions of the
- * same pipe that carry a data dependency. Crossing pipes is what
- * `SetFlag`/`WaitFlag` are for, so `PIPE_ALL` is not defined to cover a
- * cross-pipe hazard: it is absent from the headers' own `SUPPORTED_PIPE` and
- * the Ascend checker flags it as `AKA3001`. These three name the hazards this
- * kernel actually has.
- *
- * All three name vector events, so they may only be called from the vector
- * half: on the cube half of a `__mix__` kernel `WaitFlagImpl` guards those
- * cases behind `#ifndef SPLIT_CORE_CUBE` and falls through to `break`, while
- * `SetFlagImpl` has no such guard -- the flag would be raised and never
- * consumed.
- */
+struct Workspace {
+    TBuf<TPosition::VECCALC> input_buf, value_buf, other_buf, work_buf;
+    TBuf<TPosition::VECCALC> half_buf, packed_buf, staging_buf, scale_buf;
+    TBuf<TPosition::VECCALC> mask_buf, token_buf, input_scale_buf;
+    TBuf<TPosition::VECCALC> activation_buf, maximum_buf;
+    TBuf<TPosition::VECCALC> count_buf, start_buf, source_buf, slot_buf;
+    TBuf<TPosition::VECCALC> weight_buf, original_weight_buf;
+    LocalTensor<int8_t> input;
+    LocalTensor<float> value, other, work, scale, token, activation, maximum;
+    LocalTensor<float> weight, original_weight, input_scale;
+    LocalTensor<half> half_value;
+    LocalTensor<int4b_t> packed;
+    LocalTensor<int32_t> staging, mask, count, start, source, slot;
 
-/** Order a load into UB against the vector work that reads it. */
-__aicore__ inline void AfterLoad()
-{
-    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-}
+    __aicore__ inline void Init(TPipe& pipe)
+    {
+        constexpr int64_t span = kVectorTile + kSlack;
+        pipe.InitBuffer(input_buf, span);
+        pipe.InitBuffer(value_buf, span * sizeof(float));
+        pipe.InitBuffer(other_buf, span * sizeof(float));
+        pipe.InitBuffer(work_buf, span * sizeof(float));
+        pipe.InitBuffer(half_buf, span * sizeof(half));
+        pipe.InitBuffer(packed_buf, span / 2 + kSlack);
+        pipe.InitBuffer(staging_buf, span * sizeof(int32_t));
+        pipe.InitBuffer(scale_buf, span * sizeof(float));
+        pipe.InitBuffer(mask_buf, span * sizeof(int32_t));
+        pipe.InitBuffer(token_buf, kMaxRowsPerExpert * sizeof(float));
+        pipe.InitBuffer(input_scale_buf, kMaxTokens * sizeof(float));
+        pipe.InitBuffer(activation_buf,
+                        kMaxRowsPerExpert * kIntermediate * sizeof(float));
+        pipe.InitBuffer(maximum_buf,
+                        kMaxRowsPerExpert * kBlockFloats * sizeof(float));
+        pipe.InitBuffer(count_buf, kMaxExperts * sizeof(int32_t));
+        pipe.InitBuffer(start_buf, kMaxExperts * sizeof(int32_t));
+        pipe.InitBuffer(source_buf, kMaxRoutes * sizeof(int32_t));
+        pipe.InitBuffer(slot_buf, kMaxRoutes * sizeof(int32_t));
+        pipe.InitBuffer(weight_buf, kMaxRoutes * sizeof(float));
+        pipe.InitBuffer(original_weight_buf, kMaxRoutes * sizeof(float));
+        input = input_buf.Get<int8_t>();
+        value = value_buf.Get<float>();
+        other = other_buf.Get<float>();
+        work = work_buf.Get<float>();
+        half_value = half_buf.Get<half>();
+        packed = packed_buf.Get<int4b_t>();
+        staging = staging_buf.Get<int32_t>();
+        scale = scale_buf.Get<float>();
+        mask = mask_buf.Get<int32_t>();
+        token = token_buf.Get<float>();
+        input_scale = input_scale_buf.Get<float>();
+        activation = activation_buf.Get<float>();
+        maximum = maximum_buf.Get<float>();
+        count = count_buf.Get<int32_t>();
+        start = start_buf.Get<int32_t>();
+        source = source_buf.Get<int32_t>();
+        slot = slot_buf.Get<int32_t>();
+        weight = weight_buf.Get<float>();
+        original_weight = original_weight_buf.Get<float>();
+        Duplicate(mask, int32_t(-8192), kVectorTile);
+        PipeBarrier<PIPE_V>();
+    }
+};
 
-/** Order vector work against the store that carries it out. */
-__aicore__ inline void BeforeStore()
-{
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-}
-
-/** Order a load into UB against the scalar read that follows it.
- *
- * A `GetValue` is a scalar-unit read, so the edge is `MTE2_S` and not
- * `MTE2_V` -- the vector edge says nothing about when the scalar unit may
- * look. `Narrow` reads its per-row scale with `GetValue` straight after the
- * copy that brings it in, and subblock one goes there with a cold buffer
- * where subblock zero has just run `Activate` on the same tensors. That is
- * why half the columns were wrong and the other half exact: 24571 of 24576 in
- * columns 3072 and above, 0 of 24576 below.
- */
-__aicore__ inline void AfterLoadForScalar()
-{
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-}
-
-/** Order a load against the vector work it is about to overwrite.
- *
- * The reverse direction, and the one a reused staging buffer needs. `MTE2_V`
- * says the data has arrived; `V_MTE2` says the consumer is finished and the
- * buffer may be refilled. Nothing in this kernel stalls MTE2, so without it
- * the next load runs ahead and clobbers what its consumer has not read --
- * which is how one `staging` tensor served two consecutive loads in
- * `Combine` and produced a row maximum that disagreed with the reference
- * while the product feeding it was exact.
- */
-__aicore__ inline void BeforeLoad()
-{
-    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-}
-
-/** Order a store against the vector work that overwrites what it read. */
-__aicore__ inline void AfterStore()
-{
-    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-}
-
-__aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* tiling)
+__aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* bytes)
 {
     auto* destination = (uint32_t*)&cube;
-    auto* source = (__gm__ uint32_t*)tiling;
+    auto* source = (__gm__ uint32_t*)bytes;
     for (uint32_t word = 0; word < sizeof(TCubeTiling) / sizeof(uint32_t);
          ++word) {
         destination[word] = source[word];
     }
 }
 
-/** One INT4 projection at full width, both operands packed. */
-/** One projection on a matmul that outlives the loop.
- *
- * Constructing a `Matmul` and calling `Init` once an expert exhausted
- * something after five experts a block: the sixth faulted with "the GM
- * address accessed by scalar exceeds 48 bits" at any expert count, any block
- * count, on both machines, and with the cross-core flags replaced by grid
- * barriers. `TPipe` hands out buffers cumulatively -- this file already
- * records that for the vector workspace -- and `Init` takes the cube's
- * scratch from the same pipe, so ten instantiations is what ran out.
- */
-__aicore__ inline void Project(Matmul<APacked, BPacked, CProduct, BiasNone>& mm,
-                               __gm__ int4b_t* rows,
+template <bool pad_rows = false, class MatmulType>
+__aicore__ inline void Project(MatmulType& mm, __gm__ int4b_t* rows,
                                __gm__ int4b_t* weight,
-                               __gm__ int32_t* product, int64_t columns,
-                               int64_t inner, __gm__ uint8_t* tiling)
+                               __gm__ RoutedProduct* product,
+                               __gm__ ScaleStorage* weight_scale, int64_t columns,
+                               int64_t inner, int64_t count)
 {
-    GlobalTensor<int4b_t> a;
-    GlobalTensor<int4b_t> b;
-    GlobalTensor<int32_t> c;
-    a.SetGlobalBuffer(rows, M_TILE * inner);
+    const int64_t matrix_rows = pad_rows ? GateMatrixRows(count) : 2 * count;
+    GlobalTensor<int4b_t> a, b;
+    GlobalTensor<RoutedProduct> c;
+    a.SetGlobalBuffer(rows, matrix_rows * inner);
     b.SetGlobalBuffer(weight, inner * columns);
-    c.SetGlobalBuffer(product, M_TILE * columns);
-    mm.SetOrgShape(STACKED, columns, inner);
+    c.SetGlobalBuffer(product, matrix_rows * columns);
+    mm.SetOrgShape(matrix_rows, columns, inner);
+    mm.SetSingleShape(matrix_rows, columns, inner);
+    mm.SetTensorA(a);
+    mm.SetTensorB(b, false);
+#ifdef ROUTED_FIXPIPE_HALF
+    GlobalTensor<uint64_t> scale;
+    scale.SetGlobalBuffer(weight_scale, columns);
+    mm.SetQuantVector(scale);
+#endif
+    mm.IterateAll(c);
+    mm.End();
+}
+
+#ifdef ROUTED_DOWN_STRIPED
+template <CubeFormat weight_format, class MatmulType>
+__aicore__ inline void ProjectDownStripe(
+    MatmulType& mm, __gm__ int4b_t* rows, __gm__ int4b_t* weight,
+    __gm__ RoutedProduct* product, int64_t count, int64_t column)
+{
+    const int64_t matrix_rows = 2 * count;
+    const bool nz = weight_format == CubeFormat::NZ;
+    GlobalTensor<int4b_t> a, b;
+    GlobalTensor<RoutedProduct> c;
+    a.SetGlobalBuffer(rows, matrix_rows * kIntermediate);
+    b.SetGlobalBuffer(Nibbles(weight, DownWeightColumnOffset(column, nz)),
+        nz ? kIntermediate * kDownStripeColumns
+           : (kIntermediate - 1) * kHidden + kDownStripeColumns);
+    c.SetGlobalBuffer(product + column,
+        (matrix_rows - 1) * kHidden + kDownStripeColumns);
+    // B remains a slice of the original matrix. orgKc fixes the output
+    // row stride independently of this core's N2048 computation.
+    mm.SetOrgShape(matrix_rows, kHidden, kIntermediate, kIntermediate,
+                   kHidden);
+    mm.SetSingleShape(matrix_rows, kDownStripeColumns, kIntermediate);
     mm.SetTensorA(a);
     mm.SetTensorB(b, false);
     mm.IterateAll(c);
     mm.End();
 }
+#endif
 
-/** The vector state every stage shares, allocated once a launch.
- *
- * A `TPipe` hands out buffers cumulatively, so calling `InitBuffer` inside a
- * stage that runs once an expert exhausts UB and the buffers start to
- * overlap. That showed as the low half of every split reading zero while the
- * high half read a plain x/16. Allocating once at 6144 wide still overlapped
- * -- ten buffers of a row came to 144 KB -- and the symptom moved rather than
- * went: the high half stayed right while the low half, written one `Emit`
- * later, came back as noise. So every stage works a tile at a time and the
- * footprint stops depending on the hidden size.
- */
-struct Workspace {
-    TBuf<TPosition::VECCALC> narrow_buffer;
-    TBuf<TPosition::VECCALC> value_buffer;
-    TBuf<TPosition::VECCALC> other_buffer;
-    TBuf<TPosition::VECCALC> work_buffer;
-    TBuf<TPosition::VECCALC> half_buffer;
-    TBuf<TPosition::VECCALC> code_buffer;
-    TBuf<TPosition::VECCALC> spare_half_buffer;
-    TBuf<TPosition::VECCALC> spare_code_buffer;
-    TBuf<TPosition::VECCALC> staging_buffer;
-    TBuf<TPosition::VECCALC> scale_buffer;
-    TBuf<TPosition::VECCALC> token_buffer;
-    TBuf<TPosition::VECCALC> hold_buffer;
-    // A reduction's destination is written a whole 32-byte block at a time,
-    // so the row maxima need a block each and cannot share the buffer that
-    // holds the incoming per-token scales: row zero's reduction would stamp
-    // over row one's scale, which is exactly what it did -- row zero's
-    // quantum matched the reference and row one's did not.
-    TBuf<TPosition::VECCALC> rowmax_buffer;
-    TBuf<TPosition::VECCALC> group_buffer;
-    TBuf<TPosition::VECCALC> start_buffer;
-    TBuf<TPosition::VECCALC> source_buffer;
-    TBuf<TPosition::VECCALC> weight_buffer;
-    LocalTensor<int8_t> narrow;
-    LocalTensor<float> value;
-    LocalTensor<float> other;
-    LocalTensor<float> work;
-    LocalTensor<half> half_value;
-    LocalTensor<int4b_t> code;
-    LocalTensor<half> spare_half;
-    LocalTensor<int4b_t> spare_code;
-    LocalTensor<int32_t> staging;
-    LocalTensor<float> scale;
-    LocalTensor<float> token;
-    LocalTensor<float> activation;
-    LocalTensor<float> rowmax;
-    LocalTensor<int32_t> group;
-    LocalTensor<int32_t> start;
-    LocalTensor<int32_t> source;
-    LocalTensor<float> weight;
-
-    __aicore__ inline void Init(TPipe& pipe, int64_t span)
-    {
-        pipe.InitBuffer(narrow_buffer, (span + SLACK) * sizeof(int8_t));
-        pipe.InitBuffer(value_buffer, (span + SLACK) * sizeof(float));
-        pipe.InitBuffer(other_buffer, (span + SLACK) * sizeof(float));
-        pipe.InitBuffer(work_buffer, (span + SLACK) * sizeof(float));
-        pipe.InitBuffer(half_buffer, (span + SLACK) * sizeof(half));
-        pipe.InitBuffer(code_buffer, (span + SLACK) / 2 + SLACK);
-        narrow = narrow_buffer.Get<int8_t>();
-        value = value_buffer.Get<float>();
-        other = other_buffer.Get<float>();
-        work = work_buffer.Get<float>();
-        half_value = half_buffer.Get<half>();
-        code = code_buffer.Get<int4b_t>();
-        pipe.InitBuffer(spare_half_buffer, (span + SLACK) * sizeof(half));
-        pipe.InitBuffer(spare_code_buffer, (span + SLACK) / 2 + SLACK);
-        spare_half = spare_half_buffer.Get<half>();
-        spare_code = spare_code_buffer.Get<int4b_t>();
-        pipe.InitBuffer(staging_buffer, (span + SLACK) * sizeof(int32_t));
-        pipe.InitBuffer(scale_buffer, (span + SLACK) * sizeof(float));
-        pipe.InitBuffer(token_buffer, (SCALE_SPAN + SLACK) * sizeof(float));
-        pipe.InitBuffer(hold_buffer,
-                        (STRIDE * HALF + SLACK) * sizeof(float));
-        staging = staging_buffer.Get<int32_t>();
-        scale = scale_buffer.Get<float>();
-        token = token_buffer.Get<float>();
-        activation = hold_buffer.Get<float>();
-        pipe.InitBuffer(rowmax_buffer,
-                        STRIDE * BLOCK_FLOATS * sizeof(float));
-        rowmax = rowmax_buffer.Get<float>();
-        pipe.InitBuffer(group_buffer, (MAX_EXPERTS + SLACK) * sizeof(int32_t));
-        group = group_buffer.Get<int32_t>();
-        pipe.InitBuffer(start_buffer, (MAX_EXPERTS + SLACK) * sizeof(int32_t));
-        start = start_buffer.Get<int32_t>();
-        pipe.InitBuffer(source_buffer, (MAX_TAKEN + SLACK) * sizeof(int32_t));
-        source = source_buffer.Get<int32_t>();
-        pipe.InitBuffer(weight_buffer, (MAX_TAKEN + SLACK) * sizeof(float));
-        weight = weight_buffer.Get<float>();
-    }
-};
-
-/** Split `value` into its two INT4 halves: high into `value`, low into
- *  `work`.
- *
- * `high` is `floor(x / 16)`, which lands in [-8, 7] for every INT8, and the
- * remainder `x - 16 * high` lands in [0, 15] -- unsigned, which the cube
- * cannot read. Taking eight off it gives an INT4, and the eight comes back as
- * `8 * sum(w)` a column, which depends only on the weight and so is computed
- * once when the weight is loaded. Five operations, no clamp, and the whole
- * INT8 range exact.
- */
 __aicore__ inline void SplitHalves(Workspace& held, int64_t span)
 {
     Muls(held.other, held.value, 1.0F / 16.0F, span);
@@ -316,492 +224,742 @@ __aicore__ inline void SplitHalves(Workspace& held, int64_t span)
     Adds(held.work, held.work, -8.0F, span);
     PipeBarrier<PIPE_V>();
     DataCopy(held.value, held.other, span);
-    PipeBarrier<PIPE_ALL>();
-}
-
-/** Write `span` INT4 values into `sink` at element `at`.
- *
- * One tensor over the whole destination, subscripted -- not a fresh tensor
- * whose base carries the offset. That shape loses the offset: both halves of
- * a split landed at zero, and which one survived depended on the order the
- * copies happened to complete, so the high half looked correct for as long
- * as it won. An isolated probe writing the same two halves through one
- * tensor and one staging pair lands both, at every offset from 256 to 24576,
- * under `__mix__` and `ASCENDC_CUBE_ONLY` alike.
- */
-__aicore__ inline void Emit(LocalTensor<half>& staging,
-                            LocalTensor<int4b_t>& packed,
-                            LocalTensor<float>& source,
-                            GlobalTensor<int4b_t>& sink, int64_t at,
-                            int64_t span)
-{
-    Cast(staging, source, RoundMode::CAST_RINT, span);
     PipeBarrier<PIPE_V>();
-    Cast(packed, staging, RoundMode::CAST_RINT, span);
-    BeforeStore();
-    // `DataCopyPad`, not `DataCopy`. Every `CastImpl` on this part opens with
-    // `if ASCEND_IS_AIV`, so on the cube half the two casts above compile to
-    // nothing -- while plain `DataCopy` to global memory carries no
-    // `ASCEND_IS_AIC` guard and is issued anyway, with a UB pointer, on a
-    // core that has no UB. `DataCopyPad` returns early on the cube half by
-    // construction. Two writers to one address, one of them writing whatever
-    // that pointer resolves to, is the shape of this kernel's defect: stable
-    // nonsense 6144 bytes into `stacked` and the same nonsense again 6144
-    // further on.
-    DataCopyPad(sink[at], packed,
-                DataCopyExtParams{1, (uint32_t)(span / 2), 0, 0, 0});
-    // The next call's cast writes this staging while this copy is reading
-    // it. `PipeBarrier<PIPE_ALL>` does not order a vector write against an
-    // outstanding MTE3 read: with it, two calls in a row through one staging
-    // pair gave the right halves on some runs and garbage on others, from the
-    // same binary. CANN's own `a8w4_msd_pre` uses these flags for exactly
-    // this pair.
-    AfterStore();
 }
 
-/** Stack one expert's rows as two INT4 halves. */
+__aicore__ inline void Emit(Workspace& held, LocalTensor<float> values,
+                            GlobalTensor<int4b_t>& destination,
+                            int64_t offset, int64_t count)
+{
+    Cast(held.half_value, values, RoundMode::CAST_RINT, count);
+    PipeBarrier<PIPE_V>();
+    Cast(held.packed, held.half_value, RoundMode::CAST_RINT, count);
+    Fence<HardEvent::V_MTE3>();
+    DataCopyPad(destination[offset], held.packed,
+                DataCopyExtParams{1, uint32_t(count / 2), 0, 0, 0});
+    Fence<HardEvent::MTE3_V>();
+}
+
+template <bool balanced = false>
 __aicore__ inline void Split(Workspace& held, __gm__ int8_t* rows,
-                             __gm__ int4b_t* stacked,
-                             __gm__ int4b_t* stacked_low,
-                             __gm__ int4b_t* witness, int64_t rows_held,
-                             int64_t taken_from)
+                             __gm__ int4b_t* stacked, int64_t count,
+                             int64_t start, int64_t tokens,
+                             int64_t first_row = 0, int64_t row_step = 1)
 {
-    GlobalTensor<int8_t> rows_global;
-    GlobalTensor<int4b_t> high_global;
-    GlobalTensor<int4b_t> low_global;
-    GlobalTensor<int4b_t> witness_global;
-    // Every row of the unpermuted activation is reachable, because this
-    // expert's rows are scattered through it rather than contiguous.
-    rows_global.SetGlobalBuffer(rows, MAX_TOKENS * HIDDEN);
-    high_global.SetGlobalBuffer(stacked, STRIDE * HIDDEN);
-    // The low region's base comes in already offset. Deriving it here with a
-    // cast produced a tensor whose writes never landed, while the identical
-    // write through a tensor built on a plain argument landed every time.
-    low_global.SetGlobalBuffer(stacked_low, STRIDE * HIDDEN);
-    witness_global.SetGlobalBuffer(witness, TILE);
+    GlobalTensor<int8_t> input;
+    GlobalTensor<int4b_t> high, low;
+    input.SetGlobalBuffer(rows, tokens * kHidden);
+    high.SetGlobalBuffer(stacked, count * kHidden);
+    low.SetGlobalBuffer(Nibbles(stacked, count * kHidden), count * kHidden);
+    for (int64_t row = balanced ? first_row : 0; row < count;
+         row += balanced ? row_step : 1) {
+        const int64_t source = held.source.GetValue(start + row);
+        for (int64_t column = 0; column < kHidden; column += kVectorTile) {
+            Fence<HardEvent::V_MTE2>();
+            DataCopy(held.input, input[source * kHidden + column],
+                     kVectorTile);
+            Fence<HardEvent::MTE2_V>();
+            Cast(held.half_value, held.input, RoundMode::CAST_NONE, kVectorTile);
+            PipeBarrier<PIPE_V>();
+            Cast(held.value, held.half_value, RoundMode::CAST_NONE, kVectorTile);
+            PipeBarrier<PIPE_V>();
+            SplitHalves(held, kVectorTile);
+            Emit(held, held.value, high, row * kHidden + column, kVectorTile);
+            Emit(held, held.work, low, row * kHidden + column, kVectorTile);
+        }
+    }
+}
 
-    for (int64_t row = 0; row < rows_held; ++row) {
-        for (int64_t done = 0; done < HIDDEN; done += TILE) {
-            const int64_t count = (HIDDEN - done < TILE) ? HIDDEN - done
-                                                         : TILE;
-            const int64_t source = held.source.GetValue(taken_from + row);
-            DataCopy(held.narrow, rows_global[source * HIDDEN + done],
-                     count);
-            AfterLoad();
-            Cast(held.half_value, held.narrow, RoundMode::CAST_NONE, count);
+__aicore__ inline void LoadScale(Workspace& held,
+                                 GlobalTensor<float>& scales,
+                                 int64_t offset, int64_t count)
+{
+    Fence<HardEvent::V_MTE2>();
+    DataCopy(held.scale, scales[offset], count);
+    Fence<HardEvent::MTE2_V>();
+    // A3 Fixpipe retains 10 mantissa bits in the FP32 scale carrier.
+    auto bits = held.scale.ReinterpretCast<uint16_t>();
+    auto mask = held.mask.ReinterpretCast<uint16_t>();
+    And(bits, bits, mask, 2 * count);
+    PipeBarrier<PIPE_V>();
+}
+
+__aicore__ inline void ScaledPartial(Workspace& held,
+                                     LocalTensor<float> destination,
+                                     GlobalTensor<RoutedProduct>& product,
+                                     int64_t offset, int64_t count)
+{
+    Fence<HardEvent::V_MTE2>();
+#ifdef ROUTED_FIXPIPE_HALF
+    DataCopy(held.half_value, product[offset], count);
+    Fence<HardEvent::MTE2_V>();
+    Cast(destination, held.half_value, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+#else
+    DataCopy(held.staging, product[offset], count);
+    Fence<HardEvent::MTE2_V>();
+    Cast(destination, held.staging, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+    Mul(destination, destination, held.scale, count);
+    PipeBarrier<PIPE_V>();
+    Cast(held.half_value, destination, RoundMode::CAST_RINT, count);
+    PipeBarrier<PIPE_V>();
+    Cast(destination, held.half_value, RoundMode::CAST_NONE, count);
+    PipeBarrier<PIPE_V>();
+#endif
+}
+
+__aicore__ inline void Recombine(Workspace& held,
+                                 GlobalTensor<RoutedProduct>& product,
+                                 GlobalTensor<float>& correction,
+                                 int64_t row, int64_t rows, int64_t columns,
+                                 int64_t offset, int64_t count)
+{
+    ScaledPartial(held, held.value, product, row * columns + offset, count);
+    ScaledPartial(held, held.work, product,
+                  (rows + row) * columns + offset, count);
+    Muls(held.value, held.value, 16.0F, count);
+    PipeBarrier<PIPE_V>();
+    Add(held.value, held.value, held.work, count);
+    PipeBarrier<PIPE_V>();
+    Fence<HardEvent::V_MTE2>();
+    DataCopy(held.work, correction[offset], count);
+    Fence<HardEvent::MTE2_V>();
+    Add(held.value, held.value, held.work, count);
+    PipeBarrier<PIPE_V>();
+}
+
+__aicore__ inline void SwiGlu(Workspace& held)
+{
+    DataCopy(held.other, held.value[kIntermediate], kIntermediate);
+    PipeBarrier<PIPE_V>();
+    Muls(held.work, held.value, -1.0F, kIntermediate);
+    PipeBarrier<PIPE_V>();
+    Exp(held.work, held.work, kIntermediate);
+    PipeBarrier<PIPE_V>();
+    Adds(held.work, held.work, 1.0F, kIntermediate);
+    PipeBarrier<PIPE_V>();
+    Div(held.value, held.value, held.work, kIntermediate);
+    PipeBarrier<PIPE_V>();
+    Mul(held.value, held.value, held.other, kIntermediate);
+    PipeBarrier<PIPE_V>();
+}
+
+template <bool balanced = false>
+__aicore__ inline void Activate(
+    Workspace& held, int64_t count, int64_t start, __gm__ RoutedProduct* product,
+    __gm__ float* correction, __gm__ ScaleStorage* scales,
+    __gm__ int4b_t* middle, __gm__ float* middle_scales,
+    int64_t first_row = 0, int64_t row_step = 1)
+{
+    GlobalTensor<RoutedProduct> dots;
+    GlobalTensor<float> bias, weight_scales, output_scales;
+    GlobalTensor<int4b_t> high, low;
+    dots.SetGlobalBuffer(product, 2 * count * kGateUp);
+    bias.SetGlobalBuffer(correction, kGateUp);
+#ifndef ROUTED_FIXPIPE_HALF
+    weight_scales.SetGlobalBuffer(scales, kGateUp);
+#endif
+    output_scales.SetGlobalBuffer(middle_scales, count);
+    high.SetGlobalBuffer(middle, count * kIntermediate);
+    low.SetGlobalBuffer(Nibbles(middle, count * kIntermediate),
+                        count * kIntermediate);
+#ifndef ROUTED_FIXPIPE_HALF
+    LoadScale(held, weight_scales, 0, kGateUp);
+#endif
+    for (int64_t row = balanced ? first_row : 0; row < count;
+         row += balanced ? row_step : 1) {
+        Recombine(held, dots, bias, row, count, kGateUp, 0, kGateUp);
+        const int64_t source = held.source.GetValue(start + row);
+        const float activation_scale = held.input_scale.GetValue(source);
+        Fence<HardEvent::S_V>();
+        Muls(held.value, held.value, activation_scale, kGateUp);
+        PipeBarrier<PIPE_V>();
+        SwiGlu(held);
+        DataCopy(held.activation[row * kIntermediate], held.value,
+                 kIntermediate);
+        Abs(held.work, held.value, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        auto reduce_work = held.staging.ReinterpretCast<float>();
+        ReduceMax(held.maximum[row * kBlockFloats], held.work, reduce_work,
+                  kIntermediate, false);
+        PipeBarrier<PIPE_V>();
+    }
+    Fence<HardEvent::V_S>();
+    for (int64_t row = balanced ? first_row : 0; row < count;
+         row += balanced ? row_step : 1) {
+        const float maximum = held.maximum.GetValue(row * kBlockFloats);
+        const float quantum = maximum / 127.0F;
+        const float factor = maximum == 0.0F ? 0.0F : 1.0F / quantum;
+        Muls(held.value, held.activation[row * kIntermediate], factor,
+             kIntermediate);
+        PipeBarrier<PIPE_V>();
+        Mins(held.value, held.value, 127.0F, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        Maxs(held.value, held.value, -127.0F, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        // Fused GMM1 casts FP32 -> FP16 -> INT8. Keep that first rounding
+        // before obtaining the integer to split into the two signed nibbles.
+        Cast(held.half_value, held.value, RoundMode::CAST_RINT, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        Cast(held.value, held.half_value, RoundMode::CAST_NONE, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        Cast(held.value, held.value, RoundMode::CAST_RINT, kIntermediate);
+        PipeBarrier<PIPE_V>();
+        SplitHalves(held, kIntermediate);
+        Emit(held, held.value, high, row * kIntermediate, kIntermediate);
+        Emit(held, held.work, low, row * kIntermediate, kIntermediate);
+        if constexpr (balanced) {
+            // Other AIVs own adjacent scales. Write exactly four bytes from
+            // an aligned UB source, then wait before reusing that source.
+            held.token.SetValue(0, quantum);
+            Fence<HardEvent::S_MTE3>();
+            DataCopyPad(output_scales[row], held.token,
+                DataCopyExtParams{1, sizeof(float), 0, 0, 0});
+            Fence<HardEvent::MTE3_S>();
+        } else {
+            held.token.SetValue(row, quantum);
+        }
+    }
+    if constexpr (!balanced) {
+        Fence<HardEvent::S_MTE3>();
+        DataCopyPad(output_scales, held.token,
+                    DataCopyExtParams{1, uint32_t(count * sizeof(float)), 0, 0, 0});
+        Fence<HardEvent::MTE3_S>();
+    }
+}
+
+template <bool balanced = false>
+__aicore__ inline void StoreRoutes(
+    Workspace& held, int64_t count, int64_t start, __gm__ RoutedProduct* product,
+    __gm__ float* correction, __gm__ ScaleStorage* scales,
+    __gm__ float* middle_scales, __gm__ bfloat16_t* routes,
+    int64_t begin, int64_t end, int64_t tokens,
+    int64_t first_row = 0, int64_t row_step = 1)
+{
+    GlobalTensor<RoutedProduct> dots;
+    GlobalTensor<float> bias, weight_scales, activation_scales;
+    GlobalTensor<bfloat16_t> output;
+    dots.SetGlobalBuffer(product, 2 * count * kHidden);
+    bias.SetGlobalBuffer(correction, kHidden);
+#ifndef ROUTED_FIXPIPE_HALF
+    weight_scales.SetGlobalBuffer(scales, kHidden);
+#endif
+    activation_scales.SetGlobalBuffer(middle_scales, count);
+    output.SetGlobalBuffer(routes, tokens * kTopK * kHidden);
+    Fence<HardEvent::S_MTE2>();
+    DataCopyPad(held.token, activation_scales,
+                DataCopyExtParams{1, uint32_t(count * sizeof(float)), 0, 0, 0},
+                DataCopyPadExtParams<float>{false, 0, 0, 0});
+    Fence<HardEvent::MTE2_S>();
+    auto narrowed = held.half_buf.Get<bfloat16_t>();
+    for (int64_t column = begin; column < end; column += kVectorTile) {
+        const int64_t span = end - column < kVectorTile
+            ? end - column : kVectorTile;
+#ifndef ROUTED_FIXPIPE_HALF
+        LoadScale(held, weight_scales, column, span);
+#endif
+        for (int64_t row = balanced ? first_row : 0; row < count;
+             row += balanced ? row_step : 1) {
+            Recombine(held, dots, bias, row, count, kHidden, column, span);
+            Muls(held.value, held.value, held.token.GetValue(row), span);
             PipeBarrier<PIPE_V>();
-            Cast(held.value, held.half_value, RoundMode::CAST_NONE, count);
-            PipeBarrier<PIPE_V>();
-            SplitHalves(held, count);
-            Emit(held.half_value, held.code, held.value, high_global,
-                 row * HIDDEN + done, count);
-            Emit(held.half_value, held.code, held.work, low_global,
-                 row * HIDDEN + done, count);
-            if (row == 0 && done == 0) {
-                Emit(held.half_value, held.code, held.work, witness_global, 0,
-                     count);
+            Cast(narrowed, held.value, RoundMode::CAST_RINT, span);
+            const int64_t source = held.source.GetValue(start + row);
+            const int64_t slot = held.slot.GetValue(start + row);
+            const int64_t offset = (source * kTopK + slot) * kHidden + column;
+            Fence<HardEvent::V_MTE3>();
+            DataCopy(output[offset], narrowed, span);
+            Fence<HardEvent::MTE3_V>();
+        }
+    }
+}
+
+__aicore__ inline void CombineTokens(Workspace& held,
+                                      __gm__ bfloat16_t* route_output,
+                                      __gm__ bfloat16_t* out,
+                                      int64_t tokens, int64_t blocks)
+{
+    GlobalTensor<bfloat16_t> routes, output;
+    routes.SetGlobalBuffer(route_output, tokens * kTopK * kHidden);
+    output.SetGlobalBuffer(out, tokens * kHidden);
+    auto values = held.half_buf.Get<bfloat16_t>();
+    const int64_t tiles_per_token = kHidden / kVectorTile;
+    const int64_t vector_cores = 2 * blocks;
+    for (int64_t tile = GetBlockIdx(); tile < tokens * tiles_per_token;
+         tile += vector_cores) {
+        const int64_t token = tile / tiles_per_token;
+        const int64_t column = (tile % tiles_per_token) * kVectorTile;
+        Duplicate(held.value, 0.0F, kVectorTile);
+        PipeBarrier<PIPE_V>();
+        for (int64_t slot = 0; slot < kTopK; ++slot) {
+            const int64_t original = token * kTopK + slot;
+            const float probability = held.original_weight.GetValue(original);
+            // Match unpermute's zero-probability behavior, including NaNs.
+            if (probability == 0.0F) {
+                continue;
             }
-            PipeBarrier<PIPE_ALL>();
-        }
-    }
-}
-
-/** `silu(gate) * up`, in place in `value`. */
-__aicore__ inline void SwiGlu(Workspace& held, int64_t span)
-{
-    Muls(held.work, held.value, -1.0F, span);
-    PipeBarrier<PIPE_V>();
-    Exp(held.work, held.work, span);
-    PipeBarrier<PIPE_V>();
-    Adds(held.work, held.work, 1.0F, span);
-    PipeBarrier<PIPE_V>();
-    Div(held.value, held.value, held.work, span);
-    PipeBarrier<PIPE_V>();
-    Mul(held.value, held.value, held.other, span);
-}
-
-/** Recombine the two halves of one row of a product into `into`. */
-__aicore__ inline void Combine(LocalTensor<float>& into,
-                               LocalTensor<float>& spare,
-                               GlobalTensor<int32_t>& product,
-                               LocalTensor<int32_t>& staging,
-                               GlobalTensor<float>& bias, int64_t at,
-                               int64_t high, int64_t low, int64_t span)
-{
-    DataCopy(staging, product[high], span);
-    AfterLoad();
-    Cast(into, staging, RoundMode::CAST_NONE, span);
-    PipeBarrier<PIPE_V>();
-    Muls(into, into, 16.0F, span);
-    PipeBarrier<PIPE_V>();
-    BeforeLoad();
-    DataCopy(staging, product[low], span);
-    AfterLoad();
-    Cast(spare, staging, RoundMode::CAST_NONE, span);
-    PipeBarrier<PIPE_V>();
-    Add(into, into, spare, span);
-    PipeBarrier<PIPE_V>();
-    BeforeLoad();
-    DataCopy(spare, bias[at], span);
-    AfterLoad();
-    Add(into, into, spare, span);
-    PipeBarrier<PIPE_V>();
-}
-
-/** Recombine, activate, quantise and split one expert's rows.
- *
- * The row maximum is over this expert's own 128 columns and this core owns
- * every one of them, so nothing crosses blocks.
- */
-__aicore__ inline void Activate(int64_t rows_held, Workspace& held,
-                                __gm__ int32_t* product,
-                                __gm__ float* gu_bias, __gm__ float* gu_scale,
-                                __gm__ float* token_scale,
-                                __gm__ int4b_t* middle,
-                                __gm__ float* out_scale)
-{
-    LocalTensor<int32_t> staging = held.staging;
-    LocalTensor<float> scale = held.scale;
-    LocalTensor<float> token = held.token;
-    LocalTensor<float> activation = held.activation;
-
-    GlobalTensor<int32_t> product_global;
-    GlobalTensor<float> scale_global;
-    GlobalTensor<float> token_global;
-    GlobalTensor<int4b_t> middle_high;
-    GlobalTensor<int4b_t> middle_low;
-    GlobalTensor<float> out_scale_global;
-    GlobalTensor<float> bias_global;
-    middle_high.SetGlobalBuffer(middle, STRIDE * HALF);
-    middle_low.SetGlobalBuffer(Nibbles(middle, STRIDE * HALF),
-                               STRIDE * HALF);
-    bias_global.SetGlobalBuffer(gu_bias, GATE_UP);
-    product_global.SetGlobalBuffer(product, M_TILE * GATE_UP);
-    scale_global.SetGlobalBuffer(gu_scale, GATE_UP);
-    token_global.SetGlobalBuffer(token_scale, SCALE_SPAN);
-    out_scale_global.SetGlobalBuffer(out_scale, SCALE_SPAN);
-
-    DataCopy(scale, scale_global, GATE_UP);
-    DataCopy(token, token_global, SCALE_SPAN);
-    AfterLoad();
-    AfterLoadForScalar();
-
-    for (int64_t row = 0; row < rows_held; ++row) {
-        Combine(held.value, held.work, product_global, staging, bias_global,
-                0, row * GATE_UP, (STRIDE + row) * GATE_UP, GATE_UP);
-        // The gate half stays in `value`; the up half moves to `other`.
-        DataCopy(held.other, held.value[HALF], HALF);
-        PipeBarrier<PIPE_ALL>();
-        Mul(held.value, held.value, scale, HALF);
-        Mul(held.other, held.other, scale[HALF], HALF);
-        PipeBarrier<PIPE_V>();
-        const float of_row = token.GetValue(row);
-        Muls(held.value, held.value, of_row, HALF);
-        Muls(held.other, held.other, of_row, HALF);
-        PipeBarrier<PIPE_V>();
-        SwiGlu(held, HALF);
-        PipeBarrier<PIPE_V>();
-        DataCopy(activation[row * HALF], held.value, HALF);
-        Abs(held.work, held.value, HALF);
-        PipeBarrier<PIPE_V>();
-        ReduceMax(held.rowmax[row * BLOCK_FLOATS], held.work, held.work,
-                  HALF, false);
-        PipeBarrier<PIPE_ALL>();
-    }
-    DataSyncBarrier<MemDsbT::UB>();
-
-    for (int64_t row = 0; row < rows_held; ++row) {
-        const float largest = held.rowmax.GetValue(row * BLOCK_FLOATS);
-        const float quantum = largest / QUANTUM_SPAN;
-        Muls(held.value, activation[row * HALF], 1.0F / quantum, HALF);
-        PipeBarrier<PIPE_V>();
-        // Round to an integer before splitting, so both halves are exact.
-        //
-        // One cast, both operands float. A `RoundMode` is a tie-break over
-        // the DESTINATION type's representable set, not an instruction to
-        // take an integer: float to half with CAST_RINT rounds to the nearest
-        // half, and only float to float rounds to an integer. The two-step
-        // version here computed ToHalf(x), which leaves the low nibble in
-        // [-8, 8) as a real -- so whenever x mod 16 reaches 15.5 the stored
-        // nibble is +8 and the INT4 cast saturates it to 7, one code unit
-        // short. The band that bites is x in [-0.5, 0), and a SwiGLU output
-        // measured against its own row maximum crowds exactly there.
-        Cast(held.value, held.value, RoundMode::CAST_RINT, HALF);
-        PipeBarrier<PIPE_V>();
-        SplitHalves(held, HALF);
-        Emit(held.half_value, held.code, held.value, middle_high,
-             row * HALF, HALF);
-        Emit(held.half_value, held.code, held.work, middle_low, row * HALF,
-             HALF);
-        PipeBarrier<PIPE_ALL>();
-        token.SetValue(row, quantum);
-    }
-    BeforeStore();
-    // The scale leaves by MTE: a scalar store to global memory from a vector
-    // core does not land.
-    DataCopyPad(out_scale_global, token,
-                DataCopyExtParams{1, (uint32_t)(SCALE_SPAN * sizeof(float)),
-                                  0, 0, 0});
-}
-
-/** Recombine and scale one expert's down product into BF16. */
-__aicore__ inline void Narrow(int64_t rows_held, int64_t taken_from,
-                              Workspace& held, __gm__ int32_t* product,
-                              __gm__ float* down_bias,
-                              __gm__ float* down_scale,
-                              __gm__ float* middle_scale,
-                              __gm__ bfloat16_t* out, int64_t from,
-                              int64_t upto)
-{
-    LocalTensor<int32_t> staging = held.staging;
-    LocalTensor<float> scale = held.scale;
-    LocalTensor<float> row_scale = held.token;
-    // BF16 output reuses the half-width buffer the casts already need.
-    LocalTensor<bfloat16_t> narrow = held.half_buffer.Get<bfloat16_t>();
-
-    GlobalTensor<int32_t> product_global;
-    GlobalTensor<float> scale_global;
-    GlobalTensor<float> middle_global;
-    GlobalTensor<bfloat16_t> out_global;
-    GlobalTensor<float> bias_global;
-    bias_global.SetGlobalBuffer(down_bias, HIDDEN);
-    product_global.SetGlobalBuffer(product, M_TILE * HIDDEN);
-    scale_global.SetGlobalBuffer(down_scale, HIDDEN);
-    middle_global.SetGlobalBuffer(middle_scale, SCALE_SPAN);
-    out_global.SetGlobalBuffer(out, MAX_TOKENS * HIDDEN);
-
-    DataCopy(row_scale, middle_global, SCALE_SPAN);
-    AfterLoadForScalar();
-
-    for (int64_t row = 0; row < rows_held; ++row) {
-        const float of_row = row_scale.GetValue(row);
-        const int64_t token = held.source.GetValue(taken_from + row);
-        const float weight = held.weight.GetValue(taken_from + row);
-        for (int64_t done = from; done < upto; done += TILE) {
-            const int64_t count = (upto - done < TILE) ? upto - done : TILE;
-            Combine(held.value, held.work, product_global, staging,
-                    bias_global, done, row * HIDDEN + done,
-                    (STRIDE + row) * HIDDEN + done, count);
-            DataCopy(scale, scale_global[done], count);
-            AfterLoad();
-            Mul(held.value, held.value, scale, count);
+            Fence<HardEvent::V_MTE2>();
+            DataCopy(values, routes[original * kHidden + column], kVectorTile);
+            Fence<HardEvent::MTE2_V>();
+            // CANN seeds from original slot 0, preserving a negative zero.
+            // A skipped slot 0 leaves +0; later slots are always additions.
+            auto term = slot == 0 ? held.value : held.other;
+            Cast(term, values, RoundMode::CAST_NONE, kVectorTile);
             PipeBarrier<PIPE_V>();
-            Muls(held.value, held.value, of_row * weight, count);
+            Muls(term, term, probability, kVectorTile);
             PipeBarrier<PIPE_V>();
-            Cast(narrow, held.value, RoundMode::CAST_RINT, count);
-            BeforeStore();
-            // The eight experts a token visits write the same output row from
-            // different blocks, so the sum the combine used to take happens
-            // here instead.
-            SetAtomicAdd<bfloat16_t>();
-            DataCopyPad(out_global[token * HIDDEN + done], narrow,
-                        DataCopyExtParams{
-                            1, (uint32_t)(count * sizeof(bfloat16_t)), 0, 0,
-                            0});
-            SetAtomicNone();
-            AfterStore();
+            if (slot != 0) {
+                Add(held.value, held.value, term, kVectorTile);
+                PipeBarrier<PIPE_V>();
+            }
         }
+        Cast(values, held.value, RoundMode::CAST_RINT, kVectorTile);
+        Fence<HardEvent::V_MTE3>();
+        DataCopy(output[token * kHidden + column], values, kVectorTile);
+        Fence<HardEvent::MTE3_V>();
     }
 }
 
 }  // namespace
 
-extern "C" __global__ __mix__(1, 2) __schedmode__(1)
+template <CubeFormat weight_format, bool from_dispatch>
+__global__ __mix__(1, 2) __schedmode__(1)
 __aicore__ void routed_int4_fused(
-    uint64_t sync_base, __gm__ int8_t* rows, __gm__ int4b_t* stacked,
-    __gm__ int4b_t* stacked_low, __gm__ int4b_t* gate_up, __gm__ float* gu_bias, __gm__ float* gu_scale,
-    __gm__ int4b_t* down, __gm__ float* down_bias, __gm__ float* down_scale,
-    __gm__ float* token_scale,
-    __gm__ int32_t* partial, __gm__ int4b_t* middle,
-    __gm__ float* middle_scale, __gm__ int32_t* wide, __gm__ bfloat16_t* out,
-    __gm__ uint8_t* gu_tiling, __gm__ uint8_t* down_tiling,
-    __gm__ int4b_t* witness, __gm__ int32_t* group_count,
+    uint64_t sync_base, __gm__ int8_t* rows, __gm__ int4b_t* gate_up,
+    __gm__ float* gu_bias, __gm__ ScaleStorage* gu_scale, __gm__ int4b_t* down,
+    __gm__ float* down_bias, __gm__ ScaleStorage* down_scale,
+    __gm__ float* token_scale, __gm__ int32_t* group_count,
     __gm__ int32_t* group_start, __gm__ int32_t* source_row,
-    __gm__ float* row_weight, GM_ADDR workspace, int64_t experts,
-    int64_t blocks)
+    __gm__ int32_t* source_slot, __gm__ float* row_weight,
+    __gm__ int4b_t* stacked, __gm__ RoutedProduct* partial,
+    __gm__ int4b_t* middle, __gm__ float* middle_scale,
+    __gm__ RoutedProduct* wide, __gm__ bfloat16_t* route_output,
+    __gm__ bfloat16_t* out, __gm__ uint8_t* gu_tiling,
+    __gm__ uint8_t* down_tiling, GM_ADDR workspace,
+    int64_t experts, int64_t tokens, int64_t blocks, DispatchInput dispatch_input,
+    __gm__ int64_t* trace
+#ifdef ROUTED_SHARED_PIPELINE
+    , pipeline::Input shared_input
+#endif
+    )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     InitSocState();
     SetSyncBaseAddr(sync_base);
-    // The `Matmul` library takes scratch from the system workspace, and this
-    // kernel never gave it one. Two regions of `stacked` held identical bytes
-    // 6144 apart, neither of them a half of the split, which is the shape of
-    // a wild write rather than of a lost one.
     SetSysWorkspace(workspace);
-
-    const int64_t per_block = (experts + blocks - 1) / blocks;
     TPipe pipe;
-
-    // One loop with the barriers at the top of it, rather than a loop a half
-    // with paired flags inside. The paired form cannot walk more than five
-    // experts a block -- six faults with "the GM address accessed by scalar
-    // exceeds 48 bits", at any expert count, any block count and on both
-    // machines -- because its flags are counted and nothing drains them
-    // between rounds. A rank holds 256 experts, so sixteen blocks walk
-    // sixteen rounds and the paired form cannot serve the engine at all.
-    //
-    // `SyncAll<false>()` is the three-way MIX barrier on flagIds 11 to 13,
-    // outside the manually allocated range, and it does not accumulate. It
-    // has to sit outside both halves' branches: every core must arrive even
-    // where its own stage does nothing, which also makes the empty-expert
-    // case structural rather than a convention to remember.
+    Timing timing;
+    timing.Begin(0);
+#ifdef ROUTED_SHARED_PIPELINE
+    static_assert(from_dispatch, "the shared pipeline requires input preparation");
+    pipeline::Stages shared(shared_input, tokens, blocks);
+    shared.StageInput(pipe);
+#endif
+    if constexpr (from_dispatch) {
+#ifdef ROUTED_INPUT_FRONT
+        if (dispatch_input.bf16_rows != 0) {
+            front::Prepare(pipe, dispatch_input, rows, token_scale, group_count,
+                           group_start, source_row, source_slot, row_weight,
+                           tokens, blocks, timing);
+        } else
+#endif
+        {
+            dispatch::Restore(pipe, dispatch_input, rows, token_scale, group_count,
+                              group_start, source_row, source_slot, row_weight,
+                              tokens, blocks, timing);
+        }
+    }
+    timing.Begin(1);
     Workspace held;
-    // The cube half reads the counts as well. Without them it ran a full
-    // matmul for every expert, and at the engine's 256 experts a round only
-    // about seventy hold rows -- which is why 256 experts cost 583 us where
-    // sixteen cost 47.
-    //
-    // Straight from global memory, because the cube core has no access to
-    // unified buffer: its local memory is L1 and the L0s. Staging the counts
-    // in a `TPosition::VECCALC` buffer and reading them here returned zero for
-    // every expert, so every matmul was skipped and the kernel's output was
-    // absent at any input -- while the vector half's copy of the same counts
-    // worked, which made the split stage look correct and the cube stage look
-    // like an arithmetic fault.
-    GlobalTensor<int32_t> cube_group;
-    Matmul<APacked, BPacked, CProduct, BiasNone> gate_mm;
-    Matmul<APacked, BPacked, CProduct, BiasNone> down_mm;
-    TCubeTiling gate_cube;
-    TCubeTiling down_cube;
+#ifdef ROUTED_SHARED_PIPELINE
+    shared.InitResident(pipe);
+    shared.Gate(pipe);
+#endif
+    GlobalTensor<int32_t> counts, starts;
     if ASCEND_IS_AIC {
+        counts.SetGlobalBuffer(group_count, kMaxExperts);
+        starts.SetGlobalBuffer(group_start, kMaxExperts);
+        // Replayed graphs update counts at the same GM address. Scalar
+        // loads must discard the preceding replay's data-cache lines.
+        DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(counts);
+    }
+    if ASCEND_IS_AIV {
+        held.Init(pipe);
+        GlobalTensor<int32_t> sources, slots;
+        GlobalTensor<float> weights, input_scales;
+        counts.SetGlobalBuffer(group_count, kMaxExperts);
+        starts.SetGlobalBuffer(group_start, kMaxExperts);
+        sources.SetGlobalBuffer(source_row, kMaxRoutes);
+        slots.SetGlobalBuffer(source_slot, kMaxRoutes);
+        weights.SetGlobalBuffer(row_weight, kMaxRoutes);
+        input_scales.SetGlobalBuffer(token_scale, tokens);
+        DataCopy(held.count, counts, kMaxExperts);
+        DataCopy(held.start, starts, kMaxExperts);
+        DataCopy(held.source, sources, kMaxRoutes);
+        DataCopy(held.slot, slots, kMaxRoutes);
+        DataCopy(held.weight, weights, kMaxRoutes);
+        DataCopyPad(held.input_scale, input_scales,
+                    DataCopyExtParams{1, uint32_t(tokens * sizeof(float)),
+                                      0, 0, 0},
+                    DataCopyPadExtParams<float>{false, 0, 0, 0});
+        Fence<HardEvent::MTE2_S>();
+        for (int64_t route = 0; route < tokens * kTopK; ++route) {
+            const int64_t original = held.source.GetValue(route) * kTopK
+                                     + held.slot.GetValue(route);
+            held.original_weight.SetValue(original, held.weight.GetValue(route));
+        }
+    }
+
+    // Every core reaches every barrier, including empty expert owners.
+    if ASCEND_IS_AIV {
+#ifdef ROUTED_ROW_BALANCED
+        const int64_t workers = 2 * blocks;
+        int64_t next = GetBlockIdx();
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            const int64_t count = held.count.GetValue(expert);
+            const int64_t begin = held.start.GetValue(expert);
+            if (next >= begin + count) {
+                continue;
+            }
+            Split<true>(held, rows, Nibbles(stacked, GateStorageRow(begin) * kHidden),
+                        count, begin, tokens, next - begin, workers);
+            do {
+                next += workers;
+            } while (next < begin + count);
+        }
+        Publish();
+#else
+        if (GetSubBlockIdx() == 0) {
+            int64_t active = 0;
+            int64_t next = GetBlockIdx() / 2;
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                if (held.count.GetValue(expert) == 0) {
+                    continue;
+                }
+                if (active++ != next) {
+                    continue;
+                }
+                next += blocks;
+                const int64_t begin = held.start.GetValue(expert);
+                Split(held, rows, Nibbles(stacked, GateStorageRow(begin) * kHidden),
+                      held.count.GetValue(expert), held.start.GetValue(expert),
+                      tokens);
+            }
+            Publish();
+        }
+#endif
+    }
+    timing.Barrier(1);
+    timing.Begin(2);
+#ifdef ROUTED_SHARED_PIPELINE
+    shared.Activate();
+#endif
+    if ASCEND_IS_AIC {
+#ifdef ROUTED_SHARED_PIPELINE
+        // The shared gate projection ended before barrier 1.
+        pipe.Reset();
+#endif
+        TCubeTiling gate_cube;
         LoadTiling(gate_cube, gu_tiling);
-        LoadTiling(down_cube, down_tiling);
+        GateProjection<weight_format> gate_mm;
         gate_mm.Init(&gate_cube, &pipe);
+        int64_t active = 0;
+        int64_t next = GetBlockIdx();
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            if (counts.GetValue(expert) == 0) {
+                continue;
+            }
+            if (active++ != next) {
+                continue;
+            }
+            next += blocks;
+            const int64_t begin = starts.GetValue(expert);
+            Project<kPadGateRows>(gate_mm,
+                    Nibbles(stacked, GateStorageRow(begin) * kHidden),
+                    Nibbles(gate_up, expert * kGateUp * kHidden),
+                    partial + GateStorageRow(begin) * kGateUp,
+                    gu_scale + expert * kGateUp, kGateUp, kHidden,
+                    counts.GetValue(expert));
+        }
+        Publish();
+    }
+    timing.Barrier(2);
+    timing.Begin(3);
+#ifdef ROUTED_SHARED_PIPELINE
+    shared.Down(pipe);
+#endif
+    if ASCEND_IS_AIV {
+#ifdef ROUTED_ROW_BALANCED
+        const int64_t workers = 2 * blocks;
+        int64_t next = GetBlockIdx();
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            const int64_t count = held.count.GetValue(expert);
+            const int64_t begin = held.start.GetValue(expert);
+            if (next >= begin + count) {
+                continue;
+            }
+            Activate<true>(held, count, begin,
+                partial + GateStorageRow(begin) * kGateUp,
+                gu_bias + expert * kGateUp, gu_scale + expert * kGateUp,
+                Nibbles(middle, 2 * begin * kIntermediate),
+                middle_scale + begin, next - begin, workers);
+            do {
+                next += workers;
+            } while (next < begin + count);
+        }
+        Publish();
+#else
+        if (GetSubBlockIdx() == 0) {
+            int64_t active = 0;
+            int64_t next = GetBlockIdx() / 2;
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                if (held.count.GetValue(expert) == 0) {
+                    continue;
+                }
+                if (active++ != next) {
+                    continue;
+                }
+                next += blocks;
+                const int64_t begin = held.start.GetValue(expert);
+                Activate(held, held.count.GetValue(expert),
+                         held.start.GetValue(expert),
+                         partial + GateStorageRow(begin) * kGateUp,
+                         gu_bias + expert * kGateUp, gu_scale + expert * kGateUp,
+                         Nibbles(middle, 2 * begin * kIntermediate),
+                         middle_scale + begin);
+            }
+            Publish();
+        }
+#endif
+    }
+    timing.Barrier(3);
+    timing.Begin(4);
+#ifdef ROUTED_SHARED_PIPELINE
+    shared.Store(pipe);
+#endif
+    if ASCEND_IS_AIC {
+        // Gate matmul has ended on every AIC before reusing L1 and events.
+        pipe.Reset();
+        TCubeTiling down_cube;
+        LoadTiling(down_cube, down_tiling);
+        Projection<weight_format> down_mm;
         down_mm.Init(&down_cube, &pipe);
-        cube_group.SetGlobalBuffer(group_count, MAX_EXPERTS);
-    }
-    GlobalTensor<int32_t> count_global;
-    GlobalTensor<int32_t> start_global;
-    GlobalTensor<int32_t> source_global;
-    GlobalTensor<float> weight_global;
-    int64_t sub = 0;
-    int64_t from = 0;
-    int64_t share = HIDDEN / 2;
-    if ASCEND_IS_AIV {
-        held.Init(pipe, TILE);
-        sub = GetSubBlockIdx();
-        from = sub * share;
-        count_global.SetGlobalBuffer(group_count, MAX_EXPERTS);
-        start_global.SetGlobalBuffer(group_start, MAX_EXPERTS);
-        source_global.SetGlobalBuffer(source_row, MAX_TAKEN);
-        weight_global.SetGlobalBuffer(row_weight, MAX_TAKEN);
-        DataCopy(held.group, count_global, MAX_EXPERTS);
-        DataCopy(held.start, start_global, MAX_EXPERTS);
-        DataCopy(held.source, source_global, MAX_TAKEN);
-        DataCopy(held.weight, weight_global, MAX_TAKEN);
-        AfterLoadForScalar();
-    }
-
-    // Stage-major, not expert-major. Expert-major cost four barriers a round,
-    // so sixteen rounds at the engine's 256 experts cost sixty-four, and the
-    // sparse case came out slower than the dense one -- an empty expert
-    // skipped its arithmetic and still arrived at every barrier. All the
-    // scratch is sized per expert, so every expert's intermediate can be live
-    // at once and the barriers drop to one a stage.
-    if ASCEND_IS_AIV {
-        if (sub == 0) {
-            for (int64_t step = 0; step < per_block; ++step) {
-                const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
-                if (expert >= experts || held.group.GetValue(expert) == 0) {
+#ifdef ROUTED_DOWN_STRIPED
+        int64_t active_count = 0;
+        if (blocks == kDownStripeBlocks) {
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                if (counts.GetValue(expert) != 0
+                    && ++active_count > kDownStripeExperts) {
+                    break;
+                }
+            }
+        }
+        if (DownStripesEnabled(blocks, active_count)) {
+            const auto stripe = DownStripeFor(GetBlockIdx(), active_count);
+            int64_t active = 0;
+            for (int64_t expert = 0;
+                 stripe.active_expert >= 0 && expert < experts; ++expert) {
+                const int64_t count = counts.GetValue(expert);
+                if (count == 0 || active++ != stripe.active_expert) {
                     continue;
                 }
-                Split(held, rows, Nibbles(stacked, expert * M_TILE * HIDDEN),
-                      Nibbles(stacked_low, expert * M_TILE * HIDDEN),
-                      Nibbles(witness, expert * TILE),
-                      held.group.GetValue(expert),
-                      held.start.GetValue(expert));
+                const int64_t begin = starts.GetValue(expert);
+                ProjectDownStripe<weight_format>(down_mm,
+                    Nibbles(middle, 2 * begin * kIntermediate),
+                    Nibbles(down, expert * kHidden * kIntermediate),
+                    wide + 2 * begin * kHidden, count, stripe.column);
+                break;
             }
-            Publish();
-        }
-    }
-    SyncAll<false>();
-
-    if ASCEND_IS_AIC {
-            for (int64_t step = 0; step < per_block; ++step) {
-            const int64_t expert = GetBlockIdx() * per_block + step;
-            if (expert >= experts || cube_group.GetValue(expert) == 0) {
+        } else {
+#endif
+        int64_t active = 0;
+        int64_t next = GetBlockIdx();
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            if (counts.GetValue(expert) == 0) {
                 continue;
             }
-            Project(gate_mm, Nibbles(stacked, expert * M_TILE * HIDDEN),
-                    Nibbles(gate_up, expert * GATE_UP * HIDDEN),
-                    partial + expert * M_TILE * GATE_UP, GATE_UP, HIDDEN,
-                    gu_tiling);
+            if (active++ != next) {
+                continue;
+            }
+            next += blocks;
+            const int64_t begin = starts.GetValue(expert);
+            Project(down_mm, Nibbles(middle, 2 * begin * kIntermediate),
+                    Nibbles(down, expert * kHidden * kIntermediate),
+                    wide + 2 * begin * kHidden,
+                    down_scale + expert * kHidden, kHidden, kIntermediate,
+                    counts.GetValue(expert));
         }
+#ifdef ROUTED_DOWN_STRIPED
+        }
+#endif
         Publish();
     }
-    SyncAll<false>();
-
+    timing.Barrier(4);
+    timing.Begin(5);
     if ASCEND_IS_AIV {
-        if (sub == 0) {
-            for (int64_t step = 0; step < per_block; ++step) {
-                const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
-                if (expert >= experts || held.group.GetValue(expert) == 0) {
-                    continue;
-                }
-                Activate(held.group.GetValue(expert), held,
-                         partial + expert * M_TILE * GATE_UP,
-                         gu_bias + expert * GATE_UP,
-                         gu_scale + expert * GATE_UP,
-                         token_scale + expert * SCALE_SPAN,
-                         Nibbles(middle, expert * M_TILE * HALF),
-                         middle_scale + expert * SCALE_SPAN);
-            }
-            Publish();
-        }
-    }
-    SyncAll<false>();
-
-    if ASCEND_IS_AIC {
-            for (int64_t step = 0; step < per_block; ++step) {
-            const int64_t expert = GetBlockIdx() * per_block + step;
-            if (expert >= experts || cube_group.GetValue(expert) == 0) {
+        const int64_t begin = GetSubBlockIdx() * (kHidden / 2);
+#ifdef ROUTED_ROW_BALANCED
+        // Both AIVs in a group retain separate H/2 columns for each row.
+        int64_t next = GetBlockIdx() / 2;
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            const int64_t count = held.count.GetValue(expert);
+            const int64_t route_begin = held.start.GetValue(expert);
+            if (next >= route_begin + count) {
                 continue;
             }
-            Project(down_mm, Nibbles(middle, expert * M_TILE * HALF),
-                    Nibbles(down, expert * HIDDEN * HALF),
-                    wide + expert * M_TILE * HIDDEN, HIDDEN, HALF,
-                    down_tiling);
+            StoreRoutes<true>(held, count, route_begin,
+                wide + 2 * route_begin * kHidden,
+                down_bias + expert * kHidden, down_scale + expert * kHidden,
+                middle_scale + route_begin, route_output,
+                begin, begin + kHidden / 2, tokens, next - route_begin, blocks);
+            do {
+                next += blocks;
+            } while (next < route_begin + count);
         }
+#else
+        int64_t active = 0;
+        int64_t next = GetBlockIdx() / 2;
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            if (held.count.GetValue(expert) == 0) {
+                continue;
+            }
+            if (active++ != next) {
+                continue;
+            }
+            next += blocks;
+            const int64_t route_begin = held.start.GetValue(expert);
+            StoreRoutes(held, held.count.GetValue(expert),
+                        held.start.GetValue(expert),
+                        wide + 2 * route_begin * kHidden,
+                        down_bias + expert * kHidden,
+                        down_scale + expert * kHidden,
+                        middle_scale + route_begin, route_output,
+                        begin, begin + kHidden / 2, tokens);
+        }
+#endif
         Publish();
     }
-    SyncAll<false>();
-
+    timing.Barrier(5);
+    timing.Begin(6);
     if ASCEND_IS_AIV {
-            for (int64_t step = 0; step < per_block; ++step) {
-            const int64_t expert = (GetBlockIdx() / 2) * per_block + step;
-            if (expert >= experts || held.group.GetValue(expert) == 0) {
-                continue;
-            }
-            Narrow(held.group.GetValue(expert), held.start.GetValue(expert),
-                   held, wide + expert * M_TILE * HIDDEN,
-                   down_bias + expert * HIDDEN, down_scale + expert * HIDDEN,
-                   middle_scale + expert * SCALE_SPAN, out, from,
-                   from + share);
-        }
+        CombineTokens(held, route_output, out, tokens, blocks);
     }
-    PipeBarrier<PIPE_ALL>();
+    timing.FinishFinal(6);
+    timing.Store(trace, tokens, blocks);
 }
 
-void routed_int4_launch(uint32_t blocks, void* stream, uint64_t sync_base,
-                        void* rows, void* stacked, void* stacked_low,
-                        void* gate_up,
-                        float* gu_bias, float* gu_scale, void* down,
-                        float* down_bias, float* down_scale,
-                        float* token_scale, void* partial, void* middle,
-                        float* middle_scale, void* wide, void* out,
-                        void* gu_tiling, void* down_tiling, void* witness,
-                        void* group_count, void* group_start,
-                        void* source_row, float* row_weight,
-                        void* workspace, int64_t experts)
+#ifndef ROUTED_ENABLE_PROFILE
+namespace {
+
+template <CubeFormat weight_format, bool from_dispatch>
+void Launch(
+    uint32_t blocks, void* stream, uint64_t sync_base, void* rows,
+    void* gate_up, float* gu_bias, ScaleStorage* gu_scale, void* down,
+    float* down_bias, ScaleStorage* down_scale, float* token_scale,
+    void* group_count, void* group_start, void* source_row,
+    void* source_slot, float* row_weight, void* stacked, void* partial,
+    void* middle, float* middle_scale, void* wide, void* route_output,
+    void* out, void* gu_tiling, void* down_tiling, void* workspace,
+    int64_t experts, int64_t tokens, DispatchInput dispatch_input
+#ifdef ROUTED_SHARED_PIPELINE
+    , pipeline::Input shared_input
+#endif
+    )
 {
-    routed_int4_fused<<<blocks, nullptr, stream>>>(
-        sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)stacked,
-        (__gm__ int4b_t*)stacked_low, (__gm__ int4b_t*)gate_up, gu_bias,
-        gu_scale, (__gm__ int4b_t*)down, down_bias, down_scale, token_scale,
-        (__gm__ int32_t*)partial, (__gm__ int4b_t*)middle, middle_scale,
-        (__gm__ int32_t*)wide, (__gm__ bfloat16_t*)out,
+    routed_int4_fused<weight_format, from_dispatch><<<blocks, nullptr, stream>>>(
+        sync_base, (__gm__ int8_t*)rows, (__gm__ int4b_t*)gate_up,
+        gu_bias, gu_scale, (__gm__ int4b_t*)down, down_bias, down_scale,
+        token_scale, (__gm__ int32_t*)group_count, (__gm__ int32_t*)group_start,
+        (__gm__ int32_t*)source_row, (__gm__ int32_t*)source_slot, row_weight,
+        (__gm__ int4b_t*)stacked, (__gm__ RoutedProduct*)partial,
+        (__gm__ int4b_t*)middle, middle_scale, (__gm__ RoutedProduct*)wide,
+        (__gm__ bfloat16_t*)route_output, (__gm__ bfloat16_t*)out,
         (__gm__ uint8_t*)gu_tiling, (__gm__ uint8_t*)down_tiling,
-        (__gm__ int4b_t*)witness, (__gm__ int32_t*)group_count,
-        (__gm__ int32_t*)group_start, (__gm__ int32_t*)source_row,
-        row_weight, (GM_ADDR)workspace, experts, blocks);
+        (GM_ADDR)workspace, experts, tokens, blocks, dispatch_input, nullptr
+#ifdef ROUTED_SHARED_PIPELINE
+        , shared_input
+#endif
+        );
 }
+
+}  // namespace
+
+#ifdef ROUTED_SHARED_PIPELINE
+extern "C"
+#endif
+void routed_int4_launch(
+    uint32_t blocks, void* stream, uint64_t sync_base, void* rows,
+    void* gate_up, float* gu_bias, ScaleStorage* gu_scale, void* down,
+    float* down_bias, ScaleStorage* down_scale, float* token_scale,
+    void* group_count, void* group_start, void* source_row,
+    void* source_slot, float* row_weight, void* stacked, void* partial,
+    void* middle, float* middle_scale, void* wide, void* route_output,
+    void* out, void* gu_tiling, void* down_tiling, void* workspace,
+    int64_t experts, int64_t tokens, int64_t weight_layout,
+    DispatchInput dispatch_input
+#ifdef ROUTED_SHARED_PIPELINE
+    , pipeline::Input shared_input
+#endif
+    )
+{
+#ifdef ROUTED_SHARED_PIPELINE
+    const auto launch = weight_layout == kWeightNZ ? &Launch<CubeFormat::NZ, true>
+                                                  : &Launch<CubeFormat::ND, true>;
+#else
+    const bool has_input = dispatch_input.rows != 0
+#ifdef ROUTED_INPUT_FRONT
+                           || dispatch_input.bf16_rows != 0
+#endif
+                           ;
+    const auto launch = has_input
+        ? (weight_layout == kWeightNZ ? &Launch<CubeFormat::NZ, true>
+                                      : &Launch<CubeFormat::ND, true>)
+        : (weight_layout == kWeightNZ ? &Launch<CubeFormat::NZ, false>
+                                      : &Launch<CubeFormat::ND, false>);
+#endif
+    launch(blocks, stream, sync_base, rows, gate_up, gu_bias, gu_scale,
+           down, down_bias, down_scale, token_scale, group_count, group_start,
+           source_row, source_slot, row_weight, stacked, partial, middle,
+           middle_scale, wide, route_output, out, gu_tiling, down_tiling,
+           workspace, experts, tokens, dispatch_input
+#ifdef ROUTED_SHARED_PIPELINE
+           , shared_input
+#endif
+           );
+}
+#else
+template <CubeFormat weight_format>
+void ProfileLaunch(uint32_t blocks, void* stream, uint64_t sync_base,
+                    const uint64_t* p, int64_t tokens)
+{
+    const uint64_t* s = p + profile::kScratchOffset;
+    const DispatchInput dispatch_input{p[6], p[7], p[8], p[9], p[10]};
+    routed_int4_fused<weight_format, true><<<blocks, nullptr, stream>>>(
+        sync_base, (__gm__ int8_t*)s[kRestoredRows], (__gm__ int4b_t*)p[0],
+        (__gm__ float*)p[1], (__gm__ ScaleStorage*)p[2], (__gm__ int4b_t*)p[3],
+        (__gm__ float*)p[4], (__gm__ ScaleStorage*)p[5],
+        (__gm__ float*)s[kRestoredScale], (__gm__ int32_t*)s[kGroupCount],
+        (__gm__ int32_t*)s[kGroupStart], (__gm__ int32_t*)s[kSourceRow],
+        (__gm__ int32_t*)s[kSourceSlot], (__gm__ float*)s[kRowWeight],
+        (__gm__ int4b_t*)s[kStacked], (__gm__ RoutedProduct*)s[kGateProduct],
+        (__gm__ int4b_t*)s[kMiddle], (__gm__ float*)s[kMiddleScale],
+        (__gm__ RoutedProduct*)s[kDownProduct], (__gm__ bfloat16_t*)s[kRouteOutput],
+        (__gm__ bfloat16_t*)s[kOutput], (__gm__ uint8_t*)s[kGateTiling],
+        (__gm__ uint8_t*)s[kDownTiling], (GM_ADDR)s[kMatmulWorkspace],
+        kMaxExperts, tokens, blocks, dispatch_input,
+        (__gm__ int64_t*)p[profile::kTraceAddress]);
+}
+
+extern "C" void routed_int4_profile_launch(
+    uint32_t blocks, void* stream, uint64_t sync_base,
+    const uint64_t* addresses, int64_t tokens, int64_t weight_layout)
+{
+    if (weight_layout == kWeightNZ) {
+        ProfileLaunch<CubeFormat::NZ>(blocks, stream, sync_base, addresses, tokens);
+    } else {
+        ProfileLaunch<CubeFormat::ND>(blocks, stream, sync_base, addresses, tokens);
+    }
+}
+#endif

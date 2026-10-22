@@ -41,13 +41,21 @@ order a mistake usually happens:
 - Compare like with like. A sum of separately-launched kernels is not what an
   engine that fuses them spends.
 - A broken index reads exactly like a failed mechanism. Twice in one day.
-- Derive a count that a distribution already fixes. "A round touches two of a
-  rank's sixteen experts" was an assumption; eight distinct picks of 256 over
-  twelve rows gives 5.07, and the fixture's own 81 of 256 confirms it. The
-  lever was overstated by 4.59 ms a round.
-- A lever that depends on a quantity another step changes is not additive.
-  Narrowing the bank is worth 164 us a layer at twelve rows and 87 at
-  thirty-two, so the width-32 acceptance gain cancels against it exactly.
+- Vary one thing. The bank probe moved the weight tensor's size and the active
+  group count together, read the whole effect as the tensor's, and carried the
+  project's largest lever for a day. The control it never ran -- a full tensor
+  with most groups empty -- took one measurement and killed it: 87.23 us against
+  87.10 for a tensor of only the touched experts.
+- Before pricing a lever, check the vendor has not already taken it. Five CANN
+  grouped-matmul kernels skip an empty group with one `continue`, and this
+  repository already anchored that line in a test nobody read.
+- Derive a count that a distribution fixes rather than assuming it. "A round
+  touches two of a rank's sixteen experts" was an assumption; eight distinct
+  picks of 256 over twelve rows gives 5.07, and the routed fixture's own 81
+  distinct of 256 confirms it.
+- Two independent paths agreeing is evidence only if they are independent. The
+  native layer's 574.15 us and the vendor layer's 575.22 looked like a
+  cross-validation until both turned out to skip the empty expert the same way.
 
 ## When implementing
 

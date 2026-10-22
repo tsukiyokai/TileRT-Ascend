@@ -1,3 +1,9 @@
+> Retracted 2026-10-22, the same day. The narrowing row is void, not
+> smaller: the vendor kernel skips an empty expert, so the engine is
+> already at the narrowed point. The remaining rows are unaffected but
+> the path no longer has a measured first step.
+> See [`bank-skip-20261022`](../bank-skip-20261022/README.md).
+
 # The road recomputed at the real distinct-expert count
 
 The 2026-10-21 table ended at 2.60 ms. Two of its inputs were wrong, and

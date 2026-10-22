@@ -234,13 +234,29 @@ class CannModel:
         super_kernel=False, attention_kernel="sfa", fp32_head=False,
         expert_parallel=False, onesided_reduce=None, graph_width=4,
         index_topk=None, plain_moe_combine=False, routed_kernel=False,
-        narrow_bank=False, aiv_collectives=True, rope_graph=False,
+        mla_tail=False, routed_shared_kernel=False, native_attention=False,
+        aiv_collectives=True, rope_graph=False,
         gather_fia_max_width=None,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
+        routed_kernel = routed_kernel or routed_shared_kernel
+        if routed_kernel and expert_parallel:
+            raise ValueError("The routed kernel requires TP16 with EP off")
+        if native_attention and (mla_tail or attention_kernel != "sfa"):
+            raise ValueError("Native attention includes the MLA tail and requires SFA")
+        self._mla_tail_enabled = mla_tail
+        self._native_attention_enabled = native_attention
+        self._routed_workspace_pool = None
+        self._routed_shared_workspace_pool = None
+        self._mla_tail_workspace_pool = None
+        self._native_attention_workspace_pool = None
+        self._restore_routed = None
+        self._restore_routed_shared = []
+        self._restore_mla_tail = []
+        self._restore_native_attention = []
         _choose_collective_engine(aiv_collectives)
         self.rope_graph = rope_graph
         self._rope_graphs = {}
@@ -316,7 +332,9 @@ class CannModel:
                 )
 
                 self._routed_kernel_hook = install_before_conversion(
-                    AscendW4A8DynamicFusedMoEMethod)
+                    AscendW4A8DynamicFusedMoEMethod,
+                    **({"weight_layout": "nz", "reuse_dispatch": True}
+                       if routed_shared_kernel else {}))
             self.worker.load_model()
             self.runner = self.worker.model_runner
             self.model = self.runner.get_model()
@@ -336,35 +354,8 @@ class CannModel:
             self._restore_combine = install()
         if routed_kernel:
             self._install_routed_kernel()
-        if narrow_bank:
-            self._install_narrow_bank()
-
-    def _install_narrow_bank(self):
-        """Hand the grouped matmul only the experts a round's rows touched.
-
-        The operator's cost follows the bank rather than the rows -- 7.53 us an
-        expert over a 55.57 intercept on one die, flat in rows -- and at batch
-        one a rank of sixteen sees two to five of its own experts touched. In a
-        graph the full bank is 180.61 us against 121.17 for six, and a
-        scattered six costs what a consecutive six does.
-        """
-        from .narrow_bank import install
-
-        # One quant method may serve every layer, so the installs are
-        # deduplicated by identity -- wrapping the same object twice would
-        # narrow an already-narrowed group list.
-        # `layers` is a ModuleList here, which iterates its modules directly.
-        # The dict form elsewhere in this file belongs to another object, and
-        # copying its walk was the first thing the arm hit.
-        methods = {}
-        for layer in self.model.model.layers:
-            method = getattr(getattr(layer, "mlp", None), "quant_method", None)
-            if method is not None:
-                methods.setdefault(id(method), method)
-        if not methods:
-            raise RuntimeError("no MoE quant method to narrow")
-        self._restore_narrow = [install(method)
-                                for method in methods.values()]
+        if routed_shared_kernel:
+            self._install_routed_shared_kernel()
 
     def _install_routed_kernel(self):
         """Send the routed experts to the hand-written kernel.
@@ -376,11 +367,58 @@ class CannModel:
         raises if it is not -- a silent miss would run the vendor path and
         report the kernel's number.
         """
-        restore, installed = self._routed_kernel_hook
+        restore, installed, pool = self._routed_kernel_hook
         if not installed:
             raise RuntimeError("the routed kernel hook took no layer; it must "
                                "be installed before the model loads")
         self._restore_routed = restore
+        self._routed_workspace_pool = pool
+
+    def _install_routed_shared_kernel(self):
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+
+        from .routed_shared import WorkspacePool, install, load
+
+        load()
+        pool = WorkspacePool()
+        runners = [module for module in self.model.modules()
+                   if isinstance(module, AscendMoERunner)]
+        if not runners:
+            raise RuntimeError("No Ascend MoE runner found for routed/shared fusion")
+        weights = self._routed_workspace_pool.layer_weights
+        try:
+            for runner in runners:
+                routed_weights = weights[id(runner.routed_experts)]
+                self._restore_routed_shared.append(
+                    install(runner, routed_weights, pool),
+                )
+        except Exception:
+            for restore in reversed(self._restore_routed_shared):
+                restore()
+            self._restore_routed_shared.clear()
+            raise
+        self._routed_shared_workspace_pool = pool
+
+    def _prepare_fused_workspaces(self, width):
+        """Reserve native storage before the wrapper enters graph capture."""
+        import torch
+
+        if self._routed_workspace_pool is not None:
+            rows = torch.empty(width, 6144, dtype=torch.int8,
+                               device=self.device)
+            self._routed_workspace_pool.reserve_capture(rows)
+        if self._routed_shared_workspace_pool is not None:
+            rows = torch.empty(width, 6144, dtype=torch.int8,
+                               device=self.device)
+            self._routed_shared_workspace_pool.reserve_capture(rows)
+        if self._mla_tail_workspace_pool is not None:
+            latent = torch.empty(width, 4, 512, dtype=torch.bfloat16,
+                                 device=self.device)
+            self._mla_tail_workspace_pool.reserve_capture(latent)
+        if self._native_attention_workspace_pool is not None:
+            hidden = torch.empty(width, 6144, dtype=torch.bfloat16,
+                                 device=self.device)
+            self._native_attention_workspace_pool.reserve_capture(hidden)
 
     def _install_tp_sum(self):
         from vllm.distributed import get_tp_group
@@ -425,6 +463,18 @@ class CannModel:
         if self._onesided is not None:
             self._onesided.close()
             self._onesided = None
+        for restore in reversed(self._restore_routed_shared):
+            restore()
+        self._restore_routed_shared.clear()
+        if self._restore_routed is not None:
+            self._restore_routed()
+            self._restore_routed = None
+        for restore in reversed(self._restore_mla_tail):
+            restore()
+        self._restore_mla_tail.clear()
+        for restore in reversed(self._restore_native_attention):
+            restore()
+        self._restore_native_attention.clear()
         self.worker.shutdown()
 
     def _bind_cache(self):
@@ -525,6 +575,33 @@ class CannModel:
             )
             for name in attention_names:
                 self._shared_attention.bind(context[name].impl)
+        if self._mla_tail_enabled:
+            from .mla_tail import WorkspacePool, install, load
+
+            load()
+            self._mla_tail_workspace_pool = WorkspacePool()
+            context = self.config.compilation_config.static_forward_context
+            self._restore_mla_tail = [
+                install(context[name].impl, self._mla_tail_workspace_pool)
+                for name in attention_names
+            ]
+        if self._native_attention_enabled:
+            from .attention_native import WorkspacePool, install, load
+
+            load()
+            self._native_attention_workspace_pool = WorkspacePool()
+            context = self.config.compilation_config.static_forward_context
+            try:
+                for name in attention_names:
+                    self._restore_native_attention.append(install(
+                        context[name], self._native_attention_workspace_pool,
+                    ))
+            except Exception:
+                for restore in reversed(self._restore_native_attention):
+                    restore()
+                self._restore_native_attention.clear()
+                self._native_attention_workspace_pool = None
+                raise
         self.builders = [
             (names, kind(spec, names, self.config, self.device))
             for (kind, spec), names in groups.items()
@@ -813,6 +890,49 @@ class CannModel:
             from .cann_head import fp32_projection
 
             objects.append(fp32_projection)
+        native_libraries = []
+        if self._routed_workspace_pool is not None:
+            from . import routed_expert
+            from vllm_ascend.quantization.methods.w4a8.w4a8 import (
+                AscendW4A8DynamicFusedMoEMethod,
+            )
+
+            objects.extend((routed_expert, AscendW4A8DynamicFusedMoEMethod))
+            native_libraries.append(
+                routed_expert.LIBRARY_DIR / "routed_int4_torch.so",
+            )
+        if self._routed_shared_workspace_pool is not None:
+            from . import routed_shared
+            from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+            from vllm_ascend.ops.fused_moe.routed_experts import (
+                AscendRoutedExperts,
+            )
+
+            objects.extend((routed_shared, AscendMoERunner, AscendRoutedExperts))
+            native_libraries.extend(routed_shared.library_paths())
+        if self._mla_tail_workspace_pool is not None:
+            from . import mla_tail
+
+            objects.append(mla_tail)
+            native_libraries.append(mla_tail.LIBRARY_DIR / "mla_tail_torch.so")
+        if self._native_attention_workspace_pool is not None:
+            from . import attention_native, mla_tail
+
+            objects.extend((attention_native, mla_tail))
+            native_libraries.extend(attention_native.library_paths())
+        if (self._routed_shared_workspace_pool is not None
+                or self._mla_tail_workspace_pool is not None
+                or self._native_attention_workspace_pool is not None):
+            from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
+                AscendW8A8DynamicLinearMethod,
+            )
+
+            objects.append(AscendW8A8DynamicLinearMethod)
+        if (self._mla_tail_workspace_pool is not None
+                or self._native_attention_workspace_pool is not None):
+            context = self.config.compilation_config.static_forward_context
+            objects.extend(type(layer.impl) for layer in context.values()
+                           if hasattr(layer, "impl"))
         if not self.config.model_config.enforce_eager:
             from vllm.compilation.decorators import support_torch_compile
             from vllm.compilation.wrapper import (
@@ -828,5 +948,6 @@ class CannModel:
             objects.append(type(self.graph))
         paths = {Path(inspect.getfile(inspect.unwrap(value))).resolve()
                  for value in objects}
+        paths.update(path.resolve() for path in native_libraries)
         return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in sorted(paths)}

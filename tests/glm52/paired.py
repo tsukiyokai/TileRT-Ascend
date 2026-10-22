@@ -29,7 +29,7 @@ def p10(directory):
     record = json.loads(path.read_text())
     values = []
     for request in record.get("requests", []):
-        if request.get("warmup"):
+        if request.get("warmup") or request.get("profiled"):
             continue
         rounds = sorted(entry["elapsed_ns"] / 1e6
                         for entry in request.get("operations", [])

@@ -26,6 +26,7 @@ class CannGraph:
         )
 
         self.device = engine.device
+        self._prepare_fused_workspaces = engine._prepare_fused_workspaces
         self.config = engine.config
         self.model = engine.model
         self.width = width
@@ -115,6 +116,7 @@ class CannGraph:
         from vllm_ascend.worker.model_runner_v1 import graph_capture
 
         caller_stream = torch.npu.current_stream(self.device)
+        self._prepare_fused_workspaces(self.width)
         enabled = monitor.cudagraph_capturing_enabled
         monitor.set_cudagraph_capturing_enabled(True)
         try:

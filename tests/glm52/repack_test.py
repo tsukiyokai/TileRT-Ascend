@@ -1,13 +1,4 @@
-"""Does the repack preserve the codes it moves?
-
-`install` has to turn the checkpoint's packing into the kernel's. The
-checkpoint pairs two INT4 codes in a byte along the output axis; the kernel
-pairs them along K. Both use the same nibble order, so nothing in a dtype or
-a shape would catch a wrong permutation -- only the codes themselves will.
-
-The property: unpacking the repacked tensor along K must give the same logical
-codes as unpacking the original along N. CPU only.
-"""
+"""Verify native non-transposed B[K,N] preserves checkpoint INT4 codes."""
 import pathlib
 import sys
 
@@ -32,13 +23,13 @@ def unpack_along_outputs(packed, columns):
     return stacked.reshape(experts, 2 * halved, inner)
 
 
-def unpack_along_inner(packed):
-    """The kernel's reading: byte holds K and K+1 for one output."""
+def unpack_native_b(packed):
+    """Native B[E,K,N/2] pairs adjacent output columns."""
     low = signed(packed & 0x0F)
     high = signed((packed >> 4) & 0x0F)
-    experts, columns, halved = packed.shape
+    experts, inner, halved = packed.shape
     stacked = torch.stack((low, high), dim=3)
-    return stacked.reshape(experts, columns, 2 * halved)
+    return stacked.reshape(experts, inner, 2 * halved).transpose(1, 2)
 
 
 def main():
@@ -47,7 +38,7 @@ def main():
         original = torch.randint(0, 256, (experts, columns // 2, inner),
                                  dtype=torch.uint8).to(torch.int8)
         expected = unpack_along_outputs(original, columns)
-        actual = unpack_along_inner(_repack(original, columns))
+        actual = unpack_native_b(_repack(original, columns))
         same = bool(torch.equal(actual, expected))
         print(f"{experts}x{columns}x{inner}: codes preserved {same}  "
               f"unequal {int((actual != expected).sum())}/{actual.numel()}")

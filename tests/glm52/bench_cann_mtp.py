@@ -7,6 +7,7 @@ and Gloo commands. Prefix readiness and reset are outside that window.
 
 import argparse
 import ast
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -159,7 +160,7 @@ def arguments():
     parser.add_argument("--profile-last", action="store_true",
                         help="Capture the device on the last request only,"
                              " at the real width and after the caches have"
-                             " settled")
+                             " settled; exclude that request from TPOT")
     parser.add_argument("--tree", action="store_true",
                         help="Draft a tree rather than a chain; the round"
                              " verifies it under a per-row attention mask and"
@@ -175,8 +176,16 @@ def arguments():
                              " many tokens a round")
     parser.add_argument("--routed-kernel", action="store_true",
                         help="Send the routed experts to the hand-written"
-                             " INT4 kernel, which replaces four vendor"
-                             " launches with one")
+                             " INT4 matrix/activation kernel")
+    parser.add_argument("--routed-shared-kernel", action="store_true",
+                        help="Interleave routed INT4 and shared W8A8 in one"
+                             " AscendC launch; implies the NZ routed adapter")
+    parser.add_argument("--mla-tail", action="store_true",
+                        help="Fuse MLA value-up, dynamic quantization and"
+                             " the local output projection in AscendC")
+    parser.add_argument("--native-attention", action="store_true",
+                        help="Fuse Prolog, optional indexer, SFA and output"
+                             " projection in AscendC")
     parser.add_argument("--onesided-reduce",
                         help="Config-store endpoint, e.g."
                              " tcp://127.0.0.1:9421, replacing the TP sum"
@@ -193,13 +202,12 @@ def arguments():
                         help="expand collectives on the device AI CPU, which "
                              "is A3's default and 1.6 to 1.9x slower at "
                              "decode sizes")
-    parser.add_argument("--narrow-bank", action="store_true",
-                        help="hand the grouped matmul only the "
-                             "experts a round's rows touched")
 
     args = parser.parse_args()
     if args.max_tokens < 2 or args.warmup < 0 or args.requests < 1:
         parser.error("Require >=2 outputs, >=0 warmup and >=1 requests")
+    if args.profile_last and args.requests < 2:
+        parser.error("--profile-last requires an unprofiled measured request")
     if args.rounds_per_command < 1:
         parser.error("--rounds-per-command must be positive")
     if (args.target_graph or args.draft_graph) and args.warmup < 1:
@@ -229,50 +237,42 @@ def drive(backend, first, args):
     try:
         for number in range(args.warmup + args.requests):
             tokens, clocks = [], []
-            # The device capture goes on the last request only. Every capture
-            # this project has taken ran at `max_tokens: 6` and `mtp_width: 4`
-            # and included warmup and prefill, so its per-round figures were
-            # divided by a round count inferred from kernel counts that were
-            # mostly not decode. Here the window is one request at the real
-            # width, after the caches and the trajectory have settled.
             last = number == args.warmup + args.requests - 1
-            capture = None
-            if args.profile_last and last:
-                import torch_npu
-                capture = torch_npu.profiler.profile(
-                    activities=[torch_npu.profiler.ProfilerActivity.NPU],
-                    on_trace_ready=(
-                        torch_npu.profiler.tensorboard_trace_handler(
-                            str(args.output / "capture"))),
-                    experimental_config=(
-                        torch_npu.profiler._ExperimentalConfig(
-                            profiler_level=(
-                                torch_npu.profiler.ProfilerLevel.Level1))))
-                capture.__enter__()
-                report["profiled"] = True
+            profiled = args.profile_last and last
+
             def deliver(token):
                 tokens.append(int(token))
                 clocks.append(perf_counter_ns())
+
             try:
                 session.inject(PrefixRequest(f"mtp-bench-{number}",
                                              PREFIX_LENGTH))
-                output = session.decode(
-                    first, max_tokens=args.max_tokens,
-                    sampling={"temperature": 0.0, "ignore_eos": True},
-                    on_token=deliver,
-                )
-                if capture is not None:
-                    capture.__exit__(None, None, None)
-                    capture = None
-                    # Analyse here, not later: the collector writes raw data
-                    # and `kernel_details.csv` only exists after this call, so
-                    # leaving it out would hand the next session a directory it
-                    # has to remember to process.
+                capture = nullcontext()
+                if profiled:
+                    import torch_npu
+                    capture = torch_npu.profiler.profile(
+                        activities=[torch_npu.profiler.ProfilerActivity.NPU],
+                        on_trace_ready=(
+                            torch_npu.profiler.tensorboard_trace_handler(
+                                str(args.output / "capture"))),
+                        experimental_config=(
+                            torch_npu.profiler._ExperimentalConfig(
+                                profiler_level=(
+                                    torch_npu.profiler.ProfilerLevel.Level1))))
+                with capture:
+                    output = session.decode(
+                        first, max_tokens=args.max_tokens,
+                        sampling={"temperature": 0.0, "ignore_eos": True},
+                        on_token=deliver,
+                    )
+                if profiled:
+                    # Parsing produces kernel_details.csv from the raw trace.
                     import torch_npu
                     torch_npu.profiler.profiler.analyse(
                         profiler_path=str(args.output / "capture"))
                 records.append({
-                    "warmup": number < args.warmup, "tokens": tokens,
+                    "warmup": number < args.warmup, "profiled": profiled,
+                    "tokens": tokens,
                     "returned_tokens": output, "timestamps_ns": clocks,
                     **token_metrics(tokens, clocks),
                     "session": dict(session.last_stats),
@@ -291,10 +291,20 @@ def drive(backend, first, args):
             )
     return records
 
+
+def timing_requests(requests):
+    """Select completed requests recorded without warmup or profiling."""
+    return [item for item in requests
+            if not item["warmup"] and not item["profiled"]]
+
+
 def validate_local(report, args):
     """Check saved local state, then return the rank-independent history."""
     histories = []
-    if (report["final_positions"] != [0, 0] or not report["closed"]
+    reset_positions = [0, None if args.lookup else 0]
+    injected_positions = [PREFIX_LENGTH,
+                          None if args.lookup else PREFIX_LENGTH - 1]
+    if (report["final_positions"] != reset_positions or not report["closed"]
             or len(report["rank_requests"]) != args.warmup + args.requests):
         raise ValueError("The rank did not reset and close every request")
     for request in report["rank_requests"]:
@@ -331,9 +341,9 @@ def validate_local(report, args):
             position, previous_end = item["retained"], item["end_ns"]
             rounds.append({key: value for key, value in item.items()
                            if not key.endswith("_ns")})
-        if (request["injected"] != [8192, 8191]
+        if (request["injected"] != injected_positions
                 or request["finished"] != [position, draft_position]
-                or request["reset"] != [0, 0]
+                or request["reset"] != reset_positions
                 or len(tokens) != args.max_tokens
                 or position != 8192 + args.max_tokens - 1):
             raise ValueError("Request output and valid KV lengths differ")
@@ -366,7 +376,7 @@ def validate_local(report, args):
 def validate_delivery(requests, histories, args):
     if len(requests) != len(histories):
         raise ValueError("Missing callback timing records")
-    for request, history in zip(requests, histories):
+    for number, (request, history) in enumerate(zip(requests, histories)):
         tokens, clocks = request["tokens"], request["timestamps_ns"]
         stats, rounds = request["session"], history["rounds"]
         operations = request["operations"]
@@ -378,7 +388,10 @@ def validate_delivery(requests, histories, args):
         expected_ops = (["inject", "start_mtp"]
                         + ["advance_mtp_n"] * len(advances)
                         + ["finish_mtp", "reset"])
-        if (tokens != request["returned_tokens"] or tokens != history["tokens"]
+        profiled = args.profile_last and number == len(requests) - 1
+        if (request["warmup"] != (number < args.warmup)
+                or request["profiled"] != profiled
+                or tokens != request["returned_tokens"] or tokens != history["tokens"]
                 or token_metrics(tokens, clocks)["tpot_ms"]
                 != request["tpot_ms"]
                 or [op["operation"] for op in operations] != expected_ops
@@ -451,7 +464,9 @@ def run(args, report):
                        expert_parallel=args.expert_parallel,
                        onesided_reduce=args.onesided_reduce,
                        routed_kernel=args.routed_kernel,
-                       narrow_bank=args.narrow_bank,
+                       routed_shared_kernel=args.routed_shared_kernel,
+                       mla_tail=args.mla_tail,
+                       native_attention=args.native_attention,
                        aiv_collectives=not args.ai_cpu_collectives,
                        rope_graph=args.rope_graph,
                        gather_fia_max_width=args.gather_fia_max_width,
@@ -626,6 +641,8 @@ def run(args, report):
             if rank == 0:
                 backend = CoordinatedBackend(executor, channel)
                 report["requests"] = drive(backend, first, args)
+                report["profiled"] = any(
+                    item["profiled"] for item in report["requests"])
             else:
                 executor.serve(channel)
         graph = target.graph
@@ -634,13 +651,13 @@ def run(args, report):
             command_serial=executor.serial, closed=executor.closed,
             final_positions=[target.position,
                              None if draft is None else draft.position],
-            draft_graph_state=None if draft.graph is None else {
+            draft_graph_state=None if draft is None or draft.graph is None else {
                 "captures": draft.graph.capture_count,
                 "replays": draft.graph.replay_count,
                 "scope": "M1 shared-index chain, including own head",
             },
             conditioned_graph_state=(
-                None if draft.conditioned_graph is None else {
+                None if draft is None or draft.conditioned_graph is None else {
                     "captures": draft.conditioned_graph.capture_count,
                     "replays": draft.conditioned_graph.replay_count,
                     "scope": "M4 target-conditioned pass, including own head",
@@ -678,8 +695,7 @@ def run(args, report):
             and not any(item["errors"] for item in receipts)
         )
         if rank == 0:
-            measured = [item for item in report["requests"]
-                        if not item["warmup"]]
+            measured = timing_requests(report["requests"])
             values = [item["tpot_ms"] for item in measured]
             summary = {
                 "status": "measured" if passed else "fail",
@@ -691,7 +707,10 @@ def run(args, report):
                                 values, n=100, method="inclusive",
                             )[94] if len(values) > 1 else values[0],
                             "min": min(values), "max": max(values)},
-                "warmup": args.warmup, "requests": args.requests,
+                "warmup": args.warmup, "requests": len(measured),
+                "requested_requests": args.requests,
+                "profiled_requests": sum(
+                    item["profiled"] for item in report["requests"]),
                 "output_tokens_per_request": args.max_tokens,
                 "drafter": ("automaton" if args.automaton else "lookup")
                            if args.lookup else "mtp",
@@ -710,6 +729,10 @@ def run(args, report):
                 "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
                 "fp32_head": args.fp32_head,
+                "routed_kernel": args.routed_kernel or args.routed_shared_kernel,
+                "routed_shared_kernel": args.routed_shared_kernel,
+                "mla_tail": args.mla_tail,
+                "native_attention": args.native_attention,
                 "ranks": [{key: item[key] for key in
                            ("rank", "report_sha256", "errors")}
                           for item in receipts],
@@ -731,7 +754,8 @@ def main():
         "source_commit": args.source_commit, "world_size": 16,
         "width": args.width, "max_tokens": args.max_tokens,
         "capacity": args.capacity, "warmup": args.warmup,
-        "measured_requests": args.requests, "target_graph": args.target_graph,
+        "measured_requests": args.requests - int(args.profile_last),
+        "target_graph": args.target_graph,
         "draft_graph": args.draft_graph,
         "conditioned_graph": args.conditioned_graph,
         "draft_projection_tp": args.draft_projection_tp,
@@ -741,6 +765,10 @@ def main():
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
         "fp32_head": args.fp32_head,
+        "routed_kernel": args.routed_kernel or args.routed_shared_kernel,
+        "routed_shared_kernel": args.routed_shared_kernel,
+        "mla_tail": args.mla_tail,
+        "native_attention": args.native_attention,
         "scope": "internal TP16 session delivery; HTTP/HIXL excluded",
         "clock": "perf_counter_ns; rank-local host clocks",
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",

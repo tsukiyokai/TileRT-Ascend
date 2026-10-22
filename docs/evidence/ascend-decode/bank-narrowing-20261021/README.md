@@ -1,3 +1,11 @@
+> Retracted 2026-10-22. The lever does not exist. The grouped matmul
+> charges nothing for an expert whose group is empty, so the engine
+> already pays only for what a round touches: a sixteen-expert tensor
+> with five nonzero groups costs 87.23 us against 87.10 for a tensor of
+> the five. This page varied the tensor size and the active group count
+> together and attributed the whole effect to the tensor.
+> See [`bank-skip-20261022`](../bank-skip-20261022/README.md).
+
 # The grouped matmul's cost follows the bank, not the rows
 
 2026-10-21, a3-84, one die, 96 sorted rows held fixed, INT8 into INT32 in a
