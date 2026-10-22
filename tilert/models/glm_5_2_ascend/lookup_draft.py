@@ -1,5 +1,14 @@
 """Propose a causal continuation from repeated prompt or output token IDs."""
 
+# A tail is keyed by a polynomial hash so that extending it by one token is a
+# multiply and an add, rather than building a tuple whose hash costs one
+# operation a token. Indexing an 8192-token prompt over tail lengths 2 to 32
+# is then 254 thousand constant-time inserts instead of 4.3 million element
+# hashes. A query verifies its one candidate against the context, so a
+# collision cannot produce a wrong proposal.
+BASE = 1000003
+MODULUS = (1 << 61) - 1
+
 
 class LookupDrafter:
     """Hold the context and propose what followed its tail last time.
@@ -30,13 +39,17 @@ class LookupDrafter:
         """Extend the context with what the target actually accepted."""
         previous_length = len(self.context)
         self.context.extend(int(token) for token in tokens)
+        context = self.context
+        latest = self._latest
         # Only index suffixes with a known continuation. A newly appended
         # token makes the preceding tail eligible, never the current tail.
-        for end in range(max(previous_length, self.shortest),
-                         len(self.context)):
-            for size in range(self.shortest, min(self.longest, end) + 1):
-                key = tuple(self.context[end - size:end])
-                self._latest[key] = end
+        for end in range(max(previous_length, self.shortest), len(context)):
+            key = 0
+            longest = min(self.longest, end)
+            for size in range(1, longest + 1):
+                key = (key * BASE + context[end - size]) % MODULUS
+                if size >= self.shortest:
+                    latest[(size, key)] = end
 
     def propose(self, count):
         """Return up to `count` tokens, longest tail match first.
@@ -46,15 +59,24 @@ class LookupDrafter:
         """
         self.rounds += 1
         context = self.context
-        for size in range(self.longest, self.shortest - 1, -1):
+        keys = []
+        key = 0
+        for size in range(1, self.longest + 1):
+            if size > len(context):
+                break
+            key = (key * BASE + context[-size]) % MODULUS
+            if size >= self.shortest:
+                keys.append((size, key))
+        for size, key in reversed(keys):
             if len(context) <= size:
                 continue
-            end = self._latest.get(tuple(context[-size:]))
-            if end is not None:
-                run = context[end:end + count]
-                if run:
-                    self.hits += 1
-                    return run
+            end = self._latest.get((size, key))
+            if end is None or context[end - size:end] != context[-size:]:
+                continue
+            run = context[end:end + count]
+            if run:
+                self.hits += 1
+                return run
         return []
 
     def report(self):
