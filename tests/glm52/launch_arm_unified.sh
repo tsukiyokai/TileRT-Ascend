@@ -71,8 +71,16 @@ rm -rf "$out" "$VLLM_CACHE_ROOT"
 mkdir -p "$out" "$VLLM_CACHE_ROOT"
 echo "=== $tag width=$width util=$utilisation hccl=$HCCL_NPU_SOCKET_PORT_RANGE $* $(date -Is)"
 
-# Static kernel packages are cached below the working directory.
-cd "$out"
+# Static kernel packages are cached below the working directory, which is the
+# arm's own by default. A series of arms that differ only in flags can share
+# one by setting KERNELS: the package key covers the dumped operator
+# parameters and the super-kernel option string, so what differs recompiles
+# and the rest is reused. It does not cover the vendor source, so an arm that
+# patches a vendor call must keep its own.
+# `grep -c "static kernel compile start" launch.log` says which happened.
+kernels=$(realpath -m "${KERNELS:-$out}")
+mkdir -p "$kernels"
+cd "$kernels"
 timeout "${ARM_TIMEOUT:-14400}" torchrun --nproc-per-node 16 \
   --master-port $((51000 + RANDOM % 2000)) \
   "$tree/tests/glm52/bench_cann_mtp.py" \
