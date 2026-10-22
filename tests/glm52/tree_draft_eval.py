@@ -194,10 +194,10 @@ def main():
           f"files {[len(body) for body in bodies]}")
     print(f"width {arguments.width}  budget {arguments.budget}  "
           f"branches {arguments.branches}  longest {arguments.longest}")
-    print(f"{'edit rate':>10}  {'chain8':>7}  {'chain32':>7}  "
-          f"{'automaton':>9}  {'adaptive':>8}  {'width':>6}  "
-          f"{'tree':>7}  {'tpot@w':>8}  {'tpot@adp':>9}  "
-          f"{'grove':>7}  {'rows':>6}  {'tpot@grv':>9}  {'rounds':>7}")
+    print(f"{'edit rate':>10}  {'chain8':>7}  {'chainL':>7}  "
+          f"{'automaton':>9}  {'adaptive':>8}  {'adp rows':>8}  "
+          f"{'tree':>7}  {'tpot@aut':>8}  {'tpot@adp':>8}  "
+          f"{'grove':>7}  {'grv rows':>8}  {'tpot@grv':>8}  {'rounds':>7}")
     for rate in [float(piece) for piece in arguments.rates.split(",")]:
         generator = random.Random(arguments.seed)
         chain_total = []
@@ -240,12 +240,12 @@ def main():
         grove_tpot = (45.88 + 0.814 * grove_rows) / grove_mean
         fixed_tpot = (45.88 + 0.814 * arguments.width) / walked_mean
         adaptive_tpot = (45.88 + 0.814 * width_mean) / adaptive_mean
-        print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {walked_mean:>9.3f}  "
-              f"{adaptive_mean:>8.3f}  {width_mean:>6.1f}  "
-              f"{tree_mean:>7.3f}  {fixed_tpot:>8.2f}  "
-              f"{adaptive_tpot:>9.2f}  {grove_mean:>7.3f}  "
-              f"{grove_rows:>6.1f}  {grove_tpot:>9.2f}  "
-              f"{len(chain_total):>7}")
+        print(f"{rate:>10.2f}  {chain_mean:>7.3f}  {long_mean:>7.3f}  "
+              f"{walked_mean:>9.3f}  {adaptive_mean:>8.3f}  "
+              f"{width_mean:>8.1f}  {tree_mean:>7.3f}  "
+              f"{fixed_tpot:>8.2f}  {adaptive_tpot:>8.2f}  "
+              f"{grove_mean:>7.3f}  {grove_rows:>8.1f}  "
+              f"{grove_tpot:>8.2f}  {len(chain_total):>7}")
 
 
 if __name__ == "__main__":

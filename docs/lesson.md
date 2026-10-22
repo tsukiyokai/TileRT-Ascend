@@ -2494,3 +2494,7 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
      capture failed: NameError: name 'reduce' is not defined" on eleven ranks,
      which reads as a communication fault and was a stale parameter name -- a
      Python error inside a capture is reported as a capture failure.
+- A table whose header is one column short of its print is read one place left,
+  and every value still looks plausible. `tree_draft_eval.py` labelled thirteen
+  columns over twelve values for a day; the automaton's acceptance was being
+  read as a long chain's.
