@@ -336,3 +336,12 @@ clobbered `triton` moved aside, because vllm imports
 a3-180 is the best machine the project has had: sixteen idle dies, 291 GB free
 on `/`, and the checkpoint NAS mounted at `/sfs-asset-inference-ci`, so the
 755 GB over 82 MB/s problem that shaped the previous days does not exist there.
+
+The asset NFS is the schedule, not the compile. Under the engine's own prefetch
+(sixteen ranks, eight threads each) the checkpoint streams into page cache at a
+measured **79 MB/s**, which is the same ceiling this project recorded for that
+export, so a cold 404 GB load is about 85 minutes. The host has 2258 GB of RAM,
+so it only happens once: every later arm reads from cache. Order a session
+accordingly -- start the first arm before anything else and spend its load on
+work that needs no device. `/mnt/sfs_turbo` has 724 TB free if a copy is ever
+worth staging for a host that reboots.
