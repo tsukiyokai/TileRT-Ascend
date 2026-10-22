@@ -24,3 +24,29 @@ extrapolation.
 
 `foreach_add_32_rows` is 4.4 times `add_32_rows`: the batched API pays more
 floor than it saves at this size, so it is not a fusion route.
+
+## The 28.8 us a kernel the fixed term is priced with reads the host
+
+The same 12-element scalar multiply, three ways on the same die:
+
+| timing | 12 elements | 32 x 6144 |
+|---|---|---|
+| back to back, one sync a batch | **13.931 us** | 14.371 |
+| eager event pair | 47.220 | 45.700 |
+| host enqueue (`perf_counter` around the call) | 16.696 | 16.450 |
+
+The round model's 28.824 sits between the eager pair and the host enqueue, not
+at the in-stream floor, which is 13.931 -- and this project's own lesson is
+that an eager event pair can read the host rather than the device.
+
+Sixteen thousand times the payload costs 3.2 percent more time, so at this
+scale the cost is the kernel floor and nothing else.
+
+## What that does to the route
+
+The fixed term was decomposed as 25 kernels a layer x 28.8 us x 78 = 56 ms,
+which is the whole of a measured 50.73 ms round. At the measured floor it is
+25 x 13.9 x 78 = **27.1 ms**, or 53 percent of the round. So the pass budget's
+saving is overstated by about a factor of two, and **23.6 ms a round now has
+no owner** -- the round's composition has to be re-derived before 48 passes to
+11 can be claimed to deliver 2.9 ms.
