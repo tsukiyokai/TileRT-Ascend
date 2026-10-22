@@ -147,6 +147,25 @@ struct Workspace {
     }
 };
 
+// Which step of a skewed schedule owns an expert. One chunk is the whole range,
+// which is the unskewed kernel; more chunks let the gate/up of step s run
+// beside the activate of step s-1, since the experts are already one matmul
+// invocation each and interleaving them costs barriers rather than reduction
+// walks.
+__aicore__ inline bool InChunk(int64_t expert, int64_t experts, int64_t chunk,
+                               int64_t chunks)
+{
+    if (chunks <= 1) {
+        return true;
+    }
+    if (chunk < 0 || chunk >= chunks) {
+        return false;
+    }
+    const int64_t span = (experts + chunks - 1) / chunks;
+    const int64_t first = chunk * span;
+    return expert >= first && expert < first + span;
+}
+
 __aicore__ inline void LoadTiling(TCubeTiling& cube, __gm__ uint8_t* bytes)
 {
     auto* destination = (uint32_t*)&cube;
@@ -653,8 +672,24 @@ __aicore__ void routed_int4_fused(
     }
     timing.Barrier(1);
     timing.Begin(2);
+#ifdef ROUTED_EXPERT_SKEW
+    constexpr int64_t chunks = ROUTED_EXPERT_SKEW;
+#else
+    constexpr int64_t chunks = 1;
+#endif
+    // One chunk gives the original schedule: the whole gate/up stage, then the
+    // whole activate stage. More chunks skew them, so each step's cube work
+    // runs beside the previous step's vector work.
+    for (int64_t step = 0; step <= chunks; ++step) {
+    const int64_t gate_chunk = step < chunks ? step : -1;
+    const int64_t activate_chunk = step > 0 ? step - 1 : -1;
+    if (chunks > 1 && step > 0) {
+        AscendC::SyncAll<false>();
+    }
 #ifdef ROUTED_SHARED_PIPELINE
-    shared.Activate();
+    if (step == 0) {
+        shared.Activate();
+    }
 #endif
     if ASCEND_IS_AIC {
 #ifdef ROUTED_SHARED_PIPELINE
@@ -675,6 +710,9 @@ __aicore__ void routed_int4_fused(
                 continue;
             }
             next += blocks;
+            if (!InChunk(expert, experts, gate_chunk, chunks)) {
+                continue;
+            }
             const int64_t begin = starts.GetValue(expert);
             Project<kPadGateRows>(gate_mm,
                     Nibbles(stacked, GateStorageRow(begin) * kHidden),
@@ -685,10 +723,14 @@ __aicore__ void routed_int4_fused(
         }
         Publish();
     }
-    timing.Barrier(2);
-    timing.Begin(3);
+    if (chunks == 1) {
+        timing.Barrier(2);
+        timing.Begin(3);
+    }
 #ifdef ROUTED_SHARED_PIPELINE
-    shared.Down(pipe);
+    if (step == chunks) {
+        shared.Down(pipe);
+    }
 #endif
     if ASCEND_IS_AIV {
 #ifdef ROUTED_ROW_BALANCED
@@ -700,11 +742,13 @@ __aicore__ void routed_int4_fused(
             if (next >= begin + count) {
                 continue;
             }
-            Activate<true>(held, count, begin,
-                partial + GateStorageRow(begin) * kGateUp,
-                gu_bias + expert * kGateUp, gu_scale + expert * kGateUp,
-                Nibbles(middle, 2 * begin * kIntermediate),
-                middle_scale + begin, next - begin, workers);
+            if (InChunk(expert, experts, activate_chunk, chunks)) {
+                Activate<true>(held, count, begin,
+                    partial + GateStorageRow(begin) * kGateUp,
+                    gu_bias + expert * kGateUp, gu_scale + expert * kGateUp,
+                    Nibbles(middle, 2 * begin * kIntermediate),
+                    middle_scale + begin, next - begin, workers);
+            }
             do {
                 next += workers;
             } while (next < begin + count);
@@ -733,6 +777,10 @@ __aicore__ void routed_int4_fused(
             Publish();
         }
 #endif
+    }
+    if (chunks == 1) {
+        break;
+    }
     }
     timing.Barrier(3);
     timing.Begin(4);

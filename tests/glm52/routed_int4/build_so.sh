@@ -60,6 +60,14 @@ if [[ ${ROUTED_GU_PAD16:-0} == 1 ]]; then
   routed_variant_flags+=(-DROUTED_GU_PAD16)
   routed_default_out=$routed_here/build-gu-pad16
 fi
+if [[ -n ${ROUTED_EXPERT_SKEW:-} ]]; then
+  if [[ ${ROUTED_ROW_BALANCED:-0} != 1 ]]; then
+    echo 'ROUTED_EXPERT_SKEW requires the row-balanced schedule' >&2
+    exit 2
+  fi
+  routed_variant_flags+=("-DROUTED_EXPERT_SKEW=$ROUTED_EXPERT_SKEW")
+  routed_default_out=$routed_here/build-skew-$ROUTED_EXPERT_SKEW
+fi
 if [[ ${ROUTED_INPUT_FRONT:-0} == 1 ]]; then
   if [[ ${ROUTED_PARTIALS:-int32} != int32 || ${ROUTED_CONTROL:-0} != 0 \
         || ${ROUTED_ROW_BALANCED:-0} != 1 \
