@@ -2545,3 +2545,8 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   the whole advantage there. Validate a drafter on the target's own output
   before building on the number, and keep both distributions when they
   disagree: the disagreement is the finding.
+- Check that a feature's second half is wired before measuring its first. The
+  tree drafter proposes and `accepted_path` resolves, but
+  `tree_attention.install` has no caller, so `mtp_round.tree_mask` stays None
+  and off-path nodes attend to the indexer's selection instead of their own
+  ancestors. A ladder of seven arms was about to measure that.
