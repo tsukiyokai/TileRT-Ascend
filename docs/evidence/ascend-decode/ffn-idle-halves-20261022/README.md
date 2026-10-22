@@ -38,8 +38,11 @@ about five experts a rank, and expert `e`'s activate is independent of expert
 `e+1`'s gate/up. Pipelining the loop puts each half's work under the other's.
 
 The cube's 71.25 microseconds is the floor. Perfect pipelining would leave
-roughly that plus one expert's fill, call it 75, against today's 136.40 -- about
-61 microseconds a layer, or 4.76 milliseconds a round. It is the largest single
+roughly that plus the schedule's own barriers. A grid barrier costs 2.29
+microseconds and a skew over three or four experts a core needs about ten, so
+the floor with the schedule is near 94 against today's 136.40 -- about 42
+microseconds a layer, or 3.3 milliseconds a round. See
+[`barrier-price-20261022`](../barrier-price-20261022/README.md). It is the largest single
 mechanism still on the table, and the shared expert already demonstrates it:
 the `ROUTED_SHARED_PIPELINE` variant places shared cube projections beside
 routed vector stages and measures 187.17 against 219.24 microseconds at twelve
