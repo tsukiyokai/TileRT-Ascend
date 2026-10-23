@@ -97,4 +97,5 @@ load 一次、算几样、store 一次。
 A3 devserver 池拒绝 key 认证，密码正确也报 Permission denied，必须
 `-o PreferredAuthentications=password -o PubkeyAuthentication=no`。
 启动失败先用 `npu-smi info -t proc-mem` 看进程名判断是否被抢占，再怀疑自己的残留。
-kbenv 的"占用"可能只是宿主内存超标，要逐 die 看 HBM。
+kbenv 的"占用"先看进程名再看 HBM，且 npu-smi 没报到的 die 算被占，所以一个空闲的 vllm 进程能把 16 die 全空的机器判成占用——
+7.150.10.78 就是这样被我连跳三台。用 `scripts/free_dies.sh` 逐卡读 HBM。

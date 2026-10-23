@@ -2581,6 +2581,11 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   consecutive launch failures read as leaked device memory were three different
   tenants arriving; `npu-smi info -t proc-mem` names the holder in one call,
   and `VLLMWorker_TP` under someone else's container is not your rank.
+- An inventory's verdict is not an inventory. `kbenv` ranks a host busy on a
+  process name before it consults HBM, and counts a die npu-smi did not report
+  as taken, so the one free A3 in the fleet read 占用 with 0 of 16 dies free
+  while every card sat at 4 percent. Three hosts were abandoned on that
+  reading. `scripts/free_dies.sh` reads the cards.
 - The A3 devserver pool rejects key authentication, and ssh then reports a
   correct password as "Permission denied". Force it:
   `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
