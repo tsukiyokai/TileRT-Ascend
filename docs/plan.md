@@ -175,6 +175,43 @@ vendor 的参数规则也关掉了一条路：`aclnnGroupedMatmulV5` 在 groupTy
 `size(groupList) == weight.shape[0]`，所以"host 侧递短列表"不可表达，除非连权重
 一起聚拢（每调用 63.7 MB，远超要省的）。
 
+## 注意力：97% 的 fixpipe 时间是串行，不是搬字节
+
+`SparseFlashAttention` 一轮 7.089 ms、一次调用 90.88 µs。读 vendor 源码
+（`vllm-ascend-8237/csrc/attention/sparse_flash_attention/op_kernel/arch22/
+sparse_flash_attention_service_cube_mla.h`）后：
+
+真正的乘累加 0.59 µs，占 AIC 活跃时间 1.2%。而 1920 次 mmad 每次占 M 管道
+116 周期、名义只需 54.4，因为那道守卫
+`if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) PipeBarrier<PIPE_M>();`
+在这个 shape 上算出 8、恒为真，于是每次调用排空 M 管道 1920 次。
+
+Fixpipe：528 次 FIX 操作（384 次 `Fixpipe` 加 144 次
+`CrossCoreSetFlag<..., PIPE_FIX>`）花 881685 周期，约 1670 周期一次，而它搬的
+3.0 MB 按 v220 速率只需 24576 周期——**97% 是延迟与串行**。三个串行化源：
+`fixParams.unitFlag = 0b11`（:1018, :1289）把每次 fixpipe 钉在其链最后一次
+mmad 之后；192 次 MM2 fixpipe 全是 `SetAtomicAdd`(:1281) 与
+`SetAtomicNone`(:1294) 夹住的 fp32 原子加，彼此无法重叠；144 个跨核 flag
+在每个 `ComputeMm1`/`ComputeMm2` 末尾强制 FIX 排空。
+
+两个一行改动：`fixParams.mSize` 从 `mL1SizeAlign`(16) 改为 `mL1Size`(4)
+（:1014, :1285，`srcStride` 留 16），停止每次 MM2 fixpipe 把 14 行垃圾原子加进
+没人读的 `mm2ResGm`；把 4 个 nL1 分块累进同一个 L0C 缓冲（16×512 fp32 = 32 KB，
+占 `L0C_PP_SIZE` 64 KB 的 12.5%），MM1 从每 S2 分块四次 fixpipe 变一次，
+384 降到 96。
+
+GM 往返：AIV 每次调用写 27.6 MB、cube 读回 52.2 MB，1536 次 `DataCopy`。
+MM1 把 nope 当 K（d 在 k 轴）、MM2 再当 V（s2 在 k 轴），所以每核每个 S2 分块读
+1088 KB。L1 fractal 布局其实兼容，MM2 那 512 KB 原则上可免，但要重构
+`ComputeMm1`/`ComputeMm2` 相隔两轮的二级预取流水。
+
+这个实例化里 cube 完全不碰分页缓存与 block table：`keyGm`/`kRopeGm`/
+`valueGm`/`blockTableGm` 与 `DataCopyPA`(:73-113) 只有 C_TEMPLATE 的 else
+分支能到。
+
+所以处方要改口径：不是"执行更少的标量指令"，而是**停止串行化**——管道排空、
+原子加、以及把对齐填充的行也写回去。
+
 ## 测量完整性已判定：起草器不改输出，宽度改
 
 同一 prompt、1024 token、sfa、同一容器内连跑：
