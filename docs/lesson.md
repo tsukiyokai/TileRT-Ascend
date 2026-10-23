@@ -352,6 +352,12 @@ order a mistake usually happens:
   contain. So the overlay's installed kernel was not produced from this tree
   state, and "patch the vendor source and rebuild" had never been exercised
   before it was needed.
+- A rule written down and not used is not written down. `runarm78.sh` exists
+  because a failed arm leaks device memory that only a new container clears,
+  and this file already said so; the next pass still put two arms in one
+  container behind a `pkill -9` and a twenty-second sleep, and left 45 to 64
+  percent of every card held with no owning process. Drive arms through the
+  per-arm recreation, always.
 - A rank wedged by an AI core fault does not answer SIGTERM. The faulted arm's
   sixteen ranks still held 87 percent of five cards fifty minutes later, and
   `pkill -f` without `-9` had already run against them. The free-memory error
