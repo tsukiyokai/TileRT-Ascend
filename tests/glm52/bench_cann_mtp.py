@@ -390,7 +390,14 @@ def validate_delivery(requests, histories, args):
         # from one prompt has one answer -- so its digest is what makes two
         # arms comparable, and a drafter that changes it has changed the
         # target's own predictions.
+        # Distinct tokens do not catch a loop: 32 of them passed at width 8
+        # while 1023 bigrams held 113 distinct ones and one token repeated 80
+        # times. Bigrams do catch it, and they stay a recorded number rather
+        # than a refusal, because a loop may be the model's own answer to this
+        # prompt -- which is what the digests across a pass decide. An arm
+        # refused on a threshold would settle that question by assumption.
         request["distinct_output_tokens"] = len(set(tokens))
+        request["distinct_output_bigrams"] = len(set(zip(tokens, tokens[1:])))
         request["output_sha256"] = prompt_digest(tokens)
         operations = request["operations"]
         # The session drives rounds through advance_mtp_n, so an expectation
