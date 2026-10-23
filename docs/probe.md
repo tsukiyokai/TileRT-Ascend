@@ -370,3 +370,40 @@ the chain's depth: row 3 shares 0.83 with row 0 where row 1 shares 0.76.
 
 Reading the whole cache instead needs 8203 positions, 2.2 times the union, and
 no gather machinery at all -- which is the trade `shared_fia` already makes.
+
+## 2026-10-23 The backend already exists, and that retires the port question
+
+`tile-ai/tilelang-ascend` is cloned at `/home/shanshan/repo/tile-ai`
+(shallow, HEAD `43b0b69`, branch `ascendc_pto`, which is also origin/HEAD;
+`npuir` is the other route and was not fetched).
+
+It is not a sketch. Two code-generation routes (AscendC with PTO, and
+AscendNPU IR), `T.Pipelined` software pipelining, `T.Parallel` auto
+vectorisation, automatic buffer reuse, automatic intra-kernel
+synchronisation insertion, cross-core shmem put/get, `T.printf` and
+`T.dump_tensor`, pip wheels, an ACLGraph integration example, and
+`torch_tl_ascend` for PyTorch.
+
+Its examples cover exactly today's hot kernels. `sparse_flash_attention`
+has eight variants including `_mask_pa.py`, which is this engine's own
+`layout_kv PA_BSND` case, plus `bench_sfa` and `sfa_golden.py`;
+`lightning_indexer` has static and dynamic shape versions;
+`quant_batch_matmul`, `fusedmoe`, `situ_glu`, `moe_token_permute`,
+`topk_selector` and `dispatch_combine` are all there. `flash_attention/
+fa_opt/run.py` already drives `msprof op simulator` to compare a TileLang
+kernel against a hand-written AscendC one.
+
+So the hour spent today patching the vendor's CMake gaps to rebuild
+`sparse_flash_attention` was spent rebuilding what upstream had already
+written in the tile DSL, with a benchmark and a golden reference.
+
+One real gap, found by reading rather than running. `carver/arch/ascend.py`
+knows `Ascend910A`, `Ascend910B` and `Ascend310P`, and detects the chip
+from `props.name`, which on this box reads `Ascend910` -- the `_9392` lives
+only in `npu-smi info -t board -i 0 -c 0`. So A3 falls through to
+`Ascend910A`: L0C 256 KB, 910A's UB and core count. `cube_core_num` and
+`l2_cache_size` are overridden from torch_npu afterwards, but UB and the
+L0 ladder are not, so the carver tiles against the wrong on-chip
+capacities. Today's reading of the vendor SFA kernel gives the real
+figures for this part: `L0C_PP_SIZE` 64 KB a buffer, L0C double-buffered,
+24 AIC against 48 AIV at 1:2.

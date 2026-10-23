@@ -1,5 +1,13 @@
 # TileRT-Ascend：A3 单用户 2 ms 解码
 
+方向更正（2026-10-23）：本仓库的 Ascend 分支至今是"用现成 CANN 算子做
+batch=1 解码的编排层"（`native_engine.py` 自述如此），而让上游 TileRT 快的
+那一部分——用 tile DSL 自己生成 kernel——不在其中。而 `tile-ai/tilelang-ascend`
+已经是一个成熟的 Ascend 后端，且对今天量到的两个最大热点
+（`SparseFlashAttention` 7.089 ms/轮、swiglu-quant grouped matmul 8.840 ms/轮）
+各有实现、基准与 golden。所以下一阶段不是"改 vendor kernel"，是把这些生成
+kernel 接进来，并为 A3 补上 carver 的芯片参数。见 probe.md 当日条目。
+
 目标：AgentX，A3 单机 16 die，GLM-5.2-W4A8C8，batch=1，8K 上下文，TPOT 2.x ms。
 vLLM-Ascend 负责 prefill，TileRT-Ascend 负责 decode。
 
