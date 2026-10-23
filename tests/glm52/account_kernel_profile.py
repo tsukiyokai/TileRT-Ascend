@@ -28,12 +28,16 @@ LAYERS = 78
 
 
 def kernel_details(capture):
-    """The one `kernel_details.csv` under a profiler output directory."""
+    """One rank's `kernel_details.csv` below a profiler output directory.
+
+    Sixteen ranks write sixteen traces into one directory, and all sixteen
+    replay the same graph, so the inventory is any one of them. The first in
+    sorted order is taken and named in the output, because an inventory that
+    silently averaged ranks would hide a rank that diverged.
+    """
     found = sorted(capture.rglob("kernel_details.csv"))
     if not found:
         raise FileNotFoundError(f"No kernel_details.csv below {capture}")
-    if len(found) > 1:
-        raise ValueError(f"{len(found)} traces below {capture}; name one")
     return found[0]
 
 
@@ -113,12 +117,14 @@ def main():
     parser.add_argument("--top", type=int, default=30)
     args = parser.parse_args()
 
-    kernels = read_kernels(kernel_details(args.capture))
+    trace = kernel_details(args.capture)
+    kernels = read_kernels(trace)
     entries = group(kernels, args.rounds)
     round_us = sum(entry["us_per_round"] for entry in entries)
     launches = sum(entry["calls_per_round"] for entry in entries)
     floor_bound, recoverable = split_at_the_floor(entries)
 
+    print(f"{trace}")
     print(f"{len(kernels)} launches over {args.rounds} rounds, "
           f"{len(entries)} distinct kernels")
     print(f"round {round_us / 1000:.3f} ms, "
