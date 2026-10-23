@@ -282,6 +282,20 @@ order a mistake usually happens:
 - The A3 devserver pool rejects key authentication, and ssh then reports a
   correct password as "Permission denied". Force it:
   `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
+- Do not assemble a flag combination no build script ships. `ROUTED_ROW_BALANCED=1
+  ROUTED_BALANCED_NAMESPACE=0` put the row-balanced schedule under the plain
+  `tilert` name that `--routed-kernel` looks up, and the arm died on an AI core
+  out-of-bounds scalar access reported asynchronously by the next kernel. The
+  tested balanced build registers `tilert_balanced`; the plain name belongs to
+  the unbalanced kernel. A build variant is a tested pair, not two free knobs.
+- An AI core fault surfaces in whoever launches next. "The address for the
+  scalar to access the internal buffer of AICore is out of bounds" arrived
+  through `aclnnSparseFlashAttention` and `aclnnInplaceCopy`, neither of which
+  was at fault. Read the error string, not the frame.
+- Run the kernel's own single-die check before a sixteen-rank arm.
+  `routed_int4/check.py` compares against the vendor chain and times both, so a
+  fault costs one die and four minutes instead of an engine start. Two arms
+  were spent before this was remembered.
 - Stage the checkpoint in tmpfs before the first arm, not after the third. One
   stream off the NAS reads 8.4 MB/s while the fleet runs its own benchmarks,
   and sixteen ranks each reading every shard put one arm's weight load at four
