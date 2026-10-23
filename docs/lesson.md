@@ -340,6 +340,18 @@ order a mistake usually happens:
   out-of-bounds scalar access reported asynchronously by the next kernel. The
   tested balanced build registers `tilert_balanced`; the plain name belongs to
   the unbalanced kernel. A build variant is a tested pair, not two free knobs.
+- When a framework swallows a step's output, run that step by hand with the
+  arguments it would have passed. `cmake`'s `execute_process` captures
+  prepare.sh into `OUTPUT_VARIABLE` and prints nothing on failure, so "ops
+  prepare build failed" was all three attempts produced; invoking prepare.sh
+  directly named both causes in one run.
+- A vendor checkout that ships an installed binary need not build. This
+  vllm-ascend tree adds `mc2` twice -- once under `NOT BUILD_OPS_RTY_KERNEL`
+  and once unconditionally, which CMake refuses as a reused binary directory
+  -- and requires `ffn` and `posembedding` directories the checkout does not
+  contain. So the overlay's installed kernel was not produced from this tree
+  state, and "patch the vendor source and rebuild" had never been exercised
+  before it was needed.
 - A rank wedged by an AI core fault does not answer SIGTERM. The faulted arm's
   sixteen ranks still held 87 percent of five cards fifty minutes later, and
   `pkill -f` without `-9` had already run against them. The free-memory error
