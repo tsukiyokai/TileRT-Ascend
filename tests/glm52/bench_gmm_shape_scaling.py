@@ -184,7 +184,16 @@ def measure(args, report):
     report["banks"] = rotation
     banks = build_banks(inputs, outputs, device, rotation)
     activation = build_activation(args.experts * args.rows, inputs, device)
-    counts = torch.zeros(EXPERTS, dtype=torch.int64, device=device)
+    # Two group counts, not one. The kernel walks every group it is given and
+    # reads a shard only for the non-empty ones, so a production call that
+    # routes twelve rows over eighty-one experts still hands over all 256.
+    # Holding the non-empty count fixed and shrinking the list prices the walk
+    # itself, which the earlier `59.37 us + 0.709/expert` fit had folded whole
+    # into its fixed term.
+    configured = args.configured_experts or EXPERTS
+    if configured < args.experts:
+        raise ValueError("The list cannot be shorter than its non-empty part")
+    counts = torch.zeros(configured, dtype=torch.int64, device=device)
     counts[:args.experts] = args.rows
     routing = build_routing(args.experts, args.rows, device)
     call = PATHS[args.path](banks, activation, counts, routing)
@@ -198,6 +207,7 @@ def measure(args, report):
     read = args.experts * group_bytes
     report.update({
         "status": "pass", "weight_bytes": read,
+        "configured_experts": configured,
         "median_us": median, "min_us": samples[0],
         "p90_us": samples[-1 - len(samples) // 10],
         "gb_per_s": read / (median / 1e6) / 1e9,
@@ -213,7 +223,11 @@ def arguments():
     parser.add_argument("--path", choices=tuple(PATHS), default="grouped")
     parser.add_argument("--banks", type=int,
                         help="override the rotation the shape derives")
-    parser.add_argument("--experts", type=int, required=True)
+    parser.add_argument("--experts", type=int, required=True,
+                        help="groups holding rows")
+    parser.add_argument("--configured-experts", type=int,
+                        help="length of the group list, walked whole"
+                             " by the kernel; defaults to 256")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--calls", type=int, default=20)
