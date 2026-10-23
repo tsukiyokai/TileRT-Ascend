@@ -282,3 +282,11 @@ order a mistake usually happens:
 - The A3 devserver pool rejects key authentication, and ssh then reports a
   correct password as "Permission denied". Force it:
   `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
+- Stage the checkpoint in tmpfs before the first arm, not after the third. One
+  stream off the NAS reads 8.4 MB/s while the fleet runs its own benchmarks,
+  and sixteen ranks each reading every shard put one arm's weight load at four
+  and a half hours. Sixteen parallel streams reach 256 MB/s, so one staged copy
+  into `/dev/shm` costs twenty minutes and every arm after it reads at memory
+  speed. `--ipc host` already shares the host's tmpfs into the container, so it
+  needs no extra mount. The tenants on this fleet serve their own weights from
+  `/dev/shm` for exactly this reason -- read their command lines.

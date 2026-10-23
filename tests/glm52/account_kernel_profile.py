@@ -46,29 +46,45 @@ def column(fieldnames, *wanted):
     raise KeyError(f"No column among {fieldnames} matches {wanted}")
 
 
+def busy_columns(fieldnames):
+    """Columns reporting a unit actually computing, as Level1 supplies them.
+
+    Their share of a kernel's duration separates a stage that is reading or
+    multiplying from one that is waiting. In a batch-one decode every stage is
+    a thin GEMV, so a low share says the lever is concurrency rather than pass
+    count -- which is the open question about the five native stages.
+    """
+    return [name for name in fieldnames
+            if "mac_time" in name.lower() or "vec_time" in name.lower()]
+
+
 def read_kernels(path):
-    """`(name, type, duration_us)` per launch, in trace order."""
+    """`(name, type, duration_us, busy_us)` per launch, in trace order."""
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle)
         name = column(reader.fieldnames, "name")
         kind = column(reader.fieldnames, "type")
         duration = column(reader.fieldnames, "duration")
-        return [(row[name], row[kind], float(row[duration]))
+        busy = busy_columns(reader.fieldnames)
+        return [(row[name], row[kind], float(row[duration]),
+                 sum(float(row[field]) for field in busy if row[field]))
                 for row in reader if row[duration]]
 
 
 def group(kernels, rounds):
     """Per kernel name: launches and microseconds a round, and the mean."""
-    totals = defaultdict(lambda: [0, 0.0, ""])
-    for name, kind, duration in kernels:
+    totals = defaultdict(lambda: [0, 0.0, 0.0, ""])
+    for name, kind, duration, busy in kernels:
         entry = totals[name]
         entry[0] += 1
         entry[1] += duration
-        entry[2] = kind
+        entry[2] += busy
+        entry[3] = kind
     return sorted(
         ({"name": name, "kind": kind, "calls_per_round": calls / rounds,
-          "us_per_round": total / rounds, "us_per_call": total / calls}
-         for name, (calls, total, kind) in totals.items()),
+          "us_per_round": total / rounds, "us_per_call": total / calls,
+          "busy_share": busy / total if total else 0.0}
+         for name, (calls, total, busy, kind) in totals.items()),
         key=lambda entry: -entry["us_per_round"],
     )
 
@@ -115,11 +131,11 @@ def main():
           f"so merging answers for "
           f"{(floor_bound + recoverable) / round_us:.0%}")
     print()
-    print(f"{'us/round':>9} {'calls':>7} {'us/call':>8}  kernel")
+    print(f"{'us/round':>9} {'calls':>7} {'us/call':>8} {'busy':>5}  kernel")
     for entry in entries[:args.top]:
         print(f"{entry['us_per_round']:9.1f} {entry['calls_per_round']:7.1f} "
-              f"{entry['us_per_call']:8.2f}  {entry['name']} "
-              f"[{entry['kind']}]")
+              f"{entry['us_per_call']:8.2f} {entry['busy_share']:5.0%}  "
+              f"{entry['name']} [{entry['kind']}]")
 
 
 if __name__ == "__main__":
