@@ -352,6 +352,16 @@ order a mistake usually happens:
   contain. So the overlay's installed kernel was not produced from this tree
   state, and "patch the vendor source and rebuild" had never been exercised
   before it was needed.
+- A bandwidth argument is not a timing argument. The twelve rows' selected
+  positions union to 3732 of 24,576, which priced a shared read at 5.5 ms a
+  round; replacing the per-row gather with a whole-cache read left the round at
+  58.4 ms against 59.4, so the 79.8 MB round trip was never on the critical
+  path. Price a lever in time, by removing it, before believing its bytes.
+- Acceptance is part of the arm, not a constant. `shared_fia` lost on TPOT by
+  54 percent at the same round time, purely because its output has 201
+  distinct tokens against 131 and a variety of 0.386 against 0.212 -- a
+  different stream is a different drafting problem. Two attention kernels that
+  compute different things cannot be compared on TPOT at all.
 - A rule written down and not used is not written down. `runarm78.sh` exists
   because a failed arm leaks device memory that only a new container clears,
   and this file already said so; the next pass still put two arms in one
