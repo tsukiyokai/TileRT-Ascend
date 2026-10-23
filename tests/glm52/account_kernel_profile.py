@@ -1,0 +1,126 @@
+"""Account a steady-state decode round's kernels against the pass budget.
+
+A layer costs `12 us x passes + 72.7 us`, which puts today's layer at 48
+passes and the 2.9 ms target at 11. That 48 is inferred from the floor, not
+enumerated, so it names no kernel to remove. This reads the profiler's
+`kernel_details.csv` and splits the round's device time into the part the
+bytes demand and the part the call count demands.
+
+The split is the lever. A kernel whose duration sits at the 12 us floor costs
+that whether it moves 4 KB or 400, so folding it into a neighbour is free; a
+kernel above the floor is reading its operands and merging it saves only the
+floor. Printed per round and per layer, because every budget in plan.md is.
+
+    python3 account_kernel_profile.py --capture <dir> --rounds <n>
+
+`--rounds` comes from the arm's own record: `session.round_calls` of the
+profiled request.
+"""
+
+import argparse
+import csv
+from collections import defaultdict
+from pathlib import Path
+
+
+PASS_FLOOR_US = 12.0
+LAYERS = 78
+
+
+def kernel_details(capture):
+    """The one `kernel_details.csv` under a profiler output directory."""
+    found = sorted(capture.rglob("kernel_details.csv"))
+    if not found:
+        raise FileNotFoundError(f"No kernel_details.csv below {capture}")
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} traces below {capture}; name one")
+    return found[0]
+
+
+def column(fieldnames, *wanted):
+    """The first header containing one of the wanted words, case-free."""
+    for word in wanted:
+        for name in fieldnames:
+            if word in name.lower():
+                return name
+    raise KeyError(f"No column among {fieldnames} matches {wanted}")
+
+
+def read_kernels(path):
+    """`(name, type, duration_us)` per launch, in trace order."""
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        name = column(reader.fieldnames, "name")
+        kind = column(reader.fieldnames, "type")
+        duration = column(reader.fieldnames, "duration")
+        return [(row[name], row[kind], float(row[duration]))
+                for row in reader if row[duration]]
+
+
+def group(kernels, rounds):
+    """Per kernel name: launches and microseconds a round, and the mean."""
+    totals = defaultdict(lambda: [0, 0.0, ""])
+    for name, kind, duration in kernels:
+        entry = totals[name]
+        entry[0] += 1
+        entry[1] += duration
+        entry[2] = kind
+    return sorted(
+        ({"name": name, "kind": kind, "calls_per_round": calls / rounds,
+          "us_per_round": total / rounds, "us_per_call": total / calls}
+         for name, (calls, total, kind) in totals.items()),
+        key=lambda entry: -entry["us_per_round"],
+    )
+
+
+def split_at_the_floor(entries):
+    """What the call count demands against what the bytes demand.
+
+    A launch at or below the floor spends the floor whichever bytes it moves,
+    so the whole of it is answerable to merging. A launch above the floor
+    spends the floor plus its own reading, and merging it recovers the floor
+    alone.
+    """
+    floor_bound = sum(entry["us_per_round"] for entry in entries
+                      if entry["us_per_call"] <= PASS_FLOOR_US)
+    recoverable = sum(entry["calls_per_round"] * PASS_FLOOR_US
+                      for entry in entries
+                      if entry["us_per_call"] > PASS_FLOOR_US)
+    return floor_bound, recoverable
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture", type=Path, required=True)
+    parser.add_argument("--rounds", type=int, required=True)
+    parser.add_argument("--layers", type=int, default=LAYERS)
+    parser.add_argument("--top", type=int, default=30)
+    args = parser.parse_args()
+
+    kernels = read_kernels(kernel_details(args.capture))
+    entries = group(kernels, args.rounds)
+    round_us = sum(entry["us_per_round"] for entry in entries)
+    launches = sum(entry["calls_per_round"] for entry in entries)
+    floor_bound, recoverable = split_at_the_floor(entries)
+
+    print(f"{len(kernels)} launches over {args.rounds} rounds, "
+          f"{len(entries)} distinct kernels")
+    print(f"round {round_us / 1000:.3f} ms, "
+          f"layer {round_us / args.layers:.1f} us, "
+          f"passes {round_us / args.layers / PASS_FLOOR_US:.1f}, "
+          f"launches {launches:.1f} a round "
+          f"({launches / args.layers:.1f} a layer)")
+    print(f"at the floor {floor_bound / 1000:.3f} ms a round, "
+          f"floor inside the larger kernels {recoverable / 1000:.3f} ms, "
+          f"so merging answers for "
+          f"{(floor_bound + recoverable) / round_us:.0%}")
+    print()
+    print(f"{'us/round':>9} {'calls':>7} {'us/call':>8}  kernel")
+    for entry in entries[:args.top]:
+        print(f"{entry['us_per_round']:9.1f} {entry['calls_per_round']:7.1f} "
+              f"{entry['us_per_call']:8.2f}  {entry['name']} "
+              f"[{entry['kind']}]")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
