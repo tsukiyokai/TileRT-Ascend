@@ -14,7 +14,10 @@
 #   scripts/free_dies.sh 7.150.10.78 7.150.13.51 ...
 #
 # A line of eight percentages is the eight cards; low everywhere means the
-# dies are yours whatever the process list says. `holder` names the tenant.
+# dies are yours whatever the process list says. `holder` names the tenant --
+# which may be you: a rank wedged by an AI core fault survives SIGTERM and
+# holds its memory indefinitely, and the next arm's "Free memory on device"
+# then reads like somebody else's machine.
 set -uo pipefail
 password=${A3_PASSWORD:-Hw123456}
 options=(-o StrictHostKeyChecking=no -o ConnectTimeout=8

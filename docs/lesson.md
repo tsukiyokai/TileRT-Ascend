@@ -305,6 +305,12 @@ order a mistake usually happens:
   out-of-bounds scalar access reported asynchronously by the next kernel. The
   tested balanced build registers `tilert_balanced`; the plain name belongs to
   the unbalanced kernel. A build variant is a tested pair, not two free knobs.
+- A rank wedged by an AI core fault does not answer SIGTERM. The faulted arm's
+  sixteen ranks still held 87 percent of five cards fifty minutes later, and
+  `pkill -f` without `-9` had already run against them. The free-memory error
+  that followed reads exactly like another tenant arriving; `npu-smi -t
+  proc-mem` named them as mine. Reap with `-9`, and check the holder before
+  believing either story.
 - An AI core fault surfaces in whoever launches next. "The address for the
   scalar to access the internal buffer of AICore is out of bounds" arrived
   through `aclnnSparseFlashAttention` and `aclnnInplaceCopy`, neither of which
