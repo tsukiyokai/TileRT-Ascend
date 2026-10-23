@@ -209,8 +209,64 @@ MM1 把 nope 当 K（d 在 k 轴）、MM2 再当 V（s2 在 k 轴），所以每
 `valueGm`/`blockTableGm` 与 `DataCopyPA`(:73-113) 只有 C_TEMPLATE 的 else
 分支能到。
 
-所以处方要改口径：不是"执行更少的标量指令"，而是**停止串行化**——管道排空、
-原子加、以及把对齐填充的行也写回去。
+AIV 侧更集中，而且那里的标量是真发射不是停顿。比值
+（aiv_scalar 0.660、aiv_mte2 0.522、aiv_vec 0.0190、aiv_mte3 0.1135）全归一个
+循环：`MergeKv`（service_vector_mla.h:994-1088，热点 :1021），每次调用迭代
+12288 次、处理 24576 个选中位置。每个位置两次相依的标量 GM 读
+（:829 `topkGm_.GetValue` 后接 :844 `blkTableGm_.GetValue`）、四次 64 位整除取模
+（:824 :830 :842 :843）、一次 1024 B 键加 128 B rope 的 `DataCopyPad`（:951 :958）。
+一次调用 49152 次标量 GM 读、98304 次 64 位除法、24576 次 MTE2 发射，
+约 203 周期一次迭代。
+
+而那两个除数编译期已知：`sparseBlockSize == 1` 是恒等、`kvCacheBlockSize == 128`
+是移位加掩码，但它们以运行时 `int64_t` 从 `constInfo` 传入
+（kernel_mla.h:213-214, :221-222），所以发射了真除法。向量算术只占 1.9%，因为
+`SoftmaxFlashV2` 每次调用只跑 48 次 4×512（:675-676），且每对里的奇 AIV
+`vecDealM == 0`（:1104-1106）直接在 :780 返回。
+
+没有任何东西随 8192/9344 增长：kernel_mla.h:343-345 夹到
+`min(sparseBlockCount*sparseBlockSize, threshold)` = 2048，所以 `s2SplitNum = 4`。
+但这个结论挂在 `sparse_block_size == 1` 上（字面量在
+`vllm_ascend/device/device_op.py:570`）；若是 64，同一个夹子给 8192，kernel
+就会走全缓存。
+
+随 12 行增长的是核划分：kernel_mla.h:528-549 每个查询行一个基块，
+`usedCoreNum = totalBaseNum = 12`，S2 轴从不跨核切分（所有编译出的 tiling key
+里 `FLASH_DECODE` 均为 0）。所以 24 个 cube 核有 12 个闲着。
+
+indexer 的账对上了：一轮 21 次（16 次量化加 5 次 bf16）对 78 次注意力，恰是
+`index_topk_freq = 4` 与 `index_skip_topk_offset = 3` 推出的层集合
+{0,1,2} ∪ {6,10,…,74}，并由 trace 独立验证（一轮 177 个算子，`LayerNormV3`
+恰好 1071 = 21×51）。那 5 次走 bf16 是因为 checkpoint 只给 16 层标了
+`.indexer.quant_type: INT8_DYNAMIC`，其余 5 层只有 `W8A8_DYNAMIC` 的
+`wq_b.weight`，被 `ascend_config.py:1220` 拒绝，于是 `device_op.py:481` 对 :505
+分叉到 bf16 算子与两倍大的索引缓存——71.21 µs 对 42.61 µs，一轮 143 µs。
+
+按置信度排序的改动（µs 一次调用）：
+
+    MergeKv 地址算术          20–35   机制高，量级中   约 20 行，一个函数内
+    fixpipe mSize + L0C 累加  15–30   中
+    去掉恒真的 PipeBarrier     5–6    高              一行
+    S2 轴跨 12 个空闲核       35–40   低中            被 usedCoreNum 挡着
+    量化 5 个 bf16 indexer   一轮 143  —              checkpoint 改动
+
+确认口径（代理给的）：单算子重 profile 同一 shape，`aiv_scalar_ratio` 须从
+0.660 落到 0.35–0.40 且 `aiv_total_cycles` 同比例下降、Duration 随之下降；若比值
+降而 Duration 不降，关键路径就是 `aiv_mte2`（0.522，24576 次发射约 92 周期），
+下一步改为 fixpipe 加索引表的 run-length 合并。正确性门：索引表里放一个 `-1`
+与一个越界项，以触发 :825 与 :1026。
+
+执行的那份源码在 7.150.10.78 的
+`/root/trt-assets/kernel-overlay/vendors/custom_transformer/op_impl/ai_core/tbe/
+custom_transformer_impl/ascendc/sparse_flash_attention/`（容器内
+`/opt/kernel-overlay/...`，`ASCEND_CUSTOM_OPP_PATH` 已指向），带 `op_host` 的
+同字节副本在同机 `/home/shanshan/tilert-megakernel-20261021/vendor-hook-pinned/
+vllm-ascend-8237/csrc/attention/sparse_flash_attention/`。CANN 9.2 自带的那份
+不参与这个算子；两个 indexer 与 MlaPrologV3 才来自 CANN。
+
+所以处方要改口径：不是"执行更少的标量指令"这种抽象说法，而是两件具体事——
+停止串行化（管道排空、原子加全序、把对齐填充的行也写回去），以及把编译期
+已知的除数真的当常量用。
 
 ## 测量完整性已判定：起草器不改输出，宽度改
 
