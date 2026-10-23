@@ -872,7 +872,10 @@ class CannModel:
         block covers them without attending to much that was never selected.
         """
         buffers = {}
-        for name, layer in self.model.model.layers.items():
+        # `named_children` rather than `items`: the pinned vendor holds the
+        # layers in a `ModuleList`, which has no `items`, so this accessor
+        # raised on every call and `--dump-indices` had never run.
+        for name, layer in self.model.model.layers.named_children():
             attention = getattr(layer, "self_attn", None)
             indices = getattr(getattr(attention, "mla_attn", None),
                               "topk_indices_buffer", None)

@@ -98,6 +98,12 @@ AIC/AIV 的 MSD 握手，是全轮最大的未解释桶。AIC 与 AIV 是物理�
 block table 一次 `DataCopyPad` 进 UB，替掉 49152 次相依标量 GM 读）。
 两条互不知情的代码路径指向同一个修复。
 
+而 MoE 侧这件事已经不需要发明：那个 256 项走查在
+`grouped_matmul_antiquant_a8w4_msd.h:271-275`，每项一次阻塞标量 GM 读、
+在全部 72 个 block 上；而**同一个 kernel 的前置 pass 已经用一次批量 UB 拷贝
+正确做过同一件事（`..._msd_pre.h:136-151`），然后把结果丢掉了**。
+改动就是复用它，而不是重走一遍。两个生产 MoE GMM 都有这段。
+
 ## 单 die 探针测的不是轮里那个算子
 
 探针测的是平凡 `GroupedMatmul`、ND 权重、宽 256 未量化输出，而轮里从不下发
