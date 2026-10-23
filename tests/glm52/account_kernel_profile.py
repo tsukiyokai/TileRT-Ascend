@@ -50,6 +50,15 @@ def column(fieldnames, *wanted):
     raise KeyError(f"No column among {fieldnames} matches {wanted}")
 
 
+def number(cell):
+    """A trace cell as a float; the profiler writes "N/A" for a unit a kernel
+    never used, and for a kernel whose duration it could not attribute."""
+    try:
+        return float(cell)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def busy_columns(fieldnames):
     """Columns reporting a unit actually computing, as Level1 supplies them.
 
@@ -71,8 +80,8 @@ def read_kernels(path):
         duration = column(reader.fieldnames, "duration")
         busy = busy_columns(reader.fieldnames)
         return [(row[name], row[kind], float(row[duration]),
-                 sum(float(row[field]) for field in busy if row[field]))
-                for row in reader if row[duration]]
+                 sum(number(row[field]) for field in busy))
+                for row in reader if number(row[duration])]
 
 
 def group(kernels, rounds):
