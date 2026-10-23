@@ -54,3 +54,36 @@ a3-84 are older than that build and their `GlmMoeDsaForCausalLM` has no `rot`,
 which the pinned `ascend-python-build` does have.
 
 So the reproduction runs the record's own tree against the pinned vendor trees.
+
+## Correction: the in-prompt share is fooled by a loop, and both fast arms loop
+
+The oracle above is wrong, and it is wrong in the direction that flatters a
+fast reading. The share of an output's bigrams that occur in the prompt rises
+when the output repeats a handful of bigrams that happen to be in the prompt --
+which is exactly what a looping decode does.
+
+The prompt is not repetitive: 8192 tokens, 1322 distinct, 4059 distinct bigrams
+of 8191. Against that, bigram variety -- distinct bigrams over total -- sorts
+the arms the other way:
+
+| arm | bigram variety | distinct tokens | TPOT |
+|---|---|---|---|
+| `shared_fia` chain, width 32 | 0.371 | 188 | 29.148 ms |
+| `sfa` chain, width 12 | 0.249 | 139 | 22.135 |
+| the record, auto12 | **0.110** | 55 | 9.4007 |
+| `shared_fia` chain, width 8 | **0.080** | 32 | 14.743 |
+
+The record's output repeats token 9897 eighty times and 13865 seventy-two
+times in 1024, and holds 113 distinct bigrams of 1023. So its 5.441 accepted a
+round is a drafter reading a loop, not a drafter exploiting an agentic coding
+model's copying -- and **this session's own best figure, 14.743 ms, loops
+harder still**.
+
+Both are therefore withdrawn as measurements of speed. What survives is the
+ordering: TPOT falls as the output loops, because acceptance rises with
+repetition, so any arm's TPOT is only comparable at equal output variety.
+
+The gate this session added -- refuse an output with no more distinct tokens
+than a round verifies -- does not catch this either: 32 distinct at width 8
+passes, and 55 at width 12 passes. Bigram variety is the quantity that
+separates them, and it belongs in the gate.
