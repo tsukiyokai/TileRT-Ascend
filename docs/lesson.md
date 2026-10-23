@@ -282,6 +282,11 @@ order a mistake usually happens:
 - The A3 devserver pool rejects key authentication, and ssh then reports a
   correct password as "Permission denied". Force it:
   `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
+- A parameter the operator accepts is not a path the kernel supports. Passing
+  the group list as a running sum (`groupListType == 0`) instead of counts
+  passes every host-side check and then faults the AI core with 507015 at both
+  projections and both expert counts. The engine passes counts because that is
+  the validated path, not because nobody looked.
 - Check the vendor's own parameter rule before designing around it.
   `aclnnGroupedMatmulV5` requires `size(groupList) == weight.shape[0]` under
   groupType 0, so the lever "hand the kernel a shorter group list" is not

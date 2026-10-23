@@ -120,7 +120,16 @@ load 一次、算几样、store 一次。
 `InitWorkSpaceSplitConfig` 与 `UpdateWorkSpaceSplitConfig` 在
 `groupListType == 1` 分支里用 `groupListGM.GetValue(i)` 逐项做标量 GM 读、
 把 256 项的前缀和反复重算（一遍 O(n)，再在 while 里嵌两遍），而
-`groupListType == 0` 分支取最后一项即可，是 O(1)。**引擎传的是 type 1。**
+`groupListType == 0` 分支取最后一项即可，是 O(1)。引擎传的是 type 1。
+
+但 type 0 不是免费的 host 改动：实测它被算子接受、随后在设备上 507015
+（AI core 执行异常），`gate_up` 与 `down` 在 81 与 27 个活跃专家上四次全挂。
+所以引擎传 type 1 不是疏忽——W4A8 这条路只在 type 1 下验证过。那 28 µs
+是否就是前缀和，仍未证实。
+
+这个探针的噪声底：27 个活跃专家处三次独立运行 77.274 / 78.435 / 83.583 µs，
+81 处四次 119.665 / 119.785 / 120.911 / 122.305，所以斜率 0.76 ± 0.05 µs
+一个专家、截距约 59 µs。
 
 MoE 的 15.3 ms 里字节只要求 6.2 ms（127 MB/层 ÷ 1607 GB/s × 78），约 9 ms 可取：
 按调用计价的 42.5 µs × 2 × 78 = 6.6 ms，按活跃专家计价的
