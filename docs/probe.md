@@ -304,3 +304,48 @@ Three hosts were abandoned today on `kbenv` verdicts before 7.150.10.78 turned
 out to have all sixteen dies at 4 percent: the tool ranks a host busy on a
 process name before it consults HBM, and counts a die npu-smi did not report
 as taken. `scripts/free_dies.sh` reads the cards instead.
+
+## 2026-10-23 The round's absolute bill, and it is scalar
+
+Six arms on 7.150.10.78, one container, width 12 unless said, sfa, 1024 tokens,
+three measured requests each. Four passed; the two structural arms died on
+their own wiring and are below.
+
+    w12-auto    tpot 23.86/23.82/23.80  accepted 2.570  sha 2cb99464  variety 0.249
+    w12-lookup  tpot 22.15/22.16/22.15  accepted 2.590  sha 2cb99464  variety 0.249
+    w4-auto     tpot 23.99/24.02/23.96  accepted 2.325  sha f06b1373  variety 0.233
+
+Swapping the drafter leaves the digest identical; changing the width changes
+it. The host is already proven width-invariant on the CPU, and a different
+drafter proposes different candidates, so a mask that leaked future rows would
+have shown it there -- it did not. What is left is reduction order moving a
+greedy near-tie, with both streams equally varied, so TPOT across widths is
+comparable and the night's "variety rises with width" suspicion is withdrawn:
+it confounded the attention kernel with the width.
+
+Lookup beats the automaton on TPOT, 22.15 against 23.86, at the same
+acceptance, because `propose` is on the round's critical path and the
+automaton's is dearer. The offline ranking counted acceptance only.
+
+The profiled arm, 51 rounds at width 12, is the first steady-state decode
+profile this project has had. 2579 launches a round, 33.1 a layer, 260
+distinct kernels, 53.052 ms:
+
+    aic_mac      1.158 ms   2.2%
+    aic_mte2     8.236     16%
+    aic_scalar  15.480     29%
+    aiv_vec      1.752      3.3%
+    aiv_scalar  13.471     25%
+
+The two MoE grouped matmuls hold 15.65 ms of that scalar. A group loop over
+about eighty-one active experts pays per-group setup for twelve rows of
+arithmetic, which is also why narrowing the expert bank saved no bytes and
+still cost: the bill is per group examined.
+
+    w12-routed  AttributeError: 'tilert' has no attribute routed_experts_prepare
+    w12-mla     Apply patches/vllm-ascend/mla-tail-hook.patch first
+
+The first is mine: `ROUTED_BALANCED_NAMESPACE` defaults to 1 under the
+row-balanced schedule and the pipeline build renames the ops again, so the
+library I built registers `tilert_pipeline_front` and `--routed-kernel` looks
+up `tilert`.
