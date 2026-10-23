@@ -349,3 +349,24 @@ The first is mine: `ROUTED_BALANCED_NAMESPACE` defaults to 1 under the
 row-balanced schedule and the pipeline build renames the ops again, so the
 library I built registers `tilert_pipeline_front` and `--routed-kernel` looks
 up `tilert`.
+
+## 2026-10-23 The twelve rows select one set, 6.59 times over
+
+`--dump-indices` had never run: `indexer_buffers` iterated `layers.items()`
+against a `ModuleList`. With that fixed, one round's shared 16x2048 indexer
+buffer gives the number the whole attention lever rests on.
+
+    rows 12   selected 24576   union 3732   ratio 6.59x
+    overlap with row 0: 1.00 0.76 0.65 0.83 0.74 0.75 0.70 0.69 0.62 0.67 0.62 0.65
+
+So `MergeKv` gathers the same positions six and a half times over. One shared
+gather with a per-row mask takes the call's GM round trip from 79.8 MB to about
+12.1 MB, its 49,152 scalar global loads to 7,464 and its 98,304 divisions to
+14,928 -- a floor of 15 to 20 microseconds against today's 90.88, which is
+about 5.5 ms of a 61.22 ms round.
+
+The overlap does not decay monotonically with row index, so it is not simply
+the chain's depth: row 3 shares 0.83 with row 0 where row 1 shares 0.76.
+
+Reading the whole cache instead needs 8203 positions, 2.2 times the union, and
+no gather machinery at all -- which is the trade `shared_fia` already makes.
