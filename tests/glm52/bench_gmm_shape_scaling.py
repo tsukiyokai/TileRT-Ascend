@@ -202,6 +202,24 @@ def measure(args, report):
         call()
     samples = sorted(batch_mean_us(call, args.calls)
                      for _ in range(args.batches))
+    # A shape's time does not say which pipeline unit spent it, and the whole
+    # question about this kernel is whether its scalar work follows the active
+    # group count or the call. Profiling after the samples keeps the reported
+    # median free of the profiler's own cost.
+    if args.profile:
+        capture = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                str(args.profile)),
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1))
+        with capture:
+            for _ in range(args.calls):
+                call()
+            torch.npu.synchronize()
+        torch_npu.profiler.profiler.analyse(profiler_path=str(args.profile))
+        report["profile"] = str(args.profile)
+        report["profiled_calls"] = args.calls
 
     median = statistics.median(samples)
     read = args.experts * group_bytes
@@ -233,6 +251,8 @@ def arguments():
     parser.add_argument("--calls", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--batches", type=int, default=20)
+    parser.add_argument("--profile", type=Path,
+                        help="write a Level1 trace of one batch")
     return parser.parse_args()
 
 

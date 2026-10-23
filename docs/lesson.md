@@ -282,6 +282,18 @@ order a mistake usually happens:
 - The A3 devserver pool rejects key authentication, and ssh then reports a
   correct password as "Permission denied". Force it:
   `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.
+- Check the vendor's own parameter rule before designing around it.
+  `aclnnGroupedMatmulV5` requires `size(groupList) == weight.shape[0]` under
+  groupType 0, so the lever "hand the kernel a shorter group list" is not
+  expressible at all -- it refuses 81 against a 256-shard weight. Four sweep
+  points were spent discovering by experiment what the error message says in
+  one line. Shortening the walk needs a kernel that enumerates, or a weight
+  gather that moves 63.7 MB a call to save nine milliseconds a round.
+- A probe that varies one number may be holding two. The expert-GMM sweep
+  always handed over a 256-long list and varied only how many entries were
+  non-zero, so its `59.37 us + 0.709/expert` folded the walk over all 256
+  configured groups into the fixed term. "Narrowing the expert bank is worth
+  nothing" was therefore only ever evidence that the bill is not in the bytes.
 - Do not assemble a flag combination no build script ships. `ROUTED_ROW_BALANCED=1
   ROUTED_BALANCED_NAMESPACE=0` put the row-balanced schedule under the plain
   `tilert` name that `--routed-kernel` looks up, and the arm died on an AI core
