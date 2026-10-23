@@ -122,10 +122,42 @@ load 一次、算几样、store 一次。
 把 256 项的前缀和反复重算（一遍 O(n)，再在 while 里嵌两遍），而
 `groupListType == 0` 分支取最后一项即可，是 O(1)。引擎传的是 type 1。
 
-但 type 0 不是免费的 host 改动：实测它被算子接受、随后在设备上 507015
-（AI core 执行异常），`gate_up` 与 `down` 在 81 与 27 个活跃专家上四次全挂。
-所以引擎传 type 1 不是疏忽——W4A8 这条路只在 type 1 下验证过。那 28 µs
-是否就是前缀和，仍未证实。
+但这条只对了一半，而且不值钱。读源码后：`InitWorkSpaceSplitConfig`
+（pipeline.h:144-164）确实是 type 1 走 256 次标量 GM 读、type 0 读一项；
+`UpdateWorkSpaceSplitConfig`（166-233）方向相反，两种类型每访问一组都读两次，
+而 type 1 独有的前缀和前言在 `loopCount == 1` 时成本为零。按 256 组、81 非空，
+每核整次调用的 groupList 标量读是 type 0 的 1025 对 type 1 的 1280，差 255 次，
+几乎全在 `Init`。
+
+实测 type 0 也走不通：被算子接受、随后设备 507015，`gate_up` 与 `down` 在 81 与
+27 个活跃专家上四次全挂。引擎传 type 1 不是疏忽。
+
+更要紧的更正：55.7 µs 的固定项不是走组。256 次循环体每核约 12000 条标量指令、
+1000–1300 次串行标量 GM 读，量级 10 µs。余下落在每次 workspace 迭代的 4 个
+`SyncAll` 加 4 个 `pipe->Reset`、`mm.Init`、以及每次调用的 `InitBuffer`
+（pre.h:94-101、post.h:287-297），尚未测量。所以**把 gate_up 与 down 融成一次
+调用**才是这笔钱的正解（约 55 µs × 78 = 4.3 ms 一轮），而它省掉的是这些
+per-call 设置，不是抽象的"固定开销"。
+
+有名有姓的结构杠杆：`groupListType == 2`（`GROUP_LIST_TYPE_SPARSE`）在平凡
+`grouped_matmul` 里已实现（`GMMGroupMSparseProcess`，kernel.h:339/358-369），
+groupList 是 `[e,2]` 的 (expertIdx, count) 前置紧排对，只访问活跃项、遇首个
+非正计数即 break。两道闸门关着它：`SET_GMM_A8W4_TPL_ARGS`
+（grouped_matmul_tiling_key.h:50-54）只给 `GROUP_LIST_TYPE` 放行 COUNT，
+int8×int4 没实例化稀疏模板；`grouped_matmul_swiglu_quant_v2` 自己只接受 0/1。
+允许改 vendor，所以这是一条具体改动。
+
+部署前提：算子以预编译 `.o` 发布
+（`GroupedMatmulSwigluQuantV2_ed7aa5e41344a2216aa977694f4ab9b3.o`，tilingKey 2），
+改头文件不生效，须重建替换或以自定义算子另名发布；项目已在用
+`ASCEND_CUSTOM_OPP_PATH` overlay，机制现成。
+
+顺带在 vendor 里发现两个缺陷（当前 shape 不触发）：`UpdateAuxiliaryMatrix`
+（post.h:345-346）恒按单张量布局索引 `weightAuxiliaryMatrixGM[curGroupIdx * tokenLen]`，
+而 `PreLoadAuxiliaryMatrix`（306-313）按 `isSingleTensor` 分支，所以
+`isSingleTensor == 0` 且某个 AIV 核的行跨两组时越界——12 行分到 12 核不会发生，
+提高每核行数或减少核数就会；pipeline.h:184-190 的 `else` 臂重算了 `if` 臂
+已经算好的和。
 
 这个探针的噪声底：27 个活跃专家处三次独立运行 77.274 / 78.435 / 83.583 µs，
 81 处四次 119.665 / 119.785 / 120.911 / 122.305，所以斜率 0.76 ± 0.05 µs
