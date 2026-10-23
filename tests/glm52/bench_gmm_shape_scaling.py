@@ -100,10 +100,20 @@ def build_activation(rows, inputs, device):
     }
 
 
-def grouped_matmul_call(banks, activation, counts, routing):
+def grouped_matmul_call(banks, activation, counts, routing,
+                        group_list_type=1):
+    """Time the expert GMM, with the group list in either of its two forms.
+
+    `group_list_type=1` passes per-group counts and `0` passes their running
+    sum, and the vendor kernel treats them very differently: with counts it
+    walks the list with scalar global loads, recomputing a prefix sum inside
+    its workspace-split loop, where with a running sum the same quantity is
+    one load of the last entry. The engine passes counts.
+    """
     import torch_npu
 
     rotation = itertools.cycle(banks)
+    group_list = counts if group_list_type else counts.cumsum(0)
 
     def call():
         bank = next(rotation)
@@ -111,8 +121,8 @@ def grouped_matmul_call(banks, activation, counts, routing):
             x=[activation["x"]], weight=[bank["weight"]],
             scale=[bank["scale"]], bias=[bank["scale_bias"]],
             per_token_scale=[activation["per_token_scale"]],
-            group_list=counts, split_item=2, group_type=0,
-            group_list_type=1, output_dtype=torch.bfloat16,
+            group_list=group_list, split_item=2, group_type=0,
+            group_list_type=group_list_type, output_dtype=torch.bfloat16,
         )[0]
 
     return call
@@ -196,7 +206,9 @@ def measure(args, report):
     counts = torch.zeros(configured, dtype=torch.int64, device=device)
     counts[:args.experts] = args.rows
     routing = build_routing(args.experts, args.rows, device)
-    call = PATHS[args.path](banks, activation, counts, routing)
+    call = PATHS[args.path](banks, activation, counts, routing,
+                            *([args.group_list_type]
+                              if args.path == "grouped" else []))
 
     for _ in range(args.warmup):
         call()
@@ -226,6 +238,7 @@ def measure(args, report):
     report.update({
         "status": "pass", "weight_bytes": read,
         "configured_experts": configured,
+        "group_list_type": args.group_list_type,
         "median_us": median, "min_us": samples[0],
         "p90_us": samples[-1 - len(samples) // 10],
         "gb_per_s": read / (median / 1e6) / 1e9,
@@ -251,6 +264,9 @@ def arguments():
     parser.add_argument("--calls", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--batches", type=int, default=20)
+    parser.add_argument("--group-list-type", type=int, default=1,
+                        choices=(0, 1),
+                        help="0 passes a running sum, 1 per-group counts")
     parser.add_argument("--profile", type=Path,
                         help="write a Level1 trace of one batch")
     return parser.parse_args()

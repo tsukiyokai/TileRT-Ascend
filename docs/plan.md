@@ -103,6 +103,37 @@ load 一次、算几样、store 一次。
     行选择最优化      贪心最小并集值 19–24%，不是需要的四倍
     树（shared_fia）  结构已正确，17.044 ms／4.263 接受，不值它更宽的轮
 
+## 标量的归属已分开，而 vendor 源码在盘上可改
+
+单 die、gate_up、每次调用（µs，20 次调用的 Level1 trace）：
+
+    活跃专家  duration  mac  mte2  cube标量  向量核标量
+      27        71       3    24     30        28
+      44        87       5    37     40        28
+      81       117       8    71     61        31
+
+`mte2` 严格正比于活跃专家（0.87 µs 一个，截距 0.5），就是权重读。
+`aic_scalar` 八成跟活跃专家走（0.574 µs 一个，每调用剩 14.5）。
+`aiv_scalar` 完全按调用计价，恒 28 µs，而同一 kernel 的 `aiv_vec` 只有 0.001 ms。
+
+那 28 µs 在 vendor 源码里找到了：`grouped_matmul_swiglu_quant_v2` 的
+`InitWorkSpaceSplitConfig` 与 `UpdateWorkSpaceSplitConfig` 在
+`groupListType == 1` 分支里用 `groupListGM.GetValue(i)` 逐项做标量 GM 读、
+把 256 项的前缀和反复重算（一遍 O(n)，再在 while 里嵌两遍），而
+`groupListType == 0` 分支取最后一项即可，是 O(1)。**引擎传的是 type 1。**
+
+MoE 的 15.3 ms 里字节只要求 6.2 ms（127 MB/层 ÷ 1607 GB/s × 78），约 9 ms 可取：
+按调用计价的 42.5 µs × 2 × 78 = 6.6 ms，按活跃专家计价的
+0.574 × 81 × 2 × 78 = 7.3 ms。
+
+CANN 的 AscendC op 源码在
+`sdk/cann-9.2.0/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/`，
+这个 kernel 3255 行，W4A8 走 `a8w4_msd_*`。穿刺阶段允许无限制修改 vendor。
+
+vendor 的参数规则也关掉了一条路：`aclnnGroupedMatmulV5` 在 groupType 0 下要求
+`size(groupList) == weight.shape[0]`，所以"host 侧递短列表"不可表达，除非连权重
+一起聚拢（每调用 63.7 MB，远超要省的）。
+
 ## 测量完整性已判定：起草器不改输出，宽度改
 
 同一 prompt、1024 token、sfa、同一容器内连跑：
