@@ -1,6 +1,11 @@
 """Fixed-width ACL graph for the CANN model and fixed cache storage."""
 
 
+# The widths a captured graph is replayed at. Narrower rounds decode eagerly,
+# so an arm that wants the narrowest comparison takes four, not two.
+CAPTURED_WIDTHS = (4, 6, 8, 12, 16, 24, 32)
+
+
 class CannGraph:
     """Capture model forward; prepare metadata and sample outside the graph.
 
@@ -46,8 +51,13 @@ class CannGraph:
             compiled = getattr(backbone, "compiled", False) or callable(
                 getattr(backbone, "aot_compiled_fn", None),
             )
-            if (width not in (4, 6, 8, 12, 16, 24, 32)
-                    or self.config.compilation_config.mode
+            # One message for four unrelated conditions cost an arm: a width
+            # the capture does not carry reported itself as a cold model.
+            if width not in CAPTURED_WIDTHS:
+                raise ValueError(
+                    f"Capture carries widths {CAPTURED_WIDTHS}, not {width}"
+                )
+            if (self.config.compilation_config.mode
                     != CompilationMode.VLLM_COMPILE
                     or backbone.do_not_compile or not compiled):
                 raise ValueError("Warm the compiled target before capture")
