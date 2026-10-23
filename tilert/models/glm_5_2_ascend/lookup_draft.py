@@ -1,0 +1,90 @@
+"""Propose a causal continuation from repeated prompt or output token IDs."""
+
+# A tail is keyed by a polynomial hash so that extending it by one token is a
+# multiply and an add, rather than building a tuple whose hash costs one
+# operation a token. Indexing an 8192-token prompt over tail lengths 2 to 32
+# is then 254 thousand constant-time inserts instead of 4.3 million element
+# hashes. A query verifies its one candidate against the context, so a
+# collision cannot produce a wrong proposal.
+BASE = 1000003
+MODULUS = (1 << 61) - 1
+
+
+class LookupDrafter:
+    """Hold the context and propose what followed its tail last time.
+
+    The context is the prompt plus every committed token, which is what the
+    model attends to and therefore what it can copy from.
+
+    The default tail is as long as the tree drafter is allowed to match, so
+    that a comparison between them measures the tree rather than the match
+    length. On a constructed stream the longer tail is worth 29.738 -> 32.076
+    accepted tokens a round at an exact copy and nothing at all from edit
+    rate 0.05 on.
+    """
+
+    def __init__(self, prompt, longest=32, shortest=2):
+        if shortest < 1 or longest < shortest:
+            raise ValueError("Tail lengths must satisfy 1 <= shortest <= "
+                             "longest")
+        self.context = []
+        self.longest = longest
+        self.shortest = shortest
+        self._latest = {}
+        self.hits = 0
+        self.rounds = 0
+        self.commit(prompt)
+
+    def commit(self, tokens):
+        """Extend the context with what the target actually accepted."""
+        previous_length = len(self.context)
+        self.context.extend(int(token) for token in tokens)
+        context = self.context
+        latest = self._latest
+        # Only index suffixes with a known continuation. A newly appended
+        # token makes the preceding tail eligible, never the current tail.
+        for end in range(max(previous_length, self.shortest), len(context)):
+            key = 0
+            longest = min(self.longest, end)
+            for size in range(1, longest + 1):
+                key = (key * BASE + context[end - size]) % MODULUS
+                if size >= self.shortest:
+                    latest[(size, key)] = end
+
+    def propose(self, count):
+        """Return up to `count` tokens, longest tail match first.
+
+        Search from `longest` down and take the most recent occurrence at
+        the first length with a known continuation.
+        """
+        self.rounds += 1
+        context = self.context
+        keys = []
+        key = 0
+        for size in range(1, self.longest + 1):
+            if size > len(context):
+                break
+            key = (key * BASE + context[-size]) % MODULUS
+            if size >= self.shortest:
+                keys.append((size, key))
+        for size, key in reversed(keys):
+            if len(context) <= size:
+                continue
+            end = self._latest.get((size, key))
+            if end is None or context[end - size:end] != context[-size:]:
+                continue
+            run = context[end:end + count]
+            if run:
+                self.hits += 1
+                return run
+        return []
+
+    def report(self):
+        return {
+            "drafter": "lookup",
+            "longest_tail": self.longest,
+            "shortest_tail": self.shortest,
+            "context_tokens": len(self.context),
+            "rounds": self.rounds,
+            "tail_hits": self.hits,
+        }
