@@ -283,3 +283,24 @@ is the device: the per-row mask inside `sfa` and `shared_fia`, or the reduction
 order, or the model itself. The next experiment is a single-die mask test --
 whether a query row's output depends on a KV row after it -- which needs one
 die rather than a machine.
+
+## 2026-10-23 The NAS was the arm, and tmpfs removes it
+
+An arm's first weight load read `2/96 shards [06:41<4:27:39]`. Measured on the
+host while the fleet ran its own 505B benchmarks:
+
+    one stream off /mnt/sfs_turbo_new        8.4 MB/s
+    eight parallel streams                  256 MB/s
+    local /data write, O_DIRECT             448 MB/s
+    the same shard once in page cache       9.8 GB/s
+
+Sixteen ranks each reading every shard is 6 TB of reads, which is where four
+and a half hours comes from. Staging the 378 GB checkpoint into `/dev/shm`
+with sixteen parallel streams costs about twenty-five minutes once, and
+`--ipc host` already shares the host's tmpfs into the container, so no mount
+changes. The tenants on this fleet serve their own weights from `/dev/shm`.
+
+Three hosts were abandoned today on `kbenv` verdicts before 7.150.10.78 turned
+out to have all sixteen dies at 4 percent: the tool ranks a host busy on a
+process name before it consults HBM, and counts a die npu-smi did not report
+as taken. `scripts/free_dies.sh` reads the cards instead.
