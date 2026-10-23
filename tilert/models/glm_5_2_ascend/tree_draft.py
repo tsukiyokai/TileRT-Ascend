@@ -207,10 +207,14 @@ class TreeDrafter:
         The name is what `MtpRoundExecutor` dispatches on: a drafter that
         offers it gets the tree round, one that does not keeps the chain. The
         budget comes from the round rather than the constructor because the
-        captured graph width bounds it -- a tree wider than the graph pays for
-        rows the graph cannot replay.
+        captured graph width bounds it -- a tree wider than the graph pays
+        for rows the graph cannot replay, and a node past the round's width
+        has no verification row to be read from at all. Raising the budget
+        to a floor of two overflowed `resolve` at width 2.
         """
-        self.budget = max(2, count)
+        if count < 1:
+            raise ValueError("A tree round must allow at least one node")
+        self.budget = count
         return self.propose()
 
     def propose(self):

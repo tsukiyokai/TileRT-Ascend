@@ -2568,3 +2568,19 @@ Evidence: [GMM2 guard boundary](evidence/ascend-decode/gmm2-compact-20261020/gua
   `sleep infinity` probe on the same host lived through five samples over two
   minutes, so the name was the problem: `trt-asc` collides with someone
   else's cleanup, and `shanshan-trt` does not.
+- Invariance is cheaper to test than speed. The question that invalidated every
+  TPOT reading overnight -- does the verification width change what is decoded
+  -- has a host-side answer that costs no die and 0.2 seconds, and it had never
+  been asked above width 4. A control that cannot fail is not evidence: the two
+  deliberately broken engines in the same file are what make the passing check
+  worth citing.
+- A drafter must not raise the round's budget. `propose_tree` floored it at
+  two, which is invisible at every width an arm has run and fatal at width 2 --
+  the width a reference arm would use.
+- Check whether the box was taken before suspecting your own residue. Three
+  consecutive launch failures read as leaked device memory were three different
+  tenants arriving; `npu-smi info -t proc-mem` names the holder in one call,
+  and `VLLMWorker_TP` under someone else's container is not your rank.
+- The A3 devserver pool rejects key authentication, and ssh then reports a
+  correct password as "Permission denied". Force it:
+  `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.

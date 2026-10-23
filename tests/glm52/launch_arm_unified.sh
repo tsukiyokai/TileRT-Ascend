@@ -77,7 +77,11 @@ export ASCEND_CUSTOM_OPP_PATH="/opt/kernel-overlay/vendors/custom_transformer${A
 # entrypoint layout and the pinned vllm is 0.25.1.
 export VLLM_PLUGINS=ascend
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export HCCL_OP_EXPANSION_MODE=AIV HCCL_DETERMINISTIC=true
+# Both belong to an arm's identity rather than to the harness: a deterministic
+# reduction fixes the summation order, which moves the logits and so the greedy
+# token, and the record this project's best result comes from set neither.
+export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AIV}
+export HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-true}
 export XDG_CACHE_HOME=/tmp/cache TRITON_CACHE_DIR=/tmp/triton
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 

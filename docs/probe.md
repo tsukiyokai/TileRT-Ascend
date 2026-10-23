@@ -253,3 +253,33 @@ steady-state decode round. Every figure read today from the six-token capture
 needed withdrawing or re-deriving -- the collectives' 858 us a call, the 3.28 ms
 super kernel, the eager dispatch account -- so that capture is worth more than
 any single lever.
+
+## 2026-10-23 Width invariance, on the CPU
+
+A verification width is a throughput choice, so the emitted stream must be the
+one serial greedy decoding produces, the same at width 2 as at width 32. The
+night's TPOT readings had put that in doubt: output bigram variety rose
+monotonically with width (0.080 at 8, 0.249 at 12, 0.371 at 32), which greedy
+text must not do.
+
+`tests/glm52/check_round_invariance.py` settles the host's half of it with no
+die at all. Three deterministic targets -- prediction from the whole history,
+from the last two tokens, from the last four -- stand in for the model, and the
+real executor runs over the real host drafters. Fifty-four combinations of
+target, drafter and width all decode the identical stream.
+
+Two controls give the check its power, and both fire: a verification mask that
+lets a row read its future changes what is decoded, and so does leaving an
+accepted path's rows where the tree put them instead of gathering them.
+
+Two defects fell out of writing it. `TreeDrafter.propose_tree` raised the
+round's budget to a floor of two, so a width-2 tree proposed three rows into a
+two-row round and `resolve` refused the count. And the existing serial-oracle
+check covered the MTP chain at widths 2 and 4 only -- never the host drafters
+and never a width any arm has shipped.
+
+So the variety-against-width correlation is not the orchestration. What remains
+is the device: the per-row mask inside `sfa` and `shared_fia`, or the reduction
+order, or the model itself. The next experiment is a single-die mask test --
+whether a query row's output depends on a KV row after it -- which needs one
+die rather than a machine.
