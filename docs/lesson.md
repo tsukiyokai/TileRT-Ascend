@@ -261,6 +261,41 @@ order a mistake usually happens:
   `sleep infinity` probe on the same host lived through five samples over two
   minutes, so the name was the problem: `trt-asc` collides with someone
   else's cleanup, and `shanshan-trt` does not.
+- Two counters that sum past the thing they describe are not shares of it. On
+  Ascend `*_time = total_cycles / (blocks x 1.85 GHz)` is a per-core mean
+  active time and the ratio columns are against `aicore_time`, not `Duration`;
+  the pipes do not partition the core (27.5 percent of rows sum above 1.0) and
+  AIC and AIV are physically separate cores (their sum exceeds Duration on
+  exactly the MIX_AIC rows, to 1.94x, while their max never does). "55 percent
+  scalar" added two concurrent timelines. The defensible wall-clock form is a
+  per-kernel max, and it reads 33 percent.
+- Omitting a counter is choosing a conclusion. The same additive method applied
+  to the four pipes left out -- aic_mte1, aic_fixpipe, aiv_mte2, aiv_mte3 --
+  totals 30.018 ms a round against scalar's 28.951, so the claim died on its
+  own arithmetic before any question of semantics.
+- A floor derived from what the code does is not a floor. "mac plus mte2, 8 to
+  9 ms a round" was an inefficiency promoted to a law: the bytes floor is
+  0.0623N + 0.542 ms, 2.25 to 3.28 ms, and the kernel-count floor is 2.68 ms.
+  Both sit on the target that was being called out of reach. Derive a floor
+  from bytes and clocks, never from a profile.
+- A time that shrinks between bit-identical calls is waiting, not work.
+  `aiv_scalar_time` has 0.44 to 0.67 relative spread over twenty identical
+  calls and falls from 28.1 to 15.2 us on the one fast call; a fixed
+  instruction stream cannot issue 46 percent fewer instructions. The vendor
+  marks only `aic_mte1_time` as excluding wait, and declines to for scalar.
+- `GetValue` is not a load, it is a cache invalidation plus a round trip.
+  `kernel_tensor_impl.h:1257-1266` charges it to the scalar pipe through
+  `__inout_pipe__(S)` and calls `DcciReadCache` unconditionally, so every
+  scalar global read costs a full L2/HBM traversal, about 125 cycles, and no
+  compiler can cache it. Bulk data belongs in UB through one DataCopy. Two
+  unrelated kernels -- the MoE group walk and attention's MergeKv -- are the
+  same defect.
+- A stand-in operator is not the operator. The single-die sweep measured plain
+  `GroupedMatmul` with ND weights and an unquantised width-256 output, which
+  the real round never issues; the round's own 3825 calls of the fused NZ
+  kernel are both the right operator and an uncontended sweep of the same
+  variable. Check the trace's kernel name against the probe's before trusting
+  a slope.
 - Invariance is cheaper to test than speed. The question that invalidated every
   TPOT reading overnight -- does the verification width change what is decoded
   -- has a host-side answer that costs no die and 0.2 seconds, and it had never
