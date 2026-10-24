@@ -407,3 +407,18 @@ L0 ladder are not, so the carver tiles against the wrong on-chip
 capacities. Today's reading of the vendor SFA kernel gives the real
 figures for this part: `L0C_PP_SIZE` 64 KB a buffer, L0C double-buffered,
 24 AIC against 48 AIV at 1:2.
+
+## 2026-10-24 宽度梯子取回，12.41 ms，以及机器的真实可用性
+
+a3-180 昨夜收回登录权限，今日恢复，`/root/work` 与 `/mnt/sfs_turbo_new/shanshan`
+原样在：378 GB 权重已暂存、全部臂脚本在、16 个 die 全空。被困在那里的宽度梯子
+三个 `summary.json` 完好，取回见 [证据](evidence/ascend-decode/width-ladder-20261023)。
+宽度 32 读 12.413 ms，是本项目最好读数；宽度 24 的接受数反比 16 低。
+
+机器盘点上的一条教训，今天第三次看到同一个形状：kbenv 两小时内对同一批机器给
+出 5、5、16 台空闲，而按卡实测这三次里"die 全空"的机器都在八台以上——它的判据
+撞上进程名或读不到 docker ps 就记占用。反过来也错：它报空闲的 10.83.185.76 实测
+0–2 号卡 29%。所以 `scripts/free_dies.sh` 的按卡实测不是补充，是判据本身。
+
+同一天 a3-78 从 16 die 全空变成八张卡 94%（租户 `sj_d0`），间隔不到两小时。所以
+"现在空闲"不是可以缓存的事实，臂启动前必须再读一次卡。
