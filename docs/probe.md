@@ -34,6 +34,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 后续 [精确压缩尾部索引](evidence/ascend-decode/lookup-radix-20261028/README.md)替代多项式哈希，并修正一个碰撞遮蔽更长命中的合法词表反例。79 项 CPU 回归、24,159 次独立提议检查与 126 个容量/EOS 场景通过。本地四类负载的每请求起草总成本 p50 从 47.988–64.813 降至 6.491–10.459 ms，120 对全部下降；无匹配稳态仍有 16.081 ms 高尾。完整分位数、差值与源码绑定保留在证据中，尚无 A3 或 TPOT 结论。
 
+[全局 radix arena](evidence/ascend-decode/lookup-arena-20261028/README.md)的 4608 个原始样本全部签名一致。坐标版使复制/轻度编辑总 CPU p50 退化约 8–9%，无保留控制下仍成立，未替换生产；四面板未重现旧约 16 ms 高尾。GC 阶段与基准对象保留分别记录，继续检验局部标签与叶子字典分配。
+
 [FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)补齐显式输出算术、实际导入源与模式准入。匹配的 C8 header 已在仓库逐文件核对；[78 层合成 CPU 执行](evidence/ascend-decode/hf-runtime-20261028/README.md)修正当前 HF gate/MoE 路由协议，实际运行最终与 77 个诊断 head。两种 head 模式各 2379 项采集/reset 对照、48 项独立检查、44 项回归及 62 项元数据检查通过。BF16/FP32 的合成贪心结果分别为 0/17；真实 checkpoint、Prolog-v3、CANN FP32 caller 及实际 graph 数值继续验收。
 
 ## 整请求速度与输出
