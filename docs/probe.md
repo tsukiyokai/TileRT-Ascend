@@ -26,6 +26,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 [离线 host 起草](evidence/ascend-decode/host-draft-model-20261028/README.md)也停止构造未执行的 MTP 模型，角色、状态与报告统一，18 项 CPU 检查通过。实际框架的全局 RoPE/共享 head 副作用仍须 A/B；tree 的 lineage 回执与树接受验收尚未闭合。
 
+后续 [tree lineage 验收](evidence/ascend-decode/tree-lineage-20261028/README.md)补齐轮结果与交付记录的父数组，独立重建分支接受；25 项 CPU 检查覆盖 26,260 个小树和 24 个 session 的 1,801 个 span，另通过宽度、round、EOS/取消回归。CANN 设备树数值与 TPOT 仍未验收。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正

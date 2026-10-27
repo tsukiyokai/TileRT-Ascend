@@ -300,6 +300,7 @@ class RoundInvariance(unittest.TestCase):
                 executor.start(expected[0], None)
                 result = executor.advance()
                 self.assertEqual(result.candidates, (expected[0],))
+                self.assertEqual(result.parents, (-1,))
                 self.assertEqual(result.commit.accepted_tokens,
                                  (expected[1],))
                 self.assertEqual(result.commit.width, 1)

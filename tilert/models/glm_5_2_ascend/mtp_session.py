@@ -130,6 +130,8 @@ class AscendMtpPDEngine(AscendPDEngine):
                         # the rejected branch, not the serial continuation.
                         "candidates": list(result.candidates),
                         "predictions": list(result.target_predictions),
+                        **({"parents": list(result.parents)}
+                           if result.parents is not None else {}),
                     }
                     spans.append(span)
                     before = len(output.tokens)

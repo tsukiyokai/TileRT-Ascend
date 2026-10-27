@@ -94,6 +94,8 @@ class MeasuredRank(CannRankEngine):
             "start_ns": start, "end_ns": end, "elapsed_ns": end - start,
             "width": commit.width, "candidates": list(result.candidates),
             "predictions": list(result.target_predictions),
+            **({"parents": list(result.parents)}
+               if result.parents is not None else {}),
             "accepted_tokens": list(commit.accepted_tokens),
             "natural_accepted": commit.natural_accepted,
             "matched_drafts": commit.matched_drafts,
@@ -316,6 +318,28 @@ def timing_requests(requests):
             if not item["warmup"] and not item["profiled"]]
 
 
+def tree_predictions(candidates, parents, predictions):
+    """Rebuild the longest valid path by walking every node to the root."""
+    if (not candidates or not isinstance(parents, list)
+            or len(parents) != len(candidates)
+            or any(type(parent) is not int for parent in parents)
+            or parents[0] != -1
+            or any(not 0 <= parent < node
+                   for node, parent in enumerate(parents) if node)):
+        raise ValueError("Tree round requires a valid parent for every row")
+    paths = []
+    for node in range(len(candidates)):
+        path = [node]
+        while path[-1] != 0:
+            path.append(parents[path[-1]])
+        path.reverse()
+        if all(candidates[child] == predictions[parent]
+               for parent, child in zip(path, path[1:])):
+            paths.append(path)
+    path = max(paths, key=len)
+    return [predictions[node] for node in path]
+
+
 def validate_local(report, args):
     """Check saved local state, then return the rank-independent history."""
     histories = []
@@ -332,13 +356,22 @@ def validate_local(report, args):
         rounds = []
         for item in request["rounds"]:
             candidates, predictions = item["candidates"], item["predictions"]
-            matched = 0
-            for proposed, predicted in zip(candidates[1:], predictions):
-                if proposed != predicted:
-                    break
-                matched += 1
-            accepted = predictions[:min(matched + 1,
-                                        args.max_tokens - len(tokens))]
+            if not len(candidates) == len(predictions) == args.width:
+                raise ValueError("Round candidate/prediction widths differ")
+            parents = item.get("parents")
+            if args.tree:
+                selected = tree_predictions(candidates, parents, predictions)
+                matched = len(selected) - 1
+            else:
+                if parents is not None:
+                    raise ValueError("Linear round cannot carry tree parents")
+                matched = 0
+                for proposed, predicted in zip(candidates[1:], predictions):
+                    if proposed != predicted:
+                        break
+                    matched += 1
+                selected = predictions[:matched + 1]
+            accepted = selected[:args.max_tokens - len(tokens)]
             if not host:
                 draft_position = position + len(accepted)
             if (item["width"] != args.width
@@ -458,6 +491,7 @@ def validate_delivery(requests, histories, args):
                     or span["output_tokens"] != count
                     or span["candidates"] != row["candidates"]
                     or span["predictions"] != row["predictions"]
+                    or span.get("parents") != row.get("parents")
                     or op["natural_accepted"] != row["natural_accepted"]
                     or span["natural_accepted"] != row["natural_accepted"]
                     or span["main_retained"] != row["retained"]):

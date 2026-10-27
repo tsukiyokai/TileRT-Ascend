@@ -21,9 +21,15 @@ class DraftSeed:
 
 @dataclass(frozen=True)
 class ExecutedRound:
+    """Retain verified rows and their tree ancestry for receipt validation.
+
+    Parents include the pending root (-1) and padded rows. Chains use None.
+    """
+
     candidates: tuple[int, ...]
     target_predictions: tuple[int, ...]
     commit: object
+    parents: tuple[int, ...] | None = None
 
 
 class MtpRoundExecutor:
@@ -190,7 +196,7 @@ class MtpRoundExecutor:
         self.target.compact(plan.main_start, path)
         self.target.truncate(commit.main.retained)
         self.drafter.commit(commit.accepted_tokens)
-        return ExecutedRound(proposals, predictions, commit)
+        return ExecutedRound(proposals, predictions, commit, tuple(lineage))
 
     def _advance_drafted(self, plan):
         """One round whose candidates come from the host, not the MTP engine.

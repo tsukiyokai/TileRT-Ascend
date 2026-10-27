@@ -19,3 +19,5 @@ PYTHONPATH=.:tests/glm52 python3 -m unittest check_bench_cann_mtp check_lookup -
 ## 后续 CPU 缺口
 
 tree 的 `validate_local`仍按线性 zip 重算接受。`nodes=[7,99,8,9]`、`parents=[-1,0,0,2]`、`predictions=[8,100,9,10]`的合法路径是 `[0,2,3]`，应提交 `[8,9,10]`，当前检查只预期 `[8]`。需在轮回执保存 lineage，再独立验证路径、提交与缓存；本次未将 tree 角色修复记作树验收完成。
+
+后续 [tree lineage 检查](../tree-lineage-20261028/README.md)已闭合上述 CPU 回执缺口；本页的 18 项记录保留当时源码身份。
