@@ -39,6 +39,21 @@ PREFIX_LENGTH = 8192
 WIDTH = 4
 
 
+def host_drafted(args):
+    return args.lookup or args.automaton or args.tree
+
+
+def create_draft(target, args):
+    if host_drafted(args):
+        return None
+    from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
+
+    draft = CannMtp(target, shard_projections=args.draft_projection_tp)
+    if not draft.model.do_not_compile:
+        raise ValueError("MTP backbone compilation must be disabled")
+    return draft
+
+
 class MeasuredRank(CannRankEngine):
     """Retain local round states and finish prefix copies before delivery."""
 
@@ -213,8 +228,12 @@ def arguments():
         parser.error("Graph capture requires an unmeasured warmup request")
     if args.conditioned_graph and not args.draft_graph:
         parser.error("--conditioned-graph requires --draft-graph")
-    if args.lookup and args.draft_graph:
-        parser.error("--lookup does not execute draft or conditioned graphs")
+    if host_drafted(args) and (args.draft_graph or args.draft_projection_tp
+                              or args.mtp_tokens):
+        parser.error("Host drafting does not execute MTP model options")
+    if args.layers is not None:
+        if not 1 <= args.layers <= 78 or not host_drafted(args):
+            parser.error("--layers requires host drafting and 1 to 78 layers")
     if args.lookup_unigram and not args.lookup:
         parser.error("--lookup-unigram requires --lookup")
     if args.compile_target and not args.target_graph:
@@ -300,11 +319,10 @@ def timing_requests(requests):
 def validate_local(report, args):
     """Check saved local state, then return the rank-independent history."""
     histories = []
-    # A draft engine is absent only when the backbone is truncated, which is
-    # what `--layers` does; a host drafter leaves it in place and unused.
-    reset_positions = [0, None if args.layers else 0]
+    host = host_drafted(args)
+    reset_positions = [0, None if host else 0]
     injected_positions = [PREFIX_LENGTH,
-                          None if args.layers else PREFIX_LENGTH - 1]
+                          None if host else PREFIX_LENGTH - 1]
     if (report["final_positions"] != reset_positions or not report["closed"]
             or len(report["rank_requests"]) != args.warmup + args.requests):
         raise ValueError("The rank did not reset and close every request")
@@ -321,7 +339,7 @@ def validate_local(report, args):
                 matched += 1
             accepted = predictions[:min(matched + 1,
                                         args.max_tokens - len(tokens))]
-            if not args.lookup:
+            if not host:
                 draft_position = position + len(accepted)
             if (item["width"] != args.width
                     or not len(candidates) == len(predictions)
@@ -457,7 +475,6 @@ def run(args, report):
     from vllm.distributed import get_world_group
     from vllm.compilation.counter import compilation_counter
     from tilert.models.glm_5_2_ascend.cann_model import CannModel
-    from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
     from tilert.models.glm_5_2_ascend.tp_runtime import (
         CoordinatedBackend, RankExecutor, TorchControlChannel,
     )
@@ -498,20 +515,8 @@ def run(args, report):
                        hoist_forward_context=args.hoist_forward_context)
     draft = None
     try:
-        if args.layers:
-            # A truncated backbone has no MTP head: the checkpoint's is layer
-            # 78 and a shortened model has nowhere to put it. The drafted
-            # round never touches the draft engine -- `_advance_drafted` reads
-            # only the target, the state and the host drafter -- so the
-            # truncated arm runs without one, and requires a host drafter.
-            if not (args.automaton or args.tree or args.lookup):
-                raise ValueError("--layers needs a host drafter: "
-                                 "--automaton, --tree or --lookup")
-        else:
-            draft = CannMtp(target,
-                            shard_projections=args.draft_projection_tp)
-            if not draft.model.do_not_compile:
-                raise ValueError("MTP backbone compilation must be disabled")
+        draft = create_draft(target, args)
+        report["draft_model_loaded"] = draft is not None
         if "float32" not in target.tp_reduction:
             raise ValueError("Keep the production FP32 TP reduction")
         channel = TorchControlChannel(get_world_group().cpu_group)
@@ -520,7 +525,7 @@ def run(args, report):
         # `--tree` select which drafter; without this they selected one and
         # left the MTP engine running, so an arm named for a drafter measured
         # the engine instead.
-        if args.lookup or args.automaton or args.tree:
+        if host_drafted(args):
             manifest = json.loads(
                 (Path(args.capture_case) / "manifest.json").read_text()
             )
@@ -627,7 +632,9 @@ def run(args, report):
                                            if args.conditioned_graph else 0))
             sources = source_hashes(target, draft)
             for name in ("mtp_session.py", "tp_runtime.py",
-                         "lookup_draft.py", "automaton_draft.py"):
+                         "lookup_draft.py", "automaton_draft.py",
+                         "tree_draft.py", "tree_mask.py", "tree_resolve.py",
+                         "tree_attention.py"):
                 path = ROOT / "tilert/models/glm_5_2_ascend" / name
                 sources[str(path)] = digest(path)
             for path in (
@@ -738,10 +745,11 @@ def run(args, report):
                 "profiled_requests": sum(
                     item["profiled"] for item in report["requests"]),
                 "output_tokens_per_request": args.max_tokens,
-                "drafter": ("automaton" if args.automaton else "lookup")
-                           if args.lookup else "mtp",
+                "drafter": report["drafter"] if host_drafted(args) else "mtp",
+                "draft_model_loaded": draft is not None,
                 "lookup_min_ngram": (
-                    (1 if args.lookup_unigram else 2) if args.lookup else None
+                    (1 if args.lookup_unigram else 2)
+                    if host_drafted(args) and not args.tree else None
                 ),
                 "target_graph": args.target_graph,
                 "round_phases": (engine.round_phases.report()
@@ -799,10 +807,13 @@ def main():
         "clock": "perf_counter_ns; rank-local host clocks",
         "tpot_formula": "(last_callback-first_callback)/(output_tokens-1)",
         "prefix_readiness": "Local synchronize then Gloo barrier before g0",
-        "round_scope": "Gloo, draft chain, verify, MTP recompute, commit",
+        "round_scope": ("Gloo, host draft, verify, commit" if host_drafted(args)
+                        else "Gloo, draft chain, verify, MTP recompute, commit"),
         "phase_device_timing": False,
-        "draft_execution": "chain_graph" if args.draft_graph else "eager",
+        "draft_execution": ("none" if host_drafted(args) else
+                            "chain_graph" if args.draft_graph else "eager"),
         "conditioned_execution": (
+            "none" if host_drafted(args) else
             "conditioned_graph" if args.conditioned_graph else "eager"),
         "ignore_eos": True, "precision_verified": False,
         "formal_1024_token_run": False, "profiled": False,

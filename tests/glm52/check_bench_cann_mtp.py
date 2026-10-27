@@ -114,7 +114,8 @@ class BenchmarkChecks(unittest.TestCase):
         }
         args = SimpleNamespace(lookup=lookup, warmup=0, requests=1,
                                max_tokens=2, width=2, target_graph=False,
-                               draft_graph=False, conditioned_graph=False)
+                               draft_graph=False, conditioned_graph=False,
+                               automaton=False, tree=False)
         report = {"rank": 1, "closed": True, "final_positions": reset,
                   "rank_requests": [request], "command_serial": 6}
         return args, report
@@ -141,6 +142,43 @@ class BenchmarkChecks(unittest.TestCase):
         report["rank_requests"][0]["injected"][1] = None
         with self.assertRaises(ValueError):
             bench.validate_local(report, args)
+
+    def test_only_device_drafting_loads_the_mtp_model(self):
+        target = object()
+        modes = ((True, False, False), (False, True, False),
+                 (False, False, True), (False, False, False))
+        for lookup, automaton, tree in modes:
+            args = SimpleNamespace(lookup=lookup, automaton=automaton,
+                                   tree=tree, draft_projection_tp=True)
+            candidate = SimpleNamespace(
+                model=SimpleNamespace(do_not_compile=True),
+            )
+            with self.subTest(mode=(lookup, automaton, tree)), patch(
+                "tilert.models.glm_5_2_ascend.cann_mtp.CannMtp",
+                return_value=candidate,
+            ) as load:
+                draft = bench.create_draft(target, args)
+                if lookup or automaton or tree:
+                    self.assertIsNone(draft)
+                    load.assert_not_called()
+                else:
+                    self.assertIs(draft, candidate)
+                    load.assert_called_once_with(target,
+                                                 shard_projections=True)
+
+    def test_host_modes_reject_unused_mtp_flags_before_loading(self):
+        required = ["bench", "--checkpoint", "checkpoint", "--capture-case",
+                    "prefix", "--output", "out", "--source-commit", "test"]
+        for mode in ("--lookup", "--automaton", "--tree"):
+            for options in (("--draft-graph",), ("--draft-projection-tp",),
+                            ("--mtp-tokens", "1")):
+                with (
+                    self.subTest(mode=mode, options=options),
+                    patch.object(sys, "argv", [*required, mode, *options]),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit):
+                        bench.arguments()
 
     def test_cli_requires_a_sample_without_profiler(self):
         command = ["bench", "--checkpoint", "checkpoint", "--capture-case", "prefix",

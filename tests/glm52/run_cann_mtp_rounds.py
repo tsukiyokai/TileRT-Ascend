@@ -332,9 +332,7 @@ def source_hashes(target, draft):
              *[Path(__file__).with_name(name) for name in
                ("run_cann_model.py", "run_native_decode.py", "prefix_io.py",
                 "frozen_teacher.py")]}
-    # The draft engine's own classes, when there is one. A truncated arm has
-    # none, and the layer this reached for is keyed "78" -- one more hard-coded
-    # depth, in a hash collection.
+    # Host drafting has no model classes to fingerprint.
     drafted = () if draft is None else (
         type(draft), type(draft.model), type(draft.model.model),
         type(draft.model.model.layers[

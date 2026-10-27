@@ -28,13 +28,14 @@ def run_request(width, lookup, shortest=2):
     target = Target(prompt, 8256)
     parent = Hidden("target", target.rows[-1][1], len(prompt))
     first = next_token(parent.context_hash, len(prompt))
-    draft = Draft(target, 8191, first, "mixed")
+    draft = None if lookup else Draft(target, 8191, first, "mixed")
     engine = MeasuredRank(target, draft, None, prompt if lookup else None,
                           lookup_min_ngram=shortest)
     engine.parent_hidden = [parent]
     engine.first_token_id = first
     engine._prompt_length = 8192
-    engine.current = {"injected": [8192, 8191], "first_token": first,
+    engine.current = {"injected": [8192, None if lookup else 8191],
+                      "first_token": first,
                       "rounds": []}
     engine.requests.append(engine.current)
     engine.start_mtp(first, 12, width, ())
@@ -51,19 +52,20 @@ def run_request(width, lookup, shortest=2):
     assert tokens == expected
     assert [token for token, _ in target.rows[:target.position]] == rows
     if lookup:
-        assert not draft.calls
+        assert engine.draft is None
         assert engine._mtp.drafter.context == list(prompt) + tokens
     engine.finish_mtp(engine.position)
     engine.reset()
     report = {
         "rank": 1, "rank_requests": engine.requests, "closed": True,
-        "final_positions": [target.position, draft.position],
+        "final_positions": [target.position,
+                            None if draft is None else draft.position],
         "command_serial": 5 + len(engine.requests[0]["rounds"]),
     }
     args = SimpleNamespace(
         warmup=0, requests=1, width=width, max_tokens=12, lookup=lookup,
         target_graph=False, draft_graph=False, conditioned_graph=False,
-        layers=None,
+        automaton=False, tree=False,
     )
     return report, args
 
@@ -75,7 +77,7 @@ class LookupChecks(unittest.TestCase):
                 report, args = run_request(width, lookup=True)
                 validate_local(report, args)
                 self.assertEqual(report["rank_requests"][0]["finished"],
-                                 [8203, 8191])
+                                 [8203, None])
 
     def test_mtp_still_requires_both_caches_to_advance(self):
         report, args = run_request(8, lookup=False)
@@ -87,7 +89,7 @@ class LookupChecks(unittest.TestCase):
         report, args = run_request(32, lookup=True, shortest=1)
         validate_local(report, args)
         self.assertEqual(report["rank_requests"][0]["finished"],
-                         [8203, 8191])
+                         [8203, None])
 
     def test_unigram_supplies_continuation_when_longer_suffix_is_absent(self):
         prompt = [1, 9, 2, 1]
@@ -99,7 +101,7 @@ class LookupChecks(unittest.TestCase):
         report, args = run_request(8, lookup=True)
         for field in ("draft_retained", "retained"):
             damaged = copy.deepcopy(report)
-            damaged["rank_requests"][0]["rounds"][0][field] += 1
+            damaged["rank_requests"][0]["rounds"][0][field] = 9999
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_local(damaged, args)
 

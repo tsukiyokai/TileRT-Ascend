@@ -24,6 +24,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 [在线 lookup 接入](evidence/ascend-decode/online-lookup-20261028/README.md)已通过 CPU/HTTP 与 16 并发 worker 检查：请求自有 prompt、width32、目标图预热回滚、零 MTP 模型加载和拒绝后复用。实际 CANN 图、HIXL、常驻显存、width32 数值及 TPOT 尚待设备验收；正式 CANN 精度门禁接线也尚未完成。
 
+[离线 host 起草](evidence/ascend-decode/host-draft-model-20261028/README.md)也停止构造未执行的 MTP 模型，角色、状态与报告统一，18 项 CPU 检查通过。实际框架的全局 RoPE/共享 head 副作用仍须 A/B；tree 的 lineage 回执与树接受验收尚未闭合。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正
