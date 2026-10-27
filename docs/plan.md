@@ -4,7 +4,7 @@
 
 ## CPU 前沿验收
 
-已完成 [主机候选批量上传](evidence/ascend-decode/token-staging-20261028/README.md)、[tree 容量尾部](evidence/ascend-decode/tree-capacity-20261028.json)、[在线 lookup/width32 的 CPU 接入](evidence/ascend-decode/online-lookup-20261028/README.md)、[host 起草零 MTP 构造](evidence/ascend-decode/host-draft-model-20261028/README.md)、[tree lineage 回执](evidence/ascend-decode/tree-lineage-20261028/README.md)、[P/D 命令计时](evidence/ascend-decode/pd-command-clock-20261028/README.md)与 [lookup 同策略 CPU 对照](evidence/ascend-decode/lookup-policy-20261028/README.md)。下一步闭合正式 CANN 精度门禁、起草器成本及请求观测对计时的影响；设备验证按单 die、少 rank、空闲 A3 推进，先核对构造副作用。CPU 结果不替代整模型精度与在线 TPOT，当前未宣告前沿耗尽。
+CPU 接入、状态、计时修复及负结果见 [10-28 账本](probe.md)；[精确压缩尾部索引](evidence/ascend-decode/lookup-radix-20261028/README.md)已通过本地语义与配对成本检查。下一步闭合正式 CANN 精度门禁、索引高尾归因及请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 
 ## 首条验证路径
 

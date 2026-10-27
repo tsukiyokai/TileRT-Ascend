@@ -1,26 +1,33 @@
 """Propose a causal continuation from repeated prompt or output token IDs."""
 
-# A tail is keyed by a polynomial hash so that extending it by one token is a
-# multiply and an add, rather than building a tuple whose hash costs one
-# operation a token. Indexing an 8192-token prompt over tail lengths 2 to 32
-# is then 254 thousand constant-time inserts instead of 4.3 million element
-# hashes. A query verifies its one candidate against the context, so a
-# collision cannot produce a wrong proposal.
-BASE = 1000003
-MODULUS = (1 << 61) - 1
+
+class _Node:
+    __slots__ = ("label", "children", "latest")
+
+    def __init__(self, label, latest):
+        self.label = label
+        self.children = {}
+        self.latest = latest
+
+
+def _common_prefix(label, word, offset):
+    length = min(len(label), len(word) - offset)
+    part = word[offset:offset + length]
+    if label[:length] == part:
+        return length
+    for index, (left, right) in enumerate(zip(label, part)):
+        if left != right:
+            return index
+    raise AssertionError("Unequal token tails have no differing element")
 
 
 class LookupDrafter:
-    """Hold the context and propose what followed its tail last time.
+    """Copy what followed the longest, most recently seen context tail.
 
-    The context is the prompt plus every committed token, which is what the
-    model attends to and therefore what it can copy from.
-
-    The default tail is as long as the tree drafter is allowed to match, so
-    that a comparison between them measures the tree rather than the match
-    length. On a constructed stream the longer tail is worth 29.738 -> 32.076
-    accepted tokens a round at an exact copy and nothing at all from edit
-    rate 0.05 on.
+    A radix trie stores reversed tails, bounded by `longest`. Each compressed
+    edge shares one latest continuation position across its token prefixes.
+    Appending a token inserts the preceding tail once, and querying walks
+    the current reversed tail once. Token comparisons are exact.
     """
 
     def __init__(self, prompt, longest=32, shortest=2):
@@ -30,54 +37,67 @@ class LookupDrafter:
         self.context = []
         self.longest = longest
         self.shortest = shortest
-        self._latest = {}
+        self._root = _Node((), -1)
         self.hits = 0
         self.rounds = 0
         self.commit(prompt)
 
+    def _insert(self, word, end):
+        node, offset = self._root, 0
+        while offset < len(word):
+            child = node.children.get(word[offset])
+            if child is None:
+                node.children[word[offset]] = _Node(word[offset:], end)
+                return
+            shared = _common_prefix(child.label, word, offset)
+            if shared == len(child.label):
+                child.latest = end
+                offset += shared
+                node = child
+                continue
+            # A new branch or shorter tail splits the old compressed edge.
+            replacement = _Node(child.label[:shared], end)
+            child.label = child.label[shared:]
+            replacement.children[child.label[0]] = child
+            node.children[word[offset]] = replacement
+            offset += shared
+            if offset < len(word):
+                replacement.children[word[offset]] = _Node(word[offset:], end)
+            return
+
     def commit(self, tokens):
-        """Extend the context with what the target actually accepted."""
-        previous_length = len(self.context)
+        """Index tails only when an accepted token supplies a continuation."""
+        previous = len(self.context)
         self.context.extend(int(token) for token in tokens)
-        context = self.context
-        latest = self._latest
-        # Only index suffixes with a known continuation. A newly appended
-        # token makes the preceding tail eligible, never the current tail.
-        for end in range(max(previous_length, self.shortest), len(context)):
-            key = 0
-            longest = min(self.longest, end)
-            for size in range(1, longest + 1):
-                key = (key * BASE + context[end - size]) % MODULUS
-                if size >= self.shortest:
-                    latest[(size, key)] = end
+        for end in range(max(previous, self.shortest), len(self.context)):
+            word = tuple(reversed(
+                self.context[max(0, end - self.longest):end],
+            ))
+            self._insert(word, end)
 
     def propose(self, count):
-        """Return up to `count` tokens, longest tail match first.
-
-        Search from `longest` down and take the most recent occurrence at
-        the first length with a known continuation.
-        """
+        """Return up to `count` tokens after the longest/latest tail match."""
         self.rounds += 1
-        context = self.context
-        keys = []
-        key = 0
-        for size in range(1, self.longest + 1):
-            if size > len(context):
+        maximum = min(self.longest, len(self.context) - 1)
+        if maximum < self.shortest or count <= 0:
+            return []
+        word = tuple(reversed(self.context[-maximum:]))
+        node, matched, end = self._root, 0, -1
+        while matched < maximum:
+            child = node.children.get(word[matched])
+            if child is None:
                 break
-            key = (key * BASE + context[-size]) % MODULUS
-            if size >= self.shortest:
-                keys.append((size, key))
-        for size, key in reversed(keys):
-            if len(context) <= size:
-                continue
-            end = self._latest.get((size, key))
-            if end is None or context[end - size:end] != context[-size:]:
-                continue
-            run = context[end:end + count]
-            if run:
-                self.hits += 1
-                return run
-        return []
+            shared = _common_prefix(child.label, word, matched)
+            matched += shared
+            end = child.latest
+            if shared < len(child.label):
+                break
+            node = child
+        if matched < self.shortest:
+            return []
+        proposed = self.context[end:end + count]
+        self.hits += bool(proposed)
+        return proposed
 
     def report(self):
         return {

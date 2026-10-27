@@ -1,6 +1,7 @@
 """CPU checks for lookup proposals, cache ownership and measurement records."""
 
 import copy
+from itertools import product
 import random
 from types import SimpleNamespace
 import unittest
@@ -111,6 +112,38 @@ class LookupChecks(unittest.TestCase):
         drafter.commit([3, 9, 1, 2])
         self.assertEqual(drafter.propose(3), [7, 1, 2])
 
+    def test_distinct_tails_do_not_hide_the_longer_match(self):
+        # These distinct tails collide under the former 61-bit polynomial.
+        left = [30000, 30712, 30000, 32048, 30503]
+        right = [30306, 30000, 30004, 30000, 30000]
+        context = left + [111] + right + [222] + left[-4:] + [333] + left
+        drafter = LookupDrafter(context, longest=5)
+        self.assertEqual(lookup(context, 1, 5, 2), [[111]])
+        self.assertEqual(drafter.propose(1), [111])
+
+    def test_match_can_end_inside_a_compressed_edge(self):
+        context = [1, 2, 3, 4, 7, 8, 9, 2, 3, 4]
+        self.assertEqual(LookupDrafter(context, longest=4).propose(3),
+                         [7, 8, 9])
+
+    def test_full_length_tail_uses_the_most_recent_continuation(self):
+        tail = list(range(32))
+        context = tail + [100] + tail + [101] + tail
+        self.assertEqual(LookupDrafter(context).propose(4), [101, 0, 1, 2])
+
+    def test_all_small_binary_contexts_match_independent_reverse_scan(self):
+        for length in range(9):
+            for context in product(range(2), repeat=length):
+                for shortest, longest in ((1, 1), (1, 8), (2, 8), (4, 32)):
+                    drafter = LookupDrafter(context[:-2], longest, shortest)
+                    drafter.commit(())
+                    drafter.commit(iter(context[-2:]))
+                    for count in (0, 1, 7):
+                        branches = lookup(list(context), count,
+                                          longest, shortest)
+                        self.assertEqual(drafter.propose(count),
+                                         branches[0] if branches else [])
+
     def test_replay_counts_padding_matches(self):
         rounds = simulate([7, 7, 7], 3, 8, 2, prompt=[1, 2])
         self.assertEqual(rounds, [{"matched_drafts": 2, "accepted": 2}])
@@ -126,7 +159,8 @@ class LookupChecks(unittest.TestCase):
 
     def test_incremental_index_matches_reverse_scan_after_each_commit(self):
         rng = random.Random(42)
-        for shortest, longest in ((1, 1), (1, 8), (2, 8), (4, 12)):
+        for shortest, longest in ((1, 1), (1, 8), (2, 8), (4, 12),
+                                  (1, 32), (2, 32), (32, 32)):
             context = [rng.randrange(4) for _ in range(40)]
             drafter = LookupDrafter(context, longest, shortest)
             for _ in range(80):

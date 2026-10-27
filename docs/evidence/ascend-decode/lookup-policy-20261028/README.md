@@ -23,7 +23,7 @@ Setup includes the common first output; steady cost sums proposal and
 commit calls. These costs exclude target inference, orchestration and I/O.
 
 | Workload | Rounds | Current setup p50, ms | rfind setup p50, ms | Current steady p50, ms | rfind steady p50, ms | Current total p50, ms | rfind total p50, ms |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | Exact copy | 32 | 42.469 | 0.304 | 5.699 | 0.092 | 48.173 | 0.397 |
 | Copy with 51 edits | 173 | 42.399 | 0.301 | 7.384 | 49.209 | 49.929 | 49.515 |
 | Ambiguous bigram | 1023 | 49.022 | 0.317 | 15.774 | 439.042 | 64.830 | 439.356 |
@@ -37,8 +37,10 @@ quantile and measured source hash was checked after the run. See
 
 The pure-copy gain is large, but short ambiguous tails and absent matches
 repeat scans over the context. This implementation remains an experiment;
-the production length-indexed lookup is unchanged. No NPU or TPOT result
-follows from these CPU measurements.
+the recorded current arm is the hash index at Git `1ef8a8d`. The subsequent
+[radix index](../lookup-radix-20261028/README.md) has its own paired records.
+No NPU or TPOT result follows from these CPU measurements. Reproduce this
+historical comparison from `1ef8a8d`.
 
 From the repository root:
 
