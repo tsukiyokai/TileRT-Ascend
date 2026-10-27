@@ -216,7 +216,7 @@ def prolog_attention_forward(
             raise ValueError("Shared DSA requires the preceding index choices")
         indices = prev_topk_indices
     excluded = indices.new_ones((batch, length, key.shape[2]),
-                               dtype=torch.bool)
+                                dtype=torch.bool)
     excluded.scatter_(-1, indices.long(), False)
     excluded = excluded.unsqueeze(1)
     if attention_mask is None:
@@ -402,19 +402,26 @@ class HfReference:
     """Run the installed HF model without CANN or production weight helpers."""
 
     def __init__(self, checkpoint, mla_preprocess="native",
-                 layer_count=LAYERS):
+                 layer_count=LAYERS, *, fp32_head=False):
         if mla_preprocess not in ("native", "prolog_v3"):
             raise ValueError("MLA preprocess must be native or prolog_v3")
         if type(layer_count) is not int or not 1 <= layer_count <= LAYERS:
             raise ValueError("The reference layer count must be in [1, 78]")
         self.mla_preprocess = mla_preprocess
-        self.weights = ReferenceWeights(checkpoint)
+        self.weights = ReferenceWeights(checkpoint, fp32_head=fp32_head)
         self.weights.contract["rotary"] = dict(ROTARY_CONTRACT)
         self.weights.contract["c8_index_scoring"] = (
             cann_arch22_scoring_contract(CANN_ARCH22_SOURCE_DIRECTORY)
         )
         raw = json.loads((self.weights.directory / "config.json").read_text())
         config = GlmMoeDsaConfig.from_dict(raw)
+        self.weights.contract["lm_head"] = {
+            "input_dtype": "bfloat16", "weight_dtype": "bfloat16",
+            "accumulator_dtype": "float32",
+            "projection_output_dtype": "float32" if fp32_head else "bfloat16",
+            "tensor_parallel_size": TP_SIZE,
+            "vocabulary_range": [0, config.vocab_size],
+        }
         config._attn_implementation = "eager"
         config._experts_implementation = "eager"
         if (config.num_hidden_layers != LAYERS or config.n_group != 1

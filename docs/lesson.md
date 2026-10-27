@@ -51,6 +51,8 @@
 
 CPU 参考要复现硬件实际使用的 scale。所记录的 A3 Fixpipe 路径在反量化前清除 FP32 scale 的低 13 位；CPU 参考使用完整 FP32 scale 时便算出了另一结果。按这条规则修正后，对应的固定输入检查通过。该对照只解释这组差异，其他模型漂移仍需独立定位。见 [参考修正及原始对照](evidence/ascend-decode/gmm2-compact-20261020/README.md)。
 
+保留 head 实际的输出舍入边界。BF16 输出再转 FP32 无法恢复未舍入积；同时绑定执行模式、有效算术与实际导入源，见 [FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)。实际图须直接对照 HF，或经覆盖相同边界的位等桥连接；两个近似对照各自通过，不保证传递后仍满足同一误差界。
+
 FP32 规约树决定加法的结合顺序，属于所选计算规则。记录并行布局、算法及 `HCCL_OP_EXPANSION_MODE`、`HCCL_DETERMINISTIC`；改变规约树或任一配置后，重新检查数值与接受率。重复运行是否一致、结果是否符合参考，分别验收。
 
 ## 4. 先校准计时，再比较性能

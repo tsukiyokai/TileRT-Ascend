@@ -29,13 +29,15 @@ def parse_arguments():
     parser.add_argument("--mla-preprocess", choices=("native", "prolog_v3"),
                         default="native")
     parser.add_argument("--layers", type=int, choices=range(1, 79), default=78)
+    parser.add_argument("--fp32-head", action="store_true",
+                        help="Keep BF16 head products in FP32 before output")
     args = parser.parse_args()
     if args.generate < 1 or args.capacity < 1:
         parser.error("Generation and cache capacity must be positive")
     return args
 
 
-def validate_trace(trace, layer_count=78):
+def validate_trace(trace, layer_count=78, *, fp32_head=False):
     position = trace["position"]
     if trace["committed_position"] != position + 1:
         raise ValueError("HF did not commit exactly one token")
@@ -46,6 +48,13 @@ def validate_trace(trace, layer_count=78):
     for name, count in counts.items():
         if len(trace[name]) != count:
             raise ValueError(f"Incomplete HF {name}")
+    if fp32_head:
+        import torch
+
+        if any(value.dtype != torch.float32 for value in (
+            trace["logits"], *trace["layer_logits"],
+        )):
+            raise ValueError("FP32 head requires FP32 final and layer logits")
     for layer, row in enumerate(trace["cache_rows"]):
         full = layer < 3 or (layer - 2) % 4 == 0
         quantized = full and 6 <= layer <= 66
@@ -172,6 +181,24 @@ def compare_replay(label, trace, previous, checks, layer_count):
                            checks, exact=True)
 
 
+def bind_reference_sources(engine, report):
+    reader = type(engine.weights)
+    loaded = {
+        "tilert/models/glm_5_2_ascend/reference.py": type(engine),
+        "tilert/models/glm_5_2_ascend/reference_weights.py": reader,
+    }
+    report["loaded_reference_sources"] = {
+        name: {"path": str(Path(inspect.getsourcefile(cls)).resolve()),
+               "sha256": digest(Path(inspect.getsourcefile(cls)))}
+        for name, cls in loaded.items()
+    }
+    if any(value["sha256"] != report["source_sha256"][name]
+           for name, value in report["loaded_reference_sources"].items()):
+        raise ValueError(
+            "Loaded HF reference source differs from the manifest"
+        )
+
+
 def run_reference(args, report):
     import torch
     import transformers
@@ -194,7 +221,8 @@ def run_reference(args, report):
         )
     }
     engine = HfReference(args.checkpoint, args.mla_preprocess,
-                         layer_count=args.layers)
+                         layer_count=args.layers, fp32_head=args.fp32_head)
+    bind_reference_sources(engine, report)
     report["weight_arithmetic"] = engine.weights.contract
     if args.mla_preprocess == "prolog_v3":
         report["expert_combine"] = engine.weights.contract["expert_combine"]
@@ -221,7 +249,7 @@ def run_reference(args, report):
             if offset < len(args.tokens):
                 token = args.tokens[offset]
             trace = engine.step(token)
-            validate_trace(trace, args.layers)
+            validate_trace(trace, args.layers, fp32_head=args.fp32_head)
             check_lengths(engine, initial + offset + 1, report,
                           f"step{initial + offset}.cache_lengths")
             name = f"step-{initial + offset:05d}.pt"
@@ -239,14 +267,14 @@ def run_reference(args, report):
         check_lengths(engine, initial, report, "reinjected.cache_lengths")
         for offset, token in enumerate(consumed):
             trace = engine.step(token)
-            validate_trace(trace, args.layers)
+            validate_trace(trace, args.layers, fp32_head=args.fp32_head)
             check_lengths(engine, initial + offset + 1, report,
                           f"replay{initial + offset}.cache_lengths")
             previous = torch.load(
                 args.output / f"step-{initial + offset:05d}.pt",
                 map_location="cpu", weights_only=True,
             )
-            validate_trace(previous, args.layers)
+            validate_trace(previous, args.layers, fp32_head=args.fp32_head)
             compare_replay(f"reset.step{initial + offset}", trace, previous,
                            report["checks"], args.layers)
     report["teacher_tokens"] = consumed
@@ -299,6 +327,7 @@ def main():
         "prompt_tokens": args.tokens, "requested_generation": args.generate,
         "mla_preprocess": args.mla_preprocess,
         "layer_count": args.layers,
+        "fp32_head": args.fp32_head,
         "last_merged_hidden": "Last decoder output before the final RMSNorm",
         "partial_layer_logits": (
             "Use the full-model intermediate norm/head projection formula"

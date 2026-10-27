@@ -147,13 +147,13 @@ class ReferenceWeights:
     ``tensor`` accepts half-open row/column ranges and an optional dtype.
     ``linear`` supports replicated, output-concatenated, or input-reduced
     projections. ``input_partials`` exposes the sixteen rank-local results
-    for MoE combine before TP reduction. Floating projections retain the
-    input's BF16/FP32 dtype; their matrix products accumulate in FP32.
+    for MoE combine before TP reduction. Floating products accumulate in FP32
+    and retain the input dtype, except for an explicitly selected FP32 head.
     Global tensors, including embedding/head slices, are never cached.
     """
 
     def __init__(self, directory, expert_cache_size=8,
-                 dense_cache_bytes=256 * 1024**2):
+                 dense_cache_bytes=256 * 1024**2, *, fp32_head=False):
         if sys.byteorder != "little":
             raise ValueError("The raw reader requires a little-endian host")
         if expert_cache_size < 0 or dense_cache_bytes < 0:
@@ -167,13 +167,18 @@ class ReferenceWeights:
         self.weight_map = index["weight_map"]
         if self.quantization.get("group_size") != 0:
             raise ValueError("The reference requires per-channel weights")
+        head_recipe = self.quantization.get("lm_head.weight", "FLOAT")
+        if fp32_head and head_recipe != "FLOAT":
+            raise ValueError("FP32 head requires unquantized head weights")
+        self.fp32_head = fp32_head
         self.contract = {
             "tp_size": TP_SIZE,
             "activation_quantization": (
                 "BF16: calibrated A3 Div(127,amax), FP32 Mul, RINT; "
                 "scale=amax*FP32(1/127)"),
             "a8_source_sha256": (
-                "fd0fb30d924b48ed4455cb505d2d530e822fa48d78b526db663d0bee69ffaefc"
+                "fd0fb30d924b48ed4455cb505d2d530e"
+                "822fa48d78b526db663d0bee69ffaefc"
             ),
             "integer_projection": (
                 "W8: INT32 dot * FP32 weight scale * FP32 A8 scale; "
@@ -183,7 +188,8 @@ class ReferenceWeights:
             "tp_sum": "FP32 rank-order sum, final BF16; not bitwise HCCL",
             "w4_scale_bias": "Checkpoint correction added once after 16H+L",
             "w4_msd_source_sha256": (
-                "a8b7c446d5373f5f50d3ee22bdf6631a8468973da420791bb97ccf0e2f351fbb"
+                "a8b7c446d5373f5f50d3ee22bdf6631a"
+                "8468973da420791bb97ccf0e2f351fbb"
             ),
             "c8_quantization": "128-channel NPU operation order uncalibrated",
             "fused_rounding": (
@@ -413,8 +419,14 @@ class ReferenceWeights:
         return tuple(partials)
 
     def _floating_product(self, prefix, x, rows=None, columns=None):
+        fp32_head = self.fp32_head and prefix == "lm_head"
+        if fp32_head and x.dtype != torch.bfloat16:
+            raise ValueError("FP32 head requires BF16 hidden input")
         weight = self.tensor(prefix + ".weight", rows, columns, x.dtype)
-        return (x.float() @ weight.float().T).to(x.dtype)
+        output = x.float() @ weight.float().T
+        if fp32_head:
+            return output
+        return output.to(x.dtype)
 
     def input_partials(self, prefix, x):
         """Apply local A8 quantization before each rank's input-shard dot."""

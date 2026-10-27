@@ -66,7 +66,7 @@ def make_prefix(length):
 
 
 def make_trace():
-    rows, routes = [], []
+    rows, routes, scores = [], [], []
     for layer in range(78):
         full = layer < 3 or (layer - 2) % 4 == 0
         rows.append({
@@ -75,11 +75,15 @@ def make_trace():
             "index_scale": object() if full and 6 <= layer <= 66 else None,
         })
         routes.append(object() if layer >= 3 else None)
+        scores.append(TensorMetadata((8193,), "FP32") if full else None)
     return {
         "token": 1, "position": 8192, "committed_position": 8193,
         "hidden_states": (None,) * 79, "layer_logits": (None,) * 78,
         "indices": [object() for _ in range(78)], "routes": routes,
         "cache_rows": rows,
+        "index_scores": scores,
+        "attention_weights": [TensorMetadata((64, 8193), "BF16")
+                              for _ in range(78)],
     }
 
 
@@ -127,7 +131,7 @@ def main():
     trace = make_trace()
     verify("trace.valid", lambda: hf.validate_trace(trace), True)
     for field in ("hidden_states", "layer_logits", "indices", "routes",
-                  "cache_rows"):
+                  "cache_rows", "index_scores", "attention_weights"):
         incomplete = copy.deepcopy(trace)
         incomplete[field] = []
         verify("trace.empty." + field,
@@ -174,6 +178,7 @@ def main():
         ("weight_arithmetic", {}),
         ("installed_hf_source_sha256", {}), ("trace_sha256", {}),
         ("index_rope_basis", "half"),
+        ("fp32_head", True), ("fp32_head", "false"),
         ("rms_norm_eps", {"ordinary": 1e-5, "q_a": 1e-6, "kv_a": 1e-6}),
     ):
         wrong = copy.deepcopy(manifest)
@@ -186,6 +191,60 @@ def main():
         wrong["weight_arithmetic"]["c8_index_scoring"][field] = value
         verify("manifest.reject.scoring." + field,
                lambda: validate_manifest(wrong), False)
+
+    head_sources = (
+        "tests/glm52/run_hf_reference.py",
+        "tilert/models/glm_5_2_ascend/reference.py",
+        "tilert/models/glm_5_2_ascend/reference_weights.py",
+    )
+    precise = copy.deepcopy(manifest)
+    precise["fp32_head"] = True
+    precise["loaded_reference_sources"] = {}
+    for name in head_sources:
+        sha = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        precise["source_sha256"][name] = sha
+        if name.startswith("tilert/"):
+            precise["loaded_reference_sources"][name] = {
+                "path": str(root / name), "sha256": sha,
+            }
+    precise["weight_arithmetic"]["lm_head"] = {
+        "input_dtype": "bfloat16", "weight_dtype": "bfloat16",
+        "accumulator_dtype": "float32", "projection_output_dtype": "float32",
+        "tensor_parallel_size": 16, "vocabulary_range": [0, 154880],
+    }
+
+    def validate_precise(value):
+        native.validate_reference_manifest(
+            value, manifest["metadata_sha256"], fp32_head=True,
+        )
+
+    verify("manifest.fp32.valid", lambda: validate_precise(precise), True)
+    verify("manifest.fp32.reject_legacy", lambda: validate_precise(manifest),
+           False)
+    for field, value in (("input_dtype", "float32"),
+                         ("weight_dtype", "float32"),
+                         ("accumulator_dtype", "bfloat16"),
+                         ("projection_output_dtype", "bfloat16"),
+                         ("tensor_parallel_size", 8),
+                         ("vocabulary_range", [0, 154879])):
+        wrong = copy.deepcopy(precise)
+        wrong["weight_arithmetic"]["lm_head"][field] = value
+        verify("manifest.fp32.reject." + field,
+               lambda: validate_precise(wrong), False)
+    for name in head_sources:
+        for sha in (None, "0" * 64):
+            wrong = copy.deepcopy(precise)
+            if sha is None:
+                wrong["source_sha256"].pop(name)
+            else:
+                wrong["source_sha256"][name] = sha
+            verify("manifest.fp32.reject_source." + name + str(sha),
+                   lambda: validate_precise(wrong), False)
+        if name.startswith("tilert/"):
+            wrong = copy.deepcopy(precise)
+            wrong["loaded_reference_sources"].pop(name)
+            verify("manifest.fp32.reject_loaded." + name,
+                   lambda: validate_precise(wrong), False)
 
     sources = [Path(__file__), reference, *(Path(__file__).with_name(name)
                for name in ("run_native_decode.py", "run_hf_reference.py"))]

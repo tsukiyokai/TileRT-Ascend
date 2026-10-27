@@ -15,7 +15,7 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def validate_reference_manifest(reference, metadata):
+def validate_reference_manifest(reference, metadata, *, fp32_head=False):
     from tilert.models.glm_5_2_ascend.ops.indexer import (
         cann_arch22_scoring_contract,
     )
@@ -31,6 +31,40 @@ def validate_reference_manifest(reference, metadata):
     if (not reference["source_sha256"]
             or not reference.get("installed_hf_source_sha256")):
         raise ValueError("HF reference needs generator and installed hashes")
+    head_mode = reference.get("fp32_head", False)
+    if type(head_mode) is not bool or head_mode != fp32_head:
+        raise ValueError("HF reference head precision differs from execution")
+    head = reference.get("weight_arithmetic", {}).get("lm_head")
+    if fp32_head or head is not None:
+        expected_head = {
+            "input_dtype": "bfloat16", "weight_dtype": "bfloat16",
+            "accumulator_dtype": "float32",
+            "projection_output_dtype": "float32" if fp32_head else "bfloat16",
+            "tensor_parallel_size": 16, "vocabulary_range": [0, 154880],
+        }
+        if head != expected_head:
+            raise ValueError("HF reference head arithmetic contract differs")
+    if fp32_head:
+        sources = (
+            "tests/glm52/run_hf_reference.py",
+            "tilert/models/glm_5_2_ascend/reference.py",
+            "tilert/models/glm_5_2_ascend/reference_weights.py",
+        )
+        root = Path(__file__).resolve().parents[2]
+        for name in sources:
+            expected_hash = digest(root / name)
+            if reference["source_sha256"].get(name) != expected_hash:
+                raise ValueError("FP32 head reference source differs: " + name)
+            if name.startswith("tilert/"):
+                loaded = reference.get("loaded_reference_sources", {}).get(
+                    name, {},
+                )
+                if (loaded.get("sha256") != expected_hash
+                        or not isinstance(loaded.get("path"), str)
+                        or not loaded["path"]):
+                    raise ValueError(
+                        "FP32 head loaded source differs: " + name
+                    )
     expected = cann_arch22_scoring_contract()
     scorer = "tilert/models/glm_5_2_ascend/ops/indexer.py"
     scorer_hash = reference["source_sha256"].get(scorer)
@@ -215,8 +249,9 @@ def compare_trace(
         "passed": len(actual["cache_rows"]) == 78
         and len(expected["cache_rows"]) == 78,
     })
-    for layer, (left, right) in enumerate(zip(actual["cache_rows"],
-                                             expected["cache_rows"])):
+    for layer, (left, right) in enumerate(zip(
+        actual["cache_rows"], expected["cache_rows"],
+    )):
         for name in ("latent", "rope", "index", "index_scale"):
             value, reference = left[name], right[name]
             integer = value is not None and not value.is_floating_point()

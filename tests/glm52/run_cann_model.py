@@ -24,8 +24,8 @@ from run_native_decode import (
 )
 
 
-def validate_reference_manifest(reference, metadata):
-    validate_hf_manifest(reference, metadata)
+def validate_reference_manifest(reference, metadata, *, fp32_head=False):
+    validate_hf_manifest(reference, metadata, fp32_head=fp32_head)
     if (reference.get("layer_count") != 78
             or reference.get("cpu_matmul", {}).get("mkldnn_enabled")
             is not False):
@@ -417,7 +417,7 @@ def compare_choices(name, actual, expected, checks, *, exact=False,
                     "reference_count": len(right_set),
                     "sets_equal": left_set == right_set,
                     "order_equal": torch.equal(value.to(torch.int64),
-                                                reference.to(torch.int64)),
+                                               reference.to(torch.int64)),
                 })
                 continue
             value = value.to(torch.int64).sort().values
