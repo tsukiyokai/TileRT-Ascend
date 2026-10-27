@@ -4,7 +4,7 @@
 
 ## CPU 前沿验收
 
-CPU 接入、状态、计时修复及负结果见 [10-28 账本](probe.md)；[精确压缩尾部索引](evidence/ascend-decode/lookup-radix-20261028/README.md)已通过本地语义与配对成本检查，[FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)已完成 [78 层合成 HF 执行检查](evidence/ascend-decode/hf-runtime-20261028/README.md)。下一步闭合实际 graph→HF 数值收集与正式 CANN 门禁、索引高尾归因及请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
+CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)；[局部上下文坐标索引](evidence/ascend-decode/lookup-coordinate-20261028/README.md)的四类 CPU p50 均改善，编辑负载仍有尾部退化。[FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)已完成 [78 层合成 HF 执行检查](evidence/ascend-decode/hf-runtime-20261028/README.md)。下一步闭合实际 graph→HF 数值收集与正式 CANN 门禁，并检验原生代码实现 lookup 及请求观测开销；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 
 ## 首条验证路径
 

@@ -21,29 +21,67 @@ def oracle(context, count, longest, shortest):
 
 def verify_nodes(drafter):
     context = drafter.context
+    expected = {}
+    for end in range(drafter.shortest, len(context)):
+        window = tuple(reversed(
+            context[max(0, end - drafter.longest):end],
+        ))
+        for length in range(1, len(window) + 1):
+            expected[window[:length]] = end
     stack = [(drafter._root, ())]
-    visited = set()
+    visited, prefixes = set(), 0
     while stack:
         node, prefix = stack.pop()
         assert id(node) not in visited
         visited.add(id(node))
-        if prefix:
-            expected = max(
-                end for end in range(drafter.shortest, len(context))
-                if end >= len(prefix) and tuple(reversed(
-                    context[end - len(prefix):end],
-                )) == prefix
-            )
-            assert node.latest == expected, (prefix, node.latest, expected)
         for token, child in node.children.items():
-            assert child.label and child.label[0] == token
-            assert len(prefix) + len(child.label) <= drafter.longest
-            stack.append((child, prefix + child.label))
+            assert 0 < child.length <= drafter.longest
+            assert 0 <= child.hi - child.length + 1 <= child.hi < len(context)
+            label = tuple(reversed(
+                context[child.hi - child.length + 1:child.hi + 1],
+            ))
+            assert label[0] == token
+            assert len(prefix) + len(label) <= drafter.longest
+            for length in range(1, len(label) + 1):
+                wanted = prefix + label[:length]
+                assert child.latest == expected.pop(wanted), (
+                    wanted, child.latest,
+                )
+                prefixes += 1
+            stack.append((child, prefix + label))
+    assert not expected
     assert len(visited) <= 1 + 2 * max(0, len(context) - drafter.shortest)
+    return prefixes
+
+
+def check_bad_compression(drafter_type):
+    drafter = drafter_type([1, 2, 7, 9, 2, 8, 2], longest=3, shortest=1)
+    verify_nodes(drafter)
+    expected = oracle(drafter.context, 1, 3, 1)
+    assert drafter.propose(1) == expected == [8]
+    branch = drafter._root.children[2]
+    edge = branch.children[1]
+    edge.hi += branch.length
+    edge.length += branch.length
+    drafter._root.children[2] = edge
+    endpoint_latest = max(
+        end for end in range(2, len(drafter.context))
+        if drafter.context[end - 2:end] == [1, 2]
+    )
+    assert edge.latest == endpoint_latest == 2
+    corrupted = drafter.propose(1)
+    assert corrupted == [7] and corrupted != expected
+    try:
+        verify_nodes(drafter)
+    except AssertionError:
+        return {"valid_proposal": expected, "corrupted_proposal": corrupted,
+                "full_edge_endpoint_latest": endpoint_latest,
+                "inner_prefix_error_rejected": True}
+    raise AssertionError("A wrong compressed-edge prefix was accepted")
 
 
 def check_proposals(drafter_type):
-    checks = contexts = 0
+    checks = contexts = prefix_checks = 0
     transcript = hashlib.sha256()
     for length in range(7):
         for values in product(range(3), repeat=length):
@@ -71,7 +109,7 @@ def check_proposals(drafter_type):
                         context, shortest, longest, count, expected, actual,
                     ]).encode())
                     checks += 1
-                verify_nodes(drafter)
+                prefix_checks += verify_nodes(drafter)
                 contexts += 1
     rng = random.Random(319)
     for shortest, longest in ((1, 32), (2, 32), (32, 32), (1, 64), (1, 96)):
@@ -87,7 +125,7 @@ def check_proposals(drafter_type):
                 ]).encode())
                 checks += 1
             if step % 20 == 0:
-                verify_nodes(drafter)
+                prefix_checks += verify_nodes(drafter)
             added = [rng.choice((0, 1, 65536, 154879))
                      for _ in range(rng.randrange(8))]
             context.extend(added)
@@ -96,13 +134,14 @@ def check_proposals(drafter_type):
         context = [5] * 128
         drafter = drafter_type(context, longest, 1)
         assert drafter.propose(31) == oracle(context, 31, longest, 1)
-        verify_nodes(drafter)
+        prefix_checks += verify_nodes(drafter)
         checks += 1
     left = [30000, 30712, 30000, 32048, 30503]
     right = [30306, 30000, 30004, 30000, 30000]
     context = left + [111] + right + [222] + left[-4:] + [333] + left
     assert drafter_type(context, 5, 2).propose(1) == [111]
     return {"proposal_checks": checks, "invariant_contexts": contexts,
+            "invariant_prefix_checks": prefix_checks,
             "max_longest": 96, "transcript_sha256": transcript.hexdigest(),
             "collision_proposal": [111]}
 
@@ -215,6 +254,7 @@ def main():
                        "capacity/EOS checks; no performance or NPU execution",
               "python": platform.python_version(), "source_sha256": hashes}
     try:
+        report["bad_compression"] = check_bad_compression(LookupDrafter)
         report["proposals"] = check_proposals(LookupDrafter)
         report["sessions"] = check_sessions(LookupDrafter)
         report["source_stable"] = all(

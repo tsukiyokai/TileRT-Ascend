@@ -1,6 +1,6 @@
 # 全局 radix arena 的负结果
 
-全局 arena 暂不替换生产索引。tuple arena 在四类负载的总成本 p50 都退化；坐标 arena 改善歧义与无匹配输入，却使复制和轻度编辑退化约 8–9%。删除基准内逐轮对象保留后，取舍仍相同。生产 `LookupDrafter` 与 GC 配置均未改变。
+全局 arena 未替换生产索引。tuple arena 在四类负载的总成本 p50 都退化；坐标 arena 改善歧义与无匹配输入，却使复制和轻度编辑退化约 8–9%。删除基准内逐轮对象保留后，取舍仍相同。该对照未修改生产索引或 GC 配置；后续[局部坐标边](../lookup-coordinate-20261028/README.md)单独验收。
 
 坐标版用整数数组保存边区间/latest，边引用 append-only context，以单个全局 transitions 表取代节点的局部字典；合法词表键为 `(parent<<18)|token`，范围外整数使用 tuple 键。tuple 版保留边标签，单独观察全局容器/访问方式的组合变化。两版均通过 [独立扫描与任意边前缀检查](tilert-lookup-arena-correctness-20261028.json)：各 4115 个 context、16460 次提议、52578 个前缀不变量，包括增量、8K、L64/96、重叠、空提交与旧 hash 碰撞反例。证明沿用[精确 radix 的 latest 不变量](../lookup-radix-20261028/README.md)。
 
@@ -25,7 +25,7 @@ fresh 在每次计时前 full collect；carry 不强制回收。GC 模式分别�
 
 原 replay 在请求内保留 round dict、interval tuple 与 proposal；无保留版用预分配数值缓冲，结束后重建原始报告，并提前切好 commit 输入、计算接受量。两版之间同时改变了这些分配与工作，差值不能全归给 GC。线上 session 本身也保留接受回执；该对照没有测量常驻服务。
 
-四面板未重现历史无匹配约 16 ms 稳态高尾；无保留面板的生产稳态 p99 为 fresh/carry `1.820/1.794 ms`。历史记录保持原值，当前证据不足以把那次高尾认定为索引固有 GC。下一步分别检验局部字典下的坐标标签、叶子字典延迟分配。
+四面板未重现历史无匹配约 16 ms 稳态高尾；无保留面板的生产稳态 p99 为 fresh/carry `1.820/1.794 ms`。历史记录保持原值，当前证据不足以把那次高尾认定为索引固有 GC。[局部表示的后续对照](../lookup-coordinate-20261028/README.md)分别检验了局部字典下的坐标标签、叶子字典延迟分配。
 
 ## 原始记录与复跑
 

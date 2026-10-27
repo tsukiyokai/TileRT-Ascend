@@ -2,32 +2,22 @@
 
 
 class _Node:
-    __slots__ = ("label", "children", "latest")
+    __slots__ = ("hi", "length", "children", "latest")
 
-    def __init__(self, label, latest):
-        self.label = label
+    def __init__(self, hi, length, latest):
+        self.hi = hi
+        self.length = length
         self.children = {}
         self.latest = latest
-
-
-def _common_prefix(label, word, offset):
-    length = min(len(label), len(word) - offset)
-    part = word[offset:offset + length]
-    if label[:length] == part:
-        return length
-    for index, (left, right) in enumerate(zip(label, part)):
-        if left != right:
-            return index
-    raise AssertionError("Unequal token tails have no differing element")
 
 
 class LookupDrafter:
     """Copy what followed the longest, most recently seen context tail.
 
     A radix trie stores reversed tails, bounded by `longest`. Each compressed
-    edge shares one latest continuation position across its token prefixes.
-    Appending a token inserts the preceding tail once, and querying walks
-    the current reversed tail once. Token comparisons are exact.
+    edge refers to an interval in the append-only accepted context and shares
+    one latest continuation position across its token prefixes. Comparisons
+    use exact token IDs; insertion and queries do not build reversed words.
     """
 
     def __init__(self, prompt, longest=32, shortest=2):
@@ -37,43 +27,60 @@ class LookupDrafter:
         self.context = []
         self.longest = longest
         self.shortest = shortest
-        self._root = _Node((), -1)
         self.hits = 0
         self.rounds = 0
+        self._root = _Node(0, 0, -1)
         self.commit(prompt)
 
-    def _insert(self, word, end):
-        node, offset = self._root, 0
-        while offset < len(word):
-            child = node.children.get(word[offset])
+    def _shared(self, child, query_hi, remaining):
+        length = min(child.length, remaining)
+        hi, context = child.hi, self.context
+        # Equal forward intervals remain equal when both are reversed.
+        if (context[hi - length + 1:hi + 1]
+                == context[query_hi - length + 1:query_hi + 1]):
+            return length
+        for offset in range(length):
+            if context[hi - offset] != context[query_hi - offset]:
+                return offset
+        raise AssertionError("Unequal edge intervals have no differing token")
+
+    def _insert(self, end):
+        window_length = min(self.longest, end)
+        node, depth, context = self._root, 0, self.context
+        while depth < window_length:
+            query_hi = end - 1 - depth
+            token = context[query_hi]
+            child = node.children.get(token)
             if child is None:
-                node.children[word[offset]] = _Node(word[offset:], end)
+                node.children[token] = _Node(
+                    query_hi, window_length - depth, end,
+                )
                 return
-            shared = _common_prefix(child.label, word, offset)
-            if shared == len(child.label):
+            shared = self._shared(child, query_hi, window_length - depth)
+            if shared == child.length:
                 child.latest = end
-                offset += shared
+                depth += shared
                 node = child
                 continue
-            # A new branch or shorter tail splits the old compressed edge.
-            replacement = _Node(child.label[:shared], end)
-            child.label = child.label[shared:]
-            replacement.children[child.label[0]] = child
-            node.children[word[offset]] = replacement
-            offset += shared
-            if offset < len(word):
-                replacement.children[word[offset]] = _Node(word[offset:], end)
+            replacement = _Node(child.hi, shared, end)
+            child.hi -= shared
+            child.length -= shared
+            replacement.children[context[child.hi]] = child
+            node.children[token] = replacement
+            depth += shared
+            if depth < window_length:
+                query_hi = end - 1 - depth
+                replacement.children[context[query_hi]] = _Node(
+                    query_hi, window_length - depth, end,
+                )
             return
 
     def commit(self, tokens):
-        """Index tails only when an accepted token supplies a continuation."""
+        """Index tails when an accepted token supplies a continuation."""
         previous = len(self.context)
         self.context.extend(int(token) for token in tokens)
         for end in range(max(previous, self.shortest), len(self.context)):
-            word = tuple(reversed(
-                self.context[max(0, end - self.longest):end],
-            ))
-            self._insert(word, end)
+            self._insert(end)
 
     def propose(self, count):
         """Return up to `count` tokens after the longest/latest tail match."""
@@ -81,21 +88,22 @@ class LookupDrafter:
         maximum = min(self.longest, len(self.context) - 1)
         if maximum < self.shortest or count <= 0:
             return []
-        word = tuple(reversed(self.context[-maximum:]))
         node, matched, end = self._root, 0, -1
+        context = self.context
         while matched < maximum:
-            child = node.children.get(word[matched])
+            query_hi = len(context) - 1 - matched
+            child = node.children.get(context[query_hi])
             if child is None:
                 break
-            shared = _common_prefix(child.label, word, matched)
+            shared = self._shared(child, query_hi, maximum - matched)
             matched += shared
             end = child.latest
-            if shared < len(child.label):
+            if shared < child.length:
                 break
             node = child
         if matched < self.shortest:
             return []
-        proposed = self.context[end:end + count]
+        proposed = context[end:end + count]
         self.hits += bool(proposed)
         return proposed
 

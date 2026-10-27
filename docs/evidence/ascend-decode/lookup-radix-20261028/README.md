@@ -14,7 +14,7 @@
 
 [79 项回归](checks-cpu.json)覆盖独立扫描、宽度不变性、缓存、TP16 命令、session、HTTP 与 16 并发标量 worker。[独立审查](audit-cpu.json)另执行 24,159 次提议检查、7,651 组小上下文/尾长配置的节点不变量检查，以及 126 个真实 session 编排的容量/EOS 场景；包括 generator、空提交、重叠、压缩边中途匹配与深度至 96。[审查脚本](../../../../experiments/lookup-index/audit.py)使用独立反向扫描与串行目标，检查有效缓存逐行一致。
 
-以下为最终生产源码对 Git `1ef8a8d` 哈希实现的本地配对测量：macOS arm64、Python 3.11.15；四个合成 8192-token 输入、各 1024 输出，width32、shortest2/longest32；两次预热，30 对交替样本，无 affinity/锁频。建立成本含共同首输出，稳态只计 propose/commit 调用；总成本按每个样本相加后取统计量。p95/p99 使用最近秩。目标推理、编排与 I/O 均在计时之外。
+以下为 Git `a24dfd4` 的 tuple radix 对 Git `1ef8a8d` 哈希实现的本地配对测量：macOS arm64、Python 3.11.15；四个合成 8192-token 输入、各 1024 输出，width32、shortest2/longest32；两次预热，30 对交替样本，无 affinity/锁频。建立成本含共同首输出，稳态只计 propose/commit 调用；总成本按每个样本相加后取统计量。p95/p99 使用最近秩。目标推理、编排与 I/O 均在计时之外。
 
 | 负载 | 建立 p50, ms | 稳态 p50, ms | 稳态 p95, ms | 稳态 p99, ms | 总成本 p50, ms |
 | --- | --- | --- | --- | --- | --- |
@@ -25,7 +25,7 @@
 
 四类输入的全部 240 个样本均与独立扫描的完整提议/接受签名一致；每类总成本 30/30 对下降，稳态分别为 30/30、30/30、30/30、29/30 对下降。无匹配输入仍有 16.081 ms 的稳态高尾；每个请求样本的 GC collection 数保存在原始记录，尚未定位这些回收与高尾的时间关系。所有计时加总、分位数、配对差值及测量源码哈希已读回核查。[摘要](paired-summary.json)、[完整样本](paired-cpu.json.gz)、[同 AST 的另一轮原始测量](repeat-paired-cpu.json.gz)与[对应冻结源码](repeat-source.txt)、[测速脚本](../../../../experiments/lookup-index/radix_probe.py)。[无索引 rfind 的退化结果](../lookup-policy-20261028/README.md)保留。
 
-[全局 arena 与 GC 分阶段对照](../lookup-arena-20261028/README.md)未重现该高尾；坐标 arena 改善无匹配输入，却使复制和轻度编辑退化，未替换生产。callback、起点与报告保留方式分别记录，历史高尾的原因继续独立核查。
+[全局 arena 与 GC 分阶段对照](../lookup-arena-20261028/README.md)未重现该高尾；坐标 arena 改善无匹配输入，却使复制和轻度编辑退化，未替换生产。保留局部字典、仅将边改为上下文坐标的实现另有[生产源码 A/B](../lookup-coordinate-20261028/README.md)。各记录绑定对应源码；callback、起点与报告保留方式分别记录，历史高尾的原因继续独立核查。
 
 从仓库根目录复跑：
 
