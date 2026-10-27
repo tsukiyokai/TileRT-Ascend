@@ -14,15 +14,16 @@ from ngram_acceptance import lookup, matched_prefix
 
 
 class ReverseScan:
-    def __init__(self, prompt, shortest=2):
+    def __init__(self, prompt, shortest=2, *, longest=32):
         self.context = list(prompt)
         self.shortest = shortest
+        self.longest = longest
 
     def commit(self, tokens):
         self.context.extend(tokens)
 
     def propose(self, count):
-        branches = lookup(self.context, count, 8, self.shortest)
+        branches = lookup(self.context, count, self.longest, self.shortest)
         return branches[0] if branches else []
 
 
@@ -76,13 +77,18 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--shortest", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--longest", type=int, default=32)
     args = parser.parse_args()
+    if args.longest < args.shortest:
+        parser.error("--longest must be at least --shortest")
     spec = importlib.util.spec_from_file_location("candidate", args.candidate)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     factories = {
-        "scan": partial(ReverseScan, shortest=args.shortest),
-        "indexed": partial(module.LookupDrafter, shortest=args.shortest),
+        "scan": partial(ReverseScan, shortest=args.shortest,
+                        longest=args.longest),
+        "indexed": partial(module.LookupDrafter, shortest=args.shortest,
+                           longest=args.longest),
     }
     record = json.loads(args.record.read_text())
     prompt = json.loads(args.manifest.read_text())["prompt_token_ids"]
@@ -94,6 +100,7 @@ def main():
         "prompt_tokens": len(prompt), "unique_trajectories": len(trajectories),
         "warmup": args.warmup, "samples": args.samples,
         "shortest_tail": args.shortest,
+        "longest_tail": args.longest,
         "source_sha256": {str(path): hashlib.sha256(
                               path.read_bytes()).hexdigest()
                           for path in (args.record, args.manifest,
