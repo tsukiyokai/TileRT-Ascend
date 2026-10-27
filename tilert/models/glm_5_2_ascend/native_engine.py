@@ -437,7 +437,7 @@ class NativeDecodeEngine:
     def host_tokens(self, *groups):
         """Read several token groups to the host in one transfer."""
         tensors = [device_tokens(group, self.device) for group in groups]
-        read = torch.cat(tensors).tolist()
+        read = (tensors[0] if len(tensors) == 1 else torch.cat(tensors)).tolist()
         result, start = [], 0
         for tensor in tensors:
             width = tensor.shape[0]

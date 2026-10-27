@@ -63,6 +63,7 @@ def run_request(width, lookup, shortest=2):
     args = SimpleNamespace(
         warmup=0, requests=1, width=width, max_tokens=12, lookup=lookup,
         target_graph=False, draft_graph=False, conditioned_graph=False,
+        layers=None,
     )
     return report, args
 

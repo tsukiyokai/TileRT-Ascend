@@ -31,11 +31,15 @@ def device_tokens(tokens, device):
     if torch.is_tensor(tokens):
         return tokens.reshape(-1).to(torch.int64)
     values = tuple(tokens) if isinstance(tokens, (list, tuple)) else (tokens,)
+    has_tensors = False
     for value in values:
         if torch.is_tensor(value):
+            has_tensors = True
             continue
         if type(value) is not int or not 0 <= value < VOCAB_SIZE:
             raise ValueError("Decode requires GLM-5.2 vocabulary tokens")
+    if not has_tensors:
+        return torch.tensor(values, dtype=torch.int64, device=device)
     return torch.stack([
         torch.as_tensor(value, dtype=torch.int64, device=device).reshape(())
         for value in values
@@ -893,7 +897,7 @@ class CannModel:
         import torch
 
         tensors = [device_tokens(group, self.device) for group in groups]
-        read = torch.cat(tensors).tolist()
+        read = (tensors[0] if len(tensors) == 1 else torch.cat(tensors)).tolist()
         result, start = [], 0
         for tensor in tensors:
             width = tensor.shape[0]

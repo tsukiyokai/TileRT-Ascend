@@ -164,9 +164,8 @@ class MtpRoundExecutor:
             self.tree_mask(lineage, plan.main_start, self.target.device)
         verified = self.target.verify(nodes, full_logits=False,
                                       depths=branch_depths(lineage))
-        proposals, predictions = self.target.host_tokens(
-            nodes, verified.token_ids,
-        )
+        proposals = tuple(nodes)
+        predictions, = self.target.host_tokens(verified.token_ids)
         # The accepted path through a tree is itself a chain, so reordering the
         # verified rows along it lets `resolve` do the committing: its linear
         # match, the EOS check, the output budget and the cache commit all
@@ -215,9 +214,8 @@ class MtpRoundExecutor:
             verified = self.target.verify(candidates, full_logits=False)
             if mark:
                 mark("verify")
-            proposals, predictions = self.target.host_tokens(
-                candidates, verified.token_ids,
-            )
+            proposals = tuple(candidates)
+            predictions, = self.target.host_tokens(verified.token_ids)
             if mark:
                 mark("host_tokens")
             commit = self.state.resolve(plan, proposals, predictions)
