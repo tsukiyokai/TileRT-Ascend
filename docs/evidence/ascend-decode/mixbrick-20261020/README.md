@@ -69,7 +69,7 @@ of one handshake:
 | 16 | the vector sets, the cube waits | returns — vector to cube works |
 | 10 | the cube sets, the vector waits | hung — so only this direction was wrong |
 
-That instrument is cheaper than every tool in [debug.md](../../debug.md) and
+That instrument is cheaper than every tool in [the debugging guide](../../../lesson.md#调试入口) and
 should be reached for first. `synccheck` reports at kernel exit and is silent
 on a hang; `msdebug` segfaults on `breakpoint set --name` followed by `run`.
 
