@@ -21,6 +21,7 @@ from tilert.pd_vllm.decode_timing import (  # noqa: E402
     atomic_json, load_timing, timing_path, token_metrics,
 )
 from tilert.pd_vllm.wire import derive_rid  # noqa: E402
+from tilert.models.glm_5_2_ascend.mtp_state import WIDTHS  # noqa: E402
 
 
 PROMPT_TOKENS = 8192
@@ -170,6 +171,67 @@ def validate_runtime(producer, precision):
         raise ValueError("Timing source differs between client and server")
 
 
+def command_rounds(operation):
+    count = (1 if operation["operation"] == "advance_mtp"
+             else operation["rounds"])
+    if type(count) is not int or count < 1:
+        raise ValueError("MTP command must complete at least one round")
+    return count
+
+
+def validate_round_commands(operations, stats, mtp_width, tokens):
+    spans = stats["accepted_spans"]
+    if (not operations or not spans
+            or stats["round_calls"] != len(spans)
+            or stats["completed_rounds"] != len(spans)):
+        raise ValueError("MTP commands lack completed round spans")
+    offset, position, accepted = 0, PROMPT_TOKENS, 0
+    for operation in operations:
+        count = command_rounds(operation)
+        group = spans[offset:offset + count]
+        count_tokens = sum(item["accepted"] for item in group)
+        if (len(group) != count
+                or operation["accepted"] != count_tokens
+                or operation["matched_drafts"]
+                != sum(item["matched_drafts"] for item in group)
+                or operation["natural_accepted"]
+                != sum(item["natural_accepted"] for item in group)):
+            raise ValueError("MTP command and round spans disagree")
+        if operation.get("accepted_tokens") != tokens[
+            1 + accepted:1 + accepted + count_tokens
+        ]:
+            raise ValueError("MTP command tokens differ from delivery")
+        for item in group:
+            if (item["width"] not in WIDTHS or item["width"] > mtp_width
+                    or not 1 <= item["accepted"] <= item["width"]
+                    or item["output_tokens"] != item["accepted"]
+                    or item["main_start"] != position
+                    or item["main_retained"] != position + item["accepted"]):
+                raise ValueError("MTP round width, delivery or cache differs")
+            position = item["main_retained"]
+            accepted += item["accepted"]
+        offset += count
+    if (offset != len(spans) or accepted != OUTPUT_TOKENS - 1
+            or stats["accepted"] != accepted
+            or stats["initial_position"] != PROMPT_TOKENS
+            or stats["committed_position"] != position):
+        raise ValueError("MTP rounds and delivered output count differ")
+
+
+def round_summary(operations):
+    durations = [(item["end_ns"] - item["start_ns"]) / 1e6
+                 for item in operations]
+    count = sum(command_rounds(item) for item in operations)
+    accepted = sum(item["accepted"] for item in operations)
+    return {
+        "count": count, "command_count": len(operations), "accepted": accepted,
+        "mean_accepted": accepted / count if count else None,
+        "timing_scope": "Host command; a command can execute several rounds",
+        "p50_command_ms": percentile(durations, 0.5),
+        "p95_command_ms": percentile(durations, 0.95),
+    }
+
+
 def validate_producer(producer, received, first_token, mtp_width):
     if (producer.get("status") != "complete"
             or producer.get("reset_complete") is not True):
@@ -189,19 +251,19 @@ def validate_producer(producer, received, first_token, mtp_width):
     operations = producer["operations"]
     if any("error" in operation for operation in operations):
         raise ValueError("A timed TP command failed")
+    if any(operation["end_ns"] < operation["start_ns"]
+           for operation in operations):
+        raise ValueError("A TP command clock ran backwards")
     rounds = [item for item in operations
-              if item["operation"] == "advance_mtp"]
+              if item["operation"] in ("advance_mtp", "advance_mtp_n")]
     if producer.get("runtime", {}).get("mtp_width") != mtp_width:
         raise ValueError("Actual server MTP width differs from the benchmark")
     if mtp_width == 1:
         calls = sum(item["operation"] == "step" for item in operations)
         if rounds or calls != OUTPUT_TOKENS - 1:
             raise ValueError("Serial producer has the wrong step count")
-    elif (not rounds or sum(item["accepted"] for item in rounds)
-          != OUTPUT_TOKENS - 1
-          or any(not 1 <= item["width"] <= mtp_width for item in rounds)
-          or stats.get("accepted") != OUTPUT_TOKENS - 1):
-        raise ValueError("MTP rounds and delivered output count differ")
+    else:
+        validate_round_commands(rounds, stats, mtp_width, producer["token_ids"])
     metrics = token_metrics(producer["token_ids"], producer["callback_ns"])
     return metrics, rounds
 
@@ -424,15 +486,7 @@ def main():
         for source in ("producer", "client"):
             report[source] = aggregate(measured, source)
         rounds = [item for request in measured for item in request["rounds"]]
-        durations = [(item["end_ns"] - item["start_ns"]) / 1e6
-                     for item in rounds]
-        accepted = sum(item["accepted"] for item in rounds)
-        report["rounds"] = {
-            "count": len(rounds), "accepted": accepted,
-            "mean_accepted": accepted / len(rounds) if rounds else None,
-            "p50_ms": percentile(durations, 0.5),
-            "p95_ms": percentile(durations, 0.95),
-        }
+        report["rounds"] = round_summary(rounds)
         report["client_ttft_ms"] = {
             "p50": percentile([item["client_ttft_ms"] for item in measured],
                               0.50),

@@ -83,11 +83,13 @@ class DecodeTimingChecks(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def fixture(self, width=4, mode="accept", prefix=3, budget=9):
+    def fixture(self, width=4, mode="accept", prefix=3, budget=9,
+                rounds_per_command=1):
         backend, ranks, channel = make_backend(mode, prefix + budget + 8)
         clock = Clock()
         timed = TimedBackend(backend, clock)
-        session = create_session(timed, width, ())
+        session = create_session(timed, width, (),
+                                 rounds_per_command=rounds_per_command)
         engine = TimedEngine(session, timed, self.directory, clock,
                              metadata={"mtp_width": width})
         prompt = tuple((row * 7 + 3) % 251 for row in range(prefix))
@@ -114,7 +116,8 @@ class DecodeTimingChecks(unittest.TestCase):
                     self.assertEqual(len(channel.commands),
                                      len(report["operations"]))
                     rounds = [item for item in report["operations"]
-                              if item["operation"] == "advance_mtp"]
+                              if item["operation"] in (
+                                  "advance_mtp", "advance_mtp_n")]
                     if width > 1:
                         self.assertEqual(sum(item["accepted"]
                                              for item in rounds), 8)
@@ -175,6 +178,64 @@ class DecodeTimingChecks(unittest.TestCase):
         self.assertEqual(metrics["output_tokens"], 1024)
         self.assertEqual(sum(item["accepted"] for item in rounds), 1023)
         self.assertTrue(all(rank.engine.position == 0 for rank in ranks))
+
+    def test_single_round_commands_remain_accepted(self):
+        engine, first, _, _ = self.fixture(prefix=8192, budget=1024)
+
+        def single_round(count):
+            self.assertEqual(count, 1)
+            return [engine.timed_backend.advance_mtp()]
+
+        with patch.object(engine.timed_backend, "advance_mtp_n", single_round):
+            tokens = engine.decode(first, 1024, sampling={"ignore_eos": True})
+        engine.reset()
+        report = load_timing(self.directory, "request")
+        _, commands = bench.validate_producer(
+            report, SimpleNamespace(token_ids=tokens), first, 4,
+        )
+        self.assertTrue(all(item["operation"] == "advance_mtp"
+                            for item in commands))
+        summary = bench.round_summary(commands)
+        self.assertEqual(summary["count"], summary["command_count"])
+        self.assertEqual(summary["accepted"], 1023)
+
+    def test_batched_commands_preserve_round_counts_and_command_timing(self):
+        engine, first, _, _ = self.fixture(prefix=8192, budget=1024,
+                                           rounds_per_command=3)
+        tokens = engine.decode(first, 1024, sampling={"ignore_eos": True})
+        engine.reset()
+        report = load_timing(self.directory, "request")
+        received = SimpleNamespace(token_ids=tokens)
+        _, commands = bench.validate_producer(report, received, first, 4)
+        summary = bench.round_summary(commands)
+        self.assertEqual(summary["count"], report["engine_stats"]["round_calls"])
+        self.assertEqual(summary["command_count"], len(commands))
+        self.assertGreater(summary["count"], summary["command_count"])
+        self.assertEqual(summary["accepted"], 1023)
+        self.assertEqual(summary["mean_accepted"], 1023 / summary["count"])
+        self.assertNotIn("p50_ms", summary)
+        self.assertEqual(summary["p50_command_ms"], 1)
+        for changes in ({"rounds": 0}, {"rounds": True}, {"rounds": 4},
+                        {"accepted": 1}, {"accepted_tokens": [0]},
+                        {"start_ns": 10**30}):
+            damaged = deepcopy(report)
+            command = next(item for item in damaged["operations"]
+                           if item["operation"] == "advance_mtp_n")
+            command.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                bench.validate_producer(damaged, received, first, 4)
+        for changes in ({"width": 3}, {"width": 5}, {"accepted": 0},
+                        {"output_tokens": 0},
+                        {"main_start": 0}, {"main_retained": 0}):
+            damaged = deepcopy(report)
+            damaged["engine_stats"]["accepted_spans"][0].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                bench.validate_producer(damaged, received, first, 4)
+        for key in ("round_calls", "completed_rounds"):
+            damaged = deepcopy(report)
+            damaged["engine_stats"][key] += 1
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                bench.validate_producer(damaged, received, first, 4)
 
     def test_zero_one_and_first_eos_have_no_tpot(self):
         for count, stop in ((0, False), (1, False), (9, True)):

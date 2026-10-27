@@ -28,6 +28,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 后续 [tree lineage 验收](evidence/ascend-decode/tree-lineage-20261028/README.md)补齐轮结果与交付记录的父数组，独立重建分支接受；25 项 CPU 检查覆盖 26,260 个小树和 24 个 session 的 1,801 个 span，另通过宽度、round、EOS/取消回归。CANN 设备树数值与 TPOT 仍未验收。
 
+[P/D 计时账本](evidence/ascend-decode/pd-command-clock-20261028/README.md)修复只统计单轮调用、遗漏实际批命令的问题；24 项 CPU 回归通过，命令数、轮数与交付/cache 一致。批命令时长单独命名，未据此生成逐轮时延或 CANN 精度结论。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正
