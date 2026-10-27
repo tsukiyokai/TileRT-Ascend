@@ -1,7 +1,8 @@
-"""Serve CANN M1 or MTP decode from full-P vLLM/HIXL prefixes."""
+"""Serve CANN serial, MTP or lookup decode from full-P HIXL prefixes."""
 
 import argparse
 from datetime import datetime, timezone
+from importlib.metadata import version
 import inspect
 import json
 import os
@@ -12,6 +13,66 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+from tilert.pd_vllm.ascend_cache import CannRankEngine  # noqa: E402
+
+
+def create_model(args, device, rank):
+    from tilert.models.glm_5_2_ascend.cann_model import CannModel
+
+    options = {}
+    if args.lookup:
+        options = {
+            "compile_target": args.compile_target,
+            "super_kernel": args.super_kernel,
+            "fp32_head": args.fp32_head,
+            "graph_width": args.mtp_width,
+        }
+    return CannModel(
+        args.checkpoint, device, rank, capacity=args.capacity,
+        gpu_memory_utilization=args.gpu_memory_utilization, **options,
+    )
+
+
+class ServingRank(CannRankEngine):
+    """Warm and capture one target width before delivering request tokens."""
+
+    def __init__(self, target, draft, *, width, target_graph, barrier):
+        super().__init__(target, draft)
+        self.width = width
+        self.target_graph = target_graph
+        self.barrier = barrier
+        self.on_inject = None
+
+    def inject(self, prefix):
+        super().inject(prefix)
+        if (self.target_graph and self.target.graph is None
+                and self.position + self.width <= self.capacity):
+            position = self.position
+            for iteration in range(4):
+                if iteration == 3:
+                    self.barrier()
+                    self.target.enable_graph(width=self.width)
+                result = self.target.verify(
+                    [self.first_token_id] * self.width, full_logits=False,
+                )
+                self.target.host_tokens(result.token_ids)
+                self.target.truncate(position)
+            self.barrier()
+        if self.on_inject is not None:
+            self.on_inject()
+
+
+def create_rank_engine(args, model, barrier):
+    if args.mtp_width == 1:
+        return model, None
+    draft = None
+    if not args.lookup:
+        from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
+
+        draft = CannMtp(model)
+    return ServingRank(model, draft, width=args.mtp_width,
+                       target_graph=args.target_graph, barrier=barrier), draft
 
 
 class DeferredModel:
@@ -31,15 +92,9 @@ class DeferredModel:
 
     def inject(self, prefix):
         if self.model is None:
-            from tilert.models.glm_5_2_ascend.cann_model import CannModel
-
             while not self.args.load_model_after.exists():
                 time.sleep(0.1)
-            self.model = CannModel(
-                self.args.checkpoint, self.device, self.rank,
-                capacity=self.capacity,
-                gpu_memory_utilization=self.args.gpu_memory_utilization,
-            )
+            self.model = create_model(self.args, self.device, self.rank)
             if self.on_load is not None:
                 self.on_load(self.model)
         return self.model.inject(prefix)
@@ -69,13 +124,12 @@ def run(args):
     import torch_npu  # noqa: F401
     import uvicorn
 
-    from tilert.models.glm_5_2_ascend.cann_model import CannModel
     from tilert.models.glm_5_2_ascend.tp_runtime import (
         CoordinatedBackend, RankExecutor, TorchControlChannel,
     )
     from tilert.pd_vllm import decode_server
     from tilert.pd_vllm.ascend_cache import (
-        AscendReceiveBuffer, CannRankEngine, checkpoint_fingerprint,
+        AscendReceiveBuffer, checkpoint_fingerprint,
         receive_device_id,
     )
     from tilert.pd_vllm.ascend_receiver import AscendReceiveServer
@@ -101,29 +155,24 @@ def run(args):
             raise ValueError("Deferred CANN serving requires TP16")
         model = DeferredModel(args, device, rank)
     else:
-        model = CannModel(
-            args.checkpoint, device, rank, capacity=args.capacity,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-        )
-    rank_engine = model
-    draft = None
-    if args.mtp_width != 1:
-        from tilert.models.glm_5_2_ascend.cann_mtp import CannMtp
-
-        draft = CannMtp(model)
-        rank_engine = CannRankEngine(model, draft)
+        model = create_model(args, device, rank)
+    channel = TorchControlChannel()
+    rank_engine, draft = create_rank_engine(
+        args, model, lambda: distributed.barrier(group=channel.group),
+    )
+    speculative = args.mtp_width != 1
     transport = HixlTransport(
         args.hixl_library, port=args.hixl_port_base + rank,
     )
     receive = AscendReceiveBuffer(
         rank, device, args.capacity, transport, args.hixl_host,
-        parent_hidden=draft is not None,
+        parent_hidden=speculative,
     )
     endpoints = [None] * 16
     distributed.all_gather_object(endpoints, receive.endpoint())
-    channel = TorchControlChannel()
-    prefix_loader = (receive.main_prefix if draft is None
-                     else receive.mtp_prefix)
+    prefix_loader = (receive.main_prefix if not speculative
+                     else lambda request: receive.mtp_prefix(
+                         request, lookup=args.lookup))
     executor = RankExecutor(rank_engine, rank, lambda request, _rank:
                             prefix_loader(request))
     fingerprint = checkpoint_fingerprint(args.checkpoint)
@@ -137,7 +186,19 @@ def run(args):
         "engine": "CannModel", "rank": rank, "device": str(device),
         "scope": "HTTP/HIXL continuation from full-P main KV",
         "mtp_width": args.mtp_width,
-        "parent_hidden": draft is not None,
+        "parent_hidden": speculative,
+        "drafter": "lookup" if args.lookup else "mtp" if speculative else None,
+        "compile_target": args.compile_target,
+        "super_kernel": args.super_kernel, "fp32_head": args.fp32_head,
+        "target_graph_requested": args.target_graph,
+        "execution": {},
+        "packages": {name: version(name) for name in
+                     ("torch", "torch-npu", "vllm", "vllm-ascend")},
+        "runtime_env": {name: os.environ.get(name) for name in (
+            "ASCEND_CUSTOM_OPP_PATH", "VLLM_CACHE_ROOT",
+            "TORCHINDUCTOR_AUTOGRAD_CACHE", "HCCL_NPU_SOCKET_PORT_RANGE",
+            "HCCL_OP_EXPANSION_MODE", "HCCL_DETERMINISTIC",
+        )},
         "precision_verified": False, "performance_measured": False,
         "checkpoint_sha256": fingerprint,
         "source_sha256": {**model.source_metadata(),
@@ -151,6 +212,18 @@ def run(args):
         "command": [sys.executable, *sys.argv], "status": "initialized",
     }
     report = args.output / f"rank-{rank}.json"
+    if speculative:
+        def record_execution():
+            graph = model.graph
+            metadata["execution"]["target_graph"] = (
+                None if graph is None else {
+                    "width": graph.width, "captures": graph.capture_count,
+                    "replays_at_inject": graph.replay_count,
+                }
+            )
+            atomic_json(report, metadata)
+
+        rank_engine.on_inject = record_execution
     if isinstance(model, DeferredModel):
         def record_model_sources(loaded):
             metadata["source_sha256"].update(loaded.source_metadata())
@@ -167,7 +240,7 @@ def run(args):
         if args.timing_dir is not None:
             backend = TimedBackend(backend)
         session = create_session(backend, args.mtp_width, stop_ids)
-        if draft is None:
+        if not speculative:
             engine = AscendDeviceContext(session, device)
         else:
             engine = AscendServingEngine(session, rank_engine, device)
@@ -176,7 +249,7 @@ def run(args):
                                  metadata=metadata)
         server = AscendReceiveServer(
             receive.layout, endpoints, fingerprint, host=args.bind_host,
-            ctrl_port=args.ctrl_port,
+            ctrl_port=args.ctrl_port, require_prompt_token_ids=args.lookup,
         )
         try:
             uvicorn.run(decode_server.build_app(server, engine),
@@ -202,7 +275,15 @@ def parse_arguments(argv=None):
     parser.add_argument("--hixl-library", type=Path, required=True)
     parser.add_argument("--hixl-port-base", type=int, default=26100)
     parser.add_argument("--capacity", type=int, default=9344)
-    parser.add_argument("--mtp-width", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--mtp-width", type=int,
+                        choices=(1, 2, 4, 6, 8, 12, 16, 24, 32), default=1)
+    parser.add_argument("--lookup", action="store_true",
+                        help="Draft from the transferred prompt IDs")
+    parser.add_argument("--compile-target", action="store_true")
+    parser.add_argument("--super-kernel", action="store_true")
+    parser.add_argument("--fp32-head", action="store_true")
+    parser.add_argument("--target-graph", action="store_true",
+                        help="Warm and capture lookup width before delivery")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--bind-host", default="0.0.0.0")
     parser.add_argument("--ctrl-port", type=int, default=5556)
@@ -212,6 +293,17 @@ def parse_arguments(argv=None):
                         help="Load M1 weights after this gate file exists")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.lookup and args.mtp_width == 1:
+        parser.error("--lookup requires --mtp-width greater than 1")
+    if not args.lookup and args.mtp_width not in (1, 2, 4):
+        parser.error("Wide verification requires --lookup")
+    if (args.compile_target or args.super_kernel or args.fp32_head
+            or args.target_graph) and not args.lookup:
+        parser.error("Target performance options require --lookup")
+    if args.super_kernel and not args.compile_target:
+        parser.error("--super-kernel requires --compile-target")
+    if args.target_graph and args.compile_target and args.mtp_width == 2:
+        parser.error("Compiled target graph requires width 4 or greater")
     if args.load_model_after is not None and args.mtp_width != 1:
         parser.error("--load-model-after requires --mtp-width 1")
     return args

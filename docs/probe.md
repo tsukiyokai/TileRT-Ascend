@@ -22,6 +22,8 @@
 
 tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tree(0)` 报错。现只验证 pending root，保持预测、compact、EOS 与缓存长度一致；[CPU 检查](evidence/ascend-decode/tree-capacity-20261028.json)覆盖八种声明宽度和 48 个单行尾部用例。
 
+[在线 lookup 接入](evidence/ascend-decode/online-lookup-20261028/README.md)已通过 CPU/HTTP 与 16 并发 worker 检查：请求自有 prompt、width32、目标图预热回滚、零 MTP 模型加载和拒绝后复用。实际 CANN 图、HIXL、常驻显存、width32 数值及 TPOT 尚待设备验收；正式 CANN 精度门禁接线也尚未完成。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正
@@ -174,7 +176,7 @@ shared-FIA 在该固定输入上存在完整 teacher 差异，局部提速与数
 
 KV 由在线链路接收，随后停止 P、加载 D，过程未用文件回灌。P/D 共驻预热因显存不足失败；成功请求总耗时 117.59 秒，其中 inject 的等待和加载约 109.18 秒。首个 decode 间隔 3790.4 ms，后六个 189.5–208.6 ms。这次冷启动验证了在线功能，稳态计时列入末节。
 
-[serve_cann_pd.py](../tests/glm52/serve_cann_pd.py)使用 `CannModel`，提供 M1/MTP2/MTP4 选项；上述在线记录只验证了 M1。当前入口尚未提供 lookup、width32、compiled target、SuperKernel、FP32 head 与 target graph 的组合。[前缀字节/receipt 校验][prefix-8k]与[多输入数值和请求计时协议][measurement]分别保留传输与验收约定。
+[serve_cann_pd.py](../tests/glm52/serve_cann_pd.py)使用 `CannModel`；上述在线记录只验证了 M1。lookup、width32、compiled target、SuperKernel、FP32 head 与 target graph 的组合在 10-28 完成 [CPU 接入检查](evidence/ascend-decode/online-lookup-20261028/README.md)，实际在线设备运行尚待验收。[前缀字节/receipt 校验][prefix-8k]与[多输入数值和请求计时协议][measurement]分别保留传输与验收约定。
 
 ## 原生融合与跨 rank 规约
 

@@ -57,12 +57,16 @@ class RankPrefix:
 
 @dataclass(frozen=True)
 class FullRankPrefix:
-    """Full-P main KV, P-1 MTP KV and normalized main hidden[P-1]."""
+    """Full-P main KV, P-1 MTP KV and normalized main hidden[P-1].
+
+    Optional prompt IDs select request-local host drafting.
+    """
 
     main: list
     mtp: dict
     parent_hidden: object
     seq_len: int
+    prompt_token_ids: tuple[int, ...] | None = None
 
 
 class AscendReceiveBuffer:
@@ -161,15 +165,22 @@ class AscendReceiveBuffer:
         self._last_generation = generation
         return prefix
 
-    def mtp_prefix(self, request):
+    def mtp_prefix(self, request, *, lookup=False):
         """Consume the v3 parent and both caches without prompt replay."""
         if PARENT_HIDDEN_REGION not in self.views:
             raise ValueError("CANN MTP requires the v3 parent-hidden layout")
         length, generation = self._validate_prefix(request)
+        prompt = None
+        if lookup:
+            prompt = request.metadata.get("prompt_token_ids")
+            validate_prompt_token_ids(
+                prompt, length, request.metadata["last_prompt_token"],
+            )
+            prompt = tuple(prompt)
         prefix = FullRankPrefix(
             [self._layer_prefix(layer, length) for layer in range(78)],
             self._layer_prefix(78, length - 1),
-            self.views[PARENT_HIDDEN_REGION], length,
+            self.views[PARENT_HIDDEN_REGION], length, prompt,
         )
         self._last_generation = generation
         return prefix
@@ -230,6 +241,7 @@ class AscendRankEngine:
         self._clear_request()
 
     def _clear_request(self):
+        self._request_prompt = self.lookup_prompt
         self.parent_hidden = None
         self.first_token_id = None
         self._prompt_length = None
@@ -278,12 +290,12 @@ class AscendRankEngine:
         if type(first_token) is not int or first_token != self.first_token_id:
             raise ValueError("First token differs from the injected prefix")
         drafter = None
-        if self.lookup_prompt is not None:
+        if self._request_prompt is not None:
             spec = DRAFTERS[self.drafter_name]
             Drafter = getattr(importlib.import_module(spec.module), spec.name)
             bounds = ({spec.tail_keyword: self.lookup_min_ngram}
                       if spec.tail_keyword else {})
-            drafter = Drafter(self.lookup_prompt, **bounds)
+            drafter = Drafter(self._request_prompt, **bounds)
             drafter.commit((first_token,))
         if self.round_phases is not None:
             self.round_phases.reset()
@@ -348,6 +360,8 @@ class CannRankEngine(AscendRankEngine):
 
     def inject(self, prefix):
         self._clear_request()
+        if prefix.prompt_token_ids is not None:
+            self._request_prompt = prefix.prompt_token_ids
         self.target.inject(prefix.main)
         if self.draft is not None:
             self.draft.inject(prefix.mtp)

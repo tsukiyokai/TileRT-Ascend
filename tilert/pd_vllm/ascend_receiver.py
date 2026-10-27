@@ -110,11 +110,12 @@ class AscendReceiveServer:
     decode. An admitted writer that disconnects without a matching done
     quarantines the slot: TCP EOF does not prove that RDMA has stopped.
     Stop senders and drain requests before close() and HIXL deregistration.
+    Lookup serving requires complete prompt IDs at admission, before WRITE.
     """
 
     def __init__(
         self, layout, endpoints, checkpoint_sha256, *, host="0.0.0.0",
-        ctrl_port=5556, request_timeout=120.0,
+        ctrl_port=5556, request_timeout=120.0, require_prompt_token_ids=False,
     ):
         validate_endpoints(endpoints, layout)
         if request_timeout <= 0:
@@ -124,6 +125,7 @@ class AscendReceiveServer:
         self.checkpoint_sha256 = checkpoint_sha256
         self.max_seq_len = layout["capacity_tokens"]
         self.request_timeout = request_timeout
+        self.require_prompt_token_ids = require_prompt_token_ids
         self.profile = AscendPDProfile(
             parent_hidden=PARENT_HIDDEN_REGION in layout["regions"],
         )
@@ -204,7 +206,7 @@ class AscendReceiveServer:
             return wire.reject_msg("mtp_parent_hidden_not_enabled")
         sampling = request.get("sampling")
         prompt = request.get("prompt_token_ids", [])
-        if "prompt_token_ids" in request:
+        if self.require_prompt_token_ids or "prompt_token_ids" in request:
             try:
                 validate_prompt_token_ids(prompt, length, token)
             except ValueError:
