@@ -47,7 +47,7 @@ from tilert.models.glm_5_2_ascend.tree_draft import TreeDrafter  # noqa: E402
 
 PROMPT = tuple((row * 7 + 3) % 23 + 1 for row in range(256))
 OUTPUT_TOKENS = 96
-WIDTHS = (2, 4, 8, 12, 16, 32)
+WIDTHS = (2, 4, 6, 8, 12, 16, 24, 32)
 DRAFTERS = {
     "lookup": LookupDrafter,
     "automaton": AutomatonDrafter,
@@ -279,6 +279,36 @@ class RoundInvariance(unittest.TestCase):
                 drafter = TreeDrafter(list(PROMPT))
                 tokens, _ = drafter.propose_tree(width - 1)
                 self.assertLessEqual(len(tokens), width - 1)
+
+    def test_tree_with_one_cache_row_only_verifies_the_pending_token(self):
+        for rule, width, stop in product(RULES, WIDTHS, (False, True)):
+            with self.subTest(rule=rule.__name__, width=width, stop=stop):
+                expected = serial_decode(rule, PROMPT, 2)
+                target = ScalarTarget(rule, PROMPT, len(PROMPT) + 1)
+                drafter = TreeDrafter(list(PROMPT))
+
+                def reject_empty_tree(count):
+                    self.fail(f"Capacity tail asked for {count} tree nodes")
+
+                drafter.propose_tree = reject_empty_tree
+                executor = MtpRoundExecutor(
+                    target, None, width, 2,
+                    eos_tokens=(expected[1],) if stop else (),
+                    drafter=drafter,
+                )
+                executor.tree_mask = target.install_mask
+                executor.start(expected[0], None)
+                result = executor.advance()
+                self.assertEqual(result.candidates, (expected[0],))
+                self.assertEqual(result.commit.accepted_tokens,
+                                 (expected[1],))
+                self.assertEqual(result.commit.width, 1)
+                self.assertEqual(target.position, target.capacity)
+                self.assertEqual([row[0] for row in target.rows],
+                                 [*PROMPT, expected[0]])
+                self.assertEqual(result.commit.finish_reason,
+                                 "eos" if stop else "length")
+                self.assertFalse(executor.failed)
 
 
 def main():

@@ -4,7 +4,7 @@
 
 ## CPU 前沿验收
 
-已完成 [主机候选批量上传](evidence/ascend-decode/token-staging-20261028/README.md)的 CPU 配对测量与状态检查。接下来依次闭合 tree 的容量尾部、在线 lookup/width32 接入和设备分级验收；CPU 结果不替代整模型精度与在线 TPOT。每项改动分别保留对照与提交，设备验证按单 die、少 rank、空闲 A3 推进。
+已完成 [主机候选批量上传](evidence/ascend-decode/token-staging-20261028/README.md)的 CPU 配对测量与状态检查，以及 [tree 容量尾部](evidence/ascend-decode/tree-capacity-20261028.json)修复。下一步闭合在线 lookup/width32 接入和设备分级验收；CPU 结果不替代整模型精度与在线 TPOT。每项改动分别保留对照与提交，设备验证按单 die、少 rank、空闲 A3 推进。
 
 ## 首条验证路径
 

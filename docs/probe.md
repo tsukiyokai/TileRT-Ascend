@@ -20,6 +20,8 @@
 
 [CPU 配对差分](evidence/ascend-decode/token-staging-20261028/README.md)：width32 每轮 `64 as_tensor + 2 stack + 1 cat` 收敛为 `1 tensor`，轮 CPU p50 为 170.255→26.839 µs，30 对样本的节省中位数 143.364 µs；线性与树轮只下载预测。候选、预测、接受及状态检查通过；A3 H2D、精度和整请求 TPOT 尚未测定。
 
+tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tree(0)` 报错。现只验证 pending root，保持预测、compact、EOS 与缓存长度一致；[CPU 检查](evidence/ascend-decode/tree-capacity-20261028.json)覆盖八种声明宽度和 48 个单行尾部用例。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正

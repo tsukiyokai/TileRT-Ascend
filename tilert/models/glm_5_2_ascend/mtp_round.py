@@ -155,7 +155,8 @@ class MtpRoundExecutor:
         from .tree_mask import branch_depths
         from .tree_resolve import accepted_path
 
-        tokens, parents = propose_tree(plan.width - 1)
+        tokens, parents = (propose_tree(plan.width - 1) if plan.width > 1
+                           else ([], []))
         nodes = [plan.pending_token, *tokens]
         lineage = [-1, *(parent + 1 for parent in parents)]
         nodes += [plan.pending_token] * (plan.width - len(nodes))
