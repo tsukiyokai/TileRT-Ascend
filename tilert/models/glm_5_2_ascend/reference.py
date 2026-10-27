@@ -2,6 +2,7 @@
 
 import json
 import math
+from pathlib import Path
 from types import FunctionType, MethodType
 
 import torch
@@ -109,17 +110,32 @@ class ReferenceMlp(nn.Module):
 class ReferenceMoe(nn.Module):
     """Retain HF routing and combine experts before each rank's TP sum."""
 
-    def __init__(self, weights, prefix, gate):
+    def __init__(self, weights, prefix, moe):
         super().__init__()
         self.weights = weights
         self.prefix = prefix
-        self.gate = gate
+        self.gate = moe.gate
+        self.route = getattr(type(moe), "route_tokens_to_experts", None)
+        if self.route is not None:
+            for name in ("n_routed_experts", "n_group", "topk_group",
+                         "norm_topk_prob", "top_k"):
+                setattr(self, name, getattr(moe, name))
         self.output_scale = 1.0
         self.fused_quantization = False
+        self.last_route = None
+
+    @property
+    def routed_scaling_factor(self):
+        return self.gate.routed_scaling_factor
 
     def forward(self, hidden):
         with StableTopk():
-            _, probabilities, choices = self.gate(hidden)
+            router_output = self.gate(hidden)
+            if self.route is None:
+                _, probabilities, choices = router_output
+            else:
+                choices, probabilities = self.route(self, router_output)
+        self.last_route = choices[0].detach().clone()
         probabilities = probabilities[0].to(torch.bfloat16)
         flat = hidden.reshape(1, -1)
         expert_partials = []
@@ -402,7 +418,8 @@ class HfReference:
     """Run the installed HF model without CANN or production weight helpers."""
 
     def __init__(self, checkpoint, mla_preprocess="native",
-                 layer_count=LAYERS, *, fp32_head=False):
+                 layer_count=LAYERS, *, fp32_head=False,
+                 c8_source_directory=None):
         if mla_preprocess not in ("native", "prolog_v3"):
             raise ValueError("MLA preprocess must be native or prolog_v3")
         if type(layer_count) is not int or not 1 <= layer_count <= LAYERS:
@@ -410,8 +427,10 @@ class HfReference:
         self.mla_preprocess = mla_preprocess
         self.weights = ReferenceWeights(checkpoint, fp32_head=fp32_head)
         self.weights.contract["rotary"] = dict(ROTARY_CONTRACT)
+        if c8_source_directory is None:
+            c8_source_directory = CANN_ARCH22_SOURCE_DIRECTORY
         self.weights.contract["c8_index_scoring"] = (
-            cann_arch22_scoring_contract(CANN_ARCH22_SOURCE_DIRECTORY)
+            cann_arch22_scoring_contract(Path(c8_source_directory).resolve())
         )
         raw = json.loads((self.weights.directory / "config.json").read_text())
         config = GlmMoeDsaConfig.from_dict(raw)
@@ -526,7 +545,7 @@ class HfReference:
                 gate.e_score_correction_bias = self.weights.tensor(
                     mlp + ".gate.e_score_correction_bias", dtype=torch.float32
                 )
-                layer.mlp = ReferenceMoe(self.weights, mlp, gate)
+                layer.mlp = ReferenceMoe(self.weights, mlp, layer.mlp)
             else:
                 layer.mlp = ReferenceMlp(self.weights, mlp)
 
@@ -551,12 +570,12 @@ class HfReference:
                 self.latents[index] = output[0, -1].detach().clone()
 
             def record_route(module, inputs, output, index=number):
-                self.routes[index] = output[2][0].detach().clone()
+                self.routes[index] = module.last_route.clone()
 
             layer.self_attn.register_forward_hook(record_attention)
             layer.self_attn.kv_a_layernorm.register_forward_hook(record_latent)
             if hasattr(layer.mlp, "gate"):
-                layer.mlp.gate.register_forward_hook(record_route)
+                layer.mlp.register_forward_hook(record_route)
 
     def reset(self):
         self.cache = DynamicCache(config=self.config)

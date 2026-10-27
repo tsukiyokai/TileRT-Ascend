@@ -31,6 +31,8 @@ def parse_arguments():
     parser.add_argument("--layers", type=int, choices=range(1, 79), default=78)
     parser.add_argument("--fp32-head", action="store_true",
                         help="Keep BF16 head products in FP32 before output")
+    parser.add_argument("--c8-source-directory", type=Path,
+                        help="Verify the pinned CANN C8 headers here")
     args = parser.parse_args()
     if args.generate < 1 or args.capacity < 1:
         parser.error("Generation and cache capacity must be positive")
@@ -221,7 +223,8 @@ def run_reference(args, report):
         )
     }
     engine = HfReference(args.checkpoint, args.mla_preprocess,
-                         layer_count=args.layers, fp32_head=args.fp32_head)
+                         layer_count=args.layers, fp32_head=args.fp32_head,
+                         c8_source_directory=args.c8_source_directory)
     bind_reference_sources(engine, report)
     report["weight_arithmetic"] = engine.weights.contract
     if args.mla_preprocess == "prolog_v3":
@@ -328,6 +331,9 @@ def main():
         "mla_preprocess": args.mla_preprocess,
         "layer_count": args.layers,
         "fp32_head": args.fp32_head,
+        "requested_c8_source_directory": (
+            str(args.c8_source_directory) if args.c8_source_directory else None
+        ),
         "last_merged_hidden": "Last decoder output before the final RMSNorm",
         "partial_layer_logits": (
             "Use the full-model intermediate norm/head projection formula"

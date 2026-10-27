@@ -10,6 +10,8 @@
 
 修改框架前，从真实入口追到实例化的类、方法签名和分派分支。参数解析、导入和 `--help` 通过后，再通过安装器和真实模型对象完成一次执行。使用属性 setter 更新关联状态，保持构造函数、benchmark 与启动脚本的版本相容。
 
+参考实现也要执行到实际 decoder。HF 将专家选择从 gate 移到 MoE 后，头部算术单测仍能通过，完整 forward 才暴露返回协议变化；保留 HF 原路由函数，并用变化输入核对全部层的实际选择，见 [78 层合成 CPU 执行](evidence/ascend-decode/hf-runtime-20261028/README.md)。
+
 本项目记录的静态算子缓存键漏掉了 vendor 源码身份，缓存又落在工作目录，曾使 A/B 两组运行同一实现。修改算子、编译选项或被捕获的调用时，分别使用独立工作目录，并核对实际 ELF；不同的 `VLLM_CACHE_ROOT` 仍会共用这层缓存。只改不影响图的宿主逻辑时，才复用经核实的暖缓存。见 [补丁重新测量](evidence/ascend-decode/kernelpatch-remeasured-20261019/README.md)。
 
 环境激活脚本可能重设加载路径。激活后再设置 overlay，保留已有 `PYTHONPATH`，并从实际请求记录核对 OPP 顺序。打包、分派、缓存和 ABI 的具体规则见 [算子包装与加载](reference/ascend-custom-op-packaging.md)。

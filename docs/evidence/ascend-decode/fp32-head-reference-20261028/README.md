@@ -10,7 +10,7 @@ manifest 记录 `fp32_head` 和 `weight_arithmetic.lm_head` 的输入/权重/累
 
 [43 项回归](head-cpu.json)包括十项 head 检查、11 项标量 verify 检查与 22 项 Native 门禁夹具；另有 [62 项纯元数据检查](metadata-cpu.json)。head 检查覆盖真实 BF16/F32 数值、原始 BF16 权重、跨词表分片的贪心差异、非 head 隔离、非法输入与量化 head、CLI、78 个输出位置的 dtype 变异及实际类文件绑定。环境为 CPU Torch 2.9.0、Transformers 5.12.0、Python 3.11.15。
 
-类来源检查使用未执行模型构造的真实类对象；78 位置检查使用合成 trace。二者分别验证来源和 dtype 拒绝逻辑。本机[头部夹具的构造尝试](constructor-prerequisite.json)在读取匹配 C8 SDK header 时停止；完整 HF 构造、完整 checkpoint 的 forward、最终/77 层诊断投影执行、CANN FP32 caller 与实际 graph 数值均未验收。`precision_verified` 与 `formal_precision_gate_passed` 保持 false。
+头部单测的类来源与 78 位置变异分别采用真实类对象和合成 trace。[完整合成 CPU 运行](../hf-runtime-20261028/README.md)另已实际执行 78 层构造与 forward、最终/77 层诊断 head、reset 和文件读回，并核对仓库内匹配的 C8 源码。完整生产 checkpoint、Prolog-v3、CANN FP32 caller 与实际 graph 数值继续验收。`precision_verified` 与 `formal_precision_gate_passed` 保持 false。
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests/glm52 python3 -m unittest \

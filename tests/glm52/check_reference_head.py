@@ -136,6 +136,16 @@ class ReferenceHeadChecks(unittest.TestCase):
             with patch.object(sys, "argv", common + flags):
                 self.assertIs(runner.parse_arguments().fp32_head, expected)
 
+    def test_cli_accepts_an_explicit_c8_source_directory(self):
+        common = ["run", "--checkpoint", "/fixture", "--output", "/fixture",
+                  "--tokens", "1", "--source-commit", "fixture"]
+        for flags, expected in (([], None), (
+            ["--c8-source-directory", "/verified/c8"], Path("/verified/c8"),
+        )):
+            with patch.object(sys, "argv", common + flags):
+                self.assertEqual(runner.parse_arguments().c8_source_directory,
+                                 expected)
+
     def test_collector_rejects_rounded_diagnostic_layer_logits(self):
         trace = single_layer_trace(self.expected[:1])
         runner.validate_trace(trace, 1, fp32_head=True)
@@ -156,8 +166,7 @@ class ReferenceHeadChecks(unittest.TestCase):
                                       fp32_head=True)
 
     def test_source_binding_reads_the_loaded_class_files(self):
-        # Provenance needs class objects; full HF construction needs C8 SDK
-        # sources and is outside this head-only CPU fixture.
+        # This head-only fixture checks source binding separately from forward.
         engine = HfReference.__new__(HfReference)
         with checkpoint() as root:
             engine.weights = ReferenceWeights(root, fp32_head=True)
