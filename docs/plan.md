@@ -1,114 +1,119 @@
 # 实施计划
 
-先完成 GLM-5.2 / A3 的完整 decode 路径，对输出质量、请求状态和时延负责。首个目标采用者是已使用 vLLM-Ascend 的服务团队；交付同一个执行核心及其离线、在线入口。跨算子、跨层和跨卡控制权按完整请求收益与维护成本逐步扩大。项目定位见 [readme]，方法见 [lesson]，结果与证据缺口见 [probe]。
+TileRT-Ascend 是构建在 Ascend 上的专用低时延 decode 框架：它从成熟服务栈接收 prefill 交来的历史状态，接管单请求或极低并发下的 token 生成关键路径，并对输出质量、请求状态与完整解码时间负责。项目定位见 [readme]，实验方法见 [lesson]，实测账本与正负证据见 [probe]。
 
 ## CPU 前沿验收
 
 CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)继续通过[无环节点 GC 对照](evidence/ascend-decode/lookup-gc-20261028/README.md)减少本地构造分配与典型成本，复制收益很弱且长尾仍有退化；默认部署尚未安装扩展。[78 层合成 HF](evidence/ascend-decode/hf-runtime-20261028/README.md)已有 [A/B/A 各 32 行的完整参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)；[持久观测槽](evidence/ascend-decode/graph-producer-20261028/README.md)已在 CPU AOT 的实际 verify 入口检查字段新鲜度与坏图拒绝。下一步闭合实际 NPU/SuperKernel graph→HF 观测与正式 CANN 门禁，检验请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 
-## 首条验证路径
+## 框架定位与物理前提
+
+构建专用低时延 decode 框架，首先要越过两重幻象。第一重是自上而下的抽象框架幻象：在尚未打穿单条极限物理路径前先搭通用算子注册表、多模型插件层与调度外壳，只会把错误的内核边界固化成维护负担；逆向拆解上游 ROCm 产物可见（见 [ROCm 融合结构][tilert-rocm]），其逐原语通用 GEMV 库在二进制中完全不可达，真正支撑单用户 469 tok/s 的是整层静态展开内核与携带代次标签的核内点对点写。第二重是 GPU 持久大内核的同构幻象（见 [AMD 机制重读][amd-reread] 与 [Ascend 融合机制][ascend-fusion]）：Ascend A3（`dav-2201`）在物理上切开了 AIC 与 AIV，不存在 `L0C→UB` 通路，跨核交接必经 `L0C → Fixpipe → L2/GM → MTE2 → UB` 并配齐 `DataSyncBarrier<DDR>`；`CrossCoreSetFlag` 仅有 16 个不可清零的 4 位硬件计数器（上限 15 次），且 `CrossCoreWaitFlag` 在 `dav-2201` 上会阻塞等待核全部流水线，强行跨越 78 层串联硬件信号必触发死锁或溢出。
+
+实测数字决定了框架的真实主攻方向。按 [A3 流量下界][a3-roofline]，GLM-5.2-W4A8C8 在单机 16 die（TP16）、8K 上下文下单 rank 逻辑读取约 4.056 GB，70% HBM 带宽效率对应的物理传输时间仅 3.62 ms，配合 [LookupDrafter][lookup-draft] 已达 5.72 至 7.1 的轮均接受数，2.x ms 的 TPOT 在物理上完全敞开。而在当前 61 至 71 ms 的整轮墙钟里（见 [probe]），Cube 与 Vector 算术活跃占比均不足 5%，真正吞噬关键路径的是四项结构税：标量流水线 `PIPE_S` 循环读取全局元数据触发无条件清缓存带来的约 20.4 ms 阻塞（集中在 256 专家分组遍历与稀疏注意力 `MergeKv` 收集）、每轮 156 次 TP16 串行集合规约会合、AIV 未流水化开销，以及 5.26 ms 宿主周转与隐式同步空洞。TileRT-Ascend 因此不是包裹厂商算子的编排壳，而是把上述硬件裂隙转化为确定性流水线的编译器与运行时联合体：先在 GLM-5.2 / A3 TP16 首条路径上逐级打穿这四项结构税，再从两条以上已验证路径的交集中析出通用框架接口。
+
+## 首条验证锚点与演进路线图
 
 | 项目 | 范围 |
 | -- | -- |
-| 模型 | 真实 GLM-5.2-W4A8C8 checkpoint |
-| decode 设备 | 一台 A3，16 die，TP16，单请求 |
-| 基准输入 | 八个不同的 8192-token 输入 |
-| 基准输出 | 每请求 1024 个 token |
-| 时延目标 | TPOT 2.x ms |
-| 服务目标 | 常驻 decode 接入成熟服务栈 |
-| 扩展测量 | 短输入、长会话、EOS、取消、AgentX |
+| 模型与精度 | 真实 GLM-5.2-W4A8C8 checkpoint，保留原稀疏 attention、量化、采样与 KV 语义 |
+| 解码拓扑 | 一台 A3，16 die（`Ascend910_9392`），TP16，单请求常驻服务 |
+| 基准负载 | 八个独立 8192-token 输入，每请求连续生成 1024 个 token |
+| 终极时延门禁 | 生产端与客户端双时钟 32 请求 p50/p95 TPOT ≤ 2.x ms（`passes_2ms`） |
+| 扩展工作负载 | 短对话、长短交替会话、EOS 与取消恢复、百万上下文 AgentX 回放 |
 
-2.x ms 由通过精度与状态检查的完整请求测量验收；字节下界和逐层预算用于选择实验。保留 checkpoint 的稀疏 attention、量化、采样与 KV 语义；改变语义的候选须单独定义质量验收。
+已有 [冻结前缀宽验证计时][width32]（内部 TPOT 中位数 12.413 ms，正式精度与多输入门禁未开）、[真实 P/D 冷启动链路][pd-live] 与 [三 rank 原生树规约整层检查][tree-check]。路线图按消除物理瓶颈的因果次序划分为五个阶段，局部算子开发与 CPU 状态检查可超前并行，但合入默认主干必须逐级通过设备数值、整模型与常驻服务验收：
 
-已有 [冻结前缀计时][width32]、[真实 P/D 功能链路][pd-live] 和 [原生执行片段检查][native-evidence]。各项结果的配置与范围见 [probe]。固定 8K/1K 测量与 AgentX 回放分别验收，均报告 P90 token 间隔、请求完成时间和每卡吞吐。
+| 阶段 | 周期参考 | 核心目标与交付物 | 整轮与 TPOT 门禁 |
+| -- | -- | -- | -- |
+| P0 | 第 1–2 周 | 收束单一运行时状态机，锁死 8×8K 精度门禁与常驻 16 路 HIXL 宽验证 P/D | 精度与状态全过，客户端 TPOT ≤ 12.0 ms |
+| P1 | 第 3–6 周 | 肃清宿主周转空洞与 `PIPE_S` 标量全局读阻塞，打通 `dav-2201` Tile 直通图编译链 | 整轮 35–40 ms，稳态 TPOT ≤ 7.0 ms |
+| P2 | 第 7–12 周 | 78 层真实权重双积木具体化（索引注意力＋专家归并）与 `aclshmem` 核内确定性树规约 | 整轮 20–24 ms，稳态 TPOT 3.5–4.5 ms |
+| P3 | 第 13–18 周 | `SoftSyncAll` 跨层静态权重预取、L2 冷热隔离与混合草拟树动态宽度闭环控制 | 双时钟通过 `passes_2ms`，AgentX 达标 |
+| P4 | 第 19 周起 | 凝结 `compiler` / `comm` / `spec` / `pd_vllm` 四层框架，接入第二模型与新拓扑/芯片 | 双路径共用核心，净收益抵偿维护成本 |
 
-## 优先级与依赖
+## P0：闭合真相基座与常驻交接契约
 
-| 阶段 | 交付物 | 完成条件 |
-| -- | -- | -- |
-| P0 | 基线与支持矩阵 | 精度、状态可重现 |
-| P1 | 首个服务接入 | 共用核心，常驻运行 |
-| P2 | 更快的完整 decode | 整请求收益可重现 |
-| P3 | 更大的执行与采用范围 | 新收益抵偿维护成本 |
+当前仓库并存三条未完全合流的执行路径：四层 BF16 功能参考 [DecodeEngine][engine]、78 层算子对账路径 [NativeDecodeEngine][native-engine]，以及复用 vLLM-Ascend 模型加载与图的 [CannModel][cann-model]。P0 的首要任务是将离线基准与在线服务收束到同一套运行时状态机与不可绕过的精度门禁 [precision_gate.py][precision-gate]，终结仅有速度读数而无正式精度凭据的状态。
 
-局部开发和 CPU 检查可与 P0、P1 并行。进入默认后端的候选依次通过设备正确性、整模型和服务验收。首个外部贡献可以是一个片段；本项目仍对它在完整 decode 中的效果负责。
+1. 身份与溯源锁死：固定 checkpoint revision、量化配方、109 个权重文件清单与全量字节哈希，完整加载 78 层主干及第 78 层 MTP 权重。每次运行随结果保存 CANN、驱动、`torch`/`torch_npu`、配套 `vLLM`/`vLLM-Ascend`、编译器参数、算子 overlay、Python 源码与实际加载设备 ELF 的哈希，并用独立缓存目录隔离编译产物。
+2. 硬件精确数值公理：按 [输入与精度协议][measurement] 冻结八个独立 8192-token 输入、前缀快照、首 token 与请求标识。将已实证的硬件算术规则固化为参考对账标准：复现 A3 Fixpipe 反量化前清除 FP32 scale 低 13 位的截断行为，保留 Norm 与 Quant 之间的中间 BF16 舍入，锁死确定性 HCCL 的 `[8,4,2,1]` FP32 规约树加法结合顺序。逐宽度、逐起草器比对层输出、logits、路由、main/indexer/MTP KV 与完整贪心序列，阈值不随失败结果放宽。
+3. 常驻在线 P/D 贯通：打通 [CANN 服务入口][serve-pd]、[AscendMtpPDEngine][mtp-session]、[AscendTileRTConnector][connector]、[KV 布局协议][layout] 与 [MTP parent 交接][parent-code]，废除先停 prefill 再加载 decode 的分时冷启动流程。规划独立 P/D 节点或覆盖加载预热峰值、多宽度图池、通信窗口及临时缓冲的确定性显存预算，使在线入口直接承载 `width=16/32` 宽验证、编译目标图、SuperKernel 与 FP32 head。
+4. 事务级状态与故障协议：遵循 [P/D 状态协议][pd-contract] 与 [parent 交接约定][parent-contract] 验收全生命周期。输入长度为 P 时交接主 KV 的 P 行、MTP 的 P−1 行及未旋转的目标模型 P−1 位置 final-norm hidden，首 token 仅交付一次且 pending token 与已提交 KV 严格分离；草稿零接受、部分接受、全接受、EOS 裁剪与取消均在全部 16 个 rank 同步回滚尾部；活跃 HIXL WRITE 完成前保留源页与接收缓冲，断连失联时隔离槽位，迟到消息不得复活旧请求；TP 广播命令序号失配时立即停止复用并执行整组恢复；不支持的采样或配置在准入前显式拒绝或分流至通用后端。
 
-## P0：固定语义与可信基线
+验收标准：八个冻结 8K 输入、长短交替请求与取消重放全部通过 16 rank 一致性、reset 隔离与串行参考对账；常驻服务无需人工触发文件即可连续响应，分别出冷启动、TTFT、HIXL 传输与稳态解码报告，客户端稳态 TPOT ≤ 12.0 ms。
 
-以 [CannModel] 为首条整模型验证路径，复用模型加载、量化和 KV 实现；[NativeDecodeEngine] 的独立检查用于算子验证。每份结果记录实际使用的引擎、入口、开关和加载库。
+## P1：肃清宿主空洞、标量阻塞与打通 Tile 编译链
 
-1. 固定 checkpoint revision、量化配方、全部权重文件清单与校验值，校验运行依赖。记录 CANN、驱动、torch/torch_npu、vLLM-Ascend、编译器、算子 overlay、源码与动态库身份。完整加载 78 层及所需 MTP 权重后建立基线。
-2. 冻结八个输入、对应前缀、首 token 和请求标识，按 [输入与精度协议][measurement] 保存全部 rank 回执。加载、前缀恢复、预热和 profiler 分别计时。
-3. 建立支持矩阵，登记模型、精度、TP/EP、上下文与容量、验证宽度、起草器、attention、图模式、KV 布局和采样。每个组合分别标注局部、整模型和在线验收状态。
-4. 固定串行 CANN 对照，比较层输出、logits、top-k 顺序、路由、main/indexer/MTP KV 和完整输出。逐宽度、逐起草器定位首次分歧；分别检查 CPU 轮状态和设备因果 mask、slot、规约顺序。接受数、重复度和输出多样性只作诊断。
+在重写整层算子前，先在 P0 可信基线上拔除宿主调度空洞与设备标量管线阻塞，并建立绕开厂商 OPP 工程束缚的直接编译底座（对照见 [低时延宿主杠杆目录][latency-baselines] 与 [自定义算子包装机制][op-packaging]）。
 
-验收：八个输入均有完整 TP16 报告；reset 后重放一致，较短请求不读旧尾部，贪心输出符合固定串行参考。局部算术按登记的逐字节要求或误差阈值检查；整模型允许的差异须先定义误差与质量标准，阈值不随失败结果放宽。长上下文、长生成覆盖累计误差、近平局、重复输出和任务完成质量。在线支持范围以整模型与服务验收为准。
+1. 零同步静态宿主信封：将解码轮内的 token、position、slot 映射、[RoPE 刷新][cann-model]、有效序列长度槽、跨层稀疏选择代次与拒绝采样 EOS 掩码全部绑定到预分配固定设备地址与锁页主机内存，消除每步分页 H2D 拷贝、事件反复创建销毁、`.tolist()` 阻塞以及退化为 `NonZero` 强制同步的布尔掩码索引；将 MoE 权重预取激活阈值降至 1 token；实现词表并行局部 argmax，仅跨 rank 收集 `(value, index)` 二元组并直接送入设备侧验证器，消除全词表 FP32 logits 聚合。
+2. 根除 `PIPE_S` 全局内存阻塞：确立内核实现的硬约束——禁止在标量管线中使用 `GetValue` 循环遍历全局内存元数据。将 MoE 算子对 256 个专家分组列表的逐项标量读取、以及稀疏注意力 `MergeKv` 的逐位置索引收集，统一改写为单次 MTE2 批量搬入 UB 后的向量侧计算，利用同一投机轮多行查询高度重合的 top-2048 索引并集消除冗余 KV 收集与注意力标量真除法。
+3. `dav-2201` Tile 编译与图直通底座：修正 `tilelang-ascend` 中 `carver/arch/ascend.py` 将 `Ascend910_9392` 误判为 `Ascend910A` 的缺陷，补齐 24 AIC / 48 AIV 核配比、双缓冲 64 KB L0C、真实 UB/L1 容量阶梯，以及裸 `bisheng -xcce --npu-arch=dav-2201` 编译下缺失的 `MTE2_S`、`S_MTE3` 与 `V_MTE2` 显式同步推导；统一通过 `torch.library` 的 `PrivateUse1` 分派键与 `fake_impl` 将 TileLang 生成内核及受控 AscendC/PTO 内核直接注册进 ACLGraph 捕获流，停止修补受限于固定函数原型的厂商二进制算子包。
 
-## P1：同一核心接入常驻服务
+验收标准：无 profiler 干扰下整轮设备墙钟从 61–71 ms 压降至 35–40 ms，5.26 ms 宿主周转空洞消失，标量管线固定开销大幅回落，八个冻结输入在线稳态 TPOT ≤ 7.0 ms 且数值完全符合 P0 门禁。
 
-首个服务接入交付可替换的 decode 核心、支持矩阵、版本要求和验收脚本。离线测量与在线调用使用同一执行实现；接入方式由采用者的模型、缓存和部署约束决定。
+## P2：层内双积木具体化与核内单边通信内生化
 
-| 接入方式 | 复用对象 | 重点验收 |
-| -- | -- | -- |
-| 框架内调用 | 模型、缓存、调度与服务入口 | 执行区域、图与状态生命周期 |
-| P/D 后端 | prefill、路由及现有交接链路 | KV 传输、资源与常驻运行 |
+P2 将 [WholeLayerManager][whole-layer] 从单/双/三 rank 合成权重的原型推进为承载 78 层真实 W4A8C8 权重与 16 个物理 die 的默认执行引擎。顺应 A3 无片上 `L0C→UB` 通路但共享大容量 L2 的物理结构，层内融合的目标是让跨核交接命中 L2、常量化静态 shape 以削去 tiling 标量税、避开无谓的 13.58 µs `MIX` 启动税（纯计算段优先采用 2.30 µs `AIC_ONLY` 与 0.70 µs `AIV_ONLY` 或受控 `__schedmode__(1)`），并将每层收敛为两块边界清晰的标准执行积木：
 
-[CANN 服务入口][serve-pd] 已将 `CannModel` 接入 session、TP command loop 和 HTTP，可用于现有 P/D 路径验收。框架内接入复用同一核心；采用者持有权重和缓存分配时，核心仍须明确暂存状态、提交、回滚和完成信号的责任。
+1. 稀疏索引与 MLA 注意力积木：按 [indexed attention 契约][attention] 组合前置残差归一化量化、分页 INT8/BF16 Lightning Indexer top-2048 选择、MLA 前处理、稀疏 KV 读取及输出投影尾段。覆盖负 slot、越界掩码与全部声明验证宽度，固定单请求与分桶宽度下的 `MatmulApiStaticTiling` 常量参数，并对多核广播读取施加 `(mBlockIdx + blockIdx) % numBlocks` 错位分核以消除 512 字节同地址窗口串行化。
+2. W4A8 路由/共享专家与核内归并积木：按 [W4A8 路由规范][routed] 与 [完整 FFN 契约][ffn] 组合路由元数据准备、A8W4 MSD 高低半字节矩阵乘、SwiGLU、Fixpipe `REQ8`/`VREQ8` 重量化（在满足舍入等价处直接省去向量侧 Cast）、down 投影及原始 top-8 顺序归并。针对 `moe_intermediate=1792` 在 INT4 下为 896 字节（非 256 字节对齐）导致的随路转换损耗，采用离线对齐排布或向量侧预转换；利用侧流（捕获期记录串行默认流、重放期开启并发以规避图池流注册限制）或核组交错让共享专家计算及归约与路由专家重叠。
+3. 核内单边对称内存规约：按 [低时延 TP 规约研究][tp-reduce]、[TP 层链][tp-layer]、[三 rank 规约顺序审计][reduce-diagnostic] 与 [树规约整层检查][tree-check]，用基于 `aclshmem_ptr` 的 MTE3 远端直写或 `aclshmemx_mte_atomic_add` 配合绕过 DCache 的单调递增窗口代次（epoch）轮询，接管每层注意力后与 FFN 后的两次跨卡规约，彻底移除每轮 156 次独立 HCCL 内核下发。实现须主动利用 A3 模组内 0.31 µs 对跨模组 0.84 µs 的物理拓扑，严格复现 TP16 下的 `[8,4,2,1]` 确定性 FP32 加法树括号，并保证捕获前按宽度与 stream 预留对称窗口、重放期设备侧自推进代次、销毁时严格遵循「停提交→同步设备→销毁引用图→跨 rank 会合→释放窗口→finalize」的生命周期。
+4. 分桶静态图与 SuperKernel 编排：在整模型 78 层上按验证宽度分桶（`M ∈ {1, 4, 12, 16, 32}`）捕获完整 ACLGraph 并开启 CANN `SuperKernel`（含 `early_start`），用同一真实 shape 与精度横向实测 TileLang-Ascend 生成代码与手写 AscendC/PTO 实现，择优固化进主干。
 
-先固定首个接入配置。P/D 部署分别记录 prefill、decode、路由的节点和设备；同机部署须覆盖加载与预热峰值。显存预算包含权重及转换副本、KV、通信缓冲、各宽度和 stream 的临时缓冲、图池与算子工作区。连续请求期间保持所需进程和模型就绪，去掉人工触发文件。
+验收标准：78 层真实 checkpoint 在 16 个物理 die 上完成局部对比、变化输入图重放、整模型精度门禁与 P0 常驻 P/D 回归，覆盖跨轮变化 payload、立即消费者与特殊浮点边界值；整轮墙钟降至 20–24 ms，稳态 TPOT 达到 3.5–4.5 ms。
 
-两种接入都须验证提交、回滚与完成信号。P/D 的传输与请求状态遵循 [P/D 状态协议][pd-contract] 和 [MTP parent 交接][parent-contract]：
+## P3：跨层持久流水与自适应投机闭环
 
-- 接收与可见性：版本、checkpoint、请求、generation、rank 和布局一致。生产者写入完成并收到匹配回执后才能释放源页；16 个 rank 全部完成后才宣布 ready。
-- main 与 MTP：输入长度为 P 时，交接主 KV 的 P 行和 MTP 的 P-1 行。首 token 仅交付一次；等待下一步消费的 pending token 与已提交 KV 分开。启用 parent 交接时，携带目标模型 P−1 位置的 final-norm hidden，已归一化且尚未应用 MTP 的 `rot.weight`。
-- 投机提交：未接受的候选尾部在全部 rank 回滚。分别记录提出、验证、接受和交付数量，覆盖草稿零接受、部分接受、全部接受、EOS 和输出预算边界。
-- 取消与重置：覆盖传输中、轮中、交付中及取消前后。按 pending/EOS 规则核对已交付范围、提交位置和有效 KV 长度；活跃 WRITE 完成前保留缓冲，失联写入隔离槽位，迟到消息不能复活旧请求。
-- rank 与故障：命令序号、请求和位置一致。广播后失配时停止复用 TP 组，按明确的整组恢复流程重启；检查所有 rank 的正常关闭与资源释放。
-- 服务能力：不支持的配置在分配或执行前拒绝，或按声明的规则路由至通用后端。满载有准入与背压；正常完成取消且写入已收束后，槽位可复用。
+P3 消除层与层之间残余的权重加载气泡，并将投机草拟与底层硬件执行斜率耦合为闭环控制器，冲刺 2.x ms 物理极限。
 
-当前 Ascend connector 采用 TP16、batch1、完整新输入、128-token 页、顺序 MTP 和贪心采样。前缀复用、增量传输、LoRA、结构化输出及其他采样方式由采用需求推动，每项独立验收；增量传输须同时验证 KV 与投机回滚的生命周期。
+1. 零硬件信号消耗的跨层静态权重预取：避开 4 位硬件 `CrossCoreSetFlag` 的 15 次饱和上限与 `CrossCoreWaitFlag` 全流水阻塞，在相邻稀疏索引层与共享索引层之间采用基于全局内存与 UB 软件记分牌（`SoftSyncAll` 机制）或 `SuperKernel` 预取描述符的细粒度依赖推进。当第 `l` 层尾部执行专家归并与单边跨卡发布时，空闲 MTE2 通道提前将第 `l+1` 层共享专家及注意力静态投影权重预取入 L2；同时对单请求仅流式读取一次的冷路由专家权重施加 `SetL2CacheHint(CACHE_MODE_DISABLE)`，防止冷分片驱逐热激活与预取权重。
+2. 投机策略与硬件斜率的联合闭环：打通 [原生链式 MTP][native-mtp]、[后缀索引起草][lookup-draft]、[自动机起草][automaton-draft] 与 [树掩码生成][tree-mask]。在固定确定性目标串上逐宽度核查轮起点、树因果掩码与接受位置，定位并消除如 width24 接受数异常回落等非单调效应；运行时依据实时后缀匹配率与实测宽度成本斜率 `T_round(W) / E[accept(W)]` 动态切换起草器与验证宽度分桶（低重复语境切回链式 MTP，高重复智能体轨迹切入后缀/自动机宽树），将策略切换本身的开销计入总墙钟。
 
-验收：采用者通过真实服务入口完成八个冻结输入、长短交替请求和长会话。在线 M1 及声明支持的投机配置通过 P0 检查；服务输出、回调、KV 状态与 TP 回执相符。取消、超时、断连、拒收和关闭后可按协议继续服务。分别报告冷启动、TTFT、P/D 传输和稳态 decode 时间。
+验收标准：在八个独立 8K 输入、连续 32 次在线 P/D 请求（3 次预热后无 profiler 测量）下，生产端回调时钟与客户端接收时钟的请求 TPOT p50/p95 均不超过 2.x ms，正式点亮 `passes_2ms`；同步交付百万上下文 AgentX 会话回放报告，分别列出排队、prefill、HIXL 传输、稳态 decode、网络与工具耗时以及任务完成质量。
 
-## P2：优化完整 decode
+## P4：从单路径具体化凝结为专用解码框架
 
-在同一基线上采集宿主下发、设备执行、同步、HBM 流量与通信时间线。每个候选说明要减少的等待、数据遍历或资源占用，并在完整请求中比较收益、兼容范围和维护成本。
+严格遵循奥卡姆剃刀：唯有在 GLM-5.2 / A3 TP16 达成 2.x ms 之后，且由真实的第二模型（如 DeepSeek-V3.2 DSA 或 Qwen3.5 / GLM-5.3 系列 MoE）及第二硬件或并行形态（同机 TP8+EP8 混合并行与热点专家复制驻留，或具备原生 `L0C→UB` 通路与完整 MTE 原子操作但须重新设计 W4 权重路径的下一代 Ascend `950PR/950DT`）驱动时，才将两条路径共同依赖的不变量沉淀为正式的四层框架接口：
 
-1. 元数据与小算子：预留固定地址和图输入，批量读取索引与专家元数据，合并可共享读取的 norm、quant、cast 和投影前处理。变化位置、宽度和路由不得产生旧值；在相同地址和内存压力下比较完整路径。
-2. 稀疏 attention：保持 top-k、因果 mask 和 cache 格式，比较批量 gather、地址计算、CUBE/AIV 交接与 projection tail。覆盖 INT8/BF16 indexer、分页映射、负 slot、越界输入和全部声明宽度；共享读取保留逐行选择语义。构建与算术要求见 [attention 接口][attention]。
-3. MoE：复用权重，减少空组扫描和重复元数据遍历，组合 routed/shared、SwiGLU、requant、down 与 combine。保持实际 W4A8 NZ 布局、原始 top-8 slot、概率舍入、量化及 combine 顺序，覆盖变化专家分布；计时包含 dispatch、恢复和路由。实现要求见 [routed/shared][routed] 和 [完整 FFN][ffn]。
-4. 计算与通信：比较生产者发布、传输、规约组合后的 HCCL 与 SHMEM 路径。实际 TP16 须保持选定 HCCL 的算术树和类型，覆盖重复图重放、立即消费者、跨轮变化 payload、取消与特殊数值。依次参考 [TP layer][tp-layer]、[三 rank 诊断][reduce-diagnostic] 和 [树规约整层检查][tree-check]；两 rank 相等不能替代 TP16 验收。
-5. 代码生成：用同一真实 shape、布局和数值要求比较 TileLang-Ascend、AscendC 或 PTO 实现。生成代码、静态资源、同步与加载库均可追溯；工具链选择由片段及整模型结果决定。
+1. `tilert.ascend.compiler`（声明式层图与 Tile 编译层）：以统一阶段图表达层内双积木与跨层预取依赖，后端对接校准好芯片画像的 TileLang-Ascend 与受控 AscendC/PTO 模板，自动注入跨核 `DataSyncBarrier<DDR>`、`PIPE_S` 显式事件配对、静态常量 tiling 与内容寻址 ELF 缓存校验。
+2. `tilert.ascend.comm`（拓扑感知设备通信与传输层）：封装单节点 HCCS 模组层级与跨机 RoCE 下的 `aclshmem` 对称内存窗口、代次推进协议、确定性规约树生成，以及面向 P/D 分离的多路 HIXL 零拷贝页映射传输。
+3. `tilert.ascend.spec`（事务型投机与缓存状态引擎）：统一管理主缓存、混合精度分页索引缓存与草稿层缓存的分配、增量前缀复用、多分支树掩码验证、原子提交与拒绝回滚，以及词表并行贪心、分布式 top-p 与结构化输出采样。
+4. `tilert.pd_vllm`（分级服务接入与共生池化层）：通过标准 `KVConnector` 与 `MultiConnector` 无侵入接入主流推理服务栈，在统一 OpenAI 路由入口下实现 SLO 分级调度——将延迟敏感的实时交互、高频决策与长程智能体会话导入 TileRT-Ascend 专用低时延解码池，将大吞吐离线批处理流量留在常规解码池，当上游通用后端在同等负载下达到同等质量、成本与时延时及时收敛重复维护。
 
-原生片段保留存储 owner 和调用顺序。当前 Torch stream 的生产者先提交，消费者读取前结果可见；跨 AIC/AIV 与跨 die 完成协议分别验证。捕获前预留各宽度和 stream 的 workspace，图销毁后释放；UB 的 SDK 保留区和通信窗口计入容量。采用窗口 epoch 的协议须在设备重放时推进，跨轮不得读取旧 payload；跨调用保留的输出须独立持有或显式拷贝。adapter 对 KV transfer、权重重载等场景的限制保留到对应生命周期检查通过。
-
-投机与执行联合优化。先用确定性目标检查预算变化下的候选、祖先、mask 与接受路径，再扫真实请求的宽度和起草器。接受数下降须结合目标输出与候选集合定位。分别记录 propose、verify、KV 提交/回滚、采样和交付时间，并保留输出。按通过质量检查的总墙钟时间和实际交付数选宽度，计入自动选择策略的开销。
-
-验收顺序为实际权重局部比较、变化输入图重放、TP16 组合、整模型、P1 服务入口。交替运行对照和候选，固定输入、权重、起草器、宽度、cache、资源与计时范围，记录编译缓存和加载库。性能退化的候选留作实验结果；有新机制或新适用范围时再验证。
-
-## P3：按收益扩大控制权与采用范围
-
-从相邻 indexed/shared-indexer 层试验静态权重预取、workspace 复用、分块发布和计算通信重叠。保留值依赖、归一化、地址产生与可见性要求；用时间线验证提前量，计入 L1/UB/L2 容量、争用和额外同步。比较多 launch 的精细依赖与合并执行，只有完整请求收益抵偿兼容与维护成本，才扩大共同执行区域。
-
-以相同请求和总资源比较 TP/EP 混合、热点专家复制与驻留策略，重新验证 shard、路由和规约。首个采用者通过后，由真实的第二模型、硬件或服务栈需求推动公共接口；仅提取两条已验证路径需要共享的部分。
-
-最终交付包含支持矩阵、可部署环境、复现入口、精度报告和完整服务测量。记录总节点、卡与 die、并发、上下文、精度、实际接受数和计时分母。平均 TPOT 为全部有效输出间隔的总时间除以间隔数，并保留逐请求分布。AgentX 单独记录回放版本、会话、输出长度、任务质量及排队、prefill、decode、网络、工具时间；结合吞吐、资源成本和尾延迟确定采用范围。
-
+[a3-roofline]: evidence/a3-roofline.md
+[amd-reread]: evidence/tilert-ascend/amd-article-reread-20261018.md
+[ascend-fusion]: reference/ascend-fusion-mechanics.md
 [attention]: ../tests/glm52/whole_layer/attention_indexed.md
-[cannmodel]: ../tilert/models/glm_5_2_ascend/cann_model.py
+[automaton-draft]: ../tilert/models/glm_5_2_ascend/automaton_draft.py
+[cann-model]: ../tilert/models/glm_5_2_ascend/cann_model.py
+[connector]: ../tilert/pd_vllm/ascend_connector.py
+[engine]: ../tilert/models/glm_5_2_ascend/engine.py
 [ffn]: ../tests/glm52/whole_layer/ffn_original_shared_gu_static/README.md
+[latency-baselines]: reference/ascend-decode-latency-baselines.md
+[layout]: ../tilert/pd_vllm/ascend_layout.py
 [lesson]: lesson.md
+[lookup-draft]: ../tilert/models/glm_5_2_ascend/lookup_draft.py
 [measurement]: evidence/ascend-decode/measurement.md
-[native-evidence]: evidence/ascend-decode/megakernel-device-20261021/README.md
-[nativedecodeengine]: ../tilert/models/glm_5_2_ascend/native_engine.py
+[mtp-session]: ../tilert/models/glm_5_2_ascend/mtp_session.py
+[native-engine]: ../tilert/models/glm_5_2_ascend/native_engine.py
+[native-mtp]: ../tilert/models/glm_5_2_ascend/native_mtp.py
+[op-packaging]: reference/ascend-custom-op-packaging.md
+[parent-code]: ../tilert/pd_vllm/ascend_parent.py
 [parent-contract]: evidence/ascend-decode/mtp-parent-handoff.md
 [pd-contract]: evidence/ascend-decode/pd-ascend.md
 [pd-live]: evidence/ascend-decode/pd-live-20261017/README.md
+[precision-gate]: ../tests/glm52/precision_gate.py
 [probe]: probe.md
 [readme]: readme.md
 [reduce-diagnostic]: evidence/ascend-decode/megakernel-device-20261021/integration/communication-order-three-rank-v1-a3-194/AUDIT.md
 [routed]: ../tests/glm52/routed_int4/README.md
 [serve-pd]: ../tests/glm52/serve_cann_pd.py
+[tilert-rocm]: reference/tilert-rocm-glm52-structure.md
 [tp-layer]: ../tests/glm52/whole_layer/layer_tp_chain/README.md
+[tp-reduce]: reference/low-latency-tp-reduce.md
 [tree-check]: evidence/ascend-decode/megakernel-device-20261021/integration/vendor-hook-tp-tree-v1-a3-194/AUDIT.md
+[tree-mask]: ../tilert/models/glm_5_2_ascend/tree_mask.py
+[whole-layer]: ../tilert/models/glm_5_2_ascend/whole_layer.py
 [width32]: evidence/ascend-decode/width-ladder-20261023/w32-lookup.json
