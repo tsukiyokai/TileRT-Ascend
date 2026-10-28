@@ -40,6 +40,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 [FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)补齐显式输出算术、实际导入源与模式准入。匹配的 C8 header 已在仓库逐文件核对；[78 层合成 CPU 执行](evidence/ascend-decode/hf-runtime-20261028/README.md)修正当前 HF gate/MoE 路由协议，实际运行最终与 77 个诊断 head。两种 head 模式各 2379 项采集/reset 对照、48 项独立检查、44 项回归及 62 项元数据检查通过。BF16/FP32 的合成贪心结果分别为 0/17；真实 checkpoint、Prolog-v3、CANN FP32 caller 及实际 graph 数值继续验收。
 
+[32 行参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)保存合成 78 层模型的 96 次实际 HF teacher forward，组成 A/B/A 三帧，各含 628 字段。完整严格账本的 297632 项检查中，256 项为预期数值负例失败，意外失败为零。旧接收器会让空参考零检查通过；当前接收器从保存的 Tensor 核对 60288 个字段行、重算 629 项标量 oracle，并拒绝 15 类空缺及身份类型反例。真实 8K/top-2048、NPU producer、SuperKernel 图与正式 CANN 精度门禁仍待闭合。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正

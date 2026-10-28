@@ -12,6 +12,8 @@
 
 参考实现也要执行到实际 decoder。HF 将专家选择从 gate 移到 MoE 后，头部算术单测仍能通过，完整 forward 才暴露返回协议变化；保留 HF 原路由函数，并用变化输入核对全部层的实际选择，见 [78 层合成 CPU 执行](evidence/ascend-decode/hf-runtime-20261028/README.md)。
 
+宽验证对账先要求完整参考行，再比较数值。空列表会让逐行循环以零检查通过；Python 的 `32.0 == 32`、`1 == True` 也不能替代身份类型检查。固定字段、行号与输入身份，解码后复制独立存储，见 [32 行参考帧正负例](evidence/ascend-decode/graph-frame32-20261028/README.md)。
+
 本项目记录的静态算子缓存键漏掉了 vendor 源码身份，缓存又落在工作目录，曾使 A/B 两组运行同一实现。修改算子、编译选项或被捕获的调用时，分别使用独立工作目录，并核对实际 ELF；不同的 `VLLM_CACHE_ROOT` 仍会共用这层缓存。只改不影响图的宿主逻辑时，才复用经核实的暖缓存。见 [补丁重新测量](evidence/ascend-decode/kernelpatch-remeasured-20261019/README.md)。
 
 环境激活脚本可能重设加载路径。激活后再设置 overlay，保留已有 `PYTHONPATH`，并从实际请求记录核对 OPP 顺序。打包、分派、缓存和 ABI 的具体规则见 [算子包装与加载](reference/ascend-custom-op-packaging.md)。
