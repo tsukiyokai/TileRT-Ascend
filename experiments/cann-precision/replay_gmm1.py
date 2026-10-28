@@ -133,6 +133,7 @@ def main():
         report["status"] = "pass" if passed else "fail"
     except Exception:
         report.update(status="error", error=traceback.format_exc())
+    report["effective_opp_path"] = os.getenv("ASCEND_CUSTOM_OPP_PATH")
     atomic_json(args.output, report)
     print(json.dumps({"status": report["status"], "output": str(args.output)}))
     return 0 if report["status"] == "pass" else 1
