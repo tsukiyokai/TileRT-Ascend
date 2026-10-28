@@ -1,0 +1,47 @@
+{
+  "scope": "CPU collection regression and primary remote CI snapshot; no new A3 kernel execution",
+  "before_commit": "2d3249b1f987594ab54a6f465b8e5a7a02abdf74",
+  "after_commit": "233047cb99f67b09e458030247068dd4f0414027",
+  "files": {
+    "README.md": {
+      "bytes": 1306,
+      "sha256": "7ec868b114fbd462b89beb81a704d862519cf9c7daaafddae2ad4977b9ab29f2"
+    },
+    "after_test_ascend_specs.py": {
+      "bytes": 3229,
+      "sha256": "9a9941d4342bcaaa817eaa70e67c7711ec49bddd5c497461331116505b175801"
+    },
+    "arch_init.py": {
+      "bytes": 1719,
+      "sha256": "4542a79d7d0b8e53646795d8f6c90b3594b1b124f91dc764372ae0e4a7dc4e91"
+    },
+    "before_test_ascend_specs.py": {
+      "bytes": 2952,
+      "sha256": "445f11fd84968fe3e1f912bba9455b47f7f6e8638bab2b4011997d030ae4363f"
+    },
+    "commands.sh": {
+      "bytes": 333,
+      "sha256": "c390833cdbfc5bdc69d0049fb4179692af7f5fb4e5f0f1e8e92013f08b40c484"
+    },
+    "cpu_check.py": {
+      "bytes": 3500,
+      "sha256": "e34ca685112bc71beec20634223d8d2eb936119b4fb7b961ea31f873c38f3ad1"
+    },
+    "remote-status.json": {
+      "bytes": 1386,
+      "sha256": "e86871dc716c60d5f88cff3b9b3901f38b9d33f8c7fcb972d1430768aef98bea"
+    },
+    "root-cpu-run.log.gz": {
+      "bytes": 204,
+      "sha256": "b123495e208d8279561670127e0b6199b65ffee1839badf18e1d3656dda9a082"
+    },
+    "root-ruff-run.log.gz": {
+      "bytes": 64,
+      "sha256": "f636dd9c38f3728b3a99bc33e28f406aee058d34de358c18939c30520bd47602"
+    },
+    "template_base.py": {
+      "bytes": 5979,
+      "sha256": "1af2ace69483e1693081928d170bd369c9327bb5db674b45d3f1f42159d0bcc5"
+    }
+  }
+}

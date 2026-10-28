@@ -49,6 +49,8 @@
 
 [checkpoint消费者核验](evidence/ascend-decode/checkpoint-a3-20261028/README.md)完成109文件、405008283962B的完整SHA与固定版本清单匹配，96个索引文件另过header/区间/张量覆盖；只读视图补齐两项optional对象。SDK9.2与匹配框架实际导入通过，整模型精度另验。[Carver资源修正](evidence/ascend-decode/carver-a3-20261028/README.md)已提交[上游PR #1955](https://github.com/tile-ai/tilelang-ascend/pull/1955)，真实9392资源读取、合法分块原生JIT和15项CPU检查通过，未声称自动选块或时延改善。
 
+PR后续SDK重构的新增测试曾在collection提前初始化NPU，造成827项bad-fork失败；`233047cb`将导入延至测试执行，根线程CPU收集反例和断言AST对照通过。[当前CI记录](evidence/ascend-decode/carver-ci-20261029/README.md)：AscendC-PTO通过，原生NPU job排队；旧JIT证据保留原版本范围。
+
 真实HF参考首次构造被Transformers5.19的RoPE构造接口拒绝；[显式CPU上下文修复](evidence/ascend-decode/hf-rope-constructor-20261028/readback.json)已过实际构造。完整32行+reset正在CPU执行；[CANN一例入口](../experiments/cann-precision/README.md)已有12项CPU检查及显式仅采集权限分离。[真实9382首跑](evidence/ascend-decode/cann-precision-a3-20261028/README.md)的16rank均在加载阶段因未知`rot`模块失败，前向帧为0。实际双进程注册表与加载方法对照确认遗漏`ascend_model`插件；补齐后，新9382完成109文件SHA、模型类解析、输入准入及96/96分片加载，随后首次前向前被采集器库哈希的`str`/`Path`类型错误中断。该错误已用真实映射ELF复现并修复；模型前向与严格HF比较另验。
 
 [线性接受数修复](evidence/ascend-decode/linear-acceptance-20261028/README.md)从实际候选/预测的首次mismatch独立重算接受和预算裁剪，拒绝字段彼此一致却虚报全接受的收据；28项CPU检查通过，未构成设备数值或TPOT结果。
