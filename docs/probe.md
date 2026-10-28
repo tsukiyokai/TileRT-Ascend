@@ -26,7 +26,7 @@
 | --- | --- | --- | --- |
 | HCCL | [width32/lookup][w32-lookup] 内部 TPOT 12.413 ms；正式精度未过 | 待对应实测 | 待对应实测 |
 | 离散 SHMEM | [完整 push][execution-gap] 为共享设备上的通信组件对照 | 待对应实测 | 待对应实测 |
-| 核内 SHMEM | 待对应实测 | [三 rank 整层 tree][native-tp-tree-v1] 数值通过；合成权重、未计时 | 待对应实测 |
+| 核内 SHMEM | [RSAG TP2/TP4/TP16](evidence/ascend-decode/rsag-a3-20261028/README.md) 双规约+CUBE 数值通过，未计时 | [三 rank 整层 tree][native-tp-tree-v1] 数值通过；合成权重、未计时 | 待对应实测 |
 
 ### 时间余量的证据边界
 
@@ -44,6 +44,14 @@
 本轮机制族排序为 SFA 元数据 MTE2→UB、分布式 FP32 butterfly、A3 编译器资源描述校正。第一族从预算 1 开始；每族两次无新物理预测的临时修订后停止，保留反例再切换路线。
 
 ---
+
+## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
+
+[原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。
+
+## 2026-10-28：RSAG 的 TP16 首轮计时未过准入
+
+[三轮 ABBA 原始记录](evidence/ascend-decode/rsag-a3-20261028/README.md)保留6对独立world、每形状30样本、连续32个完整probe均摊的双时钟。rows1退化；rows12/32原始p50虽下降，最坏提交包络比例为30.88%/13.03%，均超过预注册1%（rows1为138.47%），不足以认定性能收益；不删样本或放宽阈值。固定树的原型与数值证据保留，转接真实权重的正式CANN精度采集。
 
 ## 2026-10-28：SFA 元数据预搬运未形成收益
 
