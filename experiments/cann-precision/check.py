@@ -1,6 +1,7 @@
 """Real CPU tensor checks for the strict entry; no checkpoint or NPU proof."""
 
 import copy
+from functools import wraps
 from importlib import util
 import json
 from pathlib import Path
@@ -167,6 +168,75 @@ class StrictInterface(unittest.TestCase):
             result = subprocess.run(command + extra, capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 2)
             self.assertIn("Strict mode requires --reference", result.stderr)
+
+    def test_known_sfa_signatures_preserve_arguments_and_actual_table_values(self):
+        engine = producer.fixture_engine()
+        observation = producer.PersistentTrace(
+            engine, index_dtype=torch.int32, route_dtype=torch.int32)
+        observation.begin(1)
+        query = torch.tensor([1.0])
+        indices = torch.zeros((32, 1, 2048), dtype=torch.int32)
+        arguments = (query, object(), object(), indices, object(), object(), object())
+        calls = []
+
+        def old(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                actual_seq_lengths_query, actual_seq_lengths_key):
+            return ql_nope + 1
+
+        def new(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                actual_seq_lengths_query, actual_seq_lengths_key, block_table=None):
+            return ql_nope + (0 if block_table is None else block_table.sum())
+
+        @wraps(new)
+        def recorded(*args, **kwargs):
+            calls.append((args, kwargs))
+            return new(*args, **kwargs)
+
+        self.assertTrue(torch.equal(observation._attention(0, old)(*arguments), query + 1))
+        wrapped = observation._attention(0, recorded)
+        self.assertTrue(torch.equal(wrapped(*arguments), query))
+        self.assertEqual(calls[-1][1], {})
+        self.assertEqual(len(calls[-1][0]), 7)
+        table = torch.tensor([2, 4], dtype=torch.int32)
+        self.assertTrue(torch.equal(wrapped(*arguments, table), query + 6))
+        self.assertIs(calls[-1][0][-1], table)
+        self.assertEqual(calls[-1][1], {})
+        named = dict(zip(producer.ATTENTION_ARGUMENTS, arguments))
+        self.assertTrue(torch.equal(wrapped(**named, block_table=table), query + 6))
+        self.assertEqual(calls[-1][0], ())
+        self.assertEqual(set(calls[-1][1]), set(named) | {"block_table"})
+        self.assertTrue(all(calls[-1][1][key] is value for key, value in named.items()))
+        self.assertIs(calls[-1][1]["block_table"], table)
+        self.assertTrue(torch.equal(observation.values["indices.0"], indices[:, 0, :]))
+        self.assertEqual(int(observation.seen[observation.indices["indices.0"]]), 1)
+        count = len(calls)
+        with self.assertRaises(TypeError):
+            wrapped(*arguments, unexpected=table)
+        self.assertEqual(len(calls), count)
+
+    def test_unknown_sfa_signatures_are_rejected_before_any_call(self):
+        observation = producer.PersistentTrace(
+            producer.fixture_engine(), index_dtype=torch.int32, route_dtype=torch.int32)
+
+        def wrong_name(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                       actual_seq_lengths_query, actual_seq_lengths_key, other_table=None):
+            raise AssertionError("must not run")
+
+        def wrong_default(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                          actual_seq_lengths_query, actual_seq_lengths_key, block_table=0):
+            raise AssertionError("must not run")
+
+        def unknown_tail(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                         actual_seq_lengths_query, actual_seq_lengths_key,
+                         block_table=None, unknown=None):
+            raise AssertionError("must not run")
+
+        def unknown_variadic(*args, **kwargs):
+            raise AssertionError("must not run")
+
+        for original in (wrong_name, wrong_default, unknown_tail, unknown_variadic):
+            with self.assertRaisesRegex(ValueError, "SFA consumer signature differs"):
+                observation._attention(0, original)
 
 
 if __name__ == "__main__":

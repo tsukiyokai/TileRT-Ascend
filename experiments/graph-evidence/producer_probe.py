@@ -143,20 +143,33 @@ class PersistentTrace:
             self.write('hidden_states.78', output[0])
 
     def _attention(self, layer, original):
-        require(tuple(inspect.signature(original).parameters)
-                == ATTENTION_ARGUMENTS,
+        signature = inspect.signature(original)
+        parameters = tuple(signature.parameters.values())
+        prefix = parameters[:len(ATTENTION_ARGUMENTS)]
+        required_prefix = (
+            tuple(value.name for value in prefix) == ATTENTION_ARGUMENTS
+            and all(value.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+                    and value.default is inspect.Parameter.empty
+                    for value in prefix)
+        )
+        optional_table = (
+            len(parameters) == len(ATTENTION_ARGUMENTS) + 1
+            and parameters[-1].name == 'block_table'
+            and parameters[-1].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameters[-1].default is None
+        )
+        require(required_prefix and (len(parameters) == len(ATTENTION_ARGUMENTS)
+                                     or optional_table),
                 'SFA consumer signature differs')
 
         @wraps(original)
-        def observed(ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                     actual_seq_lengths_query, actual_seq_lengths_key):
-            selected = topk_indices
+        def observed(*args, **kwargs):
+            arguments = signature.bind(*args, **kwargs).arguments
+            selected = arguments['topk_indices']
             if selected.ndim == 3:
                 selected = selected[:, 0, :]
             self.write(f'indices.{layer}', selected)
-            return original(ql_nope, q_pe, kv_cache, topk_indices,
-                            attn_metadata, actual_seq_lengths_query,
-                            actual_seq_lengths_key)
+            return original(*args, **kwargs)
 
         return observed
 
