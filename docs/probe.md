@@ -81,6 +81,8 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [prefix Value缓存](evidence/ascend-decode/prefix-values-a3-20261029/README.md)一次准备固定前缀投影、decode仅写当前行，在真实9382单die完成两臂各32次完整attention重放。缓存臂逐位匹配固定CPU PV，输入与缓存未变；目前只支持M1/8193，尚未验收整模精度及性能。
 
+[随后三臂计时](evidence/ascend-decode/prefix-value-timing-a3-20261029/README.md)在同一9382单die取得60组原生/展开/缓存对照，各臂逐位复现自身冻结输出、输入与缓存未变。12组预热、六种次序、独立进程/缓存、计时外256MiB压力、profiler关闭；完整attention＋UV墙钟p50为263.544/783.941/906.016µs，event为197.310/738.320/808.510µs。缓存未达到相对展开至少20%改善，反而慢15.6%；相对原生60组均更慢，停止此实现的性能接入，保留数值干预价值。无新增TPOT。
+
 本轮执行反省：局部舍入对账挤占了完整请求对照；逐层准备约48秒，完成16/78层后才停止并换常驻模型。传播误差下降尚未形成通过精度的基线，完整性能A/B也未完成。后续常驻整模对照沿用固定容差，组件候选单独取得数值与配对墙钟证据；容差内的CPU比特差异不作为继续迭代的理由。
 
 [速度门禁反例修复](evidence/ascend-decode/diversity-gate-20261029/README.md)：八输入、32请求、1024个零、双钟1ms的同一CPU夹具，从旧`passes_target=true`变为false。当前从请求工件重算token/bigram/周期及文件SHA，应用显式冻结policy，并保留双钟与覆盖条件。36项CPU检查通过；这是准入修复，未测设备时延。
