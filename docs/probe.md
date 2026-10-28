@@ -53,6 +53,8 @@
 
 [线性接受数修复](evidence/ascend-decode/linear-acceptance-20261028/README.md)从实际候选/预测的首次mismatch独立重算接受和预算裁剪，拒绝字段彼此一致却虚报全接受的收据；28项CPU检查通过，未构成设备数值或TPOT结果。
 
+随后v4取得16rank×32个真实M1帧：[首帧与单位对照](evidence/ascend-decode/sfa-index-units-a3-20261028/README.md)显示embedding及第0层新KV逐位匹配HF，hidden1偏差8.18%、hidden2起NaN；M32被INT32/64观测槽不匹配中断。冻结BF16 SFA把token索引配成block16，同一实际算子的单die1/16/1见证逐位输出1/1.9375/1。观测dtype已修正并过15项CPU检查，block1单因素整模型复验另行验收。
+
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 
 [原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。

@@ -981,6 +981,10 @@ class CannModel:
             from .cann_attention import SharedKVAttention
 
             objects.append(SharedKVAttention)
+        elif self.attention_kernel == "sfa":
+            from vllm_ascend.device import DeviceOperator
+
+            objects.append(DeviceOperator.execute_sparse_flash_attention_process)
         if self.fp32_head:
             from .cann_head import fp32_projection
 

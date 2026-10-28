@@ -81,10 +81,16 @@ class PersistentTrace:
         require(not any(layer.use_sequence_parallel_moe
                         for layer in backbone.layers),
                 'Observation requires unsharded rows')
+        request_buffers = {'input_ids': engine.input_ids,
+                           'positions': engine.positions}
+        require(all(isinstance(value, torch.Tensor)
+                    and value.dtype in (torch.int32, torch.int64)
+                    for value in request_buffers.values()),
+                'Request buffers must retain INT32 or INT64 dtype')
         self.engine = engine
         self.epoch = torch.zeros((), dtype=torch.int64, device=engine.device)
-        shapes = {'input_ids': ((WIDTH,), torch.int64),
-                  'positions': ((WIDTH,), torch.int64)}
+        shapes = {tag: ((WIDTH,), value.dtype)
+                  for tag, value in request_buffers.items()}
         shapes.update({f'hidden_states.{layer}': (
             (WIDTH, backbone.hidden_size), torch.bfloat16,
         ) for layer in range(LAYERS + 1)})
@@ -410,7 +416,7 @@ def fixture_engine():
     engine.attention_kernel, engine.graph_width = 'sfa', WIDTH
     engine.graph, engine.config = None, SimpleNamespace()
     engine.model = FixtureLM(engine.capacity)
-    engine.input_ids = torch.empty(WIDTH, dtype=torch.int64)
+    engine.input_ids = torch.empty(WIDTH, dtype=torch.int32)
     engine.positions = torch.empty(WIDTH, dtype=torch.int64)
     engine.cache = [
         {name: getattr(layer, name) for name in CACHE_FIELDS.values()

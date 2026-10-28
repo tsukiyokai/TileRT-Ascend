@@ -129,6 +129,83 @@ class StrictInterface(unittest.TestCase):
         with self.assertRaises(ValueError):
             producer.CannTrace(engine.model, 32)  # The old guard remains intact.
 
+    def test_actual_verify_keeps_request_dtypes_addresses_and_replay_epochs(self):
+        tokens = list(range(1, 33))
+        for token_dtype in (torch.int32, torch.int64):
+            with self.subTest(token_dtype=token_dtype):
+                engine = producer.fixture_engine()
+                engine.input_ids = torch.empty(32, dtype=token_dtype)
+                with producer.cpu_context_adapters(), torch.inference_mode(), producer.PersistentTrace(
+                    engine, index_dtype=torch.int32, route_dtype=torch.int32,
+                ) as observation:
+                    addresses = observation.addresses()
+                    request_addresses = (engine.input_ids.data_ptr(), engine.positions.data_ptr())
+                    first = None
+                    for epoch, ids in ((1, tokens), (2, list(range(65, 97))), (3, tokens)):
+                        if epoch == 3:
+                            engine.reset()
+                        start = engine.position
+                        observation.begin(epoch)
+                        self.assertTrue(bool(torch.all(observation.seen == -1)))
+                        result = engine.verify(ids)
+                        values = observation.readback(result, ids, start)
+                        self.assertEqual(observation.values["input_ids"].dtype, token_dtype)
+                        self.assertEqual(observation.values["positions"].dtype, torch.int64)
+                        self.assertTrue(torch.equal(observation.values["input_ids"], engine.input_ids))
+                        self.assertTrue(torch.equal(observation.values["positions"], engine.positions))
+                        self.assertTrue(bool(torch.all(observation.seen == epoch)))
+                        self.assertEqual(observation.addresses(), addresses)
+                        self.assertEqual((engine.input_ids.data_ptr(), engine.positions.data_ptr()),
+                                         request_addresses)
+                        if epoch == 1:
+                            first = values
+                        elif epoch == 3:
+                            self.assertTrue(all(value is None if first[tag] is None else
+                                                torch.equal(value, first[tag])
+                                                for tag, value in values.items()))
+
+    def test_request_slots_follow_both_integer_dtypes_and_reject_contract_changes(self):
+        for token_dtype in (torch.int32, torch.int64):
+            for position_dtype in (torch.int32, torch.int64):
+                with self.subTest(token_dtype=token_dtype, position_dtype=position_dtype):
+                    engine = producer.fixture_engine()
+                    engine.input_ids = torch.empty(1, dtype=token_dtype)
+                    engine.positions = torch.empty(1, dtype=position_dtype)
+                    observation = producer.PersistentTrace(
+                        engine, index_dtype=torch.int32, route_dtype=torch.int32)
+                    self.assertEqual(observation.values["input_ids"].shape, (32,))
+                    self.assertEqual(observation.values["positions"].shape, (32,))
+                    addresses = observation.addresses()
+                    engine.input_ids = torch.arange(32, dtype=token_dtype)
+                    engine.positions = torch.arange(32, dtype=position_dtype)
+                    observation.begin(1)
+                    observation._embedding_input(None, (engine.input_ids,))
+                    for tag in ("input_ids", "positions"):
+                        value = getattr(engine, tag)
+                        self.assertEqual(observation.values[tag].dtype, value.dtype)
+                        self.assertTrue(torch.equal(observation.values[tag], value))
+                        self.assertEqual(int(observation.seen[observation.indices[tag]]), 1)
+                    observation.begin(2)
+                    for tag in ("input_ids", "positions"):
+                        value = getattr(engine, tag)
+                        other_dtype = torch.int64 if value.dtype == torch.int32 else torch.int32
+                        for wrong in (value[:31], value.to(other_dtype),
+                                      torch.empty(32, dtype=value.dtype, device="meta")):
+                            with self.assertRaisesRegex(ValueError, "contract differs"):
+                                observation.write(tag, wrong)
+                            self.assertEqual(int(observation.seen[observation.indices[tag]]), -1)
+                    self.assertEqual(observation.addresses(), addresses)
+
+    def test_request_slots_reject_unsupported_engine_buffer_dtypes(self):
+        for tag in ("input_ids", "positions"):
+            for dtype in (torch.float32, torch.float16, torch.bool, torch.int16):
+                with self.subTest(tag=tag, dtype=dtype):
+                    engine = producer.fixture_engine()
+                    setattr(engine, tag, torch.empty(32, dtype=dtype))
+                    with self.assertRaisesRegex(ValueError, "INT32 or INT64"):
+                        producer.PersistentTrace(
+                            engine, index_dtype=torch.int32, route_dtype=torch.int32)
+
     def test_teacher_contract_rejects_changed_prompt_and_missing_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
