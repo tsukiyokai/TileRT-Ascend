@@ -59,6 +59,8 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [16rank三次M32边界采集](evidence/ascend-decode/reset-boundaries-a3-20261028/README.md)将首个已采差异推进至layer3 MoE：rank1/2的TP输入已变化，清尾部后rank3也变化；此前归一化与注意力采样重复一致。仅看rank0会误归因规约。下一步细分本地共享/路由专家及合并，无新增TPOT结论。
 
+随后首差收窄至融合GMM1；[实际ELF重放](evidence/ascend-decode/gmm1-selection-a3-20261029/README.md)确认插件把原vendor加到overlay之前。保留原vendor路径使overlay优先后，同一9392单die的8192行INT8码全匹配CPU、32次逐位重复；FP32 scale尚有32行最多3 ULP，严格退出1。启动器修正路径顺序，整模型精度与TPOT继续验收。
+
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 
 [原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。

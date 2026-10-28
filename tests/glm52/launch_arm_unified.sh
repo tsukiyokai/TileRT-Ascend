@@ -56,7 +56,8 @@ runtime=${RUNTIME:?}
 # `vllm.platform_plugins`. Without it `VLLM_PLUGINS=ascend` selects nothing, no
 # platform registers, and the engine dies in `DeviceConfig` on an empty device
 # string rather than on anything to do with devices.
-export PYTHONPATH="$tree:${VLLM_TREE:-$runtime/vendor-hook-pinned/vllm-a982-py311-compatible}:${VLLM_ASCEND_TREE:-$runtime/vendor-hook-pinned/ascend-python-build}:$runtime/vendor-hook-pinned/vendor-metadata:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
+ascend_tree=${VLLM_ASCEND_TREE:-$runtime/vendor-hook-pinned/ascend-python-build}
+export PYTHONPATH="$tree:${VLLM_TREE:-$runtime/vendor-hook-pinned/vllm-a982-py311-compatible}:$ascend_tree:$runtime/vendor-hook-pinned/vendor-metadata:$runtime/vendor-hook-deps/transformers519:$runtime/vendor-hook-deps/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # `fla_npu` cannot be dropped even though its kernels are not wanted here:
 # `vllm_ascend/ops/gdn.py` imports it unconditionally for Qwen3.5. Its
@@ -70,7 +71,9 @@ export LD_LIBRARY_PATH="/opt/openEuler/gcc-toolset-12/root/usr/lib64${LD_LIBRARY
 # speed, not about existence: `aclnnScatterNdUpdateSk` is in this overlay's
 # `libcust_opapi.so` and in no `libopapi.so`, so the KV scatter faults without
 # it.
-export ASCEND_CUSTOM_OPP_PATH="/opt/kernel-overlay/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+# Keep the original vendor present so plugin bootstrap preserves this order.
+original_vendor=$ascend_tree/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+export ASCEND_CUSTOM_OPP_PATH="/opt/kernel-overlay/vendors/custom_transformer:$original_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 # Select the Ascend platform and model adapters before the first vLLM import.
 # The image's omni_npu uses a different vLLM entrypoint layout.
 export VLLM_PLUGINS=ascend,ascend_model
