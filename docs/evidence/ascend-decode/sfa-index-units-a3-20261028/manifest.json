@@ -2,12 +2,24 @@
   "scope": "Observed SFA unit witness, failed v4 model and CPU request-slot checks; no TPOT acceptance",
   "files": {
     "README.md": {
-      "bytes": 1946,
-      "sha256": "3393062e79e82b80b1632cb58046d2384994c6889cf11eed5a79002e3643ed0f"
+      "bytes": 2840,
+      "sha256": "f038a49198e605287e5901e19ffd4d7eaf8424158def715ad6f5816a45627744"
+    },
+    "candidate-v6-readback.json.gz": {
+      "bytes": 21025,
+      "sha256": "2eecb91e99a892e8acdf630552b22a1db6a320c2dfb4211e59f62eb2a68e5007"
+    },
+    "candidate-v6-reset.json.gz": {
+      "bytes": 653,
+      "sha256": "02a855a5136b6073f29a4ddcab503866cd534ad5be97757414baae8b3d16a041"
     },
     "device-sfa-consumer.txt": {
       "bytes": 2650,
       "sha256": "aa5b6fbad42817e997cd0f007bf8670969bd140c303cd588d984519aa4ab4558"
+    },
+    "hf-complete.json": {
+      "bytes": 483,
+      "sha256": "18409f72be5e87519e7a99864f3195ec31b8645ebe7e3e5d4f062d758af1bf6c"
     },
     "request-dtype-cpu.log.gz": {
       "bytes": 647,
