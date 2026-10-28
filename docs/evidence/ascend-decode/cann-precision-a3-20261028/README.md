@@ -10,4 +10,4 @@
 
 统一启动器在第一次 vLLM import 前设置 `ascend,ascend_model`。独立 precision/server 启动也须携带这份配置并使用全新进程；插件及模型解析均有进程内缓存。原始 CPU 日志压缩保存于本目录。
 
-v3的[实际A3准入](v3-admission.json)完成新消费者109文件完整SHA、9382/16die和真正模型类解析；96/96分片加载完成，随后在首次前向之前因采集器将字符串传给`digest(Path)`接口而退出。[16rank错误和真实退出1](v3-runtime-error.json)保留。库哈希改为显式`Path(path)`；原错误由真实映射的CPU ELF复现，修复后同一映射检查及共12项CPU检查通过，见[日志](mapped-library-cpu.log)。尚无模型前向或精度通过。
+v3的[实际A3准入](v3-admission.json)完成新消费者109文件完整SHA、9382/16die和真正模型类解析；96/96分片加载完成，随后在首次前向之前因采集器将字符串传给`digest(Path)`接口而退出。[16rank错误和真实退出1](v3-runtime-error.json)保留。库哈希改为显式`Path(path)`；原错误由真实映射的CPU ELF复现，修复后同一映射检查及共12项CPU检查通过，见[日志](mapped-library-cpu.log.gz)。尚无模型前向或精度通过。

@@ -2,16 +2,16 @@
   "scope": "Failed captures and verified plugin/runtime admission; no model precision or timing pass",
   "files": {
     "README.md": {
-      "sha256": "748b744677996cc3dba2d87240a4921a7a1f5dfd14055fe48cfed07bea345c5a",
-      "bytes": 1971
+      "sha256": "0c54446152bd5d7190cb965117f2084d31fe4217c1c34d9e0549bbdc7da83a4d",
+      "bytes": 1974
     },
     "failure-readback.json": {
       "sha256": "6e4f4a1315b4519b97a4031f4f288fe4a975cd8f67840509be03d7b2b240e6a8",
       "bytes": 7764
     },
-    "mapped-library-cpu.log": {
-      "sha256": "40cfcba2432c445c2788cb250d1380b0a7910c84af405721440eaad934fa93fb",
-      "bytes": 1919
+    "mapped-library-cpu.log.gz": {
+      "sha256": "83fc4d578d3bcf378518d68aeacf354db09d2579f0b8199f651676236e952a3b",
+      "bytes": 551
     },
     "plugin-admission/actual-loader.json": {
       "sha256": "e271ba8a31236b2b6ff80c09f9adebbe7d59e11bc109da9996cb196efe51b4a7",
