@@ -644,6 +644,14 @@ def execute(args):
     engine.replay_progress = args.replay_call = {} if round_trace else None
     engine.onesided_endpoint, engine._onesided = None, None
     engine._tp_sum_group, engine.graph = None, None
+    engine._routed_workspace_pool = None
+    engine._routed_shared_workspace_pool = None
+    engine._mla_tail_workspace_pool = None
+    engine._native_attention_workspace_pool = None
+    engine._restore_combine, engine._restore_routed = None, None
+    engine._restore_routed_shared = []
+    engine._restore_mla_tail = []
+    engine._restore_native_attention = []
     torch.npu.set_device(engine.device)
     total = torch.npu.get_device_properties(engine.device).total_memory
     torch.npu.set_per_process_memory_fraction(

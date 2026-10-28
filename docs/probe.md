@@ -69,6 +69,12 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [固定真实概率的Value重排](evidence/ascend-decode/mla-value-order-a3-20261029/README.md)在9392单die比较BF16先展开与后投影，各32次逐字节稳定；先展开匹配CPU，后投影对自身CPU最大差9.31e-10。两图有510/1024项不同、NRMSE为0.00333698。新用例的CPU设置已对齐冻结HF的mkldnn=False；该见证尚待实际层0 attention/Oproj输入确认对hidden1的贡献，未测时延。
 
+[真实TP16第一层采样](evidence/ascend-decode/layer0-boundaries-a3-20261029/README.md)每rank22项检查全过，逐位复现原完整CANN首帧。input norm匹配HF；固定实际attention输出后，原HF post norm与MLP逐位重建CANN h1；固定实际16份o_proj输入，参考投影的BF16汇总也匹配实际attention。首token的第一层偏差收窄到o_proj之前。局部partial与FP32规约差异均未改变该处BF16汇总；无新增模型精度或TPOT通过。
+
+同一层的[Value闭包](evidence/ascend-decode/layer0-boundaries-a3-20261029/value-result.json)固定HF概率并接原o_proj/norm/MLP：先展开分支逐位重建HF h1；后投影分支对HF h1的NRMSE为0.00348409，对实际CANN仍有0.00350671残差。Value见证已接入第一层，但尚不能单因解释CANN偏差；继续采集实际SFA边界。
+
+[实际SFA边界](evidence/ascend-decode/layer0-boundaries-a3-20261029/sfa-result.json)再次逐位复现原完整CANN首帧；实际SFA输出接参考UV/o_proj/HF尾部，在16rank逐位闭合CANN h1。固定实际query/KV的FP32候选context对设备NRMSE为0.00028106–0.00101148，概率对HF为0.00452071–0.02901260；仅把概率转BF16仍未闭合。下一步区分QK分数舍入与query吸收投影，不把全局CPU softmax当CANN内部模拟。
+
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 
 [原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。
