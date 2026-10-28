@@ -77,6 +77,14 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [score/Value舍入与扩层](evidence/ascend-decode/attention-rounding-a3-20261029/README.md)：保持BF16概率的单因素CPU对照中，BF16 score令概率最大NRMSE从0.028113降至0.001300。组合先展开Value后，真实TP16 h1误差从0.003595降至0.001961；单die重放的score/P逐位闭合CPU，Value改FP32未改变最终PV，停止该旋钮。前三层误差为0.001961/0.004716/0.006684，16rank一致、原hidden容差内；h3只改善约14%，未达预注册30%预测。局部逐位对账没有转化为整模精度或时延通过；下一步沿原采集扩层，保留首个越界与离散选择证据，避免继续追平容差内的CPU比特。
 
+[完整常驻模型](evidence/ascend-decode/resident-attention-a3-20261029/README.md)随后取得两臂各首帧/reset的64个PT和32份rank报告。同一冻结HF、相同模型与world、固定HF32=false，原臂复现既有0.0771525 logits误差；组合降至0.0608584，首个hidden越界h7→h8、首个专家选择分歧layer6→14，满足预先登记的两项传播预测。16rank的全部观测字段一致，reset及新增路由weights/logits逐位重复；首帧精度仍失败，无新增TPOT。
+
+[prefix Value缓存](evidence/ascend-decode/prefix-values-a3-20261029/README.md)一次准备固定前缀投影、decode仅写当前行，在真实9382单die完成两臂各32次完整attention重放。缓存臂逐位匹配固定CPU PV，输入与缓存未变；目前只支持M1/8193，尚未验收整模精度及性能。
+
+本轮执行反省：局部舍入对账挤占了完整请求对照；逐层准备约48秒，完成16/78层后才停止并换常驻模型。传播误差下降尚未形成通过精度的基线，完整性能A/B也未完成。后续常驻整模对照沿用固定容差，组件候选单独取得数值与配对墙钟证据；容差内的CPU比特差异不作为继续迭代的理由。
+
+[速度门禁反例修复](evidence/ascend-decode/diversity-gate-20261029/README.md)：八输入、32请求、1024个零、双钟1ms的同一CPU夹具，从旧`passes_target=true`变为false。当前从请求工件重算token/bigram/周期及文件SHA，应用显式冻结policy，并保留双钟与覆盖条件。36项CPU检查通过；这是准入修复，未测设备时延。
+
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 
 [原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。

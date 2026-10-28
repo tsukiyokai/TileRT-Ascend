@@ -50,11 +50,36 @@ def terminal(count=3):
             "finish_reason": "length"}
 
 
-def benchmark_summary(requests, precision, warmup=3):
+def benchmark_request(tokens, number=0, producer_ns=1000000,
+                      client_ns=1000000):
+    return {
+        "rid": str(number), "client_token_ids": list(tokens),
+        "producer_report": {"token_ids": list(tokens),
+                            "returned_token_ids": list(tokens)},
+        "diversity": bench.output_diversity(tokens),
+        "producer": token_metrics(tokens, [i * producer_ns
+                                          for i in range(len(tokens))]),
+        "client": token_metrics(tokens, [i * client_ns
+                                        for i in range(len(tokens))]),
+        "prompt_sha256": bench.prompt_digest([number % 8] * 8192),
+    }
+
+
+def save_request(directory, name, request):
+    bench.atomic_json(directory / name, request)
+    return hashlib.sha256((directory / name).read_bytes()).hexdigest()
+
+
+def benchmark_summary(requests, precision, directory, warmup=3, policy=None):
+    names = [f"request-{number:04d}.json" for number in range(len(requests))]
+    (directory / "diversity-policy.json").unlink(missing_ok=True)
     return {
         **{source: bench.aggregate(requests, source)
            for source in ("producer", "client")},
-        "requests": list(range(len(requests))),
+        "requests": names,
+        "request_sha256": {name: save_request(directory, name, request)
+                           for name, request in zip(names, requests)},
+        "diversity_policy": bench.freeze_diversity_policy(policy, directory),
         "warmup_requests": list(range(warmup)), "precision": precision,
         "measured_prompt_counts": dict(Counter(
             item["prompt_sha256"] for item in requests
@@ -454,17 +479,166 @@ class DecodeTimingChecks(unittest.TestCase):
 
     def test_buffered_client_cannot_hide_slow_producer(self):
         tokens = list(range(1024))
-        requests = [{
-            "producer": token_metrics(tokens, [i * 3000000 for i in tokens]),
-            "client": token_metrics(tokens, [4000000000] * len(tokens)),
-            "prompt_sha256": bench.prompt_digest([number % 8] * 8192),
-        } for number in range(32)]
+        requests = [benchmark_request(tokens, number, 3000000, 0)
+                    for number in range(32)]
         precision = {"prompt_sha256s": sorted(set(
             request["prompt_sha256"] for request in requests
         ))}
-        summary = benchmark_summary(requests, precision)
+        summary = benchmark_summary(requests, precision, self.directory,
+                                    policy=self.diversity_policy())
         self.assertEqual(summary["client"]["request_p95_ms"], 0)
-        self.assertFalse(bench.passes_target(summary))
+        self.assertFalse(bench.passes_target(
+            summary, requests, self.directory,
+        ))
+
+    def diversity_policy(self, tokens=2, bigrams=2):
+        path = self.directory / "policy-source.json"
+        bench.atomic_json(path, {"min_distinct_tokens": tokens,
+                                 "min_distinct_bigrams": bigrams})
+        return bench.load_diversity_policy(path)
+
+    def frozen_diversity_policy(self, tokens=2, bigrams=2):
+        policy = self.diversity_policy(tokens, bigrams)
+        (self.directory / "diversity-policy.json").unlink(missing_ok=True)
+        return bench.freeze_diversity_policy(policy, self.directory)
+
+    def diversity_case(self, tokens=None):
+        if tokens is None:
+            tokens = list(range(1024))
+        requests = [benchmark_request(tokens, number) for number in range(32)]
+        precision = {"prompt_sha256s": sorted({
+            request["prompt_sha256"] for request in requests
+        })}
+        summary = benchmark_summary(requests, precision, self.directory,
+                                    policy=self.diversity_policy())
+        return summary, requests
+
+    def test_explicit_diversity_policy_has_no_default_minima(self):
+        self.assertIsNone(bench.load_diversity_policy(None))
+        policy = self.diversity_policy(1024, 1023)
+        self.assertEqual(policy["sha256"], hashlib.sha256(
+            Path(policy["file"]).read_bytes()).hexdigest())
+        for value in (None, {}, [], {"min_distinct_tokens": 2}):
+            path = self.directory / "invalid-policy.json"
+            bench.atomic_json(path, value)
+            with self.assertRaises(ValueError):
+                bench.load_diversity_policy(path)
+        for field in ("min_distinct_tokens", "min_distinct_bigrams"):
+            for value in (True, 1, 0, -1, 2.0, "2"):
+                values = {"min_distinct_tokens": 2, "min_distinct_bigrams": 2}
+                values[field] = value
+                bench.atomic_json(path, values)
+                with self.assertRaises(ValueError):
+                    bench.load_diversity_policy(path)
+        summary, requests = self.diversity_case()
+        source = Path(summary["diversity_policy"]["source"]["file"])
+        raw = b'{ "min_distinct_tokens": 2, "min_distinct_bigrams": 2 }\n'
+        source.write_bytes(raw)
+        frozen = self.directory / "diversity-policy.json"
+        frozen.unlink()
+        summary["diversity_policy"] = bench.freeze_diversity_policy(
+            bench.load_diversity_policy(source), self.directory,
+        )
+        self.assertEqual(frozen.read_bytes(), raw)
+        source.unlink()
+        self.assertTrue(bench.passes_target(
+            summary, requests, self.directory,
+        ))
+
+    def test_fast_complete_outputs_need_the_explicit_policy(self):
+        summary, requests = self.diversity_case()
+        summary["diversity_policy"] = None
+        summary["diversity_passed"] = True
+        self.assertFalse(bench.passes_target(
+            summary, requests, self.directory,
+        ))
+
+    def test_one_ms_constant_output_cannot_pass_the_target(self):
+        summary, requests = self.diversity_case([0] * 1024)
+        for source in ("producer", "client"):
+            self.assertEqual(summary[source]["request_p95_ms"], 1.0)
+        self.assertEqual(len(summary["measured_prompt_counts"]), 8)
+        self.assertFalse(bench.passes_target(
+            summary, requests, self.directory,
+        ))
+
+    def test_whole_output_period_rejects_even_truncated_repetitions(self):
+        for period in (257, 512, 513):
+            tokens = [row % period for row in range(1024)]
+            summary, requests = self.diversity_case(tokens)
+            summary["diversity_policy"] = self.frozen_diversity_policy(128, 128)
+            self.assertEqual(
+                requests[0]["diversity"]["minimum_period"], period,
+            )
+            self.assertEqual(
+                bench.passes_target(summary, requests, self.directory),
+                period > 512,
+            )
+
+    def test_diversity_minima_are_applied_to_actual_tokens_and_bigrams(self):
+        for tokens, bigrams, passed in ((1024, 1023, True),
+                                       (1025, 1023, False),
+                                       (1024, 1024, False)):
+            summary, requests = self.diversity_case()
+            summary["diversity_policy"] = self.frozen_diversity_policy(
+                tokens, bigrams,
+            )
+            self.assertEqual(
+                bench.passes_target(summary, requests, self.directory), passed,
+            )
+
+    def test_missing_or_forged_diversity_statistics_are_recomputed(self):
+        mutations = (None, "output_sha256", "distinct_output_tokens",
+                     "distinct_output_bigrams", "minimum_period",
+                     "output_tokens")
+        for field in mutations:
+            summary, requests = self.diversity_case()
+            if field is None:
+                del requests[0]["diversity"]
+            elif field == "output_sha256":
+                requests[0]["diversity"][field] = "0" * 64
+            else:
+                requests[0]["diversity"][field] += 1
+            name = summary["requests"][0]
+            summary["request_sha256"][name] = save_request(
+                self.directory, name, requests[0],
+            )
+            self.assertFalse(bench.passes_target(
+                summary, requests, self.directory,
+            ), msg=str(field))
+
+    def test_request_bytes_counts_and_complete_token_lists_are_required(self):
+        for field in ("sha", "raw", "tokens", "returned", "count", "coverage",
+                      "measured", "policy"):
+            summary, requests = self.diversity_case()
+            name = summary["requests"][0]
+            if field == "sha":
+                summary["request_sha256"][name] = "0" * 64
+            elif field == "raw":
+                with (self.directory / name).open("a") as stream:
+                    stream.write(" ")
+            elif field == "tokens":
+                requests[0]["client_token_ids"].pop()
+            elif field == "returned":
+                requests[0]["producer_report"]["returned_token_ids"][0] = 7
+            elif field == "count":
+                requests[0]["client"]["output_tokens"] -= 1
+                summary["client"] = bench.aggregate(requests, "client")
+            elif field == "coverage":
+                prompt = requests[0]["prompt_sha256"]
+                summary["measured_prompt_counts"][prompt] += 1
+            elif field == "measured":
+                requests.pop()
+            else:
+                with (self.directory / "diversity-policy.json").open("ab") as stream:
+                    stream.write(b" ")
+            if field in ("tokens", "returned", "count"):
+                summary["request_sha256"][name] = save_request(
+                    self.directory, name, requests[0],
+                )
+            self.assertFalse(bench.passes_target(
+                summary, requests, self.directory,
+            ), msg=field)
 
     def test_prompt_identity_matches_the_prefix_producer(self):
         prompts = [[token] * 8192 for token in range(8)]
@@ -488,6 +662,7 @@ class DecodeTimingChecks(unittest.TestCase):
             precision_dir=self.directory / "precision",
             checkpoint=self.directory / "checkpoint", mtp_width=4,
             expert_bank=False, output=self.directory / "benchmark",
+            diversity_policy=self.diversity_policy()["file"],
             warmup=warmup, requests=requests,
         )
 
@@ -508,23 +683,28 @@ class DecodeTimingChecks(unittest.TestCase):
         prompts = [[token] * 8192 for token in range(8)]
         precision = {"prompt_sha256s": [bench.prompt_digest(prompt)
                                        for prompt in prompts]}
-        metrics = token_metrics(list(range(1024)),
-                                [i * 2000000 for i in range(1024)])
         cases = (
-            (prompts, 3, 32, True, 8),
-            (prompts[:1], 3, 32, False, 1),
-            ([prompts[7]] + prompts[:7] * 5, 3, 32, False, 7),
-            (prompts[:1], 0, 1, False, 1),
+            (prompts, 3, 32, True, 8, True),
+            (prompts, 3, 32, False, 8, False),
+            (prompts, 2, 32, False, 8, True),
+            (prompts, 3, 31, False, 8, True),
+            (prompts[:1], 3, 32, False, 1, True),
+            ([prompts[7]] + prompts[:7] * 5, 3, 32, False, 7, True),
+            (prompts[:1], 0, 1, False, 1, True),
         )
-        for submitted, warmup, count, passes, coverage in cases:
+        for number, case in enumerate(cases):
+            submitted, warmup, count, passes, coverage, policy = case
             args = self.benchmark_args(warmup, count)
+            args.output = self.directory / f"benchmark-{number}"
+            if not policy:
+                args.diversity_policy = None
             bench.atomic_json(args.prompt_ids, submitted)
             calls = []
 
-            def measured(_args, prompt, _precision):
+            def measured(_args, prompt, _precision, calls=calls):
                 calls.append(prompt)
-                return {"rid": str(len(calls)), "client": metrics,
-                        "producer": metrics, "rounds": [],
+                return {**benchmark_request(list(range(1024)), len(calls),
+                                            2000000, 2000000), "rounds": [],
                         "client_ttft_ms": 1,
                         "prompt_sha256": bench.prompt_digest(prompt)}
 
@@ -539,6 +719,26 @@ class DecodeTimingChecks(unittest.TestCase):
             self.assertEqual(len(result["requests"]), count)
             self.assertEqual(len(result["warmup_requests"]), warmup)
             self.assertEqual(len(result["measured_prompt_counts"]), coverage)
+            self.assertEqual(result["status"], "measured")
+            self.assertEqual(result["diversity_policy"] is not None, policy)
+
+    def test_diversity_does_not_relax_either_clock_or_trust_aggregate_timing(self):
+        for source in ("producer", "client"):
+            summary, requests = self.diversity_case()
+            for request in requests:
+                request[source] = token_metrics(
+                    request["client_token_ids"],
+                    [i * 3000000 for i in range(1024)],
+                )
+            summary[source] = bench.aggregate(requests, source)
+            self.assertFalse(bench.passes_target(
+                summary, requests, self.directory,
+            ))
+            summary[source]["request_p50_ms"] = 1.0
+            summary[source]["request_p95_ms"] = 1.0
+            self.assertFalse(bench.passes_target(
+                summary, requests, self.directory,
+            ))
 
     def test_request_mean_and_token_weighted_statistics_differ(self):
         requests = [

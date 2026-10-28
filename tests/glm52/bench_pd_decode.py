@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import http.client
+from itertools import pairwise
 import json
 import math
 from pathlib import Path
@@ -120,6 +121,60 @@ def prompt_digest(prompt):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def load_diversity_policy(path):
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    raw = path.read_bytes()
+    policy = json.loads(raw)
+    fields = ("min_distinct_tokens", "min_distinct_bigrams")
+    if (not isinstance(policy, dict)
+            or any(type(policy.get(name)) is not int or policy[name] <= 1
+                   for name in fields)):
+        raise ValueError(
+            "Diversity minima must be explicit integers greater than one",
+        )
+    return {"file": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+            **{name: policy[name] for name in fields}}
+
+
+def freeze_diversity_policy(policy, directory):
+    if policy is None:
+        return None
+    raw = Path(policy["file"]).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != policy["sha256"]:
+        raise ValueError("Diversity policy changed before its snapshot")
+    name = "diversity-policy.json"
+    with (Path(directory) / name).open("xb") as stream:
+        stream.write(raw)
+    return {**policy, "file": name,
+            "source": {"file": policy["file"], "sha256": policy["sha256"]}}
+
+
+def output_diversity(tokens):
+    if (not isinstance(tokens, list) or len(tokens) != OUTPUT_TOKENS
+            or any(type(token) is not int or not 0 <= token < VOCAB_SIZE
+                   for token in tokens)):
+        raise ValueError("Diversity requires all 1024 actual output token IDs")
+    # N - longest proper border gives the minimum period, including a final
+    # partial repetition; divisibility by the period is not required.
+    borders = [0] * len(tokens)
+    for index in range(1, len(tokens)):
+        length = borders[index - 1]
+        while length and tokens[index] != tokens[length]:
+            length = borders[length - 1]
+        if tokens[index] == tokens[length]:
+            length += 1
+        borders[index] = length
+    return {
+        "output_tokens": len(tokens),
+        "distinct_output_tokens": len(set(tokens)),
+        "distinct_output_bigrams": len(set(pairwise(tokens))),
+        "minimum_period": len(tokens) - borders[-1],
+        "output_sha256": prompt_digest(tokens),
+    }
+
+
 def validate_prompts(prompts, precision):
     expected = precision.get("prompt_sha256s")
     if (not isinstance(expected, list) or len(expected) != 8
@@ -134,20 +189,58 @@ def validate_prompts(prompts, precision):
     return actual
 
 
-def passes_target(summary):
-    count = len(summary["requests"])
-    coverage = summary["measured_prompt_counts"]
-    return (
-        len(summary["warmup_requests"]) >= 3 and count >= 32
-        and len(coverage) == 8
-        and set(coverage) == set(summary["precision"]["prompt_sha256s"])
-        and sum(coverage.values()) == count
-        and all(summary[source]["requests"] == count
-                for source in ("producer", "client"))
-        and all(summary[source][stat] <= 2.0
-                for source in ("producer", "client")
-                for stat in ("request_p50_ms", "request_p95_ms"))
-    )
+def passes_target(summary, measured, directory):
+    """Recheck saved outputs; diversity alone does not establish model quality."""
+    try:
+        count = len(measured)
+        names = summary["requests"]
+        coverage = dict(Counter(item["prompt_sha256"] for item in measured))
+        prompts = summary["precision"]["prompt_sha256s"]
+        if (len(summary["warmup_requests"]) < 3 or count < 32
+                or len(names) != count or len(set(names)) != count
+                or len(prompts) != 8 or len(set(prompts)) != 8
+                or coverage != summary["measured_prompt_counts"]
+                or set(coverage) != set(prompts)):
+            return False
+        for source in ("producer", "client"):
+            actual = aggregate(measured, source)
+            if (summary[source] != actual or not all(
+                    actual[stat] <= 2.0
+                    for stat in ("request_p50_ms", "request_p95_ms"))):
+                return False
+        policy = summary.get("diversity_policy")
+        if policy is None or policy["file"] != "diversity-policy.json":
+            return False
+        frozen = load_diversity_policy(Path(directory) / policy["file"])
+        if (policy != {**frozen, "file": policy["file"],
+                       "source": policy["source"]}
+                or policy["source"]["sha256"] != frozen["sha256"]):
+            return False
+        for name, request in zip(names, measured):
+            if Path(name).name != name:
+                return False
+            raw = (Path(directory) / name).read_bytes()
+            if (hashlib.sha256(raw).hexdigest()
+                    != summary["request_sha256"][name]
+                    or json.loads(raw) != request):
+                return False
+            tokens = request["client_token_ids"]
+            stats = output_diversity(tokens)
+            producer = request["producer_report"]
+            if (request.get("diversity") != stats
+                    or producer["token_ids"] != tokens
+                    or producer["returned_token_ids"] != tokens
+                    or any(request[source]["output_tokens"] != len(tokens)
+                           for source in ("producer", "client"))
+                    or stats["minimum_period"] * 2 <= len(tokens)
+                    or stats["distinct_output_tokens"]
+                    < policy["min_distinct_tokens"]
+                    or stats["distinct_output_bigrams"]
+                    < policy["min_distinct_bigrams"]):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 def validate_runtime(producer, precision):
@@ -416,6 +509,7 @@ def run_request(args, prompt, precision):
         "rid": rid, "request_start_ns": start,
         "prefill_response": response, "first_token_id": first,
         "prompt_sha256": prompt_digest(prompt),
+        "diversity": output_diversity(received.token_ids),
         "client": client, "client_token_ns": received.timestamps_ns,
         "client_token_ids": received.token_ids,
         "client_messages": received.messages, "client_reads": received.reads,
@@ -452,6 +546,9 @@ def parse_arguments():
     parser.add_argument("--prompt-ids", type=Path, required=True)
     parser.add_argument("--timing-dir", type=Path, required=True)
     parser.add_argument("--precision-dir", type=Path, required=True)
+    parser.add_argument("--diversity-policy", type=Path,
+                        help="Explicit token/bigram minima; without a policy, "
+                             "passes_2ms remains false")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--mtp-width", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--expert-bank", action="store_true")
@@ -470,6 +567,7 @@ def main():
     from precision_gate import validate_workload_precision
 
     prompts = load_prompts(args.prompt_ids)
+    diversity_policy = load_diversity_policy(args.diversity_policy)
     precision = validate_workload_precision(
         args.precision_dir, args.checkpoint, mtp_width=args.mtp_width,
         expert_backend="bank" if args.expert_bank else "per_expert",
@@ -477,11 +575,13 @@ def main():
     )
     prompt_hashes = validate_prompts(prompts, precision)
     atomic_json(args.output / "prompts.json", prompts)
+    diversity_policy = freeze_diversity_policy(diversity_policy, args.output)
     report = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "scope": "A3 TP16 GLM-5.2-W4A8C8 batch1 PD decode; 8192 -> 1024",
         "python": platform.python_version(), "precision": precision,
+        "diversity_policy": diversity_policy,
         "submitted_prompt_sha256s": prompt_hashes,
         "arguments": {key: str(value) if isinstance(value, Path) else value
                       for key, value in vars(args).items()},
@@ -495,7 +595,8 @@ def main():
                 ROOT / "tilert/pd_vllm/wire.py",
             )
         },
-        "requests": [], "warmup_requests": [], "status": "running",
+        "requests": [], "warmup_requests": [], "request_sha256": {},
+        "status": "running",
     }
     seen = set()
     measured = []
@@ -510,6 +611,9 @@ def main():
             seen.add(result["rid"])
             name = f"request-{number:04d}.json"
             atomic_json(args.output / name, result)
+            report["request_sha256"][name] = hashlib.sha256(
+                (args.output / name).read_bytes(),
+            ).hexdigest()
             report["warmup_requests" if warmup else "requests"].append(name)
             if not warmup:
                 measured.append(result)
@@ -527,7 +631,7 @@ def main():
         report["measured_prompt_counts"] = dict(Counter(
             item["prompt_sha256"] for item in measured
         ))
-        report["passes_2ms"] = passes_target(report)
+        report["passes_2ms"] = passes_target(report, measured, args.output)
     except BaseException as error:
         report.update(status="error", error=f"{type(error).__name__}: {error}")
         raise

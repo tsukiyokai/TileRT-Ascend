@@ -47,6 +47,8 @@
 
 局部诊断要有退出条件。[Attention扩层](evidence/ascend-decode/attention-rounding-a3-20261029/README.md)中，h1误差下降约45%，h3却只改善约14%；第一层逐位闭合不能替代传播检查。已在原容差内的比特差异，先检查是否导致后续越界、索引/路由分歧或宽度不一致，再决定是否继续细分。数学图及阈值保持固定，原CANN精确比较与独立HF容差比较分别报告。
 
+速度准入从请求工件重算输出及统计，并在测时前冻结quality policy原始字节与SHA。[全零1ms反例](evidence/ascend-decode/diversity-gate-20261029/README.md)表明，八输入覆盖、完整token数量和双钟达标仍能容纳退化输出。整段周期和token/bigram计数补充准入，独立数值与会话状态继续分别验证。
+
 ## 3. 保留计算中的舍入和编码规则
 
 融合去掉写回时，仍须保留该位置的中间 BF16 舍入。Norm 后量化、路由概率转换、专家乘权与求和，以及 TP 归约的数据类型和结合顺序，共同决定基线计算。项目中的 Norm/Quant 融合改变了 INT8 编码，继而改变完整模型输出，见 [融合舍入实验](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md)。等价替换沿用原舍入规则；采用更高精度时，另立计算与质量对照。
