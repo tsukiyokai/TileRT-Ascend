@@ -4,7 +4,9 @@ TileRT-Ascend 是构建在 Ascend 上的专用低时延 decode 框架：它从�
 
 ## 当前验收
 
-A3 单 die 已通过 [token staging 对照](evidence/ascend-decode/token-staging-a3-20261028/README.md)，width32 配对节省 p50 为 2.13–2.24 ms/整数夹具轮；[SFA 元数据预搬运](evidence/ascend-decode/sfa-metadata-a3-20261028/README.md)数值通过却使配对时延退化，保留原实现。下一项比较规约所有权与数据交换结构，独立修正 Carver 的 A3 资源描述；组件结果继续接到真实权重、TP16 和在线门禁。
+A3 单 die 已通过 [token staging 对照](evidence/ascend-decode/token-staging-a3-20261028/README.md)，width32 配对节省 p50 为 2.13–2.24 ms/整数夹具轮；[SFA 元数据预搬运](evidence/ascend-decode/sfa-metadata-a3-20261028/README.md)数值通过却使配对时延退化，保留原实现。规约所有权与数据交换原型、Carver 资源修正均已留档；组件结果继续接到真实权重、TP16 和在线门禁。
+
+当前先闭合修正运行包的数值基线：[SFA索引单位](evidence/ascend-decode/sfa-index-units-a3-20261028/README.md)与[GMM1加载顺序](evidence/ascend-decode/gmm1-selection-a3-20261029/README.md)均已形成实物证据，独立HF的真实32行与reset已完成。下一步核对TP16的M1/M32/reset，再扩展八个冻结8K输入与在线双时钟；既有规约和graph原型保留。[本轮整机尝试](evidence/ascend-decode/fixed-hf-launch-20261029/README.md)在加载期间被回收，尚无修正包的整模型精度或新增TPOT结果。
 
 CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)继续通过[无环节点 GC 对照](evidence/ascend-decode/lookup-gc-20261028/README.md)减少本地构造分配与典型成本，复制收益很弱且长尾仍有退化；默认部署尚未安装扩展。[78 层合成 HF](evidence/ascend-decode/hf-runtime-20261028/README.md)已有 [A/B/A 各 32 行的完整参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)；[持久观测槽](evidence/ascend-decode/graph-producer-20261028/README.md)已在 CPU AOT 的实际 verify 入口检查字段新鲜度与坏图拒绝。下一步闭合实际 NPU/SuperKernel graph→HF 观测与正式 CANN 门禁，检验请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 

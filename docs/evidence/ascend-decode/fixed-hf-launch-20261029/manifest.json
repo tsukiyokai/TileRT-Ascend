@@ -1,0 +1,53 @@
+{
+  "scope": "Interrupted strict-HF TP16 launch; no captured forward or TPOT acceptance",
+  "files": {
+    "README.md": {
+      "bytes": 1131,
+      "sha256": "ad1a761cc29236730a2cc8b455a54b7c57624476339f31336b073db8c120f11f"
+    },
+    "assets.sha256": {
+      "bytes": 357,
+      "sha256": "8281d182add6c54d2714aa0b03e228ffb43913ea4ea9315956622cf50c6005ff"
+    },
+    "before.txt": {
+      "bytes": 7227,
+      "sha256": "df29ed55313e56510a7bff9371373ff7e0fde2620f49df1aa8e2c9e7da24da8f"
+    },
+    "checkpoint-174.json": {
+      "bytes": 32641,
+      "sha256": "cb4ffa91f1e56b8ffb6bc46063ee20b9908fa8641a108cdb6dd39fb48e257390"
+    },
+    "docker-events.jsonl": {
+      "bytes": 6225,
+      "sha256": "bc5b4eac37148667d767ef0f17d3e168e31268fb1720c3e511a85785a6a9f942"
+    },
+    "full-fixed-v1-container.log.gz": {
+      "bytes": 20,
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    "full-fixed-v1-driver.log.gz": {
+      "bytes": 7668,
+      "sha256": "d12e07d2eb0ea521dd81bce89672cadb4eac569024800b1fbeccc8d9c4d6034c"
+    },
+    "hash-model-view.py": {
+      "bytes": 2071,
+      "sha256": "8987b660e10c070046b3654a2f43373e0f5798909e8b2f5c312b5761cbd915a6"
+    },
+    "image-id.txt": {
+      "bytes": 72,
+      "sha256": "39cce21ae468802d94c0537b02d5c0b3ab67a16b5e031537abbb3da24282b8f3"
+    },
+    "interruption.json": {
+      "bytes": 767,
+      "sha256": "ef9c94f6b5d46dbdcdaaa67cefe38eda121378a5bc8f76d21b85b7c8a118d977"
+    },
+    "launch.sh": {
+      "bytes": 1929,
+      "sha256": "fbf8607152e6fd6426b9d909b023a597af542191e1e9752c07c4865740d632bf"
+    },
+    "launch.sha256": {
+      "bytes": 403,
+      "sha256": "e85334b0817ff83d9cd91f852fbd66f32b325f847103c3e74c16084cb282285f"
+    }
+  }
+}
