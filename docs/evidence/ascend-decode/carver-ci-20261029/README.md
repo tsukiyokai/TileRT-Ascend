@@ -4,4 +4,4 @@
 
 `233047cb`只把该测试文件的Carver导入移到fixture/test执行期。根线程重新执行[CPU检查](cpu_check.py)，[原始输出](root-cpu-run.log.gz)确认旧版collection触发Carver并退出2，新版不触发、退出0且仍收集六项；前后断言、参数与fixture表达式AST相同。实际类定义与架构函数源码在CPU替身下触发`get_arch('ascend')`；[Ruff检查](root-ruff-run.log.gz)通过，生产资源配置代码未变。
 
-[远端快照](remote-status.json)核对PR head和新CI：AscendC-PTO通过，TileLang-Ascend NPU job排队。这里只证明collection边界；[先前9392 JIT](../carver-a3-20261028/README.md)先于SDK重构，当前head的原生验证继续等待CI。输入、脚本和日志的字节SHA见[manifest](manifest.json)。
+[远端快照](remote-status.json)确认当前head的AscendC-PTO与TileLang-Ascend CI均通过。[原生NPU job日志](native-ci.log.gz)记录新增六项全部通过，主集1352项通过、3项跳过，示例153项通过；PR描述已更新并读回核对。[先前9392 JIT](../carver-a3-20261028/README.md)保留SDK重构前的版本范围。输入、脚本和日志的字节SHA见[manifest](manifest.json)；整模型与TPOT继续独立验收。
