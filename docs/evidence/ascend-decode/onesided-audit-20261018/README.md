@@ -125,7 +125,7 @@ is between 0.1 and 1.8 ms, and about zero on the wall measure.
 ## What the arithmetic now says
 
 | term | ms per round | note |
-|---|---|---|
+| --- | --- | --- |
 | budget at acceptance 3.433 | 6.866 | |
 | weight stream | 3.880 … 6.50 | die rate against wall median |
 | the 157 reductions, one-sided | 3.70 | against 5.08 with HCCL |

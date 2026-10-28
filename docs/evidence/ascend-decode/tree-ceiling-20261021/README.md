@@ -5,7 +5,7 @@ Budget and branching swept against the capture case's 8192-token prompt and the
 merges leave -- 45.88 - 15.73 = 30.15 ms -- plus 0.66 a verified row.
 
 | budget | branches | accepted | TPOT ms |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 16 | 2 | 6.564 | 6.20 |
 | **16** | **4** | **6.649** | **6.12** |
 | 24 | 4 | 7.367 | 6.24 |

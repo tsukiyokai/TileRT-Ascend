@@ -11,7 +11,7 @@ object read back from its own recorded search path, 1024 output tokens, three
 warmups and three measured requests.
 
 | arm | gmm1 object | round p10 | TPOT |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | barrier only | `a9863296` at index 3 | 57.110, 56.875, 56.839 | 13.1049, 12.9081, 12.8858 |
 | + three kernel patches | `0a20fe78` at index 3 | 55.749, 55.343, 55.327 | 12.6554, 12.6037, 12.6427 |
 

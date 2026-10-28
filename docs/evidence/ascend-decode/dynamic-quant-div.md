@@ -5,7 +5,7 @@ master20260917, native FP32 `Div(127,amax)` explains the first 8K
 indexer difference. For the frozen BF16 row, `amax=1.078125`:
 
 | Boundary | Native A3 | CPU IEEE FP32 |
-|---|---|---|
+| --- | --- | --- |
 | Factor | 117.7970962524414 (`0x42eb981d`) | 117.79710388183594 (`0x42eb981e`) |
 | Product at `x=amax/2` | 63.499996185302734 | 63.5 |
 | RINT | 63 | 64 |

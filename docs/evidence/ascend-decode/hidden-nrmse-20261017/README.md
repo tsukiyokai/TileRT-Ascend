@@ -15,7 +15,7 @@ captured 8K prefix and teacher inputs. The run uses `a3-gs:trt-asc`,
 TP16, batch 1, the SwiGLU barrier overlay and FP32 TP reduction.
 
 | Consumed position / token | Layer 0 | Peak | Layer 76 | Layer 77 + final norm |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | 8192 / 6500 | 0.38890% | 18.00430% at L39 | 10.75438% | 9.31897% |
 | 8193 / 382 | 0.53628% | 20.89024% at L38 | 9.24998% | 8.24223% |
 

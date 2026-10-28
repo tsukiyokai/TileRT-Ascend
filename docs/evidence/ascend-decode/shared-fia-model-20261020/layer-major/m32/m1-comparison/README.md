@@ -10,7 +10,7 @@ All 32 selected-token sets are identical at every layer: 524,288 index
 entries, 100% per-query overlap. The order differs in a few positions:
 
 | Layer | Different ordered entries | Same set for all 32 rows |
-|---|---:|---|
+| --- | ---: | --- |
 | 0 | 0 | yes |
 | 1 | 40 | yes |
 | 2 | 6 | yes |

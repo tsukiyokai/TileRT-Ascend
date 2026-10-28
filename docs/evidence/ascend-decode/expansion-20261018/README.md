@@ -8,7 +8,7 @@ gather_fia --fp32-head` with `TORCHINDUCTOR_AUTOGRAD_CACHE=0` and
 `VLLM_DISABLE_COMPILE_CACHE=1`. Only `HCCL_OP_EXPANSION_MODE` differs.
 
 | case | mode recorded | TPOT median (ms) | three runs | rounds | A | round (ms) |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | unset | `None` | 16.489 | 16.346 / 16.489 / 16.630 | 298 | 3.433 | 56.61 |
 | explicit | `AI_CPU` | 16.441 | 16.399 / 16.441 / 16.456 | 298 | 3.433 | 56.44 |
 | explicit | `AIV` | 15.978 | 15.927 / 15.978 / 16.051 | 298 | 3.433 | 54.85 |

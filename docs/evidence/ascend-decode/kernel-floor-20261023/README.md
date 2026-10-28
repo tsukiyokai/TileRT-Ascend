@@ -8,7 +8,7 @@ not any pass's inner loop, so fusion is the only lever. The numbers behind it
 were measured on another host and another CANN. Rechecked here:
 
 | operation | median | min | p90 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | add_32_rows | 11.836 us | 10.751 | 12.401 |
 | foreach_add_32_rows | 51.752 | 50.626 | 53.381 |
 | cast_round_trip_8_rows | 26.965 | 25.818 | 29.135 |
@@ -30,7 +30,7 @@ floor than it saves at this size, so it is not a fusion route.
 The same 12-element scalar multiply, three ways on the same die:
 
 | timing | 12 elements | 32 x 6144 |
-|---|---|---|
+| --- | --- | --- |
 | back to back, one sync a batch | **13.931 us** | 14.371 |
 | eager event pair | 47.220 | 45.700 |
 | host enqueue (`perf_counter` around the call) | 16.696 | 16.450 |

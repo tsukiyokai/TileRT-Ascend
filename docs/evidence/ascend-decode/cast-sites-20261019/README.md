@@ -9,7 +9,7 @@ a verify, which at a measured 19.30 µs a launch is 9.32 ms of launch cost for
 ## What they convert
 
 | count | conversion |
-|---|---|
+| --- | --- |
 | 869 | `FLOAT → DT_BF16` |
 | 622 | `DT_BF16 → FLOAT` |
 | 151 | `INT32 → INT64` |
@@ -26,7 +26,7 @@ runs of `DT_BF16>FLOAT` followed by `FLOAT>DT_BF16` at `8,6144`, with 471 of
 them inside the target graph.
 
 | count | producer | | consumer |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 237 | `QuantBatchMatmulV3` | → [Cast Cast] → | `AddRmsNormBias` |
 | 225 | `ForeachAddList` | → [Cast Cast] → | `AddRmsNormBias` |
 

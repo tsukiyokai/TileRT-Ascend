@@ -1199,7 +1199,7 @@ From the internal 串讲 notes (Wiki `WIKI2026022410189615`, 学习笔记):
 > ## 八、重要技术决策
 >
 > | 决策 | 说明 |
-> |------|------|
+> | ------ | ------ |
 > | **串行调度** | 第一版采用纯串行调度，暂不支持 Cube/Vector 并行 |
 > | **Mix1:2 强制提升** | 混合算子检测 Mix1:2 后强制提升模式 |
 > | **待确定功能** | DFX 调试能力、双流并行调度、ACLGraph 正式接口集成 |
@@ -3844,7 +3844,7 @@ The other MTE atomics all carry `Supported hardware platform: Ascend950.` in the
 > ### 2.1 接口清单
 >
 > | 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | `aclshmemx_mte_atomic_fetch` | T | int32, uint32, float, int64, uint64 | 950 |
 > | `aclshmemx_mte_atomic_set` | void | uint32, uint64 | 950 |
 > | `aclshmemx_mte_atomic_swap` | T | uint32, uint64 | 950 |
@@ -3859,7 +3859,7 @@ The other MTE atomics all carry `Supported hardware platform: Ascend950.` in the
 > 所有 MTE 后端接口调用后，如果存在**标量计算单元（Scalar）与搬运单元（MTE2/MTE3）之间的数据依赖**，开发者需根据实际数据流插入同步：
 >
 > | 时机 | 场景 | 同步方式 |
-> |---|---|---|
+> | --- | --- | --- |
 > | 调用前 | 其他单元（如 MTE2）正在写同一 UB 区域 | `SetFlag/WaitFlag` on `MTE2_S` |
 > | 调用后 | 后续操作依赖原子操作在 GM 中的结果 | `SetFlag/WaitFlag` on `MTE3_MTE2` |
 > | 调用后 | 需要复用同一 UB 区域写入新数据 | `SetFlag/WaitFlag` on `MTE3_S` |
@@ -3869,7 +3869,7 @@ The other MTE atomics all carry `Supported hardware platform: Ascend950.` in the
 > `aclshmemx_mte_atomic_add` 在 Ascend950 上按类型有两种实现路径：
 >
 > | 类型组 | 支持类型 | 实现方式 | 同步要点 |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
 > | Scalar AtomicAdd 路径 | uint32, uint64, int64 | Scalar 单元直接执行标量 AtomicAdd 写 GM，不经过 UB 和 MTE3 | 不需要 UB/MTE3 相关 fence；仅在 Scalar↔MTE2/MTE3 有 GM 数据依赖时按通用规则同步 |
 
@@ -4510,7 +4510,7 @@ syntactic surprise worth more than the rest of the page: a kernel declared
 > AI CPU与CCU路径的主要差异如下：
 >
 > | 项目 | AI CPU路径 | CCU路径 |
-> |---|---|---|
+> | --- | --- | --- |
 > | commEngine取值 | **2，AICPU_TS**，表示AI CPU通信服务端 | **5，CCU_MS；或6，CCU_SCHED，推荐使用6** |
 > | 服务端启动stream | 必须传入独立的aclrtStream | 传入nullptr，launch stream由资源上下文内部携带 |
 > | AI Core侧初始化 | hccl.InitV2(contextGM) | hccl.InitV2(contextGM) |
@@ -4778,7 +4778,7 @@ __schedmode__(1) __global__ __mix__(1, 2) void aiv_syncall_kernel()
 Measured table:
 
 > | 程序 | 全核 28 AIC / 56 AIV | 半机 16 AIC / 32 AIV |
-> |---|---|---|
+> | --- | --- | --- |
 > | `aiv_syncall` | **PASS**（`rc=0`） | **PASS**（`rc=0`） |
 > | `aiv_mode0_sync` | **PASS**（`rc=0`） | **PASS**（`rc=0`） |
 >
@@ -4808,7 +4808,7 @@ Timeout discipline worth copying:
 > ## 5. 新卡复现：52/54 悬崖**不复现**（2026-10-05）
 >
 > | blocks | AIV 数 | 结果 | 输出自证 |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | 16 | 32 | **通过** rc=0（~7–8 s） | `output[0]`=496=Σ(0..31) |
 > | 26 | 52 | **通过** rc=0（~7–8 s） | `output[0]`=1326=Σ(0..51) |
 > | 27 | 54 | **通过** rc=0（~7–8 s，3/3 复现） | `output[0]`=1431=Σ(0..53) |
@@ -6238,7 +6238,7 @@ Date: fetched 2026-10-20
 > ## 本样例支持的产品及CANN软件版本
 >
 > | 产品 | CANN软件版本 |
-> |------|-------------|
+> | ------ | ------------- |
 > | Ascend 950PR&950DT系列产品 | >= CANN 9.2.0 |
 > | Atlas A3系列产品 | >= CANN 9.2.0 |
 > | Atlas A2系列产品 | >= CANN 9.2.0 |
@@ -11013,7 +11013,7 @@ __aicore__ inline void SyncAllImpl()
 Read it line by line:
 
 | what | mode | flagId | set pipe | issuing core |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `SyncAll<true>` whole barrier | 0 | **14** | `PIPE_MTE3` | AIV |
 | `SyncAll<false>` step 1: V→C gather | **2** | **12** | `PIPE_MTE3` | **AIV** |
 | `SyncAll<false>` step 2: all-AIC barrier | 0 | **11** | `PIPE_FIX` | AIC |
@@ -11497,7 +11497,7 @@ From mindspore-ai/hyper-parallel#658, verbatim:
 > 当前待补齐的能力：
 >
 > | 能力 | PyTorch | MindSpore |
-> |------|---------|-----------|
+> | ------ | --------- | ----------- |
 > | 对称内存基础原语（put/get/signal/wait/put_with_signal） | ✅ | ✅ |
 > | `shmem_allgather` | ✅ | ✅ |
 > | `shmem_alltoall` | ✅ | ❌ |
@@ -11541,7 +11541,7 @@ symm.shmem_recv(tensor, src_rank, group=None)
 The target scenarios, verbatim — note the first one:
 
 > | 场景 | 说明 |
-> |------|------|
+> | ------ | ------ |
 > | **MoE 通算掩盖** | TP/EP group 内对称内存替代 Hccl，减少同步开销，与多核并行协同 |
 > | **FSDP/HSDP 梯度同步** | DP group 内用 `shmem_reduce_scatter` / `shmem_allreduce`，降低延迟 |
 > | **序列并行 / Context Parallel** | CP group 内用对称内存通信，与计算流水线重叠 |
@@ -11567,7 +11567,7 @@ Design goals including the precision one:
 > HP 的三层能力通过**三种不同的桥接方式**接入，**均不产生编译依赖**：
 >
 > | 层 | 能力 | 桥接方式 | 对 HP 编译依赖 |
-> |---|------|---------|:---:|
+> | --- | ------ | --------- | :---: |
 > | 第 1 层 | 通信原语（put_mem_signal 等 5 个） | `SymmMemBridge` 双向注入（函数指针）；推荐由 HP 独立 bridge .so 暴露 C ABI | 零 |
 > | 第 2 层 | 融合算子（fused_all_gather_matmul 等） | 运行时 `from hyper_parallel import` | 零 |
 > | 第 3 层 | **Mega Kernel（moe_ffn_fwd/bwd）** | `torch::ops::hyper_parallel::*` dispatch | 零 |
@@ -12811,7 +12811,7 @@ pos=48: stream_id=32771, task_id=48, sqe_type=3, post_p=0
 ### SQE-type values therefore publicly attested
 
 | sqe_type | printed name | source |
-|---|---|---|
+| --- | --- | --- |
 | 0 | `FFTS` / `(ffts)` | §59 doc dump + `sqe_type=0(ffts)` error line |
 | 1 | `aicpu` | `sqe_type=1(aicpu)` form seen in runtime logs |
 | 3 | *(no name printed — only `post_p=0`)*, and always on `stream_id=32771` (= 0x8003, a logic/model-maintenance stream), bracketing the model body at `pos=39` and `pos=48` | §59 doc dump |
@@ -13224,7 +13224,7 @@ L0C→UB(VECCALC) 的 Fixpipe 指令族 (dualDstCtl 0/1/2 均试) 在 1:1 下全
 ## 验证矩阵 (关键轮, 全部可信构建 + 真机 e2e + plog)
 
 | 轮 | 配置 | 结果 |
-|---|---|---|
+| --- | --- | --- |
 | b81 | 最小空内核 (仅 MIX_1_1 契约) | exception=0 → 框架/契约无辜 |
 | b82/83 | Init±同步 (modeId=4) | +同步→AIV 259 / 无→净 → sync 指令为病灶 |
 | b84 | modeId 4→2 | AIV 转净 |
@@ -15219,7 +15219,7 @@ const std::vector<std::string> StarsEngine::StarsCqeErrorDesc_ = {
 Index = count-trailing-zeros of `errType`. So the complete decode is:
 
 | errType | bit | enum | printed string |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0x01 | 0 | `RT_STARS_CQE_ERR_TYPE_EXCEPTION` | `task exception` |
 | 0x02 | 1 | `RT_STARS_CQE_ERR_TYPE_TRAP` | `task trap` |
 | 0x04 | 2 | `RT_STARS_CQE_ERR_TYPE_TASK_TIMEOUT` | `task timeout` |
@@ -15660,7 +15660,7 @@ And `tsTaskType_t`, whose value 3 is reported in the wild as `EVENT_WAIT` (from 
 ### The collision table for the value 3
 
 | field | value 3 means |
-|---|---|
+| --- | --- |
 | `sqe_type` (`rtDavidStarsSqeType`) | `RT_DAVID_SQE_TYPE_PLACE_HOLDER` |
 | `task_type` (`tsTaskType_t`) | reported as `EVENT_WAIT` |
 | `CodeMode` (asc-devkit host stub) | `NORMAL` |

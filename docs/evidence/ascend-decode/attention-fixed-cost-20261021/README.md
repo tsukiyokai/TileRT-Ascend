@@ -3,7 +3,7 @@
 One die, twelve rows, four heads, the cache capacity swept:
 
 | capacity | MB | us | GB/s | us a 1024 rows |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 512 | 0.6 | 171.75 | 3.4 | 335.44 |
 | 1024 | 1.2 | 169.78 | 6.9 | 165.80 |
 | 2048 | 2.4 | 172.10 | 13.7 | 84.03 |
@@ -80,7 +80,7 @@ bound on what a captured layer spends.
 Profiled, one die, four heads, 8192 cache rows, 9.4 MB:
 
 | rows | us | GB/s | us a row |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 32.10 | 294 | 32.10 |
 | 4 | 33.85 | 279 | 8.46 |
 | 12 | 44.29 | 213 | 3.69 |

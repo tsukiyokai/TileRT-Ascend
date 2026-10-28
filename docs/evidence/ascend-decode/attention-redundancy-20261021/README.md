@@ -11,7 +11,7 @@ attention over a replicated KV cache, and the reduce disappears.
 2026-10-21, a3-84, one die, 12 rows, 8192 cache rows, 9.4 MB of cache.
 
 | heads | us | per head |
-|---|---|---|
+| --- | --- | --- |
 | 4 | 87.17 | 21.79 |
 | 8 | 91.53 | 11.44 |
 | 16 | 115.53 | 7.22 |

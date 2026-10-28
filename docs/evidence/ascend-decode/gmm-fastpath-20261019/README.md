@@ -26,7 +26,7 @@ only when that core type was the critical path, while shortening the table
 shortens both paths. The ablation figures are therefore lower bounds.
 
 | item | µs | status |
-|---|---|---|
+| --- | --- | --- |
 | **cost linear in `group_list` length** | **37–50** | mechanism certain, 4.157 attributed |
 | kernel launch floor | ~23 | by subtraction, so inherits the above |
 | cube matmul | ≥12 | ablation lower bound |
@@ -42,7 +42,7 @@ Measured in one process, one set of captured graphs, 32 calls per graph, 30
 rounds taking the minimum then the median, host 0.44–1.17 µs per call:
 
 | operator | µs per call in a graph |
-|---|---|
+| --- | --- |
 | `torch.add`, 8 float32 | 1.127–1.310, floor 1.192 |
 | `npu_dynamic_quant`, 4×32 bf16 | 2.797–3.590 |
 | `npu_quant_matmul`, 4×32 by 32×32 | 8.183–8.808, floor 8.303 |
@@ -56,7 +56,7 @@ moving the cut later, paired graph replays within one binary, σ ≤ 0.26, 30 of
 30, 256 slots:
 
 | segment | µs, 256 slots | µs, 8 slots |
-|---|---|---|
+| --- | --- | --- |
 | enter + base tiling | 16.43 | 16.42 |
 | + two tiling copies (one `TCubeTiling`) + `mm.Init` | 4.54 | 5.18 |
 | + `op.Init` (global buffers, sum the table) | **38.55** | ~0 |
@@ -203,7 +203,7 @@ Three variants, each one binary with two arms selected by the inert input bit,
 graph replay, paired:
 
 | where the bulk read happens | result |
-|---|---|
+| --- | --- |
 | both core types | **hangs** — 4m53s at 100% AICore, killed |
 | vector cores only | runs, bit-identical, **5.512 µs slower** (σ 0.271, 25 of 25) |
 | cube cores only | **hangs**, killed by a 150 s watchdog |
@@ -251,7 +251,7 @@ pair is reading the host.
 ## The prologue list so far
 
 | operator | in-graph per call | prologue |
-|---|---|---|
+| --- | --- | --- |
 | `torch.add`, 8 float32 | 1.127–1.310 µs | — (this is the dispatch floor) |
 | `npu_dynamic_quant` | 2.797–3.590 µs | not separated |
 | `npu_quant_matmul` | 8.183–8.808 µs | not separated |

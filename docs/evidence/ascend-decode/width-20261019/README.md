@@ -85,7 +85,7 @@ round(4)=47.093 ms, round(6)=55.651, round(8)=59.014 and 57.366 — about
 2.774 ms per unit of M, decomposed:
 
 | term | ms per unit M |
-|---|---|
+| --- | --- |
 | attention, 0.42 µs × 78 layers | 0.033 |
 | dense projections | ~0 |
 | expert GMM via the union, 0.820 µs × 4.48 groups × 2 × 75 | 0.55 |

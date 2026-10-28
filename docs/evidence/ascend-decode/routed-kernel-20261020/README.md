@@ -29,7 +29,7 @@ processes. Correctness is reported for every configuration, sentinel included,
 so an unwritten element cannot pass as a right one.
 
 | experts | blocks | wall, µs | against the host reference |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 4 | 4 | 47.108 | 0 of 49152 |
 | 8 | 4 | 85.090 | 0 of 98304 |
 | 16 | 4 | 162.047 | 0 of 196608 |
@@ -78,7 +78,7 @@ every expert to one capacity would cost nothing and retire the host side of a
 group list.
 
 | capacity | wall, µs | against the host reference |
-|---|---|---|
+| --- | --- | --- |
 | 2 | 49.289 | 0 of 196608 |
 | 4 | 51.969 | 0 of 393216 |
 | 8 | 55.263 | 0 of 786432 |
@@ -130,7 +130,7 @@ eviction by its own weight stream is not it.
 sixteen blocks:
 
 | pipe | time, µs | ratio |
-|---|---|---|
+| --- | --- | --- |
 | scalar | 27.860 | **0.625** |
 | MTE2 | 32.826 | 0.733 |
 | fixpipe | 13.924 | 0.311 |
@@ -170,7 +170,7 @@ If the cost is scalar and the scalar work is per iteration inside
 sixteen blocks, correctness unchanged at 0 of 196608 throughout:
 
 | baseN | baseK | wall, µs |
-|---|---|---|
+| --- | --- | --- |
 | the library's own choice | | 49.692 |
 | 256 | 128 | 49.874 |
 | 128 | 256 | 42.095 |
@@ -191,7 +191,7 @@ The cost is inside the iteration, which is why the tile size is what moved it.
 With the tiling fixed:
 
 | experts | blocks | wall, µs | before | vendor |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 4 | 4 | 38.761 | 47.108 | |
 | 8 | 8 | 40.000 | 47.755 | |
 | **16** | **16** | **41.990** | 49.276 | 165.2 |
@@ -209,7 +209,7 @@ the comparison has been stated as though they were the same. From the capture
 itself:
 
 | op | input shapes | µs |
-|---|---|---|
+| --- | --- | --- |
 | `GroupedMatmulSwigluQuantV2` | `8,6144;8;256;256,4,384,16,64;256,256;256,256` | 98.950 |
 | `GroupedMatmul` | `8,128;256,128,6144;256,6144;256,1,6144;;;;256;8` | 58.226 |
 

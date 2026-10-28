@@ -25,7 +25,7 @@ input clones in both graphs. Each cell is the median of six paired samples,
 in microseconds per attention call before TP reduction:
 
 | Indexer cache | M | Indexed launch | Separate chain | Reduction |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | C8 | 1 | 232.369 | 265.254 | 12.40% |
 | C8 | 12 | 288.416 | 307.314 | 6.15% |
 | C8 | 32 | 406.476 | 419.642 | 3.14% |
@@ -49,7 +49,7 @@ the selector's tested merge partition and equal-score ordering.
 `indexed_attention_out` accepts these groups of tensors on one NPU:
 
 | Group | Contract |
-|---|---|
+| --- | --- |
 | Hidden and quantized input | BF16 hidden `[M,6144]` after the layer's input normalization; corresponding INT8 codes `[M,6144]` and FP32 scales `[M,1]` |
 | Nine main weights | DQ, UQ/QR, UK, DKV/KR, three channel scales, CQ gamma, CKV gamma, in the order used by `attention_host.h` |
 | Six indexer weights | Packed INT8 WQ `[16,2048,256]`, original FP32/BF16 scales `[4096]`, packed BF16 WK/head-weight matrix `[5,6144,32]`, FP32 gamma/beta `[128]`, BF16 Hadamard `[128,128]` |
@@ -110,7 +110,7 @@ arena already used by the standalone entry. No other phase arenas overlap.
 At 24 groups and an 8K sequence:
 
 | M | C8 scratch bytes | BF16 scratch bytes | Tiling bytes |
-|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: |
 | 1 | 100,029,952 | 126,600,704 | 40,960 |
 | 12 | 108,518,912 | 135,136,256 | 40,960 |
 | 32 | 130,138,624 | 156,840,448 | 81,920 |
@@ -228,7 +228,7 @@ For one cache geometry per mode and page tables containing at least four
 pages, the three retained pool entries per exact M and stream occupy:
 
 | M | Indexed 24 groups, shared 8 groups | All entries 24 groups |
-|---:|---:|---:|
+| ---: | ---: | ---: |
 | 1 | 235.5503 MiB | 274.1128 MiB |
 | 12 | 254.7642 MiB | 298.3267 MiB |
 | 32 | 303.2939 MiB | 359.3564 MiB |

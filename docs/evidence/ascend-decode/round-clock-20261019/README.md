@@ -11,7 +11,7 @@ read directly, with no profiler and therefore no profiler-induced starvation.
 ## Six requests, two independent runs, one floor
 
 | run | rounds | TPOT | round median | p10 | p90 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | this baseline | 227 | 12.9709 | 57.616 | 56.757 | 60.840 |
 | | 227 | 12.8348 | 57.487 | 56.789 | 59.160 |
 | | 227 | 12.7836 | 57.204 | 56.676 | 58.809 |
@@ -34,7 +34,7 @@ Width 8 accepts 1023 tokens in 227 rounds, so 4.507 a round, and a round may
 therefore cost 9.013 ms at a 2 ms TPOT.
 
 | | |
-|---|---|
+| --- | --- |
 | round now | 57.2 ms median, 56.7 floor |
 | over budget | 6.3× |
 | weight floor, per rank per round | 3.886 ms, 43% of the budget |

@@ -8038,7 +8038,7 @@ aclshmem_<type>_atomic_<op>()          ← 标准接口
 ### 2.1 接口清单
 
 | 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `aclshmemx_mte_atomic_fetch` | T | int32, uint32, float, int64, uint64 | 950 |
 | `aclshmemx_mte_atomic_set` | void | uint32, uint64 | 950 |
 | `aclshmemx_mte_atomic_swap` | T | uint32, uint64 | 950 |
@@ -8053,7 +8053,7 @@ aclshmem_<type>_atomic_<op>()          ← 标准接口
 所有 MTE 后端接口调用后，如果存在**标量计算单元（Scalar）与搬运单元（MTE2/MTE3）之间的数据依赖**，开发者需根据实际数据流插入同步：
 
 | 时机 | 场景 | 同步方式 |
-|---|---|---|
+| --- | --- | --- |
 | 调用前 | 其他单元（如 MTE2）正在写同一 UB 区域 | `SetFlag/WaitFlag` on `MTE2_S` |
 | 调用后 | 后续操作依赖原子操作在 GM 中的结果 | `SetFlag/WaitFlag` on `MTE3_MTE2` |
 | 调用后 | 需要复用同一 UB 区域写入新数据 | `SetFlag/WaitFlag` on `MTE3_S` |
@@ -8063,7 +8063,7 @@ aclshmem_<type>_atomic_<op>()          ← 标准接口
 `aclshmemx_mte_atomic_add` 在 Ascend950 上按类型有两种实现路径：
 
 | 类型组 | 支持类型 | 实现方式 | 同步要点 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
 
 | UB + MTE3 路径 | int8, int16, bf16, half, int32, float | Scalar 写操作数到 UB → MTE3 读 UB → MTE3 atomic add 写 GM | 需关注 UB 相关 fence（MTE2_S、MTE3_S）和 GM fence（MTE3_MTE2） |
@@ -8086,7 +8086,7 @@ RDMA AMO 的 target/source 参数会作为本地对称地址换算到指定 PE�
 ### 3.1 接口清单（同步接口——内部完成 quiet）
 
 | 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `aclshmemx_roce_atomic_fetch` | T | 32/64 位整数 | 950 |
 | `aclshmemx_roce_atomic_fetch_add` | T | 32/64 位整数 | 950 |
 | `aclshmemx_roce_atomic_fetch_inc` | T | 32/64 位整数 | 950 |
@@ -8101,7 +8101,7 @@ RDMA AMO 的 target/source 参数会作为本地对称地址换算到指定 PE�
 ### 3.2 接口清单（异步接口——需调用者 quiet）
 
 | 接口完整名 | 返回值 | 支持类型 | 硬件平台 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `aclshmemx_roce_atomic_set` | void | 32/64 位整数 | 950 |
 | `aclshmemx_roce_atomic_add` | void | 32/64 位整数 | 950 |
 | `aclshmemx_roce_atomic_inc` | void | 32/64 位整数 | 950 |

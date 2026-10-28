@@ -7,7 +7,7 @@ splits the verify without double counting.
 [the floors](../mix-structure-20261019/README.md)
 
 | | ms a verify | share |
-|---|---|---|
+| --- | --- | --- |
 | the MIX structure: 595 kernels × 12.84 µs | 7.64 | 19.3% |
 | 1788 single-engine kernels at their floors | 1.69 | 4.3% |
 | what the operators spend above those floors | **21.77** | **54.9%** |
@@ -18,7 +18,7 @@ The third term attributes to 82% of what was previously unattributed.
 ## Above the floor, by operator
 
 | ms a verify | above floor | p10 | calls | operator |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 4.759 | 74.36 µs | 88.56 | 64 | `SparseFlashAttention` |
 | 4.450 | 72.06 | 86.26 | 62 | `GroupedMatmulSwigluQuantV2` |
 | 3.538 | 57.30 | 71.50 | 62 | `GroupedMatmul` |
@@ -31,7 +31,7 @@ The third term attributes to 82% of what was previously unattributed.
 Against each operator's own live bytes, once the structural floor is removed:
 
 | operator | above floor | its bytes | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `SparseFlashAttention` | 74.36 µs | 12.26 | **6.07×** |
 | `GroupedMatmulSwigluQuantV2` | 72.06 | 32.68 | 2.20× |
 | `GroupedMatmul` | 57.30 | 16.34 | 3.51× |

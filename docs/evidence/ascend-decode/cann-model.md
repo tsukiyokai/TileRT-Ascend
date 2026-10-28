@@ -125,7 +125,7 @@ identical local stages at position 8193. Independent CPU reconstruction
 using raw W4 weights identifies these incorrect expert rows:
 
 | Rank | Initial execution | Reset |
-|---|---|---|
+| --- | --- | --- |
 | 0 | 174 | 174, 221 |
 | 12 | 132, 144 | None |
 | 15 | 144 | 77, 132, 144, 174, 221 |

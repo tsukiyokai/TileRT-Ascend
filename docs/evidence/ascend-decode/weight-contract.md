@@ -7,7 +7,7 @@ Scope: `Eco-Tech/GLM-5.2-w4a8c8`, ModelScope revision `67e2b7157ac7d8ce1d15d7251
 The checkpoint architecture is `GlmMoeDsaForCausalLM`. The Ascend registry selects `AscendGlmMoeDsaForCausalLM` in `models/deepseek_mtp.py`; `glm5next/model.py` is a different model entry. [Registry](https://github.com/vllm-project/vllm-ascend/blob/f558b58c177916424ae9dcf9bb8e66c0b9031236/vllm_ascend/models/__init__.py#L72-L99)
 
 | Tensor | Stored format | Runtime use |
-|---|---|---|
+| --- | --- | --- |
 | `optional/quarot.safetensors:global_rotation` | FP32 `[6144,6144]` | Optional auxiliary-model basis conversion. The GLM-5.2 backbone and its DeepSeek MTP entry do not call `get_rotation_matrix`. |
 | `rot.safetensors:rot.weight` | BF16 `[6144,6144]` | Backbone loader drops `rot.*`. MTP applies `h @ rot.weight.T` before its `hnorm` on every forward. |
 | `model.layers.78.embed_tokens.weight` | BF16 `[154880,6144]` | Loaded into the MTP model embedding; the proposer may replace it with the target embedding. |
@@ -28,7 +28,7 @@ W8A8 performs dynamic per-token INT8 activation quantization and per-output-chan
 For a logical W4 matrix `[N,K]`, the checkpoint stores INT8 bytes `[N/2,K]`. Each byte's low nibble is output row `2j`, and its high nibble is row `2j+1`; sign-extend each nibble into `[-8,7]`. Runtime transposition and INT32 packing are storage conversions, not additional quantization. The runtime INT64 scale carrier contains FP32 bit patterns in its low 32 bits; a numeric float-to-integer cast is incorrect. [Packing and scale conversion](https://github.com/vllm-project/vllm-ascend/blob/f558b58c177916424ae9dcf9bb8e66c0b9031236/vllm_ascend/quantization/methods/w4a8/w4a8.py#L131-L185), [conversion implementation](https://github.com/vllm-project/vllm-ascend/blob/f558b58c177916424ae9dcf9bb8e66c0b9031236/vllm_ascend/quantization/methods/w4a8/w4a8.py#L345-L371).
 
 | Per-expert tensor | Checkpoint | TP16 rank `r` |
-|---|---|---|
+| --- | --- | --- |
 | gate/up packed weight | `[1024,6144]` | Output packed rows `[64r:64(r+1)]`, logical `[128,6144]` |
 | gate/up scale and scale-bias | `[2048,1]` | Output rows `[128r:128(r+1)]` |
 | down packed weight | `[3072,2048]` | Input columns `[128r:128(r+1)]`, logical `[6144,128]` |
@@ -48,7 +48,7 @@ A bounded checkpoint read independently confirmed this identity for output rows 
 The following cache layout requires `attention_config.indexer_kv_dtype="int8"` and BF16 model dtype. Ascend also filters quantized layers using explicit per-layer recipes. With the indexer dtype switch disabled, the presence of `indexer_quant_type` alone does not activate this cache layout. [Enable condition](https://github.com/vllm-project/vllm-ascend/blob/f558b58c177916424ae9dcf9bb8e66c0b9031236/vllm_ascend/ascend_config.py#L914-L931), [layer filter](https://github.com/vllm-project/vllm-ascend/blob/f558b58c177916424ae9dcf9bb8e66c0b9031236/vllm_ascend/ascend_config.py#L1178-L1246).
 
 | Layers | Indexer key cache per token |
-|---|---|
+| --- | --- |
 | `6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,66` | 128 INT8 values + one FP16 scale = 130 B |
 | `0,1,2,70,74` | 128 BF16 values, no scale tensor = 256 B |
 | MTP `78` | Full indexer with 128 BF16 values, no scale tensor = 256 B |
@@ -70,7 +70,7 @@ Layers 3–5 reuse layer 2. For each full layer `f` in `6,10,...,74`, layers `f+
 Checkpoint metadata SHA256:
 
 | File | SHA256 |
-|---|---|
+| --- | --- |
 | `config.json` | `817f5fb39ca5d4c4b5648de89ca00deaea7537d8c2f130172a459252a05c1073` |
 | `quant_model_description.json` | `a8242dd24f993b914ce567d6850ac86f044651d098a0b463a83ce63623c51985` |
 | `quant_model_weights.safetensors.index.json` | `0e69a90937d7b14d4c699bbfbe0d86f1c476f4ee90c38b2b91236f1a25cfed82` |

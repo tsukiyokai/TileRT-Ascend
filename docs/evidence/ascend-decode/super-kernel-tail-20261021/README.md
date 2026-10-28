@@ -3,7 +3,7 @@
 637 distinct super kernels, each called once a round, 33.58 ms a round.
 
 | kernel | us a call | ms a round |
-|---|---|---|
+| --- | --- | --- |
 | `sk_1277_full_model_start_aiv_all_reduce_float_` | **3282.3** | **3.28** |
 | `sk_681_..._static_kernel_AddRmsNorm` | 215.4 | 0.22 |
 | `sk_1195_..._static_kernel_AddRmsNorm` | 212.7 | 0.21 |

@@ -9,7 +9,7 @@ Eight real streams, TPOT at the profiled device-busy floor of 15.83 ms a round
 with rows free.
 
 | branches | depth | accepted | rows | ms |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | 16 | 2.807 | 8.6 | 5.64 |
 | 2 | 16 | 2.979 | 15.3 | 5.32 |
 | 4 | 16 | 3.108 | 24.4 | 5.09 |

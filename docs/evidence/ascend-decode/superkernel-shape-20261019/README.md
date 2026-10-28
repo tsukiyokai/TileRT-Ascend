@@ -19,7 +19,7 @@ proposed it without checking.
 ## But it merges dispatch, not the data path
 
 | row | calls | total µs |
-|---|---|---|
+| --- | --- | --- |
 | `SuperKernel` / MIX_AIC | 1053 | 68386.994 |
 | `SuperKernel` / MIX_AIV | 858 | 35199.677 |
 

@@ -4,7 +4,7 @@
 treatments of a copy of `_cann_ops_custom/vendors/custom_transformer`:
 
 | treatment | grouped matmul | norm+quant | gating |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | the package as shipped | 104.9 to 124.0 us | 43.038 | 26.455 |
 | TBE kernel dir and config removed | 116.376 | 50.875 | 30.032 |
 | its `binary_info_config.json` entry removed | 115.823 | 46.579 | 36.479 |

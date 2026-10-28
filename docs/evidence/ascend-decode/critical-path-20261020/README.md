@@ -20,7 +20,7 @@ it, leaving around 2 ms of real gap. It is not an 11 ms target, and the
 pinned-staging work already took 3.4–3.8 ms of whatever gap there was.
 
 | per round, ms | round 2 | round 3 |
-|---|---|---|
+| --- | --- | --- |
 | span | 63.003 | 61.871 |
 | stream 81, backbone compute, alone | 35.632 | 35.588 |
 | stream 80, TP reduction, alone | 5.451 | 5.248 |
@@ -42,7 +42,7 @@ MIX_AIC. Apply them to this round's call counts and the decomposition has a
 floor of its own, before any kernel computes anything.
 
 | core | calls | floor ms | spent ms | floor is |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | AI_VECTOR_CORE | 1893 | 1.325 | 9.071 | 15% |
 | MIX_AIC | 505 | 6.858 | 26.190 | 26% |
 | AI_CORE | 306 | 0.704 | 4.197 | 17% |
@@ -64,7 +64,7 @@ bandwidth bound. Every unfused neighbour runs at 3x to 91x. Fusion is not a
 launch-count argument here; it is the difference between 1.1x and 5x.
 
 | family | ms | byte floor ms | x |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | SparseFlashAttention | 6.973 | 1.382 | 5.0 |
 | GroupedMatmulSwigluQuantV2 | 6.793 | 2.272 | 3.0 |
 | GroupedMatmul | 5.596 | 1.212 | 4.6 |
@@ -147,7 +147,7 @@ spellings in every batch, so they are paired by construction
 ([record](combine-floor-die1.json)):
 
 | median µs | 1 row | 8 rows | 32 rows |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | plain add | 9.176 | 9.520 | 9.681 |
 | multi-tensor add | 38.704 | 38.490 | 38.318 |
 
@@ -168,7 +168,7 @@ whole scale-and-add for about what an add costs.
 That gives two steps rather than one, and only the first is free of numerics:
 
 | step | per layer, device side | a round | exact? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | now: `Muls` 8.46 + `ForeachAddList` 21.403 | 29.86 µs | — | — |
 | plain add, keeping `Muls` | 10.36 µs | 1.46 ms | bit-exact |
 | one `add(..., alpha=scale)` | about 3.5 µs | 1.98 ms | more accurate |
@@ -198,7 +198,7 @@ It is not. `check_shared_expert_layout.py` reads the tensor headers, which
 settle it in seconds without a device:
 
 | layer 4 | shared | routed expert 0 |
-|---|---|---|
+| --- | --- | --- |
 | `gate_proj.weight` | (2048, 6144) I8 | (1024, 6144) I8 |
 | `down_proj.weight` | (6144, 2048) I8 | (3072, 2048) I8 |
 | `*.weight_scale` | (2048, 1) F32 | (2048, 1) F32 |
@@ -222,7 +222,7 @@ issues 6.5 MIX_AIC calls; the floor budget for a 13.92 ms round with room left
 for arithmetic is one to two. The per-layer sequence to collapse:
 
 | layer stage | calls now | core |
-|---|---|---|
+| --- | --- | --- |
 | MlaPrologV3 | 1 | MIX_AIC |
 | SparseFlashAttention | 1 | MIX_AIC |
 | O projection, `QuantBatchMatmulV3` | 1 | MIX_AIC |

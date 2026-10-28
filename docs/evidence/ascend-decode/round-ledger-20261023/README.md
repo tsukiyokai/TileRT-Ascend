@@ -6,7 +6,7 @@ owner. This re-derives the round from items measured on one die today rather
 than from a kernel count.
 
 | item | us a layer | ms a round | scope |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | MoE gate_up, 68 active experts | 111.90 | 8.73 | measured, 1.08 TB/s |
 | MoE down, 68 active experts | 99.17 | 7.74 | measured, 0.671 TB/s |
 | attention, gather feeding dense FIA at width 12 | 139.36 | 10.87 | upper bound |
@@ -26,7 +26,7 @@ MoE is bytes at the roofline and the collective is rendezvous, so
 is the floor if attention and routing were driven to zero. What that allows:
 
 | accepted a round | TPOT at that floor |
-|---|---|
+| --- | --- |
 | 5.441, the recorded engine figure | 3.97 ms |
 | 6.966, the tree at budget 32 on the engine's own streams | **3.10** |
 | 7.447, the tree at budget 64 | **2.90** |

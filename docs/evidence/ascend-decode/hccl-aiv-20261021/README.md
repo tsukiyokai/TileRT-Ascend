@@ -7,7 +7,7 @@ for an invalid value names the legal ones: `Atlas A3: AI_CPU | AIV`. Switching
 to the vector cores:
 
 | rows | KB | | all_reduce | reduce_scatter | all_gather |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 12 | 144 | default | 300.56 | 318.09 | 326.74 |
 | 12 | 144 | **AIV** | **183.40** | **177.41** | **175.40** |
 | 24 | 288 | default | 332.77 | 311.13 | 306.79 |
@@ -81,7 +81,7 @@ engine's environment. No code.
 The same all_reduce of 144 KB under both modes, one world size a run:
 
 | ranks | default | AIV | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 2 | 214.12 | 117.27 | 1.83x |
 | 4 | 192.15 | 140.93 | 1.36x |
 | 8 | 227.61 | 131.06 | 1.74x |

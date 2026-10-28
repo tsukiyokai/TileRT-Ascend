@@ -5,7 +5,7 @@ taken far past anything the round can afford. TPOT computed at the one-die
 compute floor of 24.76 ms a round.
 
 | budget | tree | ms | chain | ms |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 16 | 3.692 | 6.71 | 3.177 | 7.79 |
 | 32 | 3.978 | 6.22 | 3.336 | 7.42 |
 | 64 | 4.143 | 5.98 | 3.394 | 7.29 |

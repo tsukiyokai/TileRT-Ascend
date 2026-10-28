@@ -11,11 +11,11 @@ prefixes; stop at31 non-root nodes. Pending is the root, so every verification
 has32 rows. Freeze proposals before reading the reference continuation.
 
 | Policy | Rounds | Verified rows | Committed/round | Complete mean round cost allowed vs flat |
-|---|---|---|---|---|
-|Flat32|147|4704|6.959184|1|
-|Tree2|135|4320|7.577778|<1.088889|
-|Tree4|132|4224|7.750000|<1.113636|
-|Tree8|140|4480|7.307143|<1.050000|
+| --- | --- | --- | --- | --- |
+| Flat32 | 147 | 4704 | 6.959184 | 1 |
+| Tree2 | 135 | 4320 | 7.577778 | <1.088889 |
+| Tree4 | 132 | 4224 | 7.750000 | <1.113636 |
+| Tree8 | 140 | 4480 | 7.307143 | <1.050000 |
 
 Each policy walks its own boundaries and commits1023 tokens, excluding the
 common first output. Twelve CPU checks cover duplicate prefixes, allocation

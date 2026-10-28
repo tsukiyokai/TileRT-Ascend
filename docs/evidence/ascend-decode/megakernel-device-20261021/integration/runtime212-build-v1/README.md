@@ -8,7 +8,7 @@ of `DeepseekV2DecoderLayer`, `AscendSFAImpl`, `ACLGraphWrapper` and
 reported separately. [CPU report](cpu-v2/report.json)
 
 | Library | SHA-256 |
-|---|---|
+| --- | --- |
 | Indexed attention | `e957650c7def45dff8b918b74c987a8ce44eb0b2cca816e7246cbbff8a52378e` |
 | Shared-index attention | `64108f6f1eefe286c999dd11fa52bd1cef90535c0888f89915c209cbcc5c8a7c` |
 | Official SFA adapter, independent build | `bd8aff02f36dca1948b4eea1aa03805d6977b5ae8bf39573b51d73b68a61be3e` |

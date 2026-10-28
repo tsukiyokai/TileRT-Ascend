@@ -8,7 +8,7 @@ processes retain identical query, key, weights and selected indices;
 peak reserved memory is 144 MiB on shared die 15.
 
 | Boundary | Actual comparison |
-|---|---|
+| --- | --- |
 | Input RMSNorm | 6,144/6,144 BF16 values exact |
 | Input DynamicQuant | Scale exact; 10/6,144 INT8 codes differ by one |
 | Prolog with those actual A8 inputs | 2,048/2,048 query codes exact; scale differs by one FP32 ULP |

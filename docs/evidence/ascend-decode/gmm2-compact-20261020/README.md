@@ -36,12 +36,12 @@ group-list address offset selects dense traversal with identical numeric data.
 The switch is absent from the release patch. [Access receipt](paired-v2-access.json).
 
 | Width / routing | Dense p50 µs | Compact p50 µs | Paired median delta µs | Wins/30 |
-|---|---:|---:|---:|---:|
-| 1 / random top8 |62.424|34.860|−27.577|30|
-| 8 / random top8/token |91.266|72.614|−18.655|30|
-| 32 / random top8/token |149.682|149.875|+0.293|5|
-| 32 / shared8 |64.587|41.403|−23.123|30|
-| 32 / all256 |214.628|214.949|+0.339|2|
+| --- | ---: | ---: | ---: | ---: |
+| 1 / random top8 | 62.424 | 34.860 | −27.577 | 30 |
+| 8 / random top8/token | 91.266 | 72.614 | −18.655 | 30 |
+| 32 / random top8/token | 149.682 | 149.875 | +0.293 | 5 |
+| 32 / shared8 | 64.587 | 41.403 | −23.123 | 30 |
+| 32 / all256 | 214.628 | 214.949 | +0.339 | 2 |
 
 The [unmodified-ELF address control](alignment-control.json) has paired median
 deltas−0.310/+0.007/−0.283/−0.335/−0.435µs for these cases. This bounds the

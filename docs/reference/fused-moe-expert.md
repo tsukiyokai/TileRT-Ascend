@@ -443,10 +443,10 @@ Single/multi tensor shape table:
 
 > | group_type | supported scenario | x shape | weight shape | y shape | optional-dynamic inputs shape if needed | group_list shape if passed | per_token_scale shape if passed |
 > | :--------: | :----------------: | :-----: | :----------: | :-----: | :-------------------------------------: | :------------------------: | :-----------------------------: |
-> | -1         |        多多多         | [(M1,K1),(M2,K2),...] | [(K1,N1),(K2,N2),...] | [(M1,N1),(M2,N2),...] | [(N1),(N2),...] | not support | not support |
-> | 0          |        单单单         | [(M,K)] | [(G,K,N)] | [(M,N)] | [(G,N)] | (G) | (M) |
-> | 0          |        单多单         | [(M,K)] | [(K,N),(K,N),...] | [(M,N)] | [(N),(N),...] | (G) | not support |
-> | 0          |        多多单         | [(M1,K1),(M2,K2),...] | [(K1,N),(K2,N),...] | [(M,N)] | [(N),(N),...] | (G) | not support |
+> | -1 | 多多多 | [(M1,K1),(M2,K2),...] | [(K1,N1),(K2,N2),...] | [(M1,N1),(M2,N2),...] | [(N1),(N2),...] | not support | not support |
+> | 0 | 单单单 | [(M,K)] | [(G,K,N)] | [(M,N)] | [(G,N)] | (G) | (M) |
+> | 0 | 单多单 | [(M,K)] | [(K,N),(K,N),...] | [(M,N)] | [(N),(N),...] | (G) | not support |
+> | 0 | 多多单 | [(M1,K1),(M2,K2),...] | [(K1,N),(K2,N),...] | [(M,N)] | [(N),(N),...] | (G) | not support |
 >
 > 例如在多多多场景，x shape={{4，16}, {12，16}, {16，16}}，weight shape={{16，8}，{16，8}，{16，8}}，y shape={{4，8}，{12，8}，{16，8}}，如果想在单单单场景进行相同的计算，则x shape={32，16}，weight shape= {3，16，8}，y shape={32，8}，groupList={4，12，16}。
 
@@ -1281,11 +1281,11 @@ https://gitcode.com/cann/ops-transformer/blob/master/gmm/grouped_matmul_finalize
 >
 > ## 产品支持情况
 >
-> |产品      | 是否支持 |
-> |:----------------------------|:-----------:|
-> |<term>Ascend 950PR&950DT系列产品</term>|      √     |
-> |<term>Atlas A3系列产品</term>|      √     |
-> |<term>Atlas A2系列产品</term>|      √     |
+> | 产品 | 是否支持 |
+> | :---------------------------- | :-----------: |
+> | <term>Ascend 950PR&950DT系列产品</term> | √ |
+> | <term>Atlas A3系列产品</term> | √ |
+> | <term>Atlas A2系列产品</term> | √ |
 >
 > ## 功能说明
 >
@@ -1844,7 +1844,7 @@ https://github.com/vllm-project/vllm-ascend/pull/17201
 > Paired operator measurements below use E=14/K=3584/N=6144, capacity=28672 and the eight fitted routing cases. Each ND/NZ pair used the same card and alternating independent weight sets, 50 graph replays per batch and five batches. Values are median NPU Graph Event time per operator call; they are not an end-to-end throughput comparison or a comparison against the prior W8-cache implementation.
 >
 > | Case | Valid rows | ND (us) | Native NZ (us) | NZ / ND |
-> |---|---:|---:|---:|---:|
+> | --- | ---: | ---: | ---: | ---: |
 > | 1 | 320 | 235.37 | 167.37 | 0.711 |
 > | 2 | 260 | 242.50 | 177.28 | 0.731 |
 > | 3 | 320 | 260.27 | 187.17 | 0.719 |
@@ -1879,7 +1879,7 @@ https://github.com/vllm-project/vllm-ascend/pull/10488
 > - **vs. bf16:** faster on decode (**1.20x**) *and* the 4x-smaller expert weights free enough HBM to grow KV-cache capacity / max concurrency by **+30%**.
 >
 > | stage | engine | work |
-> |---|---|---|
+> | --- | --- | --- |
 > | 1 | cube | 64x64 block-diagonal Hadamard on activations (fp16 GEMM) |
 > | 2 | vector | fp16 -> INT4 activations + fp32 scale, fused routing scatter |
 > | 3 | cube | INT4xINT4 -> INT32 `gate_up` |
@@ -1890,7 +1890,7 @@ https://github.com/vllm-project/vllm-ascend/pull/10488
 > - Cube matmuls: AscendC `MatmulImpl<int4b_t>`. Vector stages: PTO-ISA. Cross-core scheduling via FFTS so cube/vector overlap across expert-chunks.
 >
 > | config | GPQA decode (3-seed) | vs bf16 | vs vendor W4A4 |
-> |---|---:|:--:|:--:|
+> | --- | ---: | :--: | :--: |
 > | bf16 | 276 +/- 25 tok/s | — | — |
 > | w4a4 vendor — `torch_npu` `npu_*` chain (separated) | 227 +/- 22 tok/s | 0.82x | 1.00x |
 > | **w4a4 hybrid-mega (ours, fused single launch)** | **332 +/- 18 tok/s** | **1.20x** | **1.46x** |
@@ -1915,7 +1915,7 @@ https://github.com/vllm-project/vllm-ascend/pull/15714
 > Profiled with `torch_npu.profiler` on Qwen3-30B-A3B, 8x Atlas 800I A2, EP=8, batch 1, ACL graph captured, rank 0:
 >
 > | kernel | before | after |
-> |---|--:|--:|
+> | --- | --: | --: |
 > | `aclnnConstantPadNd_PadV3AiCore_PadV3` | 945.2 us/step | 0.0 (0 calls) |
 > | `aclnnConstantPadNd_PadV3AiCore_MemSet` | 808.4 us/step | 0.0 (0 calls) |
 > | all padding kernels | 36.7 us/layer | 0.20 us/layer |
@@ -1925,7 +1925,7 @@ https://github.com/vllm-project/vllm-ascend/pull/15714
 > **Decode latency, batch 1** — 32 prompts served one at a time, 128 generated tokens, 3 rounds with the arms rotated within each round to cancel thermal drift:
 >
 > | round | ITL unpatched | ITL patched | delta |
-> |--:|--:|--:|--:|
+> | --: | --: | --: | --: |
 > | 1 | 18.3972 ms | 17.6319 ms | -4.16% |
 > | 2 | 18.4899 ms | 17.5666 ms | -4.99% |
 
@@ -1958,7 +1958,7 @@ https://github.com/vllm-project/vllm-ascend/pull/16606
 > **Operator level** (torch_npu profiler, rank 13, identical request, decode path; 11776 GroupedMatmul calls in both runs, deterministic and directly comparable):
 >
 > | metric | baseline | tuning_config | delta |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | total (ms) | 776.2 | 743.4 | -4.2% |
 > | mean (us) | 65.9 | 63.1 | -4.2% |
 > | median (us) | 61.6 | 58.4 | -5.2% |
@@ -1968,7 +1968,7 @@ https://github.com/vllm-project/vllm-ascend/pull/16606
 > **E2E** (benchmark_serving, 20 requests, 20k-40k input tokens, max-concurrency=1):
 >
 > | metric | baseline | tuning_config | delta |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | duration (s) | 1242.13 | 1161.33 | -6.5% |
 > | output throughput (tok/s) | 27.94 | 30.08 | +7.7% |
 > | TPOT mean (ms) | 32.70 | 28.51 | -12.8% |
@@ -2005,7 +2005,7 @@ https://github.com/vllm-project/vllm-ascend/pull/19033
 >    The side-stream overlap path was not capture-safe: during NPU graph capture the shared-experts side stream is not registered with the graph pool, so any side-stream op — or even a `wait_stream()` recording an event on it — fails with `aclrtAllocatorGetByStream` / `rtStreamWaitEvent` errors, crashing startup at graph capture when MTP is combined with the overlap.
 >
 > | Scenario | Before | After |
-> |---|---|---|
+> | --- | --- | --- |
 > | c=1 TPOT (no MTP) | ~8.2 ms | ~7.6 ms |
 > | c=1 TPOT (MTP=4, min_tokens=512) | ~7.0 ms | ~5.1 ms (-27%) |
 > | c=4 TPOT (MTP=4, min_tokens=512) | ~8.9 ms | ~9.0 ms (unchanged) |
@@ -2489,20 +2489,20 @@ The derived geometry table — every tile count is a closed form of (E, N, K) an
 > `UP_W_SLOTS` = SLOTS = 4; `UP_COL_HALVES` = UCH is derived).  All stage geometry
 > follows from these and the (E, N, K) dims:
 >
-> | derived quantity  | formula                                 | value | meaning                             |
+> | derived quantity | formula | value | meaning |
 > | ----------------- | --------------------------------------- | ----- | ----------------------------------- |
-> | `UCH`             | `max(1, 2N·DCT / (128·K))`              | 1     | 128-row M-atoms per up-block        |
-> | `UP_GRID`         | `2N / (128·UCH)`                        | 8     | blocks per expert, up-proj          |
-> | `UP_GROUPS`       | `GRID_SIZE / UP_GRID`                   | 16    | experts in parallel, up-proj        |
-> | `K_TILES_UP`      | `K / KUP`                               | 8     | up-proj outer K iterations          |
-> | `K_SUBSTEPS_UP`   | `KUP / 128`                             | 2     | 128-K substeps per iteration        |
-> | `UP_ARM_DISTANCE` | `max(1, SLOTS − 2)`                     | 2     | weight-TMA prefetch distance        |
-> | `DOWN_GRID`       | `K / DCT`                               | 8     | blocks per expert, down-proj        |
-> | `DOWN_GROUPS`     | `GRID_SIZE / DOWN_GRID`                 | 16    | experts in parallel, down-proj      |
-> | `DOWN_COL_HALVES` | `DCT / 128`                             | 2     | 128-col WGMMA passes per K-step     |
-> | `K_TILES_DOWN`    | `N / KDN`                               | 2     | down-proj outer K iterations        |
-> | `K_SUBSTEPS_DOWN` | `KDN / 128`                             | 2     | 128-K substeps per iteration        |
-> | `K_BLOCKS_TOTAL`  | `K / 128`                               | 16    | routing-window / quantization atoms |
+> | `UCH` | `max(1, 2N·DCT / (128·K))` | 1 | 128-row M-atoms per up-block |
+> | `UP_GRID` | `2N / (128·UCH)` | 8 | blocks per expert, up-proj |
+> | `UP_GROUPS` | `GRID_SIZE / UP_GRID` | 16 | experts in parallel, up-proj |
+> | `K_TILES_UP` | `K / KUP` | 8 | up-proj outer K iterations |
+> | `K_SUBSTEPS_UP` | `KUP / 128` | 2 | 128-K substeps per iteration |
+> | `UP_ARM_DISTANCE` | `max(1, SLOTS − 2)` | 2 | weight-TMA prefetch distance |
+> | `DOWN_GRID` | `K / DCT` | 8 | blocks per expert, down-proj |
+> | `DOWN_GROUPS` | `GRID_SIZE / DOWN_GRID` | 16 | experts in parallel, down-proj |
+> | `DOWN_COL_HALVES` | `DCT / 128` | 2 | 128-col WGMMA passes per K-step |
+> | `K_TILES_DOWN` | `N / KDN` | 2 | down-proj outer K iterations |
+> | `K_SUBSTEPS_DOWN` | `KDN / 128` | 2 | 128-K substeps per iteration |
+> | `K_BLOCKS_TOTAL` | `K / 128` | 16 | routing-window / quantization atoms |
 >
 > `UP_GROUPS == DOWN_GROUPS` (16), so the site-#2 producer/consumer sets coincide.
 > The routing-window tile is 32 KB (BS=8).  These constraints hold: `GRID_SIZE` is
@@ -2669,11 +2669,11 @@ The shared-memory budget, with the lifetime union and the bank-conflict padding:
 > The dominant space is a union whose members have strictly disjoint lifetimes
 > (separated by the Phase-2 trailing sync and the site-#2 barrier):
 >
-> | view                                   | phase | size (N512_K2048 cfg0) |
+> | view | phase | size (N512_K2048 cfg0) |
 > | -------------------------------------- | ----- | --------------- |
-> | `bf16_in_full[K/128][BS][128]`         | 1–2   | 32 KB           |
-> | `w_wgmma[UP_W_SLOTS][M_total][128]`    | 3     | 64 KB           |
-> | `w_down_wgmma[2][DCT·K_SUBSTEPS][128]` | 4     | dominates       |
+> | `bf16_in_full[K/128][BS][128]` | 1–2 | 32 KB |
+> | `w_wgmma[UP_W_SLOTS][M_total][128]` | 3 | 64 KB |
+> | `w_down_wgmma[2][DCT·K_SUBSTEPS][128]` | 4 | dominates |
 >
 > Other notable fields:
 >
@@ -2720,12 +2720,12 @@ The global scratchpad, and the address-stability invariant required for graph re
 
 TMA descriptor table:
 
-> | descriptor       | tensor                               | box     | swizzle |
+> | descriptor | tensor | box | swizzle |
 > | ---------------- | ------------------------------------ | ------- | ------- |
-> | up weights       | `[E·2N, K]` fp8 (interleaved or raw) | 128×128 | 128B    |
-> | activations      | `[BS, K]` bf16                       | 8×128   | none    |
-> | down weights     | `[E·K, N]` fp8 (raw)                 | 128×128 | 128B    |
-> | down activations | `temp_fp8 [rows, N]` fp8             | 8×128   | 128B    |
+> | up weights | `[E·2N, K]` fp8 (interleaved or raw) | 128×128 | 128B |
+> | activations | `[BS, K]` bf16 | 8×128 | none |
+> | down weights | `[E·K, N]` fp8 (raw) | 128×128 | 128B |
+> | down activations | `temp_fp8 [rows, N]` fp8 | 8×128 | 128B |
 
 ## Relevance
 
@@ -8054,7 +8054,7 @@ expansion of the acronym, and the assumption that one paper covers it.
 The four families, all verified in-tree:
 
 | # | Family | Activation | Components | Radix / scales | Cube out | Where |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 1 | **A8W4 MSD** — OURS | INT8 | 2 × int4 nibbles | 16 | `half` | `grouped_matmul*/..._a8w4_msd*`, `ops-nn/matmul/quant_batch_matmul_v4/op_kernel/quant_batch_matmul_v4_msd.h` |
 | 2 | A16W8 MSD | BF16/FP16 | 2 × int8 digits | 127.499, then 127.499²·2 | `int32` | `ops-nn/matmul/weight_quant_batch_matmul_v2/op_kernel/weight_quant_batch_matmul_v2_msd_*.h` |
 | 3 | A16W4 MSD | BF16/FP16 | 2 × int8 | `float multiFactors[2] = {127.0f, 254.0f}` | `int32` (`LocalTensor<int32_t> s32l0c_`) | `ops-transformer/gmm/grouped_matmul/op_kernel/a16w4_msd/` |
@@ -8104,7 +8104,7 @@ literally `GlobalTensor<DTYPE_BIAS_A8W4MSD> biasGm; // for 8 * weight`), and `yO
    > scales. Eff. Bits and Error Bound are for the K shown.
    >
    > | Activation | Weight | MSD Decomposition | K | Eff. Bits | Error Bound |
-   > |---|---|---|---|---|---|
+   > | --- | --- | --- | --- | --- | --- |
    > | BF16 | INT8 | BF16→INT8 + INT8 | 2 | ∼16 | M/64516 |
    > | BF16 | MXFP4 | BF16→MXFP4 + MXFP4 | 2 | ∼6.6 | α/64 |
    > | BF16 | FP8 | BF16→FP8 + FP8 | 2 | ∼16 | TBD |
@@ -8369,7 +8369,7 @@ Table 2, verbatim:
 > Table 2: Effective compute time: MXFP8 baseline vs. MSD-MXFP4 (K = 2)
 >
 > | Method | Raw FLOPs | Throughput | Effective Time |
-> |---|---|---|---|
+> | --- | --- | --- | --- |
 > | MXFP8 × MXFP4 (dequant) | 2mn (FP8) | 2× | 1.0 mn |
 > | MSD-MXFP4 (2 × FP4) | 4mn (FP4) | 4× | 1.0 mn |
 >

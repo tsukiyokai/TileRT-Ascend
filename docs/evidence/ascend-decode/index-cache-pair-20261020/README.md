@@ -19,10 +19,10 @@ SHA4548b3a8758c11d7c5a2278d056936303a11aa41843026e5f239130b10b127ff
 was opened and read by the runtime; [receipt](device-access-02-2.json).
 
 | Width | Two scatters p50 µs | Paired p50 µs | Paired wins/30 |
-|---|---:|---:|---:|
-|1|19.943|4.727|30|
-|8|19.363|4.929|30|
-|32|21.320|8.685|29|
+| --- | ---: | ---: | ---: |
+| 1 | 19.943 | 4.727 | 30 |
+| 8 | 19.363 | 4.929 | 30 |
+| 32 | 21.320 | 8.685 | 29 |
 
 One graph replay of10 updates per sample;30 alternating AB/BA pairs, event
 time divided by10, one warmup replay per arm. Input/cache reset and sync are
@@ -44,10 +44,10 @@ updates/Graph, one warmup per arm, and the same event timing scope. Every
 candidate pair wins; peak NPU reservation84MiB. [Summary](method-summary.json).
 
 | Width | Original p50 µs | Patched p50 µs |
-|---|---:|---:|
-|1|25.794|8.586|
-|8|28.966|10.342|
-|32|28.460|16.716|
+| --- | ---: | ---: |
+| 1 | 25.794 | 8.586 |
+| 8 | 28.966 | 10.342 |
+| 32 | 28.460 | 16.716 |
 
 Commit `48a23ac` adds13 lines only to the INT8 C8 branch. Its base is frozen unified
 `indexer.py` SHA6513151ea1baa0a806abdbecbf776016ab16dd0cf6c75d9c5cd4aa02892b7dd1.

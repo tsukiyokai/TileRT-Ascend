@@ -11,7 +11,7 @@ smallest union -- greedy on a submodular objective, which is the right
 algorithm for it.
 
 | rows kept | union mean | median | min | max |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 32, all of them | **99.36** | 96.0 | 74 | 135 |
 | 16, chosen greedily | 55.08 | 53.0 | 42 | 78 |
 | 8, chosen greedily | 33.67 | 33.0 | 25 | 43 |

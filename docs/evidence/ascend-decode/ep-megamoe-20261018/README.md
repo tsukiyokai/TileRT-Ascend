@@ -5,7 +5,7 @@
 parallel layout differs; attention stays TP16 throughout.
 
 | case | TPOT median (ms) | spread | rounds | A | per round (ms) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | TP16 | **14.247** | 0.252 | 298 | 3.4329 | **49.07** |
 | EP16, no fusion | 15.150 | 0.521 | 310 | 3.3000 | 50.16 |
 | EP16 + `MegaMoe` | 15.375 | 0.756 | 306 | 3.3431 | 51.57 |

@@ -5,7 +5,7 @@ initial transport bridge SHA256 is
 `cee498b49da610c77a50d00de200b7bc4ddf1c1304bf6a3dea19cb6f870864f5`.
 
 | Check | Observation |
-|---|---|
+| --- | --- |
 | Independent processes, die 0 → die 0 | [Connect status 103900](same-die.json); receive allocation remains unchanged. |
 | Independent processes, die 0 → die 1 | [1 KiB WRITE passes](cross-die.json); all receiver bytes equal the source pattern. |
 | Two processes per die, 0 → 1 held while 1 → 0 runs | [Both 1 KiB WRITEs pass](hixl-listen-port-20261017.json); four explicit internal listener ports are observed. |

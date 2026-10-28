@@ -9,7 +9,7 @@ A layer a rank, from the checkpoint's own shapes, at the 1200 GB/s the grouped
 matmul achieves:
 
 | item | MB | us |
-|---|---|---|
+| --- | --- | --- |
 | attention weights | 190.2 | 158.5 |
 | KV cache, 8K context | 9.4 | 7.8 |
 | expert bank, all sixteen | 302.0 | 251.7 |
@@ -52,7 +52,7 @@ already divided it once, recording 0.93 GB a rank over 78 layers. A rank's share
 is 11.9 MB a layer.
 
 | item | MB a rank | us |
-|---|---|---|
+| --- | --- | --- |
 | attention weights | 11.9 | 9.9 |
 | KV cache, 8K, replicated | 9.4 | 7.8 |
 | expert bank, all sixteen | 302.0 | 251.7 |
@@ -85,7 +85,7 @@ Comparing a narrowed floor against an unnarrowed engine gave thirteen times,
 which is apples to oranges. Against its own floor:
 
 | state | round | floor | ratio | TPOT |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | today, full bank | 50.73 | 21.01 | **2.41** | 9.32 |
 | narrowed | 33.33 | 3.84 | 8.68 | 6.13 |
 
@@ -126,7 +126,7 @@ owns `256 / ranks` experts and a round's ninety-six picks touch proportionally
 more of them:
 
 | ranks | heads | FIA us | touched | bank us | attn MB | layer us | round ms | TPOT |
-|---|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2 | 32 | 135.9 | 40.1 | 631.4 | 95.1 | 897.9 | 103.44 | 19.01 |
 | 4 | 16 | 115.5 | 20.0 | 315.7 | 47.5 | 522.1 | 70.70 | 12.99 |
 | 8 | 8 | 91.5 | 10.0 | 157.9 | 23.8 | 320.4 | 60.50 | 11.12 |

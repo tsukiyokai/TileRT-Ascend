@@ -29,7 +29,7 @@ Checked against the checkpoint's `config.json` and the operator's A2/A3
 constraint table.
 
 | constraint | required | GLM-5.2 |
-|---|---|---|
+| --- | --- | --- |
 | `hidden` | 1024–8192, % 512 | 6144 |
 | `intermediate_hidden` | 512–3072, % 512 | 2048 |
 | `num_experts` | ≥ `ep_world_size`, ≤ 1024, % `ep_world_size` | 256 |

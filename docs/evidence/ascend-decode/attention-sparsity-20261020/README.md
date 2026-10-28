@@ -12,7 +12,7 @@ evidence page has to name the run it read.
 What `SparseFlashAttention` is handed:
 
 | argument | shape | dtype |
-|---|---|---|
+| --- | --- | --- |
 | query | `1,4,512` | BF16 |
 | key | `73,128,1,512` | BF16 |
 | value | `73,128,1,512` | BF16 |

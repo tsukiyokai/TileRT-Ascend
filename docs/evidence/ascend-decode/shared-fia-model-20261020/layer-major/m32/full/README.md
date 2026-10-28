@@ -32,7 +32,7 @@ prefix checks and identical logits across ranks within each arm. Only the
 teacher gate fails. Peak shared-FIA layer allocation is942,589,952 bytes/die.
 
 | Query | Frozen label | SFA top1 / runner-up / margin | Shared-FIA top1 / runner-up / margin |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | 3 | 2524 | 2524 /6500 /0.002617 | 3797 /2524 /0.031149 |
 | 21 | 13 | 13 /26 /0.071281 | 26 /13 /0.032093 |
 

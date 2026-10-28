@@ -4,7 +4,7 @@ Same binary, one variable, two interleaved repeats at TP16 on a 96 KiB float32
 payload:
 
 | push mechanism | per reduction | spread | payload |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `aclshmemx_mte_put_nbi` + `aclshmem_quiet` | 22.556, 22.405 µs | 0.7% | `wrong 0`, `got 120.0` |
 | `aclshmem_ptr` + plain `DataCopy` | **14.623, 14.481 µs** | 1.0% | `wrong 0`, `got 120.0` |
 

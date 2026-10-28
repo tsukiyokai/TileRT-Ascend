@@ -5,7 +5,7 @@ GLM-5.2-W4A8C8, TP16/DP1, batch one. vLLM performs both prefill and decode.
 MTP uses three drafts; ACL Graph captures four target verification rows.
 
 | Statistic | Result |
-|---|---|
+| --- | --- |
 | TPOT p50 / p95 | 16.390 / 18.295 ms |
 | TPOT mean / p99 | 16.514 / 18.542 ms |
 | Token-weighted decode rate | 60.555 tok/s |

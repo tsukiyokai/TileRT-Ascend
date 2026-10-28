@@ -7,7 +7,7 @@ arm. Thirty samples a case after ten warmups; the reported spread is the
 rank-maximum p50 across ranks.
 
 | rows | payload | chain p50 | p90 | std | per call |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 1 | 12 KB | 5.590 ms | 5.644 | 0.037 | 35.83 us |
 | 4 | 48 KB | 5.085 | 5.183 | 0.062 | 32.60 |
 | 8 | 96 KB | 5.127 | 5.204 | 0.071 | 32.87 |

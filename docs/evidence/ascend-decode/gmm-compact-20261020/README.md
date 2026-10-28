@@ -45,12 +45,12 @@ All five shapes win30/30 pairs; no samples are discarded. Clocks are unlocked.
 Numbers are device event microseconds per call; host replay is below1.5µs.
 
 | Verification width / expert union | Dense p50 | Compact p50 | Paired delta p50 |
-|---|---:|---:|---:|
-| M1 / 8 |90.895|49.359|−41.473|
-| M8 / random top8 per token |111.561|83.914|−27.660|
-| M32 / random top8 per token |163.276|141.164|−22.019|
-| M32 / shared8 |96.553|59.977|−36.560|
-| M32 / all256 |211.161|192.990|−18.273|
+| --- | ---: | ---: | ---: |
+| M1 / 8 | 90.895 | 49.359 | −41.473 |
+| M8 / random top8 per token | 111.561 | 83.914 | −27.660 |
+| M32 / random top8 per token | 163.276 | 141.164 | −22.019 |
+| M32 / shared8 | 96.553 | 59.977 | −36.560 |
+| M32 / all256 | 211.161 | 192.990 | −18.273 |
 
 [Raw paired samples, distributions, p90/p99/std](paired.json),
 [full-union samples](paired-full-union.json). Full-union samples are noisier;

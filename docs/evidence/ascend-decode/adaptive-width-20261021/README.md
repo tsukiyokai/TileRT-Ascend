@@ -3,7 +3,7 @@
 2026-10-21, CPU, 34 source files from this repository, width ceiling 32.
 
 | edit rate | automaton @32 | adaptive | mean width | TPOT @32 | TPOT adaptive |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 0.02 | 10.020 | 8.318 | 12.6 | 7.18 | **6.75** |
 | 0.05 | 5.434 | 4.362 | 8.1 | 13.24 | **12.02** |
 
@@ -67,7 +67,7 @@ adaptive accepts 4.351 at a mean width of 8.0 for 12.05 -- 9.7 percent.
 Each column on its own trajectory, width ceiling 32, budget ceiling 64:
 
 | edit rate | automaton @32 | TPOT | adaptive chain | TPOT | adaptive tree | nodes | TPOT |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 0.02 | 10.063 | 7.15 | 8.385 | 6.71 | 9.288 | 13.1 | **6.09** |
 | 0.05 | 5.436 | 13.23 | 4.358 | 12.03 | 4.731 | 7.4 | **10.97** |
 

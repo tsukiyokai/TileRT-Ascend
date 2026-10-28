@@ -5,7 +5,7 @@ Read from `profile-rope-20261018`'s `op_statistic.csv` on rank 0, which covers
 per-round figures divide by three.
 
 | operator | calls (export) | total µs | per round | µs per round |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **`Cast`** | 1669 | 4628.479 | **554** | **1537** |
 | `Muls` | 235 | 1110.214 | 78 | 368 |
 | `Abs` | 235 | 207.158 | 78 | 68.8 |
@@ -65,7 +65,7 @@ In `vllm_ascend/quantization/methods/w4a8/w4a8.py` the load path converts at
 forward path has exactly four:
 
 | line | what it converts | guard |
-|---|---|---|
+| --- | --- | --- |
 | 546 | `pertoken_scale` to float32, reshaped and made contiguous | none; the value is genuinely per-call |
 | 566 | `w1_scale` elements to `w2_scale`'s dtype | yes — only when the dtypes differ |
 | 590 | `group_list` to int64 | none; per-call, 256 elements |
@@ -91,7 +91,7 @@ AscendCL event, so joining on it gives the producer where time containment gave
 the blocking call. Joining 1590 tasks:
 
 | | calls | joined to an API |
-|---|---|---|
+| --- | --- | --- |
 | total | 1590 | **99** |
 
 **1491 of them have no launching API event at all**, which is what a task
@@ -103,7 +103,7 @@ still costing device time.
 By graph:
 
 | Model Id | calls | µs | per round | µs per round |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 48, the target graph, stream 81 | 1437 | 4300.8 | **477** | **1429** |
 | 4294967295, eager, stream 17 | 99 | 167.3 | 33 | 55.6 |
 | 49, the draft graph, stream 83 | 54 | 82.6 | 18 | 27.5 |

@@ -37,7 +37,7 @@ Each arm uses ten eager warmups, ten capture calls, and thirty measured
 replays of a ten-call graph; 1280 calls total, no added pairs.
 
 | Order | V1 event µs/call | C1 event µs/call | C1/V1 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | AB | 90.053 | 998.380 | 11.087 |
 | BA | 92.406 | 1002.533 | 10.849 |
 

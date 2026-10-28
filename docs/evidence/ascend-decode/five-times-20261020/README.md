@@ -33,7 +33,7 @@ Measured 46.277 ms of device time a round against a 10.057 ms floor priced
 from the bytes each operator must move. The named pieces, all measured:
 
 | what | measured, ms a round | floor | lever |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | launch floor, 3008 calls, 82% on MIX cores | 11.512 | — | one kernel a layer takes 3008 calls to 78-156 |
 | routed experts | 12.39 | 3.48 | [the INT8 kernel measures 3.70](../routed-kernel-20261020/README.md) |
 | TP reduction, 0% overlap with compute | 5.35 | — | one-sided, fused into the layer kernel |

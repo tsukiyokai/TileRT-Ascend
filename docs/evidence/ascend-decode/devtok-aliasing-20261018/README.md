@@ -7,7 +7,7 @@ before the host reads anything
 ([commit](../../../../tilert/models/glm_5_2_ascend/mtp_round.py)).
 
 | case | TPOT median (ms) | rounds | A | round (ms) | tokens vs reference |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | reference (host ints) | 14.540 | 298 | 3.433 | 49.92 | — |
 | device tokens, chunk 1 | 24.504 | 492 | 2.079 | 50.74 | identical |
 | device tokens, chunk 8 | 23.972 | — | — | — | identical |
@@ -58,7 +58,7 @@ is not evidence it would have caught anything.
 With the clone restored, every gate holds and the change is a win:
 
 | case | TPOT median (ms) | three runs | rounds | A | tokens vs reference |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | reference | 14.540 | — | 298 | 3.4329 | — |
 | chunk 1 | **14.247** | 14.442 / 14.247 / 14.190 | 298 | 3.4329 | identical |
 | chunk 8 | 14.255 | 14.115 / 14.385 / 14.255 | 298 | 3.4329 | identical |

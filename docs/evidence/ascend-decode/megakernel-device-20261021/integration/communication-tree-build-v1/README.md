@@ -5,7 +5,7 @@ serial probe in the actual Torch 2.12 image on a3-78. No NPU was mapped or
 initialized. Device arithmetic and graph replay are separate gates.
 
 | Artifact | SHA256 |
-|---|---|
+| --- | --- |
 | Candidate DSO | `a0bd2462e2f999280720fa5060466159a2eab13ce5541639ddc7afef35a45ebf` |
 | Accepted serial DSO | `1be5fa375d0d6e7a2a6dcf7f5265cf886317108398aeec940e2b1ce0de04e22f` |
 | Frozen source manifest | `22d408d22afcccfce6941a0a9cd5c2cdc3e38c53110401f21cb46832b4b79716` |

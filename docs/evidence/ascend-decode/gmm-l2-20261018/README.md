@@ -16,7 +16,7 @@ calls old. A3 `a3-84` die 0 shared with an idle tenant, one rank, twenty
 calls per batch after twenty warmup calls, twenty batches, medians.
 
 | groups | `gate_up` (µs) | marginal | GB/s | `down` (µs) | marginal | GB/s |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 1 | 65.867 | | | 62.392 | | |
 | 4 | 65.233 | | | 67.191 | | |
 | 16 | 70.175 | | | 76.046 | | |

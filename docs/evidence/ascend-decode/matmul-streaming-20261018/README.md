@@ -6,7 +6,7 @@ The die's measured streaming maximum is 1190.77 GB/s
 ([HBM](../../a3-hbm-20261017.json)).
 
 | path | weight bytes | µs | GB/s | share of ceiling |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `torch.matmul`, bfloat16 | 25.17 MiB | 22.52 | 1117.3 | 93.8% |
 | `npu_quant_matmul`, int8 ND weight | 12.58 MiB | 23.92 | 526.0 | 44.2% |
 | this project's TileLang kernel, bfloat16 | 25.17 MiB | 127.18 | 197.9 | 16.6% |

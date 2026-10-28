@@ -54,7 +54,7 @@ The collective floor is per call and the message is free, so the reduce count
 is the only collective lever left. At 5.441 accepted:
 
 | reduces a layer | collectives ms | + compute | TPOT ms |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 2 | 29.64 | 68.11 | 12.52 |
 | 1 | 14.82 | 53.29 | 9.79 |
 | 0 | 0.00 | 38.47 | 7.07 |

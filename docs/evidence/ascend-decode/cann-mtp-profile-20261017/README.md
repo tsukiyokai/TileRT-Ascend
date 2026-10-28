@@ -20,7 +20,7 @@ Rank zero, captured rounds two and three. Stage windows run from one
 stage's CPU begin to the next stage's begin, including dependent waits.
 
 | Window | Round 2 (ms) | Round 3 (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Two chained drafts | 16.766 | 16.794 |
 | Verify → conditioned draft | 49.020 | 49.348 |
 | Conditioned draft → commit | 7.135 | 6.946 |
@@ -33,7 +33,7 @@ Notify_Wait and 1.213/1.213 ms as transit. These intervals can overlap and
 are not additive critical-path terms or bare-network measurements.
 
 | Target operator | Calls/round | Duration sum, rounds 2/3 (ms) |
-|---|---|---|
+| --- | --- | --- |
 | GroupedMatmulSwigluQuantV2 | 75 | 7.807 / 7.727 |
 | GroupedMatmul | 75 | 5.538 / 5.526 |
 | SparseFlashAttention | 78 | 7.042 / 7.037 |
@@ -85,7 +85,7 @@ calls. AIV uses `AivKernel` throughout; AI_CPU uses
 Rank zero, target ModelID49 in rounds two and three, in milliseconds:
 
 | Interval | AI_CPU | AIV |
-|---|---|---|
+| --- | --- | --- |
 | Target device span | 45.380 / 45.719 | 46.422 / 46.205 |
 | Compute union | 38.221 / 38.090 | 37.534 / 37.423 |
 | HCCL envelope union | 5.291 / 5.775 | 7.064 / 6.972 |

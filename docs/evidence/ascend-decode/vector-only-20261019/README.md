@@ -9,7 +9,7 @@ per core, a 71 GB/s DMA floor at 256-byte segments on stride 6144 — and the
 ## No configuration beats the vendor
 
 | measurement | vector-only | vendor | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | best per call, `(256, 6144)` at `block_k=1024` | 19.529 µs | — | 38% better than the shipped `block_k=256` |
 | best anywhere per 786,432 packed bytes, 48 workers | 16.487–17.643 µs | — | 44.6–47.7 GB/s |
 | eight `gate_up` experts, best-ever per-expert × 8 | 131.9 µs | 60–63 µs | 2.1× short |
@@ -51,7 +51,7 @@ The measurement the first line did not make. Holding occupancy at all 48
 workers and sweeping the call size:
 
 | packed bytes per call | µs |
-|---|---|
+| --- | --- |
 | 98,304 | 7.360 |
 | 196,608 | 9.251 |
 | 393,216 | 12.220 |
@@ -67,7 +67,7 @@ Projected to one fused launch per projection, which is a projection from that
 fit and not a measured fused kernel:
 
 | work | vector-only | vendor | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | eight `gate_up` experts, 6,291,456 B | 99.9 µs | 60–63 | 1.6× loss |
 | eight `down` experts, 3,145,728 B | 52.9 µs | 53 | **parity** |
 | layer total | 152.8 µs | 116.2 | **1.32× loss** |

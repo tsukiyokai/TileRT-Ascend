@@ -8,7 +8,7 @@ flag and keeps `--target-graph` and the rest. Baseline is
 298 rounds.
 
 | dropped | TPOT (ms) | Δ TPOT | A | Δ A | round (ms) | Δ round |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `--super-kernel` | 18.447 | +1.807 | 3.433 | 0 | 63.33 | +6.21 |
 | `--draft-graph` | 18.321 | +1.681 | 3.433 | 0 | 62.90 | +5.78 |
 | `--fp32-head` | 17.957 | +1.317 | 3.148 | −0.285 | 56.52 | −0.60 |

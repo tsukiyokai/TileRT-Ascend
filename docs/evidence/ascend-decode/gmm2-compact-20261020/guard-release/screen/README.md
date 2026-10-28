@@ -11,7 +11,7 @@ restoration. A uses the previous production adaptive ELF; B uses the new
 guard release. Processes run A1→B1→B2→A2.
 
 | Count vector | A1 | B1 | B2 | A2 | B1−A1 | B2−A2 |
-|---|---:|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Teacher layer 29 | 95.874 | 84.697 | 78.780 | 97.765 | −11.177 | −18.985 |
 | Teacher layer 60 | 94.222 | 82.058 | 75.990 | 96.237 | −12.164 | −20.247 |
 | Teacher layer 21 | 98.576 | 82.995 | 77.366 | 99.487 | −15.581 | −22.121 |

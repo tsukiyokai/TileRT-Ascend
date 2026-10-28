@@ -4,7 +4,7 @@
 Each rung adds one fusion to the arm that reads 14.743 ms and passes its gate.
 
 | rung | TPOT | verify | host_tokens | in prompt | outcome |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | baseline | 14.743 ms | — | — | 0.338 | pass |
 | `--hoist-metadata --rope-graph` | **14.605** | 2.138 | 50.454 | 0.338 | pass |
 | vendor hooks applied, no flag | 14.739 | 3.538 | 49.763 | 0.338 | pass |

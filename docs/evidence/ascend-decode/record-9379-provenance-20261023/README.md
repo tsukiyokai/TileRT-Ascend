@@ -6,7 +6,7 @@ one; it is not in this repository. It lives on a3-84 at
 searching only `docs/evidence` was the mistake.
 
 | measured request | TPOT | accepted a round | distinct | in prompt |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | 9.4007 ms | 5.441 | 55 | 0.744 |
 | 2 | 9.3879 | 5.441 | 55 | 0.744 |
 | 3 | 9.4434 | 5.441 | 55 | 0.744 |
@@ -67,7 +67,7 @@ of 8191. Against that, bigram variety -- distinct bigrams over total -- sorts
 the arms the other way:
 
 | arm | bigram variety | distinct tokens | TPOT |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `shared_fia` chain, width 32 | 0.371 | 188 | 29.148 ms |
 | `sfa` chain, width 12 | 0.249 | 139 | 22.135 |
 | the record, auto12 | **0.110** | 55 | 9.4007 |

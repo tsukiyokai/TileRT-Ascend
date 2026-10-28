@@ -13,7 +13,7 @@ At the width-16 union of 68 experts that is 16.40 ms a round against a measured
 17.33, so the fit holds to 5.4 percent. The decomposition is what matters:
 
 | part | ms a round | kind |
-|---|---|---|
+| --- | --- | --- |
 | fixed, both calls, 78 layers | **9.57** | dispatch and tiling |
 | bytes, 68 experts, both calls | 6.83 | roofline, 1.08 and 0.671 TB/s |
 | sum | 16.40 | measured 17.33 |
@@ -29,7 +29,7 @@ With the fixed part gone, MoE plus the collective is 6.83 + 5.125 = 11.96 ms a
 round:
 
 | accepted a round | TPOT |
-|---|---|
+| --- | --- |
 | 6.966, the tree at budget 32 on the engine's own streams | **1.72 ms** |
 | 5.989, the tree at budget 16 | **2.00** |
 | 5.441, the recorded engine figure | **2.20** |
@@ -52,7 +52,7 @@ four and eight experts, with the bank count pinned at 4 because the probe's
 own rotation asks for more memory than a tenant leaves:
 
 | experts | gate_up | down |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 66.85 us | 60.74 |
 | 2 | 66.10 | 60.28 |
 | 4 | 73.52 | 62.28 |
@@ -68,7 +68,7 @@ charges, not both: 4.63 ms a round of the 9.57, leaving 4.94.
     floor = bytes 6.83 + collective 5.125 + remaining fixed 4.94 = 16.90 ms
 
 | accepted a round | TPOT |
-|---|---|
+| --- | --- |
 | 6.966, tree at budget 32 | **2.43 ms** |
 | 5.989, tree at budget 16 | 2.82 |
 | 5.441, recorded | 3.11 |

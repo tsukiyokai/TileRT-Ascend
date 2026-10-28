@@ -80,7 +80,7 @@ uses 19 Cube/38 Vector blocks. [Task accounting](joint/profile/summary.json),
 Two subsequent single-change screens preserve every A/B/reset output bit:
 
 | Bitmap representation | Joint / paired SFA event median | Actual dispatch |
-|---|---|---|
+| --- | --- | --- |
 | uint8, then OR with bool | 693.825 / 94.403 us | Scatter becomes Vector, OR becomes AI_CPU. |
 | uint8 scatter, bool view before OR | 132.017 / 95.389 us | All mask kernels are Vector; the view shares the same device pointer. |
 

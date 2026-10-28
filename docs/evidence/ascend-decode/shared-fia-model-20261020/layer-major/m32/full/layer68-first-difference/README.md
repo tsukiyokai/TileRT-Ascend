@@ -5,7 +5,7 @@ The full M32/SFA run passed all 32 frozen labels on 16 ranks with identical fina
 ## Three distinguishable mechanisms
 
 | Mechanism | Discriminating evidence with identical frozen Q/KV |
-|---|---|
+| --- | --- |
 | Selected-ID order changes finite-precision softmax/PV reduction | Swapping the two columns changes query13 at fixed query width. |
 | Query width changes SFA tiling or arithmetic | M1 versus M32 changes query13 while index order remains fixed. |
 | Query preprocessing or downstream projection/MLP changes with width | The isolated attention 2×2 is identical; full-layer hidden divergence remains outside that isolated result. Q equality must be checked separately, and a later pre-O comparison can isolate V-up. |
@@ -17,7 +17,7 @@ Neither mathematical permutation invariance nor agreement of the selected set pr
 All paths below are inside `a3-194:trt-asc`, under `/workspace/experiments/m32-full-teacher-20261020/`:
 
 | Input | Relative path | SHA256 |
-|---|---|---|
+| --- | --- | --- |
 | Old M1 rank report | `m1-comparison/old/device-78x32-sfa-01/rank-0.json` | `40d3d349fd70e507c7eaae7f9f0f3ba20c65afbe3d7a22c79d3c709b6eac7c2b` |
 | Old M1 layer68 | `m1-comparison/old/device-78x32-sfa-01/rank-0/layer-68.pt` | `bbdf960f91fc44266c24c7fd7d17eae9ff06dcef0305d9834e3478bfdd58515e` |
 | New M32 rank report | `sfa-78/rank-0.json` | `7deccb93e6aeb797e3b41344e8dcf614bcd776a8d929f4c28b0fb71fc38e4eba` |

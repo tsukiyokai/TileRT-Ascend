@@ -18,7 +18,7 @@ the tensor-bit level. Both long runs preserve all sixteen ranks' six
 1024-token trajectories, proposals, acceptance and cache states.
 
 | Sequential run | Three measured TPOT values (ms) | Median (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Small packet | 22.062, 22.117, 22.292 | 22.117 |
 | Matched full vocabulary | 20.674, 21.060, 20.229 | 20.674 |
 
@@ -83,7 +83,7 @@ AddRmsNormBias plus DynamicQuant with one AddRmsNormDynamicQuant; compute
 task count falls from 45 to 44.
 
 | Replay 1 | Rank | Graph span (ms) | Compute union (ms) | O wait (ms) | Prolog span (µs) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Eager | 0 | 4.445 | 0.377 | 3.657 | 30.96 |
 | Eager | 14 | 4.444 | 0.394 | 3.648 | 39.74 |
 | Compiled | 0 | 4.572 | 1.865 | 2.255 | 1495.80 |
@@ -243,7 +243,7 @@ oracle; 17,526 positions/rank require final BF16 rounding. Accumulation
 uses FP32 in ascending rank order and rounds to BF16 once.
 
 | Constant-input 48 KiB peer pull | Rank-MAX p50 (µs) | p95 (µs) |
-|---|---|---|
+| --- | --- | --- |
 | Wait after each peer load | 21.815 | 32.368 |
 | Issue sixteen peer loads, then wait once | 14.334 | 25.621 |
 
@@ -277,7 +277,7 @@ zero-chain calls. The single-kernel variant uses the installed public
 blocks; binary load, graph capture, replay and unload complete successfully.
 
 | Shared TP16, ten dependent sums/graph | Rank-MAX p50 (µs/call) | p95 |
-|---|---|---|
+| --- | --- | --- |
 | Full push, separate producer/consumer kernels | 43.618 | 51.955 |
 | Full push, one batch-scheduled kernel | 38.059 | 47.747 |
 | Full push, double payload/READY slots, no ACK | 35.716 | 41.519 |
@@ -362,7 +362,7 @@ installed Torch matmul, draining its host submission queue before native
 publication without disabling TaskQueue.
 
 | Complete O + sum, TP16 | Rank-MAX p50/p95 (µs) | Paired installed-minus-case median (µs) | Wins/30 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Installed CANN + push16 | 162.141 / 167.688 | — | — |
 | Rebuilt CANN + push16 | 171.980 / 180.745 | −10.609 | 1 |
 | Fused push24 + consumer | 162.781 / 169.121 | −0.328 | 13 |

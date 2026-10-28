@@ -6,7 +6,7 @@ for attention (`cann_attention.shared_kv_fia`'s argument set) and the grouped
 matmul (`ops/quantized.py`'s).
 
 | item | eager | graph | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | attention | 240.33 | 81.26 | **0.338** |
 | rms_norm | 87.34 | 42.60 | 0.488 |
 | dynamic quant | 63.89 | 42.41 | 0.664 |
@@ -53,7 +53,7 @@ accepted at this shape: INT8 into INT32 without scales, and bf16 by bf16. With
 the first:
 
 | item | eager | graph | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | attention | 200.78 | 75.11 | 0.374 |
 | grouped matmul | 179.48 | **157.37** | **0.877** |
 | fused input projection | 47.30 | 46.22 | 0.977 |

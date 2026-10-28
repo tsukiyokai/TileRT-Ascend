@@ -12,7 +12,7 @@ the gap as "No traced kernel/HCCL/AICPU interval". So a stage's device span
 decomposes without subtraction. Rank 0, round 2, in ms:
 
 | stage | span | compute | collective | AICPU residual | idle | collective calls |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `chain`@8195 | 8.150 | 2.413 | 3.861 | 0.000 | 1.876 | 4 |
 | `chain`@8196 | 7.901 | 2.383 | 3.546 | 0.000 | 1.972 | 4 |
 | `verify`@8195 | 48.553 | 40.698 | 5.313 | 1.528 | 1.014 | 158 |

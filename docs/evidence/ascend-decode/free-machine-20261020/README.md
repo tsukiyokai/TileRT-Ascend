@@ -4,7 +4,7 @@
 lookup drafter, three live requests each.
 
 | arm | request TPOT, ms |
-|---|---|
+| --- | --- |
 | base-a, `--lookup` | 11.0052, 10.9691, 10.9937 |
 | combine-a, `--plain-moe-combine` | 10.9420, 10.9553, 10.9285 |
 | base-b, `--lookup` | 10.9848, 11.0309, 10.9811 |
@@ -77,7 +77,7 @@ arm, of which the first is plainly a warm-up -- 11.92, 12.07, 11.89, 11.74
 against steady states near 11.0 -- so the mean is over the other five.
 
 | arm | steady-state requests, ms | mean |
-|---|---|---|
+| --- | --- | --- |
 | base-a | 11.0403 11.0360 11.0435 11.0369 11.0638 | 11.0441 |
 | combine-a | 11.0108 10.9456 10.9132 10.9261 10.9054 | 10.9402 |
 | base-b | 11.1702 11.1130 11.1802 11.1700 11.0966 | 11.1460 |

@@ -27,7 +27,7 @@ source SHAs, and bounded excerpts. The branch emits `MMAD.bf162f32`; its
 `FP16_FP16` symbol spelling does not identify the actual operand dtype.
 
 | Coordinate | Native FP32 accumulator | Native BF16 | Vendor BF16 | BF16 midpoint |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | `(5,95)` | `0xbd657fe8` | `0xbd65` | `0xbd66` | −0.0560302734375 |
 | `(6,115)` | `0xb9937200` | `0xb993` | `0xb994` | −0.00028133392333984375 |
 

@@ -13,7 +13,7 @@ most recent occurrence of everything. Counting where each round's anchor lands,
 on a perturbed source file at width 32:
 
 | edit rate | rounds | anchor in source | in output | no anchor |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0.00 | 352 | 350 | 0 | 2 |
 | 0.02 | 1188 | 551 | 255 | 382 |
 | 0.05 | 2311 | 753 | 591 | 967 |
@@ -31,7 +31,7 @@ from the source token after it, and the index it re-anchors against covers the
 source only. Accepted tokens a round, same stream, same acceptance rule:
 
 | edit rate | width | lookup | aligned | gain |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0.00 | 12 | 12.924 | 12.998 | 1.01x |
 | 0.00 | 32 | 32.494 | 32.963 | 1.01x |
 | 0.00 | 64 | 63.544 | 64.989 | 1.02x |
@@ -87,7 +87,7 @@ width 32, lookup drafter, TPOT 11.164 and 10.922, 1024 output tokens each),
 with the same 8192-token capture prompt:
 
 | stream | distinct tokens | width | lookup | automaton | aligned |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | tail32 | 54 | 12 | 4.571 | 4.995 | 1.932 |
 | tail32 | 54 | 32 | 5.224 | 5.953 | 1.936 |
 | tail32 | 54 | 64 | 5.306 | 6.206 | 1.936 |

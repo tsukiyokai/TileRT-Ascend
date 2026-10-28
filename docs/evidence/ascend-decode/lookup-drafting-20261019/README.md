@@ -13,7 +13,7 @@ most recent earlier occurrence second. Only observed continuations are used;
 short proposals use the deployed pending-token padding.
 
 | Width | Minimum suffix 2: rounds / accepted per round | Minimum suffix 1: rounds / accepted per round |
-|---|---|---|
+| --- | --- | --- |
 | 8 | 253 / 4.0435 | 228 / 4.4868 |
 | 16 | 198 / 5.1667 | 171 / 5.9825 |
 | 32 | 174 / 5.8793 | 147 / 6.9592 |

@@ -3,7 +3,7 @@
 2026-10-21, a3-84, one die, twelve tokens, TP16 shards, 96 sorted rows.
 
 | item | us | share |
-|---|---|---|
+| --- | --- | --- |
 | attention, dense stand-in | 96.959 | 30.6% |
 | grouped matmul | 61.910 | 19.5% |
 | fused input projection | 44.783 | 14.1% |

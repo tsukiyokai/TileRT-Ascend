@@ -12,7 +12,7 @@ Shapes below are logical `[input, output]` dimensions on one TP16 rank.
 Historical checks use the source hashes in their reports.
 
 | Component | Existing operator | Target shape | Numerical evidence |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | W4 expert projections | `npu_dynamic_quant`, `npu_grouped_matmul` | Gate/up `[6144,256]`; down `[128,6144]`; INT32-packed weights and INT64 scale carriers | [32/32 frozen MSD projections](w4-msd.md); [189/190 operator checks](check-weights-msd-a8-20261016.json), one random M4 activation code differs |
 | W8 projections | `npu_dynamic_quant`, `npu_quant_matmul` | qA `[6144,2048]`, kvA `[6144,576]`, qB `[2048,1024]`, output `[1024,6144]`, index query `[2048,4096]` | All shapes execute in the TP16 short run; [A8 operation order](a8-rounding.md) calibrated on frozen inputs |
 | W8 FFN | Same quantized matmul, `npu_swiglu` | Dense gate/up `[6144,1536]`, down `[768,6144]`; shared gate/up `[6144,256]`, down `[128,6144]` | [Layer-1 same-input FFN](dense-layer1-sensitivity-20261016.json) exact; all dense/shared layers execute |

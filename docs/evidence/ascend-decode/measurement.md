@@ -102,7 +102,7 @@ the original file bytes. Capture itself does not establish numerical parity.
 Place numerical reports under `precision/case-00` through `case-07`:
 
 | Directory | Required execution |
-|---|---|
+| --- | --- |
 | `main` | TP16 `run_native_decode.py`; 32 teacher rows after the frozen 8K prefix, HF layer/logit/cache parity and reset replay |
 | `verify` | `run_native_verify.py` against the same HF manifest; M1/2/4, device indices and distributed greedy selection |
 | `mtp_seed` | HF/native MTP comparison at parent position 8191, width 1, target final-normalized parent |

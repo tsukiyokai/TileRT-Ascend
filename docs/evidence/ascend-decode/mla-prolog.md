@@ -20,7 +20,7 @@ the fused Prolog does. The [same-input comparison](cann-prolog-same-input-202610
 records the following differences.
 
 | Boundary | Previous HF unequal values | FP32 Prolog oracle unequal values |
-|---|---|---|
+| --- | --- | --- |
 | Input INT8 codes | 0/6,144 | 0/6,144 |
 | Query INT8 codes | 232/2,048 | 0/2,048 |
 | Query FP32 scale | 1/1 | 0/1 |

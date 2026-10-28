@@ -9,7 +9,7 @@ The parent [Project](parent/body/source/routed_int4/routed_body_native.h) at lin
 The installed [IterateAll](installed/matmul_impl.h) at lines 118–135 calls `Iterate` followed by one `GetTensorC` for each MN tile. [Iterate/GetTensorC](installed/matmul_impl_base.h) at lines 692–720 route to `ScheduleOnce` and `GetResult`. [ScheduleOnce](installed/scheduler/base/scheduler_norm.h) at lines 119–148 advances MN once and performs the complete K reduction before returning. Lines 193–240 contain that K loop. [KLoop](installed/scheduler/iterator/k_loop/k_loop_norm.h) at lines 49–57 and 94–111 uses `ceil(singleCoreK/baseK)` and advances one K tile per iteration.
 
 | Expert count | Parent C results / MMAD calls | Candidate C results / MMAD calls |
-|---|---:|---:|
+| --- | ---: | ---: |
 | 1–16 | 12 / 12 | 6 / 12 |
 | 17–32 | 12 / 12 | 12 / 24 |
 

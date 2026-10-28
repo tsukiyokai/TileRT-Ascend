@@ -6,7 +6,7 @@ PA_BSND paged cache, `sparse_block_size=1`, `sparse_mode=3`,
 `attention_mode=2`, taken from `sfa_v1.py:224`.
 
 | picks | 1 row | 8 rows |
-|---|---|---|
+| --- | --- | --- |
 | 128 | 92.69 µs | 96.34 |
 | 512 | 112.68 | 113.44 |
 | 1024 | 125.44 | 129.47 |

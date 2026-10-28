@@ -6,7 +6,7 @@ prefix and checkpoint for every case. `--max-tokens 1024 --capacity 9344
 for the driver to reclaim HBM.
 
 | case | flags beyond `--target-graph` | TPOT (ms) | tok/s | rounds | A | round (ms) |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | default | — | 21.210 | 47.1 | 303 | 3.376 | 71.61 |
 | no-compile | `--draft-graph --draft-projection-tp --attention-kernel gather_fia --fp32-head` | 19.496 | 51.3 | 319 | 3.207 | 62.52 |
 | composed | the above plus `--compile-target --super-kernel` | 16.640 | 60.1 | 298 | 3.433 | 57.12 |

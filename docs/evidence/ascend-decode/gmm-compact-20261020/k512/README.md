@@ -18,11 +18,11 @@ All24 changing-route Graph cases match codes/scales bit-for-bit. Timing:
 unlocked clocks under shared load; peak reserved898MiB.
 
 | Case | N256/K256 µs | N128/K512 µs | Paired delta µs | Candidate wins |
-|---|---:|---:|---:|---:|
-| M1 random |45.081|41.298|−3.699|10/10|
-| M8 random |85.242|83.499|−1.721|10/10|
-| M32 random |141.969|142.455|+0.514|0/10|
-| M32 shared8 |56.638|52.857|−3.763|10/10|
+| --- | ---: | ---: | ---: | ---: |
+| M1 random | 45.081 | 41.298 | −3.699 | 10/10 |
+| M8 random | 85.242 | 83.499 | −1.721 | 10/10 |
+| M32 random | 141.969 | 142.455 | +0.514 | 0/10 |
+| M32 shared8 | 56.638 | 52.857 | −3.763 | 10/10 |
 
 At fixed N128, M32 random saves4.665µs, but it remains slower than the
 original N256 arm. Close this GMM1 tiling branch without a production

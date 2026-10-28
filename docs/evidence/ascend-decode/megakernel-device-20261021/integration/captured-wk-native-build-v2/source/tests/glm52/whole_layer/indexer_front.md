@@ -21,7 +21,7 @@ replay 4. Its source snapshot and SDK identity remain in the build manifest.
 All tensors use contiguous physical ND storage on one NPU. `M` is 1–32.
 
 | Input | Dtype and shape | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `hidden` | BF16 `[M,6144]` | Input of replicated WK and head-weight projection |
 | `query_norm` | INT8 `[M,2048]` | Main Prolog normalized Q codes |
 | `query_norm_scale` | FP32 `[M]` | Main Prolog normalized Q token scales |

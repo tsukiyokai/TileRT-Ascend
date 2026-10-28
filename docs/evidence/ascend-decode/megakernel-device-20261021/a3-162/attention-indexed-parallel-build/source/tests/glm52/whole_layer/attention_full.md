@@ -44,7 +44,7 @@ tail scratch size. Separate stages request `L+A+T` bytes; this kernel requests
 `L+max(A,T)`. At eight mixed groups and at least four logical cache pages:
 
 | M | Full scratch bytes | Separate scratch plus latent bytes |
-|---|---:|---:|
+| --- | ---: | ---: |
 | 1 | 20,226,560 | 37,544,960 |
 | 12 | 22,943,744 | 40,262,144 |
 | 32 | 29,671,424 | 47,531,008 |

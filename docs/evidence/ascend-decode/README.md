@@ -10,7 +10,7 @@ different working directory.
 ## Results
 
 | Run | Checks | Maximum NRMSE | Minimum cosine | Maximum logits error |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | [CPU](smoke-cpu.json) | 1,729/1,729 | 0 | exact tensors | 0 |
 | [A3 NPU](smoke-npu.json) | 1,729/1,729 | 0.008435 | 0.9999645 | 0.0078125 |
 
@@ -49,7 +49,7 @@ The connector accepts an entire 8192-token prefill with chunking enabled
 and rejects a partial chunk. These checks use no NPU execution or HIXL WRITE.
 
 | Component | Evidence | Result |
-|---|---|---|
+| --- | --- | --- |
 | Real checkpoint loading and projections | [Weight reports](weights/README.md) | CPU packing/slicing 102/102; native NPU projections 172/172 |
 | Complete rank-local expert | [Expert chain](weights/expert-chain.json) | 70/70; maximum output NRMSE 0.003695; rank 0/15 partitions run on one die |
 | BF16 sparse indexer | [8K selection](indexer.json) | Positive and negative head-weight cases match all 2048 selected indices |

@@ -8,7 +8,7 @@ written where nobody read them. Login works again on 2026-10-24 and the three
 summaries were intact; `summary.json` per arm is beside this file.
 
 | width | rounds a request | accepted a round | TPOT ms | round ms |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 16 | 294 | 3.483 | 17.132 | 59.67 |
 | 24 | 322 | 3.180 | 20.108 | 63.95 |
 | 32 | 179 | 5.721 | 12.413 | 71.01 |

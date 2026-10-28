@@ -22,7 +22,7 @@ difference being the round's 5.86 ms still unattributed.
 ## Seven steps
 
 | step | saves us | layer | round ms | TPOT | basis |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | as measured today | | 575 | 44.87 | 8.25 | |
 | narrow the bank to the touched experts | 223 | 352 | 27.46 | 5.05 | **measured** |
 | fuse the router's six kernels into one | 25 | 327 | 25.51 | 4.69 | estimated |

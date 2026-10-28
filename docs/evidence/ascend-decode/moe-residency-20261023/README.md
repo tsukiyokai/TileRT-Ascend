@@ -8,7 +8,7 @@ that reuse, so one bank is the resident case and the rotation is the streaming
 one.
 
 | union | projection | banks | median |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 68 | gate_up | 1 | 114.36 us |
 | 68 | gate_up | 17 | 111.27 |
 | 68 | down | 1 | 108.31 |

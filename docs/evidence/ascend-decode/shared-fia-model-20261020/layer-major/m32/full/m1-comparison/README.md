@@ -47,7 +47,7 @@ NRMSE is `||M32−M1||₂ / ||M1||₂`, over all 32×6144 values. Full precision
 values for every layer are in [diagnostic.json](diagnostic.json).
 
 | Layer | Hidden | Residual |
-|---|---:|---:|
+| --- | ---: | ---: |
 | 0–67, each layer | 0 | 0 |
 | 68 | 0.000796813766 | 0.0000646686877 |
 | 69 | 0.0357695472 | 0.00166182690 |

@@ -36,12 +36,12 @@ Many passes inside one launch amortize the issue away and leave the device
 cost, which is what an in-graph replay pays.
 
 | 8 rows, µs | fused | three kernels | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | issue-bound, one launch a call | 5.68 | 16.70 | 2.94 |
 | device, 64 passes a launch | 0.517 | 1.222 | 2.37 |
 
 | 32 rows, µs | fused | three kernels | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | issue-bound | 6.39 | 17.90 | 2.80 |
 | device | 0.875 | 1.665 | 1.90 |
 

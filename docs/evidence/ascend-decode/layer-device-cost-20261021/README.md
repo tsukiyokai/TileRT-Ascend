@@ -4,7 +4,7 @@ One die, the engine's shapes, twelve rows, profiled rather than timed around a
 synchronise.
 
 | kernel | a layer | us | share |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `aclnnGroupedMatmulV5` | 1 | **127.17** | 56% |
 | `aclnnFusedInferAttentionScoreV4` | 1 | 50.28 | 22% |
 | `aclnnMatmul_MatMulCommon_MatMulV2` | 4 | 44.63 | 20% |
@@ -87,7 +87,7 @@ did not hold: `GatherV3` at 78 a round, `ForeachAddList` at 75, and a second
 ninety-six sorted rows:
 
 | operator | us | ms a round |
-|---|---|---|
+| --- | --- | --- |
 | the routing gather, 96 of 12 rows | 8.45 | 0.66 |
 | the expert combine, 96 into 12 | **26.98** | **2.10** |
 | a dynamic quant, 12 rows | 3.37 | 0.26 |
@@ -150,7 +150,7 @@ census found zero super kernels naming attention.
 Dependent against independent kernels in one graph, same shapes:
 
 | count | dependent | independent | gap each |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 2 | 42.63 | 27.74 | 7.45 |
 | 4 | 27.23 | 27.69 | -0.11 |
 | 8 | 32.07 | 32.10 | -0.00 |
@@ -216,7 +216,7 @@ their reductions sit inside a super kernel; the census found one `sk_*` named
 `aiv_all_reduce`.
 
 | basis | calls | us each | ms a round |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | two a layer, assumed | 156 | 32.77 | 5.11 |
 | the capture's own count | 43 | 32.77 | **1.41** |
 

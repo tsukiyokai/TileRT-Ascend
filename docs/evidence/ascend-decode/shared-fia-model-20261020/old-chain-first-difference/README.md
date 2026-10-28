@@ -5,7 +5,7 @@ The saved record locates the first difference before host commit/delivery. It do
 Three mechanisms require distinct evidence:
 
 | Mechanism | Required evidence |
-|---|---|
+| --- | --- |
 | Target arithmetic on the intended causal prefix | Actual input/metadata and matching valid KV, plus immediate target normalized hidden, logits/top2 and scores of2524/6500. |
 | Prediction/commit/delivery buffer error | Device argmax before and after conditioned MTP, then accepted-span and output-offset mapping. |
 | Rejected-tail or cross-round state | Per-cache valid-prefix identity, write coverage, live positions/slots/sequence lengths and query0 selected IDs; a matching-prefix control if these differ. |
@@ -15,7 +15,7 @@ Three mechanisms require distinct evidence:
 The local file `/tmp/lookup-offline/chain-w8-rank0.json` matches witness SHA `3aa6cce191de24a06a1131f45db3c93f30716ffe5024ad0c23ca4f8c7524d671`. Its original server reference is `a3-84:trt-asc:/workspace/experiments/lookup-20261019/chain-w8/rank-0.json`. It declares FP32 head, compiled target Graph, super-kernel, draft Graph and conditioned Graph. [result.json](result.json) retains the first two raw round records for requests3/4/5 and the scalar consistency receipt.
 
 | Round (one-based) | Pending | Main before / written / retained | Recorded predictions | Accepted output offsets |
-|---|---:|---|---|---|
+| --- | ---: | --- | --- | --- |
 | 1 | 6500 | 8192 /8200 /8195 | `[382,262,576,31989,20047,13865,2240,6539]` | offsets1–3=`[382,262,576]` |
 | 2 | 576 | 8195 /8203 /8196 | `[6500,323,374,25902,25902,393,315,576]` | offset4=`6500`, expected2524 |
 

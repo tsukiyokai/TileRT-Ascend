@@ -6,7 +6,7 @@ graph, cache fix. 1363 rounds. `status=measured`, no rank errors — and the
 first zero exit this harness has produced.
 
 | phase | p10 a call | calls | a round | share |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `verify` | 40.080 | 1 | 40.080 | 75.9% |
 | `chain` | 1.731 | 6 | 10.386 | 19.7% |
 | `conditioned` | 2.080 | 1 | 2.080 | 3.9% |
@@ -34,7 +34,7 @@ budget arithmetic gives for non-weight work, now measured on the operator that
 carries it.
 
 | | now | needed |
-|---|---|---|
+| --- | --- | --- |
 | `verify` | 40.080 | ~4 |
 | `chain` | 10.386 | ~1 |
 

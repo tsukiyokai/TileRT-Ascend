@@ -13,7 +13,7 @@ so the synthetic shape reproduces the production cost within 2%.
 ## Query heads at top-k 2048, `kv_bytes` fixed at 2,359,296
 
 | heads | median (µs) |
-|---|---|
+| --- | --- |
 | 4 | 88.303 |
 | 8 | 89.151 |
 | 16 | 89.745 |
@@ -27,7 +27,7 @@ capacity unused; TP16 does not starve this kernel.
 ## Top-k at heads 4
 
 | top-k | SFA (µs) | gather only (µs) | gather+FIA (µs) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 256 | 36.334 | 23.448 | 137.073 |
 | 512 | 43.482 | 23.776 | 136.728 |
 | 1024 | 58.751 | 23.375 | 134.187 |
@@ -59,7 +59,7 @@ it. The head sweep for it is equally flat (8/16/32 heads: 133.147, 134.247,
 trivial device work back to back, fifty calls per batch, twenty batches.
 
 | operation | median (µs) |
-|---|---|
+| --- | --- |
 | `add`, 1 element | 10.160 |
 | `add`, 1 row of 6144 BF16 | 10.094 |
 | `add`, 4 rows | 10.246 |

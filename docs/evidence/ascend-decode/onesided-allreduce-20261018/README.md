@@ -8,7 +8,7 @@ the sum must equal `pe_size*(pe_size-1)/2 = 120` and a wrong summation order
 cannot pass.
 
 | rounds | per reduction |
-|---|---|
+| --- | --- |
 | 1 | 109.825 µs |
 | 25 | 25.933 |
 | 100 | 23.144 |
@@ -24,7 +24,7 @@ four wrong explanations earlier
 is 5.64×.**
 
 | cores | per reduction |
-|---|---|
+| --- | --- |
 | **16** | **22.339** |
 | 20 | 22.666 |
 | 24 | 22.799 |
@@ -124,7 +124,7 @@ A stage that only does `aclshmem_quiet()` and `aclshmemx_sync_vec_all()` and
 moves nothing settles it. At TP16, 16 cores, 400 rounds:
 
 | stage | per reduction |
-|---|---|
+| --- | --- |
 | **sync only** | **5.078 µs** |
 | push plus sync | 17.655 |
 | local sum only | 3.368 |

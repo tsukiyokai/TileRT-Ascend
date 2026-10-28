@@ -4,7 +4,7 @@
 sorted rows, 78 layers.
 
 | item | a layer | a round | recorded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | MoE matmul | 62.578 us | 4.88 ms | 12.3 |
 | routing permute | 32.549 us | 2.54 ms | part of 12.1 |
 | routing combine | 30.076 us | 2.35 ms | part of 12.1 |

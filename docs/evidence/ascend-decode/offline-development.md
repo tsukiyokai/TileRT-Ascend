@@ -35,7 +35,7 @@ that seed after first-token delivery.
 ## Implemented paths
 
 | Component | Code | Current evidence |
-|---|---|---|
+| --- | --- | --- |
 | Main verification | [NativeDecodeEngine](../../../tilert/models/glm_5_2_ascend/native_engine.py) consumes M=1/2/4 rows, keeps M1 trace shapes, and truncates valid KV lengths | CANN source contracts; device numerical execution pending |
 | Causal index/MLA | Query lengths `[M]`, key lengths `[P+M]`, row bound `P+i+1`; selected IDs are `[M,2048]` with trailing `-1` | [21 CPU checks, 51 layouts](verify-layout.json) |
 | C8 scoring reference | [arch22 source oracle](c8-arch22/README.md) rounds weight×query scale and positive QK/1024 to FP16 before head reduction | [6 source/scalar checks](c8-arch22/scoring-stdlib.json), including two strict 8K top-k counterexamples; device scoring/encoding comparison pending |
@@ -146,7 +146,7 @@ not include shared FFN or HCCL. Full-model checks use `--expert-bank`.
 ## Remaining work
 
 | Gap | Next measurable result |
-|---|---|
+| --- | --- |
 | Full W4A8C8/TP16 precision | 78-layer HF parity; C8 encoding/scales, arch22 Cube accumulation and fused SwiGLU boundary resolved |
 | MTP precision | Execute the independent layer-78 stage/logit/cache oracle against source-matched inputs and MTP prefixes |
 | Host scheduling | Validate/profile the device GMM candidate, then implement fixed-stage graph capture from measured launch/synchronization costs |

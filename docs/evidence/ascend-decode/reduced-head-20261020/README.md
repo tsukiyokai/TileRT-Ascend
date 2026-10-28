@@ -30,10 +30,10 @@ Projection work remains unchanged.
   [rank1](rank-1.json). Reproduce with [run.sh](run.sh).
 
 | M | Eager wall p50, full→reduced (µs) | Paired delta (µs) | Graph wall p50/call, full→reduced (µs) | Paired delta (µs), wins |
-|---|---|---|---|---|
-|1|432.992→589.494|+163.144|135.863→150.043|+14.179,2/30|
-|8|367.370→538.587|+170.729|148.364→169.199|+20.737,0/30|
-|32|462.254→585.528|+113.342|180.121→206.889|+29.852,0/30|
+| --- | --- | --- | --- | --- |
+| 1 | 432.992→589.494 | +163.144 | 135.863→150.043 | +14.179,2/30 |
+| 8 | 367.370→538.587 | +170.729 | 148.364→169.199 | +20.737,0/30 |
+| 32 | 462.254→585.528 | +113.342 | 180.121→206.889 | +29.852,0/30 |
 
 Paired deltas are medians of within-pair differences, not differences between
 pooled medians. Eager wins are0/10 at all widths. Graph device-event paired

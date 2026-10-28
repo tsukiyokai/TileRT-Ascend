@@ -14,7 +14,7 @@ FP32, 156 dependent in-place SUMs on one buffer. Values below are the
 rank-MAX event p50 for the complete chain, in milliseconds.
 
 | Payload | AI_CPU | AIV |
-|---|---|---|
+| --- | --- | --- |
 | 24 KiB | 10.92500 | 4.97617 |
 | 96 KiB | 10.93072 | 5.04398 |
 

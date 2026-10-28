@@ -14,7 +14,7 @@ covering 32 queries and 2048 selected indices per query. They are not totals
 over all 78 model layers. Each QK/PV column applies separately to QK and PV.
 
 | Mechanism | Logical KV row occurrences | Pairs/head, no padding | Four-head pairs, no padding | Four-head padded pairs (16×128 tiles) | Segments |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | Per-query Top2048 | 1,376,256 | 1,376,256 | 5,505,024 | 22,020,096 (10,752) | 672 |
 | Union + query mask | 88,382 | 2,828,224 | 11,312,896 | 11,452,416 (5,592) | 21 |
 | Cascade 32→16→8→4→1 | 543,942 | 1,376,256 | 5,505,024 | 12,412,928 (6,061) | 987 |

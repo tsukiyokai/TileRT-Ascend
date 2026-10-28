@@ -6,7 +6,7 @@ indexer's selection, so a tree only has to replace that mask's causal half --
 the indexer keeps choosing the prefix at the checkpoint's own 2048 picks.
 
 | arm | TPOT | accepted | distinct | in prompt | gate |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `shared_fia` chain, width 8 | **14.743 ms** | 3.693 | 32 | 0.338 | pass |
 | `shared_fia` tree, width 32 | 17.044 | 4.263 | 99 | 0.281 | — |
 | `shared_fia` chain, width 32 | 29.148 | 2.283 | 188 | 0.368 | pass |

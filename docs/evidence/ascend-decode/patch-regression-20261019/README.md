@@ -22,7 +22,7 @@ Which arm ran first, and hence whose source both arms ran, is not recorded.
 [the cache](../w4a8-race-closed-20261019/README.md)
 
 | | baseline | four kernel patches + compact declaration |
-|---|---|---|
+| --- | --- | --- |
 | TPOT | 14.9121 / 14.4877 / 14.3187 | 17.6350 / 17.8901 / 17.5922 |
 | median | 14.4877 ms | **17.6350 ms** |
 | range | 0.5934 | 0.2979 |
@@ -88,7 +88,7 @@ here.
 ## The third arm separates them, and the cause is not what I recorded
 
 | | baseline | kernel three only | all four |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | median | 14.4877 | **14.7117** | 17.6350 |
 | range | 0.5934 | 0.3517 | 0.2979 |
 | rounds | 311, 311, 311 | **311, 311, 311** | 326, 335, 326 |

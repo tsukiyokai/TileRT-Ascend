@@ -5,7 +5,7 @@ teacher routes measured: width 8 gives 44.35 active experts, width 16 gives
 68.07, width 32 gives 99.36.
 
 | union | gate_up | down | pair | ms a round |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 44 | 90.67 us | 95.04 | 185.71 | 14.49 |
 | 68 | 116.96 | 105.26 | 222.22 | 17.33 |
 | 99 | 143.40 | 119.78 | 263.18 | 20.53 |
@@ -28,7 +28,7 @@ The previous ledger used a single 68-expert union and put the irreducible floor
 at 21.59 ms a round. Per width it is:
 
 | width | MoE + collective | tree accepted | TPOT floor |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 8 | 19.62 ms | -- | -- |
 | 16 | 22.45 | 5.989 | **3.75 ms** |
 | 32 | 25.66 | 6.966 | **3.68** |

@@ -3,7 +3,7 @@
 ## The four arms, all `status=measured` with a zero exit
 
 | width | chain | verify | round floor | acceptance | TPOT |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 6 | 1.746 × 4 | 39.496 | 48.76 | 4.125 | 12.342 |
 | 8 | 1.707 × 6 | 39.677 | 52.26 | 4.507 | **12.047** |
 | 12 | 1.684 × 10 | 41.460 | 60.74 | 4.871 | 12.995 |
@@ -12,7 +12,7 @@
 The marginal token, from the measured floors and acceptances:
 
 | | cost | tokens | a token | against the average | |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 6 → 8 | +3.50 | +0.382 | 9.17 | 12.05 | pays |
 | 8 → 12 | +8.48 | +0.365 | 23.25 | 12.99 | does not |
 | 12 → 16 | +9.54 | +0.485 | 19.69 | 13.85 | does not |
@@ -24,7 +24,7 @@ configuration whose captured width ran a stale static-kernel package.
 ## Rows are nearly free up to 8 and cost 0.45 above it
 
 | | the verify, a row |
-|---|---|
+| --- | --- |
 | 6 → 8 | +0.090 ms |
 | 8 → 12 | +0.446 ms |
 | 12 → 16 | +0.470 ms |
@@ -59,7 +59,7 @@ drift control. Best configuration: three gmm1 patches, conditioned graph,
 cache fix. Every arm `status=measured`, no rank errors, exit 0.
 
 | width | chain | verify | round floor | round p10 | rounds | acceptance | TPOT |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 8 | 1.707 × 6 | 39.677 | 52.261 | ~52.3 | 227 | 4.507 | **12.047** |
 | 12 | 1.684 × 10 | 41.460 | 60.743 | 62.280 | 210 | 4.871 | 12.995 |
 | 16 | 1.744 × 14 | 43.338 | 70.286 | 71.739 | 191 | 5.356 | 13.847 |
@@ -78,7 +78,7 @@ Widening costs **2.169 ms a unit of width**, so it pays only while acceptance
 grows faster than 2.169 / TPOT = **0.187 tokens a unit**.
 
 | | acceptance slope | verdict |
-|---|---|---|
+| --- | --- | --- |
 | 4 → 8 | 0.294 | pays |
 | 8 → 12 | 0.091 | does not pay |
 | 12 → 16 | 0.121 | does not pay |

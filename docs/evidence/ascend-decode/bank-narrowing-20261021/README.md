@@ -12,7 +12,7 @@
 graph.
 
 | experts | bank MB | us | GB/s |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 9.4 | 55.57 | 170 |
 | 2 | 18.9 | 54.24 | 348 |
 | 4 | 37.7 | 73.85 | 511 |
@@ -32,7 +32,7 @@ sixteen. Under uniform routing the expected number of a rank's own experts
 touched, and what the bank would cost if only those were handed over:
 
 | rows | picks | touched | us | saved | ms a round |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 1 | 8 | 0.49 | 55.6 | 113.0 | 8.81 |
 | 5 | 40 | 2.32 | 65.5 | 103.1 | 8.04 |
 | 12 | 96 | 5.01 | 85.8 | 82.8 | 6.46 |
@@ -68,7 +68,7 @@ routing and only declines to read experts no row selected.
 ## The saving depends entirely on routing concentration, which is unmeasured
 
 | rows | routing | touched | us | saved | ms a round |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 5 | uniform over 256 | 2.43 | 66.4 | 102.2 | 7.97 |
 | 5 | favouring 64 | 7.87 | 107.3 | 61.2 | 4.77 |
 | 5 | favouring 32 | 12.14 | 139.5 | 29.1 | 2.27 |
@@ -112,7 +112,7 @@ scores before the top eight are taken -- the model's own load-balancing term,
 readable from the checkpoint with no machine at all.
 
 | layer | min | max | std | top8 - median |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 10 | 6.8174 | 7.0632 | 0.0403 | 0.0460 |
 | 11 | 6.8044 | 7.0193 | 0.0343 | 0.0460 |
 | 13 | 6.0188 | 6.2417 | 0.0243 | 0.0200 |
@@ -127,7 +127,7 @@ deviation of the eighth-best gives 89 to 162 of 256 by layer.
 Priced over that contention set, five rows of eight picks each:
 
 | contending | touched | us | saved | ms a round |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 89 | 2.02 | 63.3 | 105.2 | 8.21 |
 | 130 | 2.16 | 64.3 | 104.2 | 8.13 |
 | 162 | 2.22 | 64.8 | 103.8 | 8.09 |
@@ -197,7 +197,7 @@ rows begin, so a wrong narrowing shifts every row after the first gap -- which
 reads as a model that still runs.
 
 | case | rows | kept | verdict |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | every expert holds rows | 96 | 16 | bit-exact |
 | six hold rows, scattered | 72 | 6 | bit-exact |
 | two hold rows | 96 | 2 | bit-exact |
@@ -248,7 +248,7 @@ Profiled rather than timed around a synchronise, 96 sorted rows, one kernel a
 call:
 
 | experts | device us | ms a round |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 19.97 | 1.56 |
 | 2 | 18.26 | 1.42 |
 | 4 | 19.27 | 1.50 |
@@ -285,7 +285,7 @@ rank receives about `12 * 8 * 16/256 = 6` rows, not the 96 the earlier
 measurement used. Profiled at both:
 
 | experts | 6 rows | 96 rows |
-|---|---|---|
+| --- | --- | --- |
 | 2 | 17.02 us | 18.15 us |
 | 16 | 114.05 | 116.95 |
 | saved | 97.03 us, **7.57 ms a round** | 98.80 us, 7.71 ms |
@@ -304,7 +304,7 @@ zero-copy form the operator accepts.
 Implied bandwidth if every listed expert's weights are read, at six rows:
 
 | experts | MB | us | GB/s |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 9.4 | 19.98 | 472 |
 | 2 | 18.9 | 18.15 | 1040 |
 | 4 | 37.7 | 19.82 | **1905** |
@@ -340,7 +340,7 @@ holds `gate_proj` and `up_proj` at `[1024, 6144]` and `down_proj` at
 Profiled at six rows and the real widths:
 
 | experts | inner | MB | us | GB/s | ms a round |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 2 | 1024 | 12.6 | 16.65 | 756 | 1.30 |
 | 2 | 2048 | 25.2 | 17.69 | 1423 | 1.38 |
 | 16 | 1024 | 100.7 | 80.21 | 1255 | 6.26 |

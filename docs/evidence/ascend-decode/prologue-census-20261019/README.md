@@ -12,7 +12,7 @@ about 27 of the 40.7 ms. The remainder is inside SuperKernel fused spans,
 which a per-operator method cannot reach.
 
 | family | calls | in-graph per call | per round | intercept |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | grouped GMM `gate_up`, custom | ~75 | 88.1–90.2 µs | 6.6–6.8 ms | 16.43 prologue + 4.60 barriers + 39.9 table |
 | grouped GMM `down`, built-in | ~75 | 54.4–59.4 µs | 4.1–4.5 ms | 62.23, slope 0.160 µs per active group |
 | MLA prolog + attention | 234 | 37.42 µs | 8.8 ms | 29.4, of which ~19 device-side |
@@ -86,7 +86,7 @@ with the same rotation and reuse distance, in three arms that separate the
 declaration from read locality:
 
 | shape | declared 256, active contiguous | declared 256, active scattered | declared 8, gathered | declaration | locality |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | K=6144 N=256 | 59.836 | 69.014 | 33.695 | 26.141 | 9.178 |
 | K=128 N=6144 | 60.073 | 65.654 | 30.401 | 29.672 | 5.581 |
 

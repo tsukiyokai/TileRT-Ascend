@@ -329,7 +329,7 @@ The successful import used a3-78's existing image
 Its packages differ from the Torch 2.12 device-validation environment:
 
 | Package | CPU import image |
-|---|---|
+| --- | --- |
 | Python | 3.12.13 |
 | Torch | 2.10.0+cpu |
 | Torch NPU | 2.10.0.post2 |

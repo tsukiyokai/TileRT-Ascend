@@ -131,7 +131,7 @@ Every one of my width-8 records resolves the same way, from each run's own
 `runtime_env`:
 
 | index | path | provides the operator |
-|---|---|---|
+| --- | --- | --- |
 | 0, 2, 3 | `fla_npu` vendors | no |
 | **1** | the hoist overlay's own `_cann_ops_custom/vendors/custom_transformer` | **yes, unpatched — wins** |
 | 4 | my barrier overlay | yes |
@@ -216,7 +216,7 @@ three measured requests each, `--target-graph --draft-graph
 --fp32-head`:
 
 | arm | median TPOT | range | rounds per request | token hashes |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | width 4 | 14.932 ms | 0.169 | 307, 307, 307 | `df10d06f911c` ×3 |
 | width 8 | 13.276 ms | 0.940 | 220, 236, 238 | three distinct |
 | width 8 + hoist | 13.041 ms | 4.080 | 287, 246, 212 | three distinct |
@@ -262,7 +262,7 @@ two independent processes per cell, inputs rewritten from a frozen copy before
 every call, and **a scratch allocation churned between calls**:
 
 | object | M=8 | M=32 | M=64 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | factory `2444c7e7` | 2 results, 1 of 64 wrong, max diff 68 | **4 results, 3–4 of 64, 115** | 2 results, 1 of 64, 114–115 |
 | barrier `2eb81546` | 1 result, 0 wrong | 1 result, 0 wrong | 1 result, 0 wrong |
 
@@ -320,7 +320,7 @@ there a name, here a static environment it had no right to depend on.
 Three arms re-run with the overlay prepended, same tree and prefix:
 
 | arm | median | range | rounds | distinct token streams |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | width 4 | 14.533 ms | 0.141 | 307, 307, 307 | **1** |
 | width 8 | 12.688 ms | 2.267 | 218, 255, 221 | **3** |
 | width 8 + hoist | 13.030 ms | 0.610 | 247, 238, 243 | **3** |
@@ -336,7 +336,7 @@ rather than reproducibility on the round.
 ## Three hypotheses eliminated, and the divergence is process-level
 
 | hypothesis | test | verdict |
-|---|---|---|
+| --- | --- | --- |
 | the vendor epilogue race | barrier overlay installed, 384 calls clean | **not it** — width 8 still gives three streams |
 | HCCL reduction order | `HCCL_DETERMINISTIC=true` | **not it** — rounds 231/227/223, three streams |
 | state leaking across requests in one process | three separate processes, one request each | **not it** — two completed runs gave 228 and 280 rounds, two streams |

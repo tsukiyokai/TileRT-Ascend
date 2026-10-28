@@ -7,7 +7,7 @@ metadata hoisted -- an arm that passes its gate and reads TPOT 14.605 ms.
 not the graph warmup, and it reports how often each step was marked:
 
 | step | ms a round | marks a round |
-|---|---|---|
+| --- | --- | --- |
 | propose, the host drafter | 0.037 | 1.0 |
 | verify, enqueueing every kernel | **2.138** | 1.0 |
 | host_tokens, the round's one synchronisation | **50.454** | 1.0 |

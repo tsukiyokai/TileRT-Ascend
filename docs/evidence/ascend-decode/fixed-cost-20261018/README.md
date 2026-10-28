@@ -8,7 +8,7 @@ rows. Five fast experiments, each a few minutes.
 ## Eager, the cost is a constant
 
 | K | weight | µs | GB/s |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 256 | 1.5 MiB | 29.97 | 52.5 |
 | 512 | 3.0 | 26.61 | 118.2 |
 | 1024 | 6.0 | 26.00 | 241.9 |
@@ -33,7 +33,7 @@ dispatch, which is what production pays
 ([the round runs inside an ACL graph](../profile-rope-20261018/README.md)).
 
 | weight | eager marginal | **graph marginal** |
-|---|---|---|
+| --- | --- | --- |
 | 1 KiB | 21.54 µs | **7.92 µs** |
 | 12 MiB | 21.63 µs | **19.22 µs** |
 
@@ -53,7 +53,7 @@ TileLang earlier in the day.
 Same 48 MiB of weight either way, all captured in one graph:
 
 | calls | each N | µs | GB/s | vs one call |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | 24576 | 54.78 | 918.7 | 1.00× |
 | 2 | 12288 | 56.72 | 887.4 | 1.04× |
 | 4 | 6144 | 87.43 | 575.7 | **1.60×** |

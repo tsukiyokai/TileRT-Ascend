@@ -33,7 +33,7 @@ have different histories and are not a teacher-forced accuracy score.
 source hashes, command, checkpoint and completed reset on all sixteen ranks.
 
 | Request | Decode steps | Internal TPOT (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Warmup | 32 | 253.9804 |
 | Measured 1 | 32 | 230.7091 |
 | Measured 2 | 32 | 260.7323 |
@@ -64,7 +64,7 @@ and device tails finish before capture completion and profiler disable.
 These checks cover the observed RECORD-stop warning for this capture.
 
 | Interval union or span (ms) | Position 8192 | Position 8193 |
-|---|---|---|
+| --- | --- | --- |
 | Rank 0 linked device span | 267.906 | 264.333 |
 | Rank 0 compute union | 36.886 | 36.035 |
 | Rank 0 collective union | 215.240 | 214.455 |

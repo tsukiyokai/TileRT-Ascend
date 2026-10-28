@@ -18,7 +18,7 @@ streaming floor at 1190.77 GB/s   3.56 ms/round
 ```
 
 | acceptance | budget at 2 ms/token | floor's share |
-|---|---|---|
+| --- | --- | --- |
 | 3.433 (today) | 6.87 ms/round | **52%** |
 | 5.0 | 10.00 | 36% |
 | 6.0 | 12.00 | 30% |
@@ -82,7 +82,7 @@ weight-stream time.
 ## Ranked, with the ordering corrected
 
 | item | worth per round | vehicle |
-|---|---|---|
+| --- | --- | --- |
 | collective inside the kernel, one-sided | 8–10 ms | hand-written MIX kernel |
 | amortise the 8 µs per-call floor | a few ms | same |
 | on-chip cube/vector handoff | ≤3.3 ms net | same |

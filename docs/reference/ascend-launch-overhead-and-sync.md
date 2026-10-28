@@ -67,7 +67,7 @@ void Process(){
 
 > | # AIC Cores | 2 | | 4 | | 8 | | 16【业务场景】 | |
 > | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-> |  | 量化 | 非量化 | 量化 | 非量化 | 量化 | 非量化 | 量化 | 非量化 |
+> | | 量化 | 非量化 | 量化 | 非量化 | 量化 | 非量化 | 量化 | 非量化 |
 > | overhead | 4.14 | 1.08 | 4.48 | 1.42 | 5.64 | 1.42 | 9.24 | 2.16 |
 > | execute | 11.7 | 24.24 | 6.78 | 13.16 | 4.76 | 8.44 | 3.34 | 5.28 |
 > | E2E | 15.84 | 25.32 | 11.26 | 14.58 | 10.4 | 9.86 | 12.58 | 7.44 |
@@ -102,7 +102,7 @@ void Process(){
 
 > Const场景
 >
-> |  | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
+> | | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
 > | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 > | 1 | 1.150555556 | 0.823333333 | 0.585 | 0.040555556 | 0.836111111 | 1.973888889 | 1.461666667 | 3.435555556 |
 > | 4 | 1.150555556 | 1.106666667 | 0.853888889 | 0.038333333 | 0.751666667 | 2.257222222 | 1.643888889 | 3.901111111 |
@@ -114,7 +114,7 @@ void Process(){
 
 > Dyn场景
 >
-> |  | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
+> | | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
 > | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 > | 1 | 1.150555556 | 0.836111111 | 0.575 | 0.422777778 | 1.330555556 | 1.986666667 | 2.328333333 | 4.315 |
 > | 4 | 1.150555556 | 1.129444444 | 0.771666667 | 0.528333333 | 1.330555556 | 2.28 | 2.630555556 | 4.910555556 |
@@ -126,14 +126,14 @@ void Process(){
 
 > ESL 仿真 16core 业务场景
 >
-> |  | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
+> | | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 硬件总开销 | 软件总开销 | 总开销 |
 > | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 > | 量化 | 1.150555556 | 2.181111111 | 2.27 | 2.845 | 1.311666667 | 3.331666667 | 6.426666667 | 9.758333333 |
 > | 非量化 | 1.150555556 | 1.972777444 | 0.885315648 | | | 3.123333 | 0.885315648 | 4.008648648 |
 >
 > 业务实测
 >
-> |  | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 总开销 |
+> | | 调度开销 | 硬件启动开销 | kernel args预取 | Tiling拷贝 | 其他软件开销 | 总开销 |
 > | --- | --- | --- | --- | --- | --- | --- |
 > | 量化 | 6.18 | | | 3.38 | 0.5 | 10.06 |
 > | 非量化 | 1.84 | | | 0.22 | 0.1 | 2.16 |
@@ -629,7 +629,7 @@ constexpr uint8_t CROSS_CORE_FLAG_ID_MAX = 16;  // ❌ 偏移量过大，导致�
 > ## 3. 各流水线对的event_id使用分析
 >
 > | 流水线对 | 当前event_id | 是否超出 | 原因 | 修改建议 |
-> |----------|--------------|----------|------|----------|
+> | ---------- | -------------- | ---------- | ------ | ---------- |
 > | **PIPE_FIX → PIPE_MTE2** | `FLAG_MTE2_VEC_ID = 9` | ❌ 超出 | 超过最大值7 | **改为 0** |
 > | **PIPE_FIX → PIPE_V** | `FLAG_MTE2_VEC_ID = 9` | ❌ 超出 | 超过最大值7 | **改为 0** |
 > | **PIPE_MTE3 → PIPE_FIX** | `FLAG_FIXP_ID = 8` | ❌ 超出 | 超过最大值7 | **改为 0** |
@@ -1388,7 +1388,7 @@ sequenceDiagram
 ### 10.3 The five critical paths and their latency characteristics
 
 > | 路径 | 机制 | 延迟特性 |
-> |------|------|----------|
+> | ------ | ------ | ---------- |
 > | **AICPU→AICore 下发** | CPU 写 HBM ring + `dc civac` cache flush + `stnp` 写 MMIO 寄存器 (DMB) | 数百 ns (cache flush + 寄存器写) |
 > | **AICore 取任务** | 轮询 DATA_MAIN_BASE 寄存器 → `dcci` cache invalidate → 读 ring | 数十 ns (寄存器轮询周期) |
 > | **AICore→AICPU 完成上报** | `set_cond` 更新 COND 寄存器 → AICPU `getReg` 轮询 | 数百 ns (MMIO 读) |
@@ -1398,7 +1398,7 @@ sequenceDiagram
 ### 10.4 Hotspot table — the ten known bottlenecks, with file:line
 
 > | # | 热点 | 位置 (文件:行) | 机理 | 影响程度 |
-> |---|------|---------------|------|---------|
+> | --- | ------ | --------------- | ------ | --------- |
 > | **H1** | `get_op_addr` 调用 `popen("nm -C ...")` | megakernel.cpp:239 | fork+exec 子进程解析符号偏移，首次注册每个算子触发 | **严重**: 首调延迟数十 ms 级，opMap 缓存后可消除 |
 > | **H2** | `setRegStnpLow` 内的 `dsb sy` + `stnp` | aicpu_manager.cpp:324-355 | 每次 `doLaunch` 执行全量内存屏障 + 非临时存储，per-tile 开销 | **严重**: 是 tile 下发的最主要开销 |
 > | **H3** | `dc civac` 缓存刷写 | aicpu_manager.cpp:589 | `doLaunch` 写 TaskEle 到 ring 后刷 CPU cache 至 HBM | **中等**: per-tile cache flush |
@@ -1413,7 +1413,7 @@ sequenceDiagram
 ### 10.5 Latency metric definitions L1–L12 (the instrumentation plan)
 
 > | ID | 指标 | 定义 | 采集点 (文件:行) | 单位 |
-> |----|------|------|-----------------|------|
+> | ---- | ------ | ------ | ----------------- | ------ |
 > | **L1** | Host launch 端到端延迟 | `aclrtLaunchMega` 入口 → 返回 | megakernel.cpp:474→523 | µs |
 > | **L2** | Kernel 注册延迟 (冷) | 首次 `get_op_addr` (popen+nm+register) | megakernel.cpp:339-353 | ms |
 > | **L3** | Kernel 注册延迟 (热) | `opMap` 命中后直接返回 | megakernel.cpp:402-405 | µs |
@@ -1430,7 +1430,7 @@ sequenceDiagram
 ### 10.6 Utilization and overhead targets (the acceptance criteria they set themselves)
 
 > | ID | 指标 | 定义 | 公式 | 目标 |
-> |----|------|------|------|------|
+> | ---- | ------ | ------ | ------ | ------ |
 > | **U1** | AICore 忙碌率 | 执行算子时间占比 | `Σ(execEnd-execStart) / (wall × N_cores)` | > 85% |
 > | **U2** | AICore 空闲率 | 轮询等任务时间占比 | `1 - U1` | < 15% |
 > | **U3** | AICPU 调度率 | work loop 时间占比 | `work_duration / total` | > 90% |
@@ -1438,7 +1438,7 @@ sequenceDiagram
 > | **U5** | AIC/AIV 利用比 | Cube 与 Vector 核的忙闲比 | `Σaic_busy / Σaiv_busy` | 接近 1.0 (MIX op) |
 
 > | ID | 指标 | 定义 | 采集点 | 目标 |
-> |----|------|------|--------|------|
+> | ---- | ------ | ------ | -------- | ------ |
 > | **O1** | 每 tile 调度开销比 | `(L7 + L10 + L11) / L12` | 延迟组合 | < 10% |
 > | **O2** | MMIO 写次数/tile | `setRegStnpLow` 调用数 / tile 数 | 插桩计数 | ≤ 1 |
 > | **O3** | Cache flush 次数/tile | `dc civac` 调用数 / tile 数 | 插桩计数 | ≤ 1 |
@@ -1447,7 +1447,7 @@ sequenceDiagram
 > | **O6** | 串行锁等待占比 | `g_mutex` 等待时间 / L1 | lock 前后 rdtsc | < 1% |
 
 > | ID | 指标 | 定义 | 采集点 | 目标 |
-> |----|------|------|--------|------|
+> | ---- | ------ | ------ | -------- | ------ |
 > | **Q1** | 任务队列深度 | `g_taskQueueAic/Aiv` 中待处理任务数 | `rte_ring_count` 采样 | 无持续打满 |
 > | **Q2** | Lazy 批量效率 | `lazyTileEnque` 实际批量大小分布 | `indexAic/Aiv.size()` 直方图 | 接近 LAZY_MIN |
 > | **Q3** | 预取命中率 | preload 队列消费 / 生产 | `g_taskPrefetchQueueAic/Aiv` 统计 | > 80% |
@@ -1459,7 +1459,7 @@ sequenceDiagram
 URL: https://wiki.huawei.com/domains/141223/wiki/353225/WIKI2026071711900818 (MegaKernel 术语)
 
 > | 术语/缩略语 | 全称 | 说明 |
-> |---|---|---|
+> | --- | --- | --- |
 > | **MK** | MegaKernel | 项目命名空间前缀，贯穿整个代码库 |
 > | **Megakernel** | Mega Kernel | 项目名称，一种面向 Tile 粒度的运行时系统，将多个算子聚合为单个巨型 Kernel |
 > | **PK** | Persistent Kernel | Megakernel 的语义等价名称，持续驻留的 Kernel |
@@ -1973,7 +1973,7 @@ https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/05_best
 raw: https://raw.gitcode.com/cann/asc-devkit/raw/master/examples/01_simd_cpp_api/05_best_practices/03_fusion_compute/quant_group_matmul_high_performance/README.md
 
 > | 产品 | CANN软件版本 |
-> |------|-------------|
+> | ------ | ------------- |
 > | Ascend 950PR&950DT系列产品 | >= CANN 9.2.0 |
 > | Atlas A3系列产品 | >= CANN 9.2.0 |
 > | Atlas A2系列产品 | >= CANN 9.2.0 |
@@ -2097,7 +2097,7 @@ The value `1` is correct. `SetScheduleMode`'s parameter table, verbatim
 (https://www.hiascend.com/doc_center/source/zh/canncommercial/81RC1/apiref/basicdataapi/atlasopapi_07_00248.html):
 
 > | 参数 | 输入/输出 | 说明 |
-> |---|---|---|
+> | --- | --- | --- |
 > | schedule_mode | 输入 | 0：普通模式，默认情况下为普通模式。<br>1：batchmode模式，**核间同步算子需要设置该模式**。 |
 
 And the attribute is the documented lever for exactly this project type — CANN 9.0, verbatim:

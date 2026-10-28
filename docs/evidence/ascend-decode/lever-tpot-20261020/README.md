@@ -8,7 +8,7 @@ supplies. Six requests an arm; the first is a warm-up and the mean is over the
 other five.
 
 | arm | one variable | requests, ms | mean |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | tail8 | the drafter's tail at 8, as shipped | 10.9518 10.9262 10.9466 10.9217 10.9224 | **10.9337** |
 | tail32 | the drafter's tail at 32 | 11.1580 11.1157 11.0746 11.2049 11.1642 | 11.1435 |
 
@@ -33,7 +33,7 @@ ignores the proposer's cost can only ever report an upper bound.
 the INT4 one a factor of two. Swept at sixteen experts on sixteen blocks:
 
 | baseN | baseK | INT4 wall, µs |
-|---|---|---|
+| --- | --- | --- |
 | the library's own choice | | 39.480 |
 | 128 | 512 | 80.243 |
 | 128 | 1024 | 79.756 |
@@ -53,7 +53,7 @@ is worthless. Read from the engine's own round records rather than from
 delivery gaps:
 
 | arm | rounds | accepted a round | round, ms | TPOT, ms | first tokens |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | tail8 | 194 | 5.273 | 56.9 | 10.93 | `6500, 382, 262, 576, 6500, 374, 264, …` |
 | tail32 | 195 | 5.246 | 57.0 | 11.14 | as above |
 | sbs16 | 40 | **25.575** | **116.0** | **4.59** | `6500, 0, 0, 0, 0, 0, 0, …` |

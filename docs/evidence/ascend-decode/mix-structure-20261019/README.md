@@ -11,7 +11,7 @@ The cheapest call of a kind bounds the fixed cost that kind pays, because no
 call can be cheaper than the structure it carries.
 
 | kind | calls | min | p10 | median |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `AI_VECTOR_CORE` | 6151 | **0.72 µs** | 0.94 | 3.98 |
 | `AI_CORE` | 1001 | 2.34 | 8.28 | 12.62 |
 | `MIX_AIV` | 718 | **13.56** | 18.20 | 22.93 |
@@ -42,7 +42,7 @@ bound is over the kind and not over a shape within it.
 ## The fixed cost splits three ways
 
 | | a verify | share |
-|---|---|---|
+| --- | --- | --- |
 | the 595 MIX kernels' structure | 7.64 ms | 21% |
 | the 1788 single-engine kernels at their floors | 1.69 | 5% |
 | not yet attributed | 26.69 | 74% |

@@ -8,7 +8,7 @@ HBM-bound.
 ## The expert axis, one row a group
 
 | active experts | median | weight read | banks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 8 | 62.041 us | 6.29 MB | 129 |
 | 16 | 68.454 | 12.58 | 65 |
 | 32 | 78.719 | 25.17 | 33 |
@@ -29,7 +29,7 @@ moves 111.896 to 132.918 us. Thirty-two times the activation for 19 percent
 more time: the weights dominate, as the round's account already said.
 
 | rows a group | median |
-|---|---|
+| --- | --- |
 | 1 | 111.896 |
 | 2 | 117.148 |
 | 4 | 113.399 |
@@ -57,7 +57,7 @@ and M32, so **2.29 experts a row**. A layer makes both calls, so the pair costs
 ## The round model's row term, now 74 percent attributed
 
 | stage | ms a row | share of 0.814 |
-|---|---|---|
+| --- | --- | --- |
 | attention, per-row gather feeding dense FIA | 0.356 | 44% |
 | expert union, two grouped calls | 0.231 | 28% |
 | TP16 collective | 0.019 | 2% |

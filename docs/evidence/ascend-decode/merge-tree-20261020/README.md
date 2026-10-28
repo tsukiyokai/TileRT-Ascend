@@ -34,7 +34,7 @@ already records as unsupported. Dealing the same 227 measured lengths in four
 orders gives, at minimum tail 1 and k=31:
 
 | Deal order | Merged acceptance | Against lookup alone (6.959) |
-|---|---|---|
+| --- | --- | --- |
 | ascending | 8.317 | 1.195 |
 | recorded | 10.129 | 1.455 |
 | reversed | 11.494 | 1.652 |
@@ -64,7 +64,7 @@ search takes the longest match first, so a longer maximum prefers a stale long
 repeat over a fresher short one. k=31, lookup alone, acceptance:
 
 | longest | minimum tail 1 | minimum tail 2 |
-|---|---|---|
+| --- | --- | --- |
 | 4 | 6.912 | 5.846 |
 | 8 | 6.959 | 5.879 |
 | 12 | 6.912 | 5.846 |

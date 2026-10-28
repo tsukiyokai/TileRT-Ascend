@@ -20,7 +20,7 @@ The [independent CPU audit](audit.json) reads all eight raw output files:
 FIA versus SFA diagnostics use `||FIA−SFA||₂ / ||SFA||₂`:
 
 | Layer | Attention NRMSE | Pre-O NRMSE | Pre-O maxabs |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | 66 | 0.00135224 | 0.00304061 | 0.001953125 |
 | 67 | 0.00159552 | 0.00312481 | 0.001953125 |
 | 68 | 0.000973759 | 0.00319462 | 0.0009765625 |

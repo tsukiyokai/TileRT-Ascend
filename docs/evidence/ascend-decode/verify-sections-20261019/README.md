@@ -13,7 +13,7 @@ per-layer count: 61 MoE layers × 90.8 µs = 5.54 ms against the 5.456 the
 global factor gives.
 
 | section | share | live bytes | floor | cost | ratio |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | MoE | 34% | 4.29 GiB | 2.99 ms | 13.57 | 4.5× |
 | attention | 23% | 1.12 GiB | 0.78 ms | 9.20 | **11.7×** |
 | the rest | 43% | small | — | 16.91 | higher |
@@ -23,7 +23,7 @@ So the section a MoE megakernel would address is the healthiest of the three.
 ## The shapes, from `kernel_details.csv`
 
 | operator | per call | blocks | shapes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GroupedMatmulSwigluQuantV2` | 89.809 static, 98.950 dynamic | 24 / 48 mix | `8,6144 ; 8 ; 256 ; 256,4,384,16,64` |
 | `GroupedMatmul` | 58.226 | 24 / 48 | `8,128 ; 256,128,6144` int4 |
 | `SparseFlashAttention` | 89.01 | 24 / 48 | q `8,4,512`+`8,4,64`, cache `73,128,1,512`, picks `8,1,2048` |

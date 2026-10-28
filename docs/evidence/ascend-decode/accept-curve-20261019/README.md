@@ -21,7 +21,7 @@ field per round in `session.accepted_spans` of every `rank-0.json`.
     python3 tests/glm52/accept_curve.py /workspace/experiments/conditioned-20261019/on-{1,2,3}
 
 | width | predicted from the width-8 record | measured in its own arm |
-|---|---|---|
+| --- | --- | --- |
 | 4 | 3.3700 | 3.3322 |
 | 6 | 4.0969 | 4.1250 |
 | 8 | 4.5110 | 4.5066 |
@@ -39,7 +39,7 @@ stands, and now it stands without a sweep.
 681 rounds, three measured requests of the width-8 arm:
 
 | matched drafts | rounds | share |
-|---|---|---|
+| --- | --- | --- |
 | 0 | 60 | 8.81% |
 | 1 | 72 | 10.57% |
 | 2 | 105 | 15.42% |

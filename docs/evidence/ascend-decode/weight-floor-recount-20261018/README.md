@@ -62,7 +62,7 @@ is an ordinary first victim that 2.4 GB of passing traffic evicts.
 ## What can be cut: 1.449 GB, worth 0.941 ms
 
 | change | bytes | ms at 1540 | risk |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | attention to W4A8 | 0.985 GB | 0.640 | numerical, and the budget is thin |
 | stop reading the head three extra times | 0.357 GB | 0.232 | none |
 | narrow the scale carrier off the vendor path | 0.107 GB | 0.069 | leaves the vendor kernel |
@@ -88,7 +88,7 @@ fantasy but a statement about operator efficiency — it is reachable if and
 only if the weight stream runs at hardware bandwidth and the host disappears.
 
 | term | ms | route |
-|---|---|---|
+| --- | --- | --- |
 | weight stream at 1540 GB/s | 3.880 | irreducible; 2.939 after the cuts above |
 | the round's 157 reductions at the measured 11.2 µs | 1.758 | one-sided, measured |
 | everything else | 1.228 | what the megakernel must fit in |

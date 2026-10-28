@@ -39,7 +39,7 @@ states. a3-84, 16 ranks, `--compile-target --super-kernel --fp32-head
 --draft-projection-tp`, no hoist overlay, `HCCL_DETERMINISTIC` unset.
 
 | condition | static kernel package | width 8 | width 4 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--compile-target` only, same script and directory | none | 1/6 | 1/6 |
 | compiled in this process, patched vendor first | fresh | 1/6, over 8 processes | 1/6 |
 | installed from this directory's own earlier build | cached, patched | 1/20 | 1/20 |
@@ -63,7 +63,7 @@ behaviour: cached 264128 = unpatched-fresh 264128 ≠ patched-fresh 264088.
 only variable is this patch.
 
 | arm | rounds | streams | median TPOT | range |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | width 8, unpatched | 251, 266, 258 | 3, none matching | 14.4640 ms | 0.8220 |
 | width 8, patched | 227, 227, 227 | 1, `68f2bc184553` | 13.0657 ms | 0.8178 |
 | width 4, patched | 307, 307, 307 | 1, `68f2bc184553` | 14.5551 ms | 0.1045 |

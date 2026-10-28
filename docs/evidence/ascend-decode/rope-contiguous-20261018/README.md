@@ -6,7 +6,7 @@ set with `HCCL_OP_EXPANSION_MODE=AIV`, `--max-tokens 1024 --capacity 9344
 `vllm_ascend/ops/rotary_embedding.py` differs between the two cases.
 
 | case | TPOT median (ms) | three runs | rounds | A | round (ms) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | before | 15.978 | 15.927 / 15.978 / 16.051 | 298 | 3.433 | 54.85 |
 | after | 14.540 | 14.529 / 14.540 / 14.572 | 298 | 3.433 | 49.92 |
 

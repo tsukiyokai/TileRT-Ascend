@@ -15,7 +15,7 @@ high its path probability.
 Accepted tokens a round, sweeping the cap:
 
 | stream | budget | automaton | b=4 | b=8 | b=16 | b=64 | uncapped |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | tail32 | 12 | 4.995 | 5.505 | 5.505 | 5.505 | 5.505 | 5.505 |
 | tail32 | 32 | 5.953 | 6.919 | 6.872 | 6.872 | 6.827 | 6.827 |
 | tail32 | 64 | 6.206 | 7.420 | 7.474 | 7.474 | 7.474 | 7.474 |

@@ -6,7 +6,7 @@ builds with `build_hccl.sh` and runs with `--expansion aiv`. Sixteen devices,
 AIV, 100 batches:
 
 | case | bytes | ops a unit | device p50 | host wall | host release |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | independent_12kib | 12288 | 1 | **10.74** | 382.94 | 235.27 |
 | chain_12kib | 12288 | 156 | 1564.14 | 5054.61 | 1783.35 |
 | independent_48kib | 49152 | 1 | **15.21** | 355.22 | 211.14 |
@@ -91,7 +91,7 @@ Sixteen ranks under AIV with determinism, a barrier before each measurement, a
 skew step being one 6144x2048 matmul at roughly 30 us:
 
 | case | rank 0 | slowest rank |
-|---|---|---|
+| --- | --- | --- |
 | aligned, no extra work | 220.59 | 231.51 |
 | aligned, four steps each | 252.32 | 290.21 |
 | rank 0 idle, others four | 265.80 | 274.79 |
@@ -119,7 +119,7 @@ profile.
 Sixteen ranks under AIV with determinism:
 
 | rows | sent MB | gathered MB | all_reduce | all_gather |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 12 | 0.15 | 2.36 | 186.96 | 178.52 |
 | 48 | 0.59 | 9.44 | 187.09 | 395.88 |
 | 96 | 1.18 | 18.87 | 202.50 | 430.76 |

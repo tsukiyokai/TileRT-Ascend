@@ -16,7 +16,7 @@ Paired, median of three, `tracemalloc` on for the memory column, replaying the
 engine's `tail32` stream at width 32:
 
 | variant | build | peak | entries | propose p50 | commit p50 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | tuple keys | 65.7 ms | 51.3 MB | 256744 | 8.93 us | 7.42 us |
 | rolling hash | 44.8 ms | 34.9 MB | 256744 | 8.82 us | 4.44 us |
 
@@ -40,7 +40,7 @@ all eight widths the engine can capture. **9 streams x 8 widths, 67071 rounds,
 ## The structure is dominated on every axis measured
 
 | | lookup | automaton |
-|---|---|---|
+| --- | --- | --- |
 | accepted a round, engine stream, w12 | 4.571 | 4.995 |
 | accepted a round, engine stream, w32 | 5.224 | 5.953 |
 | accepted a round, engine stream, w64 | 5.306 | 6.206 |

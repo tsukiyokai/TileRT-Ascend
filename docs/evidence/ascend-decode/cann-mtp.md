@@ -9,7 +9,7 @@ The target has no vLLM scheduler or speculative proposer.
 ## Boundary and execution
 
 | Component | Contract |
-|---|---|
+| --- | --- |
 | Main | Full-P cache, position P; M1/2/4 causal forwards return normalized hidden and next-token predictions. |
 | Draft | Layer 78 cache contains P-1 rows; row p consumes token[p+1] and normalized, unrotated main hidden[p]. |
 | Parent | Layout v3 transfers BF16 `[1,6144]` hidden[P-1]. Injection clones it before the receive slot can be reused. |
@@ -48,7 +48,7 @@ All checks below ran in isolated server source directories, with no NPU
 initialization. They do not measure model precision or performance.
 
 | Evidence | Passed | Executed boundary |
-|---|---:|---|
+| --- | ---: | --- |
 | [MTP API](cann-mtp-cpu-20261017.json) | 14 | Real speculative config, loader file selection, cache binding and metadata; model creation, payload loading, postprocessing and arithmetic use explicit fixtures. |
 | [PD integration](cann-mtp-pd-cpu-20261017.json) | 6 | Full-P injection, parent ownership, TP16 scalar rounds, actual ASGI streaming and decode thread, timing persistence, bad-g0 rejection, reset and next-generation admission. |
 | [PD regression](cann-mtp-regressions-20261017/ascend-pd.json) | 33 | Receiver ownership and existing serial/replay lifecycle. |

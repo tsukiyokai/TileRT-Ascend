@@ -27,7 +27,7 @@ saved HF keys and scales, binding the experiment to the original mismatch.
 The 42 native rows come from two positions and 21 full indexer layers.
 
 | Position and storage | Rows | Stepwise BF16 unequal values | FP32 rotary unequal values |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0, BF16 | 5 | 0 | 0 |
 | 0, C8 | 16 | 0 codes, 0 scales | 0 codes, 0 scales |
 | 1, BF16 | 5 | 20 | 0 |

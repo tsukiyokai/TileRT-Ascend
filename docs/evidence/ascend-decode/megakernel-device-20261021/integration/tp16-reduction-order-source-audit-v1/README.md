@@ -7,7 +7,7 @@ The installed CANN 9.2 deterministic AIV kernel uses a tree, whereas C2 adds ran
 The files were read from a3-194, `/home/shanshan/megamoe-mask-only-20261021/sdk/cann-9.2.0`. Full binaries and disassembly remain under `/tmp/tilert-megakernel-validation-20261021/tp16-reduction-audit/installed`; their hashes, commands, original paths and excerpt line numbers are in [manifest.json](manifest.json) and [installed-identities.txt](installed-identities.txt).
 
 | Artifact | SHA256 |
-|---|---|
+| --- | --- |
 | `libhccl_alg.so` | `9662caf979f889655d98278805fae701d29040b0b87a2fc21702ba11633c2956` |
 | `hccl_aiv_all_reduce_op.o` | `deafbdd1659ff53b8c5f9ce1debad90f2e1a919a2cc5a419d781830b4cf54589` |
 | C2 `communication_device.h` | `cf9e9a843c82ff77a4a4c2d6e4ff65024107cbd3c45044280c6502d65be8bde7` |
@@ -15,7 +15,7 @@ The files were read from a3-194, `/home/shanshan/megamoe-mask-only-20261021/sdk/
 The host selector is stripped. Absolute PCs below identify its instructions; the nearest exported symbol printed by `objdump` is not the internal function name. The mapping is supported by the selector string, imported-function relocations, argument fields and matching source branches.
 
 | Installed host PC | Condition or action |
-|---|---|
+| --- | --- |
 | `0x5d3730–0x5d3740` | Require one superpod. |
 | `0x5d3980–0x5d3998` | AIV enabled and ordinary AllReduce, excluding barrier sync mode. |
 | `0x5d3ea8–0x5d3ed8` | Supported AIV dtype/reduce operation; deterministic enabled, or multiple servers. |

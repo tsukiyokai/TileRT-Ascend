@@ -13,7 +13,7 @@ wrong mode there could not show. Making it load-bearing hung the routed
 experts' first launch with no output at all.
 
 | reverse mode | both subblocks set, cube waits once | subblock zero sets, cube waits once | both set, cube waits twice |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 | deadlock | deadlock | deadlock |
 | 1 | deadlock | deadlock | deadlock |
 | 2 | **live** | deadlock | deadlock |

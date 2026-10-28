@@ -126,7 +126,7 @@ P16. For unequal slices, rank `o` sends `2*E + 2*(P-2)*owned[o]` remote bytes;
 the average formula must not be presented as every rank's exact M1 traffic.
 
 | Rows | Current bytes/rank | RSAG average bytes/rank | Owner lengths | Reduction tiles/owner |
-|---|---:|---:|---|---|
+| --- | ---: | ---: | --- | --- |
 | 1 | 184320 | 23040 | 8×512, 8×256 | 1 |
 | 12 | 2211840 | 276480 | 16×4608 | 3 |
 | 32 | 5898240 | 737280 | 16×12288 | 6 |

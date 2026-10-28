@@ -7,10 +7,10 @@ score an already fixed proposal. Pending-token padding and final bonus
 clipping follow the runtime.
 
 | Width | Rounds for 32 new outputs | Planned verification rows |
-|---|---|---|
-|8|28|224|
-|16|28|448|
-|32|28|896|
+| --- | --- | --- |
+| 8 | 28 | 224 |
+| 16 | 28 | 448 |
+| 32 | 28 | 896 |
 
 Every width commits one token in 25 rounds, two in two rounds and three in
 one round. The actual indexed drafter, independent reverse scan and existing

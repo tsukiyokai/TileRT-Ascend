@@ -26,7 +26,7 @@ all-reduce.** On one protocol, 400 rounds in a single launch, 50 warmup, 16
 blocks, passes interleaved in different orders with a fresh port each:
 
 | path | µs | against HCCL's 32.340 in-graph |
-|---|---|---|
+| --- | --- | --- |
 | library wrapper, stage 0 — already synchronised | 22.363 | 1.45× |
 | float32 direct store with named events, stage 11 | 19.981 | 1.62× |
 | **bf16, stage 10** | **16.571** | **1.95×** |

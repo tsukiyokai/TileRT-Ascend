@@ -5,7 +5,7 @@
 project's documents name as its best.
 
 | output tokens | accepted a round | round | TPOT |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 256 | 1.364 | 57.90 ms | **42.46 ms** |
 | 1024 | 2.59 | 57.33 | **22.13** |
 

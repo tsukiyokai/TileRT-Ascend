@@ -21,9 +21,9 @@ are hot. Each pair averages its two samples per arm before the reported
 medians. Raw samples and the actual loaded library/ELF identities are retained.
 
 | Four-layer group | SFA | Shared FIA | Paired difference | Wins |
-|---|---|---|---|---|
-|Device event (µs)|373.365|328.620|−44.190|29/30|
-|Wall with events/sync (µs)|443.856|397.591|−45.499|29/30|
+| --- | --- | --- | --- | --- |
+| Device event (µs) | 373.365 | 328.620 | −44.190 | 29/30 |
+| Wall with events/sync (µs) | 443.856 | 397.591 | −45.499 | 29/30 |
 
 Median paired event ratio is0.88135. The pooled raw event medians are
 372.820/329.530µs. Peak allocated/reserved memory is128.81/234MiB under a

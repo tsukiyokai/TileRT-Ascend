@@ -49,7 +49,7 @@ prefix files. Physical D die `(rank+1)%16` avoids self-device connections;
 logical TP shard ownership remains rank.
 
 | Cold request stage | Time |
-|---|---|
+| --- | --- |
 | Prefill HTTP call, including HIXL | 3414.2 ms |
 | Inject, including gate wait and D loading | 109179.0 ms |
 | Eight-token decode, including first use | 4961.4 ms |

@@ -12,7 +12,7 @@ name is a synchronisation primitive (`MEM_WAIT_VALUE`, `MEM_WRITE_VALUE`,
 `PROFILER_TRACE_EX`), and union the rest per stream:
 
 | phase | span | compute union | hooked, no profiler | union/hooked |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | chain, 6 steps | 12.50 | 6.72 | 10.27 | 0.65 |
 | verify glue | 2.96 | 0.10 | 2.08 | 0.05 |
 | target | 47.84 | 44.26 | 39.68 | 1.12 |

@@ -4,7 +4,7 @@
 dies but almost no memory, which is what a tenant holding 55 GB of each leaves.
 
 | rows | KB | all_reduce | reduce_scatter | all_gather |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | 12.0 | 289.62 | 292.96 | 332.53 |
 | 4 | 48.0 | 292.16 | 314.89 | 309.25 |
 | 12 | 144.0 | 304.12 | 277.27 | 282.01 |
@@ -85,7 +85,7 @@ three mechanisms are each closed by a measurement rather than by argument.
 One all_reduce of 144 KB, one world size a run:
 
 | ranks | us |
-|---|---|
+| --- | --- |
 | 2 | 193.60 |
 | 4 | 193.11 |
 | 8 | 238.27 |
@@ -121,7 +121,7 @@ rather than assumed -- and the 193 us floor is what no rank count avoids.
 144 KB out of die 0, one process, two devices, no HCCL:
 
 | destination | us | GB/s |
-|---|---|---|
+| --- | --- | --- |
 | die 1 | 219.64 | 0.66 |
 | die 2 | 217.98 | 0.66 |
 | die 4 | 244.03 | 0.59 |
@@ -229,7 +229,7 @@ Sixteen ranks, twelve rows, AIV with determinism, N all_reduce calls captured
 in one graph and replayed:
 
 | in a graph | total us | us each | a round ms |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 150.57 | 150.57 | 23.49 |
 | 4 | 265.62 | 66.41 | 10.36 |
 | 16 | 654.75 | 40.92 | 6.38 |
@@ -366,7 +366,7 @@ Eight layers on sixteen ranks in one graph, with the reductions placed where
 TP16 needs them -- after the attention's projection and after the MoE:
 
 | reductions a layer | us a layer | added | ms a round |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 | 38.30 | 0.00 | 0.00 |
 | 1 | 82.92 | 44.62 | 3.48 |
 | 2 | 116.48 | 78.19 | **6.10** |

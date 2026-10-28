@@ -12,7 +12,7 @@ All three pipelines use the same values and reversed physical-page table.
 Each pipeline's two executions have identical output bits.
 
 | Pipeline versus original SFA | Real M1 NRMSE | Synthetic M4 NRMSE |
-|---|---|---|
+| --- | --- | --- |
 | Device paged gather → existing nonpaged FIA | 0.000521 | 0.000876 |
 | Four 512-slot SFA partitions → FP32 AttentionUpdate | 0.002370 | 0.002153 |
 
@@ -65,7 +65,7 @@ pipeline order over thirty samples. Same-stream event time is divided by
 ten; mapping, gather, input transforms and merging are included.
 
 | Pipeline | Real M1 p50 (µs) | Synthetic M4 p50 (µs) |
-|---|---|---|
+| --- | --- | --- |
 | Original SFA | 86.67 | 88.44 |
 | Paged gather → FIA | 91.11 | 136.26 |
 | Split SFA → AttentionUpdate | 59.83 | 95.59 |
@@ -102,7 +102,7 @@ kernel's eager execution across 819,200 BF16 elements. SFA reproduces the
 original real M1/M4 capture contexts bit for bit.
 
 | Complete hot graph | Real M1 p50 (µs) | Real M4 p50 (µs) |
-|---|---|---|
+| --- | --- | --- |
 | SFA | 86.36 | 89.05 |
 | Direct INT32 gathers → FIA | 46.52 | 69.15 |
 

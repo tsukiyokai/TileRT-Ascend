@@ -13,7 +13,7 @@ save each token's top-2048 and restore it at every shared-index layer.
 This preserves M1 shapes and numerical configuration during the reorder.
 
 | Device control | Raw tensor comparisons | Elements compared |
-|---|---|---|
+| --- | --- | --- |
 | [2 layers × 2 tokens](dense-audit.json), sixteen ranks | 416 | 1,355,776 |
 | [7 layers × 2 tokens](mixed-index-audit.json), sixteen ranks | 1472 | 5,716,000 |
 
@@ -170,7 +170,7 @@ outside the timing window. Thirty AB/BA pairs first take the maximum
 of sixteen rank times, then compute paired statistics.
 
 | Two-chain wall time | p50 (ms) | p95 (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Eager | 29.51294 | 29.71705 |
 | Graph | 28.88505 | 30.92198 |
 
@@ -199,7 +199,7 @@ checkpoint weights and frozen parents. Thirty AB/BA pairs take rank-MAX
 device-event times before aggregation:
 
 | Projection path | Original p50 (ms) | Sharded p50 (ms) | Paired median saved (ms) | Wins |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | M1 | 2.98914 | 0.56152 | 2.38907 | 30/30 |
 | M4 | 2.95538 | 0.58270 | 2.36528 | 30/30 |
 
@@ -249,7 +249,7 @@ two-chain warmups, then one measured sample. Seed, restore, capture,
 validation and cleanup are outside the window; both token reads are inside.
 
 | Two-chain Graph wall time | p50 (ms) | p95 (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Original projections | 28.30291 | 30.93028 |
 | Sharded projections | 27.42619 | 29.92008 |
 
@@ -272,7 +272,7 @@ two two-chain replays per variant on all sixteen ranks: 128 chain windows
 and 640 collectives. Profiling is enabled; these are diagnostic durations.
 
 | Head TASK elapsed, 64 samples/variant | p50 (µs) | p90 (µs) | max (µs) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Original | 144.683 | 3129.756 | 3510.240 |
 | Sharded | 148.252 | 3222.114 | 3858.640 |
 
@@ -300,7 +300,7 @@ The 640 AICPU collective wrappers are outside this counter coverage.
 Raw integer counters reproduce all 896 AICORE time/Cube/MTE conversions.
 
 | Same-shape instance | TASK elapsed (µs) | Counter-derived AICORE time (µs) |
-|---|---|---|
+| --- | --- | --- |
 | Original head, fastest / slowest | 128.02 / 3579.44 | 103.09 / 3466.16 |
 | Sharded rotation, fastest / slowest | 10.52 / 115.34 | 4811.09 / 4.78 |
 
@@ -336,7 +336,7 @@ seed, restore and tensor snapshots stay outside the window. One graph is
 resident at a time.
 
 | Two dependent draft calls, rank-MAX wall | p50 (ms) | p95 (ms) |
-|---|---|---|
+| --- | --- | --- |
 | Two replays | 27.20328 | 30.23225 |
 | One two-chain Graph | 27.16949 | 28.97017 |
 

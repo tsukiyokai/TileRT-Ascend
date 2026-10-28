@@ -46,7 +46,7 @@ the same cap the comparison would partly measure a longer match rather than a
 tree. Tokens accepted a round, averaged over 423 to 5907 rounds:
 
 | edit rate | chain, tail 8 | chain, tail 32 | tree, 32 nodes | tree over long chain |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0.00 | 29.738 | 32.076 | 32.470 | 1.012 |
 | 0.02 | 10.601 | 10.942 | 12.326 | 1.127 |
 | 0.05 | 4.967 | 5.026 | 6.500 | 1.293 |

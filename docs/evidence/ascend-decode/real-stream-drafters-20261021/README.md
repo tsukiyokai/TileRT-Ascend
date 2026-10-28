@@ -5,7 +5,7 @@ produced from it -- `lever84-20261020/auto12`. Every earlier drafter comparison
 used this repository's source files as a stand-in.
 
 | drafter | width | accepted | rounds | TPOT ms |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | lookup | 12 | 4.900 | 209 | 10.98 |
 | automaton | 12 | 5.565 | 184 | 9.67 |
 | tree | 12 | 6.059 | 169 | 8.88 |

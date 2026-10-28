@@ -10,7 +10,7 @@ copies `CannModel._metadata` makes. The queue depths are the real ones: 73
 kernels is one draft graph, 365 is five of them, 2489 is the target graph.
 
 | queue depth | width | pageable | pinned | removed |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0 | 1 | 108.17 | 42.39 | 65.8 |
 | 73 | 1 | 139.36 | 47.79 | 91.6 |
 | 365 | 1 | 345.88 | 50.66 | 295.2 |

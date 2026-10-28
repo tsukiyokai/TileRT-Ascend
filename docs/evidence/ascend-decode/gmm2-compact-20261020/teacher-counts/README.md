@@ -6,7 +6,7 @@ Forced-wide improves the three sampled fallback count vectors by
 and rejects always-wide for M32.
 
 | Count vector | Active / hot / max | Tasks compact → wide | Arm medians, µs | Paired wide−compact, µs | Wide wins |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | Teacher layer 29 | 89 / 1 / 17 | 1068 → 540 | 101.073 → 85.645 | −15.884 | 30/30 |
 | Teacher layer 60 | 88 / 2 / 30 | 1056 → 540 | 99.265 → 82.258 | −16.546 | 28/30 |
 | Teacher layer 21 | 94 / 3 / 19 | 1128 → 582 | 100.560 → 80.497 | −20.029 | 30/30 |

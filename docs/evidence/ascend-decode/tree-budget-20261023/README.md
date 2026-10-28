@@ -9,7 +9,7 @@ capture whitelist and `route_metadata`'s `MAX_TOKENS` stop there. This prices
 the climb before either is touched.
 
 | budget | accepted | nodes used | TPOT now | with shared read | and eleven passes |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 12 | 5.491 | 11.3 | 10.14 | 9.36 | 3.91 |
 | 16 | 5.989 | 14.9 | **9.84** | 8.89 | **3.89** |
 | 24 | 6.544 | 22.2 | 10.00 | **8.69** | 4.12 |

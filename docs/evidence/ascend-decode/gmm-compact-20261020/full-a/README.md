@@ -17,11 +17,11 @@ no profiler, unlocked clocks and a resident foreign job. Peak reserved is
 898MiB. These are synthetic single-die screening results.
 
 | Case | Compact128 µs | Full-A64 µs | Paired delta µs | Full-A wins |
-|---|---:|---:|---:|---:|
-| M1 random |46.382|46.873|+0.543|1/10|
-| M8 random |84.072|88.256|+4.215|0/10|
-| M32 random |144.541|145.951|+1.348|1/10|
-| M32 shared8 |59.747|60.733|+1.505|2/10|
+| --- | ---: | ---: | ---: | ---: |
+| M1 random | 46.382 | 46.873 | +0.543 | 1/10 |
+| M8 random | 84.072 | 88.256 | +4.215 | 0/10 |
+| M32 random | 144.541 | 145.951 | +1.348 | 1/10 |
+| M32 shared8 | 59.747 | 60.733 | +1.505 | 2/10 |
 
 Against streamed-A64, full-A paired deltas are −0.621,+2.587,+2.083,+1.471µs
 respectively. No complete-package benefit survives; retain compact128 and

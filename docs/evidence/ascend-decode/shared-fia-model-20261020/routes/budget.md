@@ -4,11 +4,11 @@ The current TP16 W4A8 representation assigns128 intermediate columns to
 each rank. Per distinct routed expert, each rank holds:
 
 | Projection | W4 bytes | UINT64 scale bytes | FP32 compensation bytes |
-|---|---:|---:|---:|
-| Gate |393216|1024|512|
-| Up |393216|1024|512|
-| Down |393216|49152|24576|
-| Total |1179648|51200|25600|
+| --- | ---: | ---: | ---: |
+| Gate | 393216 | 1024 | 512 |
+| Up | 393216 | 1024 | 512 |
+| Down | 393216 | 49152 | 24576 |
+| Total | 1179648 | 51200 | 25600 |
 
 For `S = sum(U_layer)` over75 routed layers, logical expert reads are
 `1,256,448 * S` bytes per rank, assuming one read per participating group.

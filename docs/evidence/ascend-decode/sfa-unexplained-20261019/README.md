@@ -5,7 +5,7 @@ a verify above its structural floor, 73.43 µs a call, at 24 cube blocks with 48
 vector subblocks. Four candidates, each measured rather than argued.
 
 | candidate | measurement | verdict |
-|---|---|---|
+| --- | --- | --- |
 | the rows it carries | 85.31 µs at one row, 89.17 at eight | excluded: 8× the rows costs 4.5% |
 | the structure it runs in | the cheapest MIX call is 13.58 µs, already subtracted | excluded by construction |
 | the bytes it gathers | 2048 slots of 1152 B read in **2.30 µs** | excluded: 2.6% of the call |
@@ -16,7 +16,7 @@ vector subblocks. Four candidates, each measured rather than argued.
 2048 slots of 1152 bytes, the paged cache's slot size, over 16 blocks:
 
 | pattern | a pass | rate |
-|---|---|---|
+| --- | --- | --- |
 | contiguous | 2.54 µs | 863.7 GB/s |
 | one page apart | 4.84 | 454.4 |
 | a permutation with no locality | **2.30** | **956.7** |

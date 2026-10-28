@@ -50,7 +50,7 @@ identified that changes the acceptance curve's shape rather than its position.
 Sweeping the edit rate at width 32, budget 64, four branches:
 
 | edit rate | chain8 | automaton | tree |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0.02 | 8.291 | 9.978 | **14.542** |
 | 0.05 | 4.276 | 5.393 | 6.851 |
 | 0.10 | 2.391 | 3.134 | 3.890 |

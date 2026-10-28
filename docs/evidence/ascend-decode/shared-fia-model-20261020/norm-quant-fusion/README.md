@@ -11,9 +11,9 @@ uses frozen HF layer0 post-attention operands and current checkpoint gamma.
 M8 repeats that M1 pair; it is not the historical M8 candidate input.
 
 | Width | Different INT8 values | Maximum code difference | Scale difference | Residual |
-|---|---:|---:|---:|---|
-|1|451/6144|1|2.56449e-5|bit identical|
-|8|3608/49152|1|2.56449e-5 on all8 rows|bit identical|
+| --- | ---: | ---: | ---: | --- |
+| 1 | 451/6144 | 1 | 2.56449e-5 | bit identical |
+| 8 | 3608/49152 | 1 | 2.56449e-5 on all8 rows | bit identical |
 
 Exit0; peak Torch allocation17,617,920 bytes. [Prepared operands](prepared.json),
 [API registration](cpu-api.json), [probe](probe.py) and [launch](run.sh)
@@ -48,9 +48,9 @@ dense post-attention norm/quant computations change; attention, TP reduction,
 weights, cache and FP32 head use the accepted eager path.
 
 | Arm | Trusted predictions | Labels |
-|---|---|---|
-|Separate norm→BF16→quant|382,262,576,2524|4/4|
-|Fused norm/quant|382,262,576,6500|3/4 on all16 ranks|
+| --- | --- | --- |
+| Separate norm→BF16→quant | 382,262,576,2524 | 4/4 |
+| Fused norm/quant | 382,262,576,6500 | 3/4 on all16 ranks |
 
 The prepared-input OFF control matches the accepted execution in384 saved
 field comparisons across three layers and16 ranks. The ON run validates

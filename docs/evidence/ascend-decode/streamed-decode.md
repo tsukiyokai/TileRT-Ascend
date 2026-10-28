@@ -35,7 +35,7 @@ The [corrected five-layer diagnostics](hf-corrected-20261017/README.md)
 use the same frozen CANN execution and the repaired HF reference.
 
 | Layer | Hidden NRMSE | Logits max-abs | Common indices / 2,048 |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | 0 | 0.003889 | 0.062500 | 2,048 |
 | 1 | 0.006168 | 0.077148 | 2,046 |
 | 2 | 0.007783 | 0.093750 | 2,044 |
@@ -70,7 +70,7 @@ is 3.046875 MiB; frequency, scaling and maximum-position parameters retain
 their original values. Subsequent layers reuse the same RoPE object.
 
 | Measurement | Result |
-|---|---|
+| --- | --- |
 | Torch allocator limit per rank | 2 GiB |
 | Peak allocated, including initial full RoPE construction | 907.62 MiB |
 | Allocated after each five-layer phase | 245.5 MiB |

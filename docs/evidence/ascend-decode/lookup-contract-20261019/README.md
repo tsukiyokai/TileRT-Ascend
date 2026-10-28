@@ -22,7 +22,7 @@ the total also includes request-local index construction. Target inference is
 excluded. Every pair has identical proposal/acceptance signatures.
 
 | Width | Rounds | Scan total p50, ms | Indexed total p50, ms | Index setup p50, ms | Indexed query p50, µs |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 8 | 253 | 1031.537 | 20.591 | 17.776 | 2.090 |
 | 16 | 198 | 1034.633 | 20.734 | 18.023 | 2.201 |
 | 32 | 174 | 1029.860 | 20.895 | 18.228 | 2.250 |

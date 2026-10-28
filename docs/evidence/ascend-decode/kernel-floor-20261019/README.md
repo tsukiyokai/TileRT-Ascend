@@ -10,7 +10,7 @@ What each operator actually costs is measured directly in
 `kernel_details.csv`, and `tests/glm52/kernel_accounting.py` reports it:
 
 | | the table below | measured |
-|---|---|---|
+| --- | --- | --- |
 | fold the Cast pairs | 18.53 ms | **0.93** |
 | fold every Cast | 9.32 | **1.88** |
 | MegaMoE's MoE block | 5.89 | **2.92** (routing + quant + add; the matmuls stay) |
@@ -42,7 +42,7 @@ the same loop, measured both as a long loop divided by its iterations and as a
 single launch.
 
 | mode | an iteration | one launch | body |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 | 0.014 µs | 26.700 µs | empty |
 | 1 | 0.233 | 20.320 | one 32 KiB read |
 | 2 | 0.274 | 31.061 | read + a vector pass |
@@ -60,7 +60,7 @@ does not move with rows, measured at 36.02 ms — divided by that count is
 **19.30 µs a kernel**.
 
 | | a kernel | a verify |
-|---|---|---|
+| --- | --- | --- |
 | a bare launch on an idle die | 24.00 µs | 44.80 ms |
 | the in-graph dispatch floor | 1.20 | 2.24 |
 | **what the fixed cost implies** | **19.30** | **36.02** |
@@ -71,14 +71,14 @@ the fixed cost is not a property of any operator; it is the number of them.
 ## What 2 ms requires, as an integer
 
 | the verify must cost | kernels | from 1867 |
-|---|---|---|
+| --- | --- | --- |
 | 9.013 ms (a whole round's budget) | 467 | 4.0× fewer |
 | 4 ms | 207 | 9.0× fewer |
 
 ## Every fusion on the board, re-priced
 
 | kernels removed | a verify saves | share | the fusion |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1787 | 34.49 ms | 86.9% | a layer in one kernel, 1867 → 80 |
 | 483 | 9.32 | 23.5% | every `Cast` folded into its producer |
 | 305 | 5.89 | 14.8% | MegaMoE: the MoE block's 6 kernels into 1, 61 layers |

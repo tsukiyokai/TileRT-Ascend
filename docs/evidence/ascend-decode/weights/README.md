@@ -5,7 +5,7 @@ one Ascend910_9392 die. Inputs are seeded synthetic tensors; weights come
 from layer 3, expert 0 of the checkpoint in the [weight contract](../weight-contract.md).
 
 | Run | Result | Scope |
-|---|---|---|
+| --- | --- | --- |
 | [CPU packing](weights-cpu-final.json) | 102/102 exact | INT32 layout, all 16 TP weight slices and scale-bias identities |
 | [NPU projections](weights-npu-snapshot.json) | 172/172; maximum projection NRMSE 0.001108 | rank 0/15, M=1/4 gate/up/down; W8 qA; zero inputs; input preservation |
 | [NPU expert](expert-chain.json) | 70/70; maximum output NRMSE 0.003695 | merged gate/up, BF16 SiLU/product, dynamic A8 and down, rank 0/15, M=1/4 |

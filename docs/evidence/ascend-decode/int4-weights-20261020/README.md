@@ -9,7 +9,7 @@ The model is W4A8. So the dominant term is twice the size it has to be.
 From this project's own capture, `kernel_details.csv` on rank zero:
 
 | op | input data types | input formats |
-|---|---|---|
+| --- | --- | --- |
 | `GroupedMatmulSwigluQuantV2` | `INT8;FLOAT;INT64;DT_INT4;UINT64;FLOAT` | `ND;ND;ND;FRACTAL_NZ;ND;ND` |
 | `GroupedMatmul` | `INT8;DT_INT4;FLOAT;UINT64;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT` | `ND;FRACTAL_NZ;ND;NCL;ND;ND;ND;ND;ND` |
 
@@ -50,7 +50,7 @@ rather than a limit of the part.
 Six compile probes, all accepted on `--npu-arch=dav-2201`:
 
 | what | verdict |
-|---|---|
+| --- | --- |
 | `DataCopy(LocalTensor<int4b_t> in UB, GlobalTensor<int4b_t>, count)` | accepted |
 | the same with `DataCopyParams` -- the call the library failed on | accepted |
 | the same bytes as INT8, half the count | accepted |
@@ -114,7 +114,7 @@ M, K and N are 16, 64 and 16, one INT4 fractal of K a side, and both operands
 are filled so that the answer does not depend on the fractal order.
 
 | right-hand filling | expected | got |
-|---|---|---|
+| --- | --- | --- |
 | `0x11`, every nibble a one | 64, which is K | 64 everywhere, nothing untouched |
 | `0x21`, nibbles of one and two | 96 | 96 everywhere |
 
@@ -209,7 +209,7 @@ The isolated probe was made to match the kernel exactly, one factor at a time,
 and every combination lands all 2048 values:
 
 | probe shape | result |
-|---|---|
+| --- | --- |
 | plain vector kernel, offset 256 | 256 of 256 |
 | with `ASCENDC_CUBE_ONLY` | 256 of 256 |
 | as `__mix__(1, 2)`, vector half working | 256 of 256 |
@@ -352,7 +352,7 @@ product above is with that layout.
 ## Where it stands
 
 | experts | blocks | wall, µs | INT8 form |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 4 | 4 | 35.442 | 47.108 |
 | 8 | 8 | 36.897 | 47.755 |
 | 16 | 16 | 38.991 | 49.276 |
@@ -374,7 +374,7 @@ compare.
 ## Correct, at every shape, and four defects deep
 
 | experts | blocks | wall, µs | against the reference | INT8 form |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 4 | 4 | 36.995 | 0 of 49152 | 38.761 |
 | 8 | 8 | 38.149 | 0 of 98304 | 40.000 |
 | 16 | 16 | **40.299** | **0 of 196608** | 41.990 |

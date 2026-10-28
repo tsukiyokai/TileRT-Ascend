@@ -11,7 +11,7 @@ epilogue, and a FRACTAL_NZ weight read at the vendor's rate.
 Only AscendC expresses all three today, and a probe already compiles.
 
 | capability | AscendC | TileLang 0.1.4 | PTO-ISA |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | cube/vector handoff | yes, `CrossCoreSetFlag<2, PIPE_MTE3>` / `CrossCoreWaitFlag` | yes, on chip, 12/12 verified | **no on-chip path exists on A3** |
 | device-side collective | yes, `Hccl<HCCL_SERVER_TYPE_AICPU>::ReduceScatter` | one-sided put/get only, no reduce | yes, `TREDUCE<CollEngine::AIV>`, arbitrary rank subsets |
 | FRACTAL_NZ weight read | yes, `MatmulType<GM, CubeFormat::NZ, …>` | **no**, cannot reach `gemm_v0`'s L1 layout | yes, explicit 5-D `GlobalTensor` + `Layout::NZ` |

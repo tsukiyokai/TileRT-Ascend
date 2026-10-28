@@ -109,7 +109,7 @@ hypothesis — and the production decode path is entirely graph-captured.
 Small messages, 200 loops, `-t put`:
 
 | path | small-message put | HCCL pairwise `all_reduce` |
-|---|---|---|
+| --- | --- | --- |
 | die 0 → 1, same module | **0.31–0.33 µs** | 94.38 µs |
 | die 0 → 8, across modules | **0.84–0.90 µs** | 74.52 µs |
 

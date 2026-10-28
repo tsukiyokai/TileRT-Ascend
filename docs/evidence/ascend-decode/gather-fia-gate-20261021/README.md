@@ -46,7 +46,7 @@ a time, which is what serial equivalence means. Random selections, 2048 rows a
 query, bf16:
 
 | width | max abs | max rel | verdict |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 0 | 0 | exact |
 | 2 | 0 | 0 | exact |
 | 4 | 0 | 0 | exact |
@@ -87,7 +87,7 @@ lever, and the gathered path reads only the 2048 rows `topk_indices` selects
 against the full 8192. One die:
 
 | width | full 8192 | gathered 2048 | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 4 | 183.07 | 214.30 | 0.85 |
 | 8 | 193.27 | 229.54 | 0.84 |
 | 12 | 196.23 | 243.57 | 0.81 |

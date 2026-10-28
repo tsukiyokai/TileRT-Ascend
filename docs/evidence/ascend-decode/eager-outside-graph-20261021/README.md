@@ -8,7 +8,7 @@ replay.
 Per round, from `profile-rope-20261018` rank 1 over its three rounds:
 
 | family | calls a round | device ms a round |
-|---|---|---|
+| --- | --- | --- |
 | collective | 43 | 36.62 |
 | super kernel (captured) | 637 | 33.58 |
 | aclnn (eager) | **1108** | 7.40 |
@@ -106,7 +106,7 @@ tenant holds.
 ## The full list, and attention is on it
 
 | kernel | a round | dispatch ms |
-|---|---|---|
+| --- | --- | --- |
 | `aclnnInplaceCopy_CastAiCore_Cast` | 530 | 6.03 |
 | `aclnnFusedInferAttentionScoreV4` | **81** | 0.93 |
 | `aclnnAbs_AbsAiCore_Abs` | 78 | 0.89 |

@@ -196,18 +196,18 @@ https://gitcode.com/cann/ops-transformer/blob/master/attention/mla_prolog_v3/doc
 >
 > TilingKey为uint64类型，每个模板参数对应TilingKey中的一到数个二进制位，具体实现如下：
 >
-> |二进制位|变量名|说明|参数列表|
-> |-------|------|----|-------|
-> |0-3|CACHE_MODE|KVCache的存储格式|0-ND（BSND/TND），1-PA_BSND，2-PA_NZ，3-PA_BLK_BSND，4-PA_BLK_NZ|
-> |4-5|SCENARIO|输入场景|0-FP16(预留)，1-BF16，2-量化场景|
-> |6-11|QUANT_MODE|量化场景|0-非量化，1-MMQcQr量化，2-MMQcQr量化+KVcache量化，3-MMcqCkvKr量化+MMQcQr量化，4-MMCqCkvkr量化+MMQcQr量化+KVcache量化，5-MMQcQr量化+KVcache pertoken-pergroup量化，6-MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化，7-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化，8-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，9-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化，10-fp8量化+MMcqCkvKr量化+MMQcQr量化，11-fp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，12-hif8量化+MMcqCkvKr量化+MMQcQr量化，13-hif8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，14-fp8量化+MMcqCkvKr量化+MMQcQr量化+KVcache pertoken-pergroup量化，15-hif8量化+MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化|
-> |12|ENABLE_DEQUANT_OPTIONAL|反量化开启，不能与ENABLE_GROUP_COMPUTE_OPTIONAL一同使用|0-关闭，1-开启|
-> |13|ENABLE_GROUP_COMPUTE_OPTIONAL|量化的算力分组优化，不能与ENABLE_DEQUANT_OPTIONAL一同使用|0-关闭，1-开启|
-> |14-15|EMPTY_TENSOR_MODE|空tensor场景，用于输入tensor维度为0的情况|0-无空tensor，1-kv_cache/kr_cache为空，2-query为空且不更新cache|
-> |16-17|ACTUAL_SEQ_LEN_MODE|actualSeqLen开启场景|0-关闭，1-开启actualSeqLen|
-> |18-19|SPLIT_M_MODE|切M模式|0-关闭(切N)，1-开启(切M)|
-> |20|ENABLE_ROPE|RoPE开关，仅V4可选关闭（doRope=false时直通写出），V1/V2/V3仅编译开启|0-关闭(passthrough)，1-开启|
-> |21-29|CV_MODE|CV分核模式|ASCENDC_TPL_MIX_AIC_1_1(6)：1:1模式，ASCENDC_TPL_MIX_AIC_1_2(7)：1:2模式|
+> | 二进制位 | 变量名 | 说明 | 参数列表 |
+> | ------- | ------ | ---- | ------- |
+> | 0-3 | CACHE_MODE | KVCache的存储格式 | 0-ND（BSND/TND），1-PA_BSND，2-PA_NZ，3-PA_BLK_BSND，4-PA_BLK_NZ |
+> | 4-5 | SCENARIO | 输入场景 | 0-FP16(预留)，1-BF16，2-量化场景 |
+> | 6-11 | QUANT_MODE | 量化场景 | 0-非量化，1-MMQcQr量化，2-MMQcQr量化+KVcache量化，3-MMcqCkvKr量化+MMQcQr量化，4-MMCqCkvkr量化+MMQcQr量化+KVcache量化，5-MMQcQr量化+KVcache pertoken-pergroup量化，6-MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化，7-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化，8-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，9-Mxfp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化，10-fp8量化+MMcqCkvKr量化+MMQcQr量化，11-fp8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，12-hif8量化+MMcqCkvKr量化+MMQcQr量化，13-hif8量化+MMCqCkvkr量化+MMQcQr量化+KVcache量化，14-fp8量化+MMcqCkvKr量化+MMQcQr量化+KVcache pertoken-pergroup量化，15-hif8量化+MMCqCkvkr量化+MMQcQr量化+KVcache pertoken-pergroup量化 |
+> | 12 | ENABLE_DEQUANT_OPTIONAL | 反量化开启，不能与ENABLE_GROUP_COMPUTE_OPTIONAL一同使用 | 0-关闭，1-开启 |
+> | 13 | ENABLE_GROUP_COMPUTE_OPTIONAL | 量化的算力分组优化，不能与ENABLE_DEQUANT_OPTIONAL一同使用 | 0-关闭，1-开启 |
+> | 14-15 | EMPTY_TENSOR_MODE | 空tensor场景，用于输入tensor维度为0的情况 | 0-无空tensor，1-kv_cache/kr_cache为空，2-query为空且不更新cache |
+> | 16-17 | ACTUAL_SEQ_LEN_MODE | actualSeqLen开启场景 | 0-关闭，1-开启actualSeqLen |
+> | 18-19 | SPLIT_M_MODE | 切M模式 | 0-关闭(切N)，1-开启(切M) |
+> | 20 | ENABLE_ROPE | RoPE开关，仅V4可选关闭（doRope=false时直通写出），V1/V2/V3仅编译开启 | 0-关闭(passthrough)，1-开启 |
+> | 21-29 | CV_MODE | CV分核模式 | ASCENDC_TPL_MIX_AIC_1_1(6)：1:1模式，ASCENDC_TPL_MIX_AIC_1_2(7)：1:2模式 |
 
 V3's additional outputs beyond V1:
 
@@ -1506,14 +1506,14 @@ CANN `ops-transformer`, master.
 >
 > ## 产品支持情况
 >
-> |产品      | 是否支持 |
-> |:----------------------------|:-----------:|
-> |<term>Ascend 950PR&950DT系列产品</term>|      √     |
-> |<term>Atlas A3系列产品</term>|      √     |
-> |<term>Atlas A2系列产品</term>|      √     |
-> |<term>Atlas 200I/500 A2推理产品</term>|      ×     |
-> |<term>Atlas推理系列产品</term>|      ×     |
-> |<term>Atlas训练系列产品</term>|      ×     |
+> | 产品 | 是否支持 |
+> | :---------------------------- | :-----------: |
+> | <term>Ascend 950PR&950DT系列产品</term> | √ |
+> | <term>Atlas A3系列产品</term> | √ |
+> | <term>Atlas A2系列产品</term> | √ |
+> | <term>Atlas 200I/500 A2推理产品</term> | × |
+> | <term>Atlas推理系列产品</term> | × |
+> | <term>Atlas训练系列产品</term> | × |
 >
 > ## 功能说明
 >
@@ -2165,7 +2165,7 @@ answer rather than a data-movement one.
 give a batch=1 single-query decode its parallelism are each disabled by a constant:
 
 | lever | state on A3 | where |
-|---|---|---|
+| --- | --- | --- |
 | split-KV across cores (`FLASH_DECODE`) | `GET_TPL_TILING_KEY(0U, ...)` literal; never in `ASCENDC_TPL_SEL`; `splitKVFlag_` assigned nowhere | `GenTilingKey()`, `template_tiling_key.h` |
 | split over Q heads (`IS_SPLIT_G`) | only when `gSize > 64`, i.e. >64 heads per rank | `GenTilingKey()` |
 | S2 base block size | `sInnerSize_ = 512` always, decode halving branch unreachable | `CalcInnerSize()` |
@@ -2928,14 +2928,14 @@ The earlier Gaps entry recorded "nothing states ... whether `sparse_flash_mla` i
 >
 > ## 产品支持情况
 >
-> | 产品                                                          | 是否支持 |
+> | 产品 | 是否支持 |
 > | :------------------------------------------------------------ | :------: |
-> |<term>Ascend 950PR&950DT系列产品</term>                         |     √    |
-> |<term>Atlas A3系列产品</term>         |     √    |
-> |<term>Atlas A2系列产品</term>         |     √    |
-> |<term>Atlas 200I/500 A2推理系列产品</term>                      |     ×    |
-> |<term>Atlas推理系列产品</term>                                 |     ×    |
-> |<term>Atlas训练系列产品</term>                                 |     ×    |
+> | <term>Ascend 950PR&950DT系列产品</term> | √ |
+> | <term>Atlas A3系列产品</term> | √ |
+> | <term>Atlas A2系列产品</term> | √ |
+> | <term>Atlas 200I/500 A2推理系列产品</term> | × |
+> | <term>Atlas推理系列产品</term> | × |
+> | <term>Atlas训练系列产品</term> | × |
 
 > - 算子功能：
 >
@@ -3176,7 +3176,7 @@ CANN ships **two** sparse MLA attention operators that both claim A3 support, an
 exactly the axis that governs our batch=1 cost:
 
 | | `SparseFlashAttention` | `SparseFlashMla` |
-|---|---|---|
+| --- | --- | --- |
 | A3 (`Atlas A3系列`) | √ | √ |
 | S2 (KV) split across cores | no — `actBatchS2 = 1`, `FLASH_DECODE` literal `0U` | yes — `FA_S2_START_INDEX` / `FA_S2_END_INDEX` per core |
 | flash-decode combine | dead code behind `if constexpr (FLASH_DECODE)` | `SplitFD` + `fdMetadata` per AIV |
@@ -3968,14 +3968,14 @@ vLLM-Ascend project, CANN custom op. Fetched 2026-10-20 via
 >
 > ## 产品支持情况
 >
-> |产品      | 是否支持 |
-> |:----------------------------|:-----------:|
-> |<term>Ascend 950PR&950DT 系列产品</term>|√|
-> |<term>Atlas A3 系列产品</term>|√|
-> |<term>Atlas A2 系列产品</term>|√|
-> |<term>Atlas 200I/500 A2 推理产品</term>|×|
-> |<term>Atlas 推理系列产品</term>|×|
-> |<term>Atlas 训练系列产品</term>|×|
+> | 产品 | 是否支持 |
+> | :---------------------------- | :-----------: |
+> | <term>Ascend 950PR&950DT 系列产品</term> | √ |
+> | <term>Atlas A3 系列产品</term> | √ |
+> | <term>Atlas A2 系列产品</term> | √ |
+> | <term>Atlas 200I/500 A2 推理产品</term> | × |
+> | <term>Atlas 推理系列产品</term> | × |
+> | <term>Atlas 训练系列产品</term> | × |
 >
 > ## 功能说明
 >
@@ -4169,7 +4169,7 @@ plus `当前验证的分组头配置为N1=4、N2=1，PageAttention的block_size�
 predicted above and is now stated as *the* GLM-5.2 decode configuration:
 
 | predicted in | prediction | vendor statement |
-|---|---|---|
+| --- | --- | --- |
 | 8.1 | `FLASH_DECODE` never 1 | `FLASH_DECODE=0` |
 | 8.1, 13 | `IS_SPLIT_G = 0` because `Q_N <= 64` | `IS_SPLIT_G=0`, `N1=4` |
 | 8.6, 9.1 | `sparse_block_size = 1` → `V_TEMPLATE` → `kvMergeGm_` round trip | `TEMPLATE_MODE=V_TEMPLATE`, `sparseBlockSize ... 取值为1` |
@@ -4316,7 +4316,7 @@ All on `Atlas A3系列产品 √`, for a batch=1 single-query (or MTP-4) MLA dec
 block list:
 
 | op | sparse index input | S2 split across cores | combine | task type | A3 decode viability |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `SparseFlashAttention` | `sparse_indices` `[T1,KV_N,K]`, `sparse_block_size` 1..128 | **no** (`FLASH_DECODE=0`, `actBatchS2=1`) | dead code | `MIX_AIC_1_2` | this is what we run; 4 of 24 cores at `T1=4` |
 | `KvQuantSparseFlashAttention` | same + C8/TQ4 packed slot | **no** (0 `splitKVFlag_` sites) | dead code | `MIX_AIC_1_2` | folds dequant in; same core limit |
 | `NsaSelectedAttentionInfer` | NSA selected blocks | **no** (0 sites, logs `PA FlashDecode is not enabled`) | dead code | none declared | same core limit |
@@ -4354,7 +4354,7 @@ TP16 — and `K1仅支持512` means top-512, not top-2048. Wrong shape for us on
 `bsnd_basic`, `bsnd_multi_batch`, `pa_bsnd`, `tnd_basic`, `tnd_pa_multi_batch`. Their shapes:
 
 | case | B | S1 | S2 | N1 | K (top-k) | `sparse_block_size` |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `bsnd_basic` | 1 | **5** | 262144 | 8 | 16 | 1 |
 | `bsnd_multi_batch` | 32 | **6** | 512 | 64 | 32 | 1 |
 | `pa_bsnd` | 2 | **8192** | 1024 | 16 | 2048 | 1 |
@@ -4555,7 +4555,7 @@ GLM-5.2 at TP16 seq 8K: `top_k = 2048`, `sparse_block_size = 1`, PA `block_size 
 `V_TEMPLATE` (what we run — `TEMPLATE_MODE=V_TEMPLATE` per section 14.2):
 
 | stage | instruction | count | bytes per instruction |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | index read | `topkGm_.GetValue` (scalar GM) | 2048 | 4 |
 | block table read | `blkTableGm_.GetValue` (scalar GM) | 2048 | 4 |
 | nope gather (MTE2) | `DataCopyPad`, `blockCount=2` | 1024 | 2 x 1024 = 2 KiB |
@@ -4577,7 +4577,7 @@ bytes.
 with `B x 1024` bytes each — and **no** GM staging, no flush, no reload:
 
 | `sparse_block_size` | selected blocks | MTE2 instructions | bytes/instruction (nope) | GM staging |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 (`V_TEMPLATE`) | 2048 | 1024 pairs + 1024 rope + flush + reload | 2 KiB / 256 B | **yes, 3 transits** |
 | 16 (`C_TEMPLATE`) | 128 | 128 | 16 KiB | no |
 | 32 (`C_TEMPLATE`) | 64 | 64 | 32 KiB | no |
@@ -4714,7 +4714,7 @@ CANN `ops-transformer`, master, commit `3efc65dad2a97a4fea856c3be319da596a42fb8a
 > **2. 访存模式差异**
 >
 > | 特性 | SIMD实现 | SIMT实现 |
-> |------|----------|----------|
+> | ------ | ---------- | ---------- |
 > | 数据访问 | 通过DataCopyPad显式搬运到UB | 线程直接通过`__gm__`指针访问GM |
 > | Buffer管理 | 需AllocTensor/EnQue/DeQue/FreeTensor | 无需显式buffer，硬件自动管理 |
 > | 同步机制 | 显式事件同步（HardEvent::MTE2_V等） | 线程间隐式同步 |
@@ -4807,7 +4807,7 @@ Nance-Mike, opened 2026-09-04, merged 2026-09-24 by LLMZhangYC. Test platform A3
 > **仍慢于 baseline 的 case 族及根因**（逐族定量分析见 `bottleneck_analysis.md`）：
 >
 > | 族 | 现状 | 根因 |
-> |----|----|----|
+> | ---- | ---- | ---- |
 > | B 族大 shape（cases 1-5、20） | 0.07-0.12x | dense kernel 本身已 4.4× 于 gather 路径，但 bitmap scatter 构建开销（~450ns/写）+ 每 (block,n) ~3.4μs 的 CV 握手串行吞掉大半收益 |
 > | MLA 族（cases 9-13） | 0.23-0.33x | CV relay 全口径流量约为 gather 的 7×（ws 暂存 + acc_gm 往返），聚合带宽 ~1TB/s 饱和；M=32 小 tile staging 次因 |
 > | 小批量 decode（cases 14、16、18） | 0.45-0.71x | 块数 16-32 ≈ 核数 20，单块 relay 即 makespan，flash-decoding 拆分经定量推演为负收益 |
@@ -5148,7 +5148,7 @@ Huawei / CANN `asc-devkit`, HEAD `5f50fc4c6adab4bf891de229f4ff69b9d49e1897`, ret
 优化点1, GM→UB via `DataCopyPad`, Tensor=[12288,12288] half, Block Num=48:
 
 | Scenario | 配置 | Task Duration(μs) | aiv_total_cycles | aiv_mte2_time(μs) | aiv_mte2_ratio | 相对基线MTE2性能提升 | 说明 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Tile=[1,64] `DataCopyParams={blockCount=1, blockLen=128B, srcStride=24448B}` | 564.84 | 49222116 | 548.161 | 0.989 | 基线 | 小分块搬运 |
 | 2 | Tile=[64,64] `DataCopyParams={blockCount=64, blockLen=128B, srcStride=24448B}` | 233.54 | 20167322 | 220.772 | 0.972 | +148.3% | 中等分块搬运 |
 | 3 | Tile=[64,1024] `DataCopyParams={blockCount=64, blockLen=2048B, srcStride=22528B}` | 215.82 | 18563430 | 202.657 | 0.969 | +170.5% | 大分块搬运 |
@@ -5521,7 +5521,7 @@ to. This retires the "short DMA burst" hypothesis as a significant contributor a
 **The full penalty budget for A3, each measured:**
 
 | cause | measured A2/A3 penalty | source |
-|---|---|---|
+| --- | --- | --- |
 | one instruction per block vs 64 per instruction, same 128 B burst | **2.48x** | 20.1 sc. 1 vs 2 |
 | burst 128 B vs 2048 B, same instruction count | **1.09x** | 20.1 sc. 2 vs 3 |
 | non-aligned tail, GM→UB | 1.22x | 20.2 优化点2 |

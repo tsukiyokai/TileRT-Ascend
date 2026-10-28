@@ -10,11 +10,11 @@ uses32 calls/Graph,5 warmups and10 ABBA pairs, two weight banks, no profiler
 and unlocked clocks under shared load. Peak reserved is898MiB.
 
 | Case | N256 µs | N128 µs | Paired N128 delta µs | N128 wins | Paired N64 delta µs |
-|---|---:|---:|---:|---:|---:|
-| M1 random |48.486|45.259|−3.216|10/10|+0.674|
-| M8 random |87.373|84.223|−3.144|10/10|+14.275|
-| M32 random |137.001|143.423|+6.490|0/10|+56.250|
-| M32 shared8 |56.227|52.198|−4.064|10/10|+0.672|
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M1 random | 48.486 | 45.259 | −3.216 | 10/10 | +0.674 |
+| M8 random | 87.373 | 84.223 | −3.144 | 10/10 | +14.275 |
+| M32 random | 137.001 | 143.423 | +6.490 | 0/10 | +56.250 |
+| M32 shared8 | 56.227 | 52.198 | −4.064 | 10/10 | +0.672 |
 
 N64 loses every pair in all four cases. N128 helps small expert unions but
 regresses M32 with152–174 active experts; no production policy is selected.

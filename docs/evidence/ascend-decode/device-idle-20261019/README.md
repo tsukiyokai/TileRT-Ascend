@@ -23,7 +23,7 @@ already took.
 ## The real split
 
 | | |
-|---|---|
+| --- | --- |
 | profile wall | 618.496 ms |
 | device busy, union | 318.201 ms (51.4%) |
 | device idle | 300.295 ms (48.6%) |
@@ -33,7 +33,7 @@ or capture and not a decode stall. Windowing to the middle half of the 471
 `all_reduce_float` groups gives steady state:
 
 | | |
-|---|---|
+| --- | --- |
 | steady window | 249.141 ms, 236 reductions |
 | device busy, union | 151.179 ms (60.7%) |
 | device idle | 97.962 ms (39.3%) |
@@ -49,7 +49,7 @@ The span that ends at a gap's start names what the device was last told to do.
 Ranked by the idle each precedes, within the steady window:
 
 | idle preceded | gaps | each | operator |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 34.938 ms | 36 | 970.5 µs | `aclnnIndex` |
 | 13.706 ms | 4 | 3426.5 µs | `aclnnArgMax` |
 | 9.870 ms | 31 | 318.4 µs | `aclnnInplaceCopy` |

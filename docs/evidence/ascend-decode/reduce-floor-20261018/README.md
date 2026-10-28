@@ -5,7 +5,7 @@ timed calls on device events.
 [baseline](../../../../tests/glm52/bench_reduce_floor.py).
 
 | elements | message | µs | GB/s |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 4 B | 157.43 | 0.00 |
 | 16 | 64 B | 121.63 | 0.00 |
 | 256 | 1 KiB | 97.06 | 0.01 |
@@ -23,7 +23,7 @@ measurement at all; it is 96 KiB divided by a rendezvous.
 By collective, at the production shape:
 
 | collective | single µs | marginal µs | mode |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `all_reduce` | 188.67 | 126.20 | AIV |
 | `reduce_scatter` | 110.52 | 148.16 | AIV |
 | `all_gather` | 196.90 | 104.08 | AIV |

@@ -7,7 +7,7 @@ falling back. Die ceiling 1190.77 GB/s.
 [rates](rates.json), [benchmark](../../../../tests/glm52/bench_quant_matmul_nz.py).
 
 | shape | rows | layout | eager µs | GB/s | share of ceiling |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | o_proj `[2048, 6144]` | 4 | ND | 23.94 | 525.5 | 44.1% |
 | o_proj | 4 | **NZ** | **22.67** | **555.0** | 46.6% |
 | q_b_proj `[1536, 6144]` | 4 | NZ | 22.74 | 415.0 | 34.9% |

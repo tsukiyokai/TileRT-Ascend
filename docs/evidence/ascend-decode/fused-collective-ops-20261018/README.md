@@ -55,7 +55,7 @@ Two neighbours in the same family do run on A3
 ([inventory](probe_fused_comm_inventory.py)):
 
 | operator | verdict |
-|---|---|
+| --- | --- |
 | `npu_mm_reduce_scatter_base` | runs; `(8, 2048) × (2048, 6144)` at world 2 gives `(4, 6144)` |
 | `npu_all_gather_base_mm` | runs; gives `[(8, 6144), (8, 2048)]` |
 | `npu_quant_mm_reduce_scatter` | not established — the probe's own arguments were wrong |
@@ -68,7 +68,7 @@ evidence the shape is the usual one on this hardware. It is not ours
 ([row constraint](probe_rs_rows.py)):
 
 | rows | world | result |
-|---|---|---|
+| --- | --- | --- |
 | 2 | 2 | `(1, 6144)` |
 | 4 | 2 | `(2, 6144)` |
 | 5 | 2 | `The M-axis in input of Matmul should be be divisible by world_size.` |

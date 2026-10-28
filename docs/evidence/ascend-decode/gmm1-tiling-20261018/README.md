@@ -9,7 +9,7 @@ the fixed A8W4 MSD shape K=6144/N=256. The validated SwiGLU device binary
 and its barrier remain unchanged; the other SDK tiling fields are preserved.
 
 | Clone + complete GMM1 graph | p50 (µs/call) | p95 |
-|---|---|---|
+| --- | --- | --- |
 | Existing baseN=256 | 121.525 | 482.393 |
 | Candidate baseN=128 | 124.588 | 488.564 |
 
@@ -40,7 +40,7 @@ Four separate processes run baseline/candidate/candidate/baseline. Each
 records thirty event samples of ten captured clone+GMM1 calls:
 
 | Process order | Event p50 (µs/call) |
-|---|---|
+| --- | --- |
 | Baseline | 116.814 |
 | Candidate | 111.299 |
 | Candidate | 112.741 |

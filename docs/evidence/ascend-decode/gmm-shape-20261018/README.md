@@ -21,7 +21,7 @@ production cost.
 ## Active groups at one row each
 
 | groups | `gate_up` (µs) | marginal | `down` (µs) | marginal |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | 73.00 | | 60.89 | |
 | 2 | 69.19 | | 70.46 | |
 | 4 | 59.49 | | 60.79 | |

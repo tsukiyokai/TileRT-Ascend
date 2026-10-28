@@ -11,7 +11,7 @@ loop; prefix readiness, reset, HTTP and HIXL are outside internal TPOT.
 source snapshot. Each uses one warmup and three 32-step requests.
 
 | Request TPOT (ms) | Original affinity | Bound threads |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 222.156 | 227.715 |
 | 2 | 256.843 | 246.645 |
 | 3 | 301.381 | 286.644 |
@@ -71,7 +71,7 @@ capture and 64 replays; the four subsequent requests add 128 forwards.
 Every rank completes command serial 137 and finishes reset at position 0.
 
 | Profiler-off request | Internal TPOT (ms) |
-|---|---|
+| --- | --- |
 | Warmup | 44.8040 |
 | Measured 1 | 44.7035 |
 | Measured 2 | 44.6755 |
@@ -140,7 +140,7 @@ Only the target uses an ACL graph; draft execution stays eager. Each run
 has one warmup request, followed by the measured requests below.
 
 | Target execution | Requests | Median TPOT (ms) | P95 TPOT (ms) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Eager | 3 | 152.461543 | 155.3382743 |
 | M4 graph | 30 | 38.7026239 | 39.0243213 |
 
@@ -184,7 +184,7 @@ history, acceptance and reset. Main and MTP positions finish at 9215 and
 reset to zero; one target graph is captured and replayed 1818 times.
 
 | Measured request | Internal TPOT (ms) | Rounds | Actual tokens/round |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 20.441157 | 303 | 3.376238 |
 | 2 | 20.422166 | 303 | 3.376238 |
 | 3 | 20.957581 | 303 | 3.376238 |
@@ -225,7 +225,7 @@ positions agree exactly between runs. Each run has three warmup and
 three measured requests.
 
 | Profiler-off metric | AI_CPU | AIV |
-|---|---|---|
+| --- | --- | --- |
 | Median internal TPOT (ms) | 20.441157 | 21.473259 |
 | Mean internal TPOT (ms) | 20.606968 | 21.316405 |
 | Backend round wall median (ms) | 69.518428 | 72.029132 |

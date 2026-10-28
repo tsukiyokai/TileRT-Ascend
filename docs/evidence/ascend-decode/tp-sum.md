@@ -18,7 +18,7 @@ The table reports the p50 of the per-sample maximum across sixteen ranks,
 in milliseconds for the complete 156-call chain.
 
 | Payload | Python submission | Graph replay |
-|---|---:|---:|
+| --- | ---: | ---: |
 | BF16, 12 KiB | 25.114 | 5.518 |
 | BF16, 48 KiB | 22.910 | 5.033 |
 | FP32, 24 KiB | 26.756 | 5.028 |
@@ -45,7 +45,7 @@ submission method. All 64 rank reports pass. The table is event rank-MAX
 p50 in milliseconds for 156 dependent graph sums, without a profiler.
 
 | Payload | AI_CPU | AIV |
-|---|---|---|
+| --- | --- | --- |
 | BF16, 12 KiB | 10.951 | 5.455 |
 | BF16, 48 KiB | 10.896 | 4.970 |
 | FP32, 24 KiB | 10.925 | 4.976 |

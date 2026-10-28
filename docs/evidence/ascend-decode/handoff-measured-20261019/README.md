@@ -3,7 +3,7 @@
 One die, no HCCL, no model. `tests/glm52/handoff`.
 
 | mode | per round trip |
-|---|---|
+| --- | --- |
 | the read depends on the write | 1.364 µs |
 | same bytes, no dependency | 1.381 µs |
 

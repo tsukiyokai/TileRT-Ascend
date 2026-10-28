@@ -42,7 +42,7 @@ ideal dot. Dynamic quantization of an actual zero row supplies scale zero.
 Directory: `/opt/ascend/cann-9.2.0/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/grouped_matmul/op_kernel/`.
 
 | File | Contract | SHA256 |
-|---|---|---|
+| --- | --- | --- |
 | `grouped_matmul_antiquant_a8w4_msd_pre.h` | Lines 180–207: high/low split and offset | `169c9b2e3f07bca932eb031db21a5a044d018aa201d3ec11cb2f588c09af1616` |
 | `grouped_matmul.cpp` | Line 293: FP16 intermediate C | `12e4d86d672e88c4cdda1cb5ea5ab8e1298ac205ebf76c708363930c437d562a` |
 | `grouped_matmul_antiquant_a8w4_msd.h` | Lines 356–363, 470–530: scaled partials and recombination | `a8b7c446d5373f5f50d3ee22bdf6631a8468973da420791bb97ccf0e2f351fbb` |
@@ -50,7 +50,7 @@ Directory: `/opt/ascend/cann-9.2.0/opp/built-in/op_impl/ai_core/tbe/impl/ops_tra
 Server diagnostics are in `/workspace/experiments/glm52/`:
 
 | Script | SHA256 |
-|---|---|
+| --- | --- |
 | `quantized-msd-input-20261016.py` | `7cb498d5353a6abd5e3b58ccc52e17261c9d4eda9f24caffac0716dc1146a737` |
 | `quantized-msd-m4-input-20261016.py` | `5cdde9e794ad05656239e543b36a9d343dee3ff0f800fc80cb7477acf47c53f6` |
 

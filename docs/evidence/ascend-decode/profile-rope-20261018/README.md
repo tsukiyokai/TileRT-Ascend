@@ -14,7 +14,7 @@ longer and the first one includes capture, so these shares describe the
 composition, not the wall clock.
 
 | operator | core | calls/round | per round (ms) | avg (µs) | max (µs) | share |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `SuperKernel` | MIX_AIC | 351 | 22.80 | 64.94 | 195.54 | 53.6% |
 | `SuperKernel` | MIX_AIV | 286 | 11.73 | 41.02 | 6047.15 | 27.6% |
 | `FusedInferAttentionScore` | MIX_AIC | 81 | 3.04 | 37.42 | 44.26 | 7.2% |

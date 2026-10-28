@@ -12,7 +12,7 @@ whole cache once under a per-row mask, which is what the engine's
 Median microseconds a layer:
 
 | width | gather | gather_fia | shared_fia |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 30.811 | 131.583 | 107.084 |
 | 4 | 29.491 | 147.598 | 102.490 |
 | 8 | 43.604 | 158.767 | 93.970 |
@@ -40,7 +40,7 @@ That is why the shared read wins by more as the width grows: its bytes are the
 cache, 9.44 MB, whatever the width.
 
 | width | per-row read | shared read | gather_fia / shared_fia |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 12 | 28.3 MB | 9.44 MB | 1.31x |
 | 32 | 75.5 MB | 9.44 MB | 2.63x |
 | 64 | 151.0 MB | 9.44 MB | 2.93x |

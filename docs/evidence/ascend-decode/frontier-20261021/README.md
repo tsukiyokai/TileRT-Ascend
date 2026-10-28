@@ -4,7 +4,7 @@
 0.66 ms a row is unattributed. Every figure measured today.
 
 | per layer (us) | lookup@12 5.441 | tree@16 5.394 | automaton@32 6.872 | oracle@16 9.660 | oracle@24 11.011 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **588** engine now, fitted term / 78 | 8.43 | 8.51 | 6.68 | 4.75 | 4.17 |
 | **386** after the measured merges | 5.54 | 5.59 | 4.39 | 3.12 | 2.74 |
 | **317** the layer's parts, warm | 4.55 | 4.59 | 3.60 | 2.56 | 2.25 |
@@ -93,7 +93,7 @@ the ceiling rather than the ceiling, and the right way to use it is as the
 conservative column.
 
 | per layer | tree 4.289 | lookup 5.441 | automaton 6.872 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | the layer's parts, warm 317.5 | 5.77 | 4.55 | 3.60 |
 | the same layer in a graph 213.9 | 3.89 | 3.07 | 2.43 |
 | its profiled device-busy 202.5 | 3.68 | 2.90 | 2.30 |

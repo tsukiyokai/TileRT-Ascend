@@ -18,7 +18,7 @@ initialization. Numerical thresholds remain per-head NRMSE ≤0.01 and
 cosine ≥0.999; inputs, indices and caches are checked exactly.
 
 | Comparison | Checks | Maximum NRMSE | Minimum cosine |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Reconstructed absorbed query vs actual query | 8/8 | 0, bitwise equal | 0.99999988 |
 | SFA and compressed chain vs FP32 CPU oracle | 16/16 | 0.002808 | 0.99999613 |
 | Value projection from the same device context | 8/8 | 0, bitwise equal | 1 |

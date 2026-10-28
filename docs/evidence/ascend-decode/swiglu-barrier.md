@@ -25,7 +25,7 @@ and the original `_C_ascend` wrapper. Independent CPU arithmetic checks
 every INT8 code and FP32 scale, repeated calls and the amax invariant.
 
 | Vendor | Rank shard | Calls | Exact expert rows |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Original | 0 | 8 | 62/64 |
 | Rebuilt, barrier | 0 | 8 | 64/64 |
 | Rebuilt, barrier | 12 | 32 | 256/256 |

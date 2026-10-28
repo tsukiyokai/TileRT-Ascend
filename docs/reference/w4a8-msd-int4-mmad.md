@@ -1268,16 +1268,16 @@ V2 differs from V1 only in plurality:
 
 The scenario table, verbatim:
 
-> |场景名|    x    |    weight      |   out | 约束说明|计算公式|
-> |---------|---------|----------------|--------|--------|--|
-> |非量化|FLOAT32|FLOAT32|FLOAT32|...|
-> |非量化|BFLOAT16|BFLOAT16|BFLOAT16|...|
-> |非量化|FLOAT16|FLOAT16|FLOAT16|...|
-> |全量化-A8W8|INT8|INT8|BFLOAT16/FLOAT16/INT32/INT8|[A8W8场景约束](#a8w8场景约束)|[计算公式](#全量化场景)|
-> |全量化-A4W4|INT4|INT4|BFLOAT16/FLOAT16|[A4W4场景约束](#a4w4场景约束)|[计算公式](#全量化场景)|
-> |伪量化-A8W4|INT8|INT4|BFLOAT16/FLOAT16|[A8W4场景约束](#a8w4场景约束)|[计算公式](#a8w4伪量化场景)|
-> |伪量化-A16W8|BFLOAT16/FLOAT16|INT8|BFLOAT16/FLOAT16|...|
-> |伪量化-A16W4|BFLOAT16/FLOAT16|INT4|BFLOAT16/FLOAT16|...|
+> | 场景名 | x | weight | out | 约束说明 | 计算公式 |
+> | --------- | --------- | ---------------- | -------- | -------- | -- |
+> | 非量化 | FLOAT32 | FLOAT32 | FLOAT32 | ... |
+> | 非量化 | BFLOAT16 | BFLOAT16 | BFLOAT16 | ... |
+> | 非量化 | FLOAT16 | FLOAT16 | FLOAT16 | ... |
+> | 全量化-A8W8 | INT8 | INT8 | BFLOAT16/FLOAT16/INT32/INT8 | [A8W8场景约束](#a8w8场景约束) | [计算公式](#全量化场景) |
+> | 全量化-A4W4 | INT4 | INT4 | BFLOAT16/FLOAT16 | [A4W4场景约束](#a4w4场景约束) | [计算公式](#全量化场景) |
+> | 伪量化-A8W4 | INT8 | INT4 | BFLOAT16/FLOAT16 | [A8W4场景约束](#a8w4场景约束) | [计算公式](#a8w4伪量化场景) |
+> | 伪量化-A16W8 | BFLOAT16/FLOAT16 | INT8 | BFLOAT16/FLOAT16 | ... |
+> | 伪量化-A16W4 | BFLOAT16/FLOAT16 | INT4 | BFLOAT16/FLOAT16 | ... |
 
 The four formulas, side by side, verbatim — this is the cleanest statement of the accuracy
 difference anywhere in the material:
@@ -1313,8 +1313,8 @@ split into two is not mentioned in the `GroupedMatmulV4` doc at all; only the Sw
 > **数据类型要求**
 >
 > | x | weight | bias | scale | offset | antiquantScale | antiquantOffset | perTokenScale | groupList | activationInput | activationQuantScale | activationQuantOffset | out |
-> |---|---|---|---|---|---|---|---|---|---|---|---|---|
-> | INT8 | INT4 (ND/NZ) | FLOAT | UINT64 | null | null | null | FLOAT | INT64 | null | null | null | BFLOAT16|
+> | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+> | INT8 | INT4 (ND/NZ) | FLOAT | UINT64 | null | null | null | FLOAT | INT64 | null | null | null | BFLOAT16 |
 > | INT8 | INT4 (ND/NZ) | FLOAT | UINT64 | FLOAT/null | null | null | FLOAT | INT64 | null | null | null | FLOAT16 |
 >
 > **约束说明**
@@ -1531,21 +1531,21 @@ The dtype table for the W4A8 row (K-C && K-T), verbatim, with the A8W8 rows for 
 > | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 > | INT8 | INT32 | FLOAT32 | UINT64/INT64 | null | null | null | FLOAT32 | FLOAT16/BFLOAT16 |
 > | INT8 | INT8 | null | UINT64/INT64 | null | null | null/INT32 | null | FLOAT16 |
-> | INT8 | INT8 | null | UINT64/INT64 | null/FLOAT32| null | null/INT32 | null | INT8 |
-> | INT8 | INT8 | null/FLOAT32| FLOAT32/BFLOAT16| null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
+> | INT8 | INT8 | null | UINT64/INT64 | null/FLOAT32 | null | null/INT32 | null | INT8 |
+> | INT8 | INT8 | null/FLOAT32 | FLOAT32/BFLOAT16 | null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
 > | INT8 | INT8 | FLOAT32 | FLOAT32 | null | null | null/INT32/FLOAT16/FLOAT32 | null | FLOAT16 |
 > | INT4/INT32 | INT4/INT32 | null | UINT64/INT64 | null | null | null/INT32 | null | FLOAT16 |
-> | INT8 | INT8 | null | FLOAT32/BFLOAT16| null | null | null/INT32 | null | INT32 |
+> | INT8 | INT8 | null | FLOAT32/BFLOAT16 | null | null | null/INT32 | null | INT32 |
 > | INT8 | INT8 | FLOAT32 | FLOAT32 | null | null | FLOAT32 | null | BFLOAT16 |
-> | INT4/INT32 | INT4/INT32 | FLOAT32 | FLOAT32/BFLOAT16| null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
+> | INT4/INT32 | INT4/INT32 | FLOAT32 | FLOAT32/BFLOAT16 | null | null | null/INT32/BFLOAT16/FLOAT32 | null | BFLOAT16 |
 > | INT4/INT32 | INT4/INT32 | FLOAT32 | FLOAT32 | null | null | null/INT32/FLOAT16/FLOAT32 | null | FLOAT16 |
 
 And the K-G shape table:
 
-> |量化类型| x1数据类型 | x2数据类型 | x1Scale数据类型| x2Scale数据类型| x1 shape | x2 shape| x1Scale shape| x2Scale shape|x2Offset shape| yOffset shape| [gsM，gsN，gsK]|
-> | ----- | --- | --- | --- | --- | --- | --- | --- | --- |--- | --- | --- |
-> | K-G量化 | INT8 |INT32 |FLOAT32 |UINT64/INT64 |(m, k) |(k, ceil(n / 8))|(m, 1)|(ceil(k / 256), n)|null| (n) | [0, 0, 256]|
-> | K-G量化 | INT4 |INT4 |FLOAT32 |FLOAT32 |(m, k)|(n, k)|(m, 1)|(ceil(k / 256), n)|(ceil(k / 256), n)| null | [0, 0, 256]|
+> | 量化类型 | x1数据类型 | x2数据类型 | x1Scale数据类型 | x2Scale数据类型 | x1 shape | x2 shape | x1Scale shape | x2Scale shape | x2Offset shape | yOffset shape | [gsM，gsN，gsK] |
+> | ----- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+> | K-G量化 | INT8 | INT32 | FLOAT32 | UINT64/INT64 | (m, k) | (k, ceil(n / 8)) | (m, 1) | (ceil(k / 256), n) | null | (n) | [0, 0, 256] |
+> | K-G量化 | INT4 | INT4 | FLOAT32 | FLOAT32 | (m, k) | (n, k) | (m, 1) | (ceil(k / 256), n) | (ceil(k / 256), n) | null | [0, 0, 256] |
 
 > - x1的约束：
 >   - 当数据类型为INT8时，k需与256对齐，并小于29576。transposeX1为false。
@@ -3033,7 +3033,7 @@ Measured (E=14 / K=3584 / N=6144, capacity 28672, median NPU Graph Event time pe
 50 graph replays per batch, five batches), verbatim:
 
 > | Case | Valid rows | ND (us) | Native NZ (us) | NZ / ND |
-> |---|---:|---:|---:|---:|
+> | --- | ---: | ---: | ---: | ---: |
 > | 1 | 320 | 235.37 | 167.37 | 0.711 |
 > | 2 | 260 | 242.50 | 177.28 | 0.731 |
 > | 3 | 320 | 260.27 | 187.17 | 0.719 |

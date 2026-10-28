@@ -10,7 +10,7 @@ below.
 the same block count. Raw output in [die1.txt](die1.txt).
 
 | | 8 rows | 32 rows |
-|---|---|---|
+| --- | --- | --- |
 | fused, µs | 31.414–31.873 | 36.952–37.015 |
 | cube kernel plus vector kernel, µs | 35.761–36.176 | 45.459–45.548 |
 | saved | 4.2–4.4 | 8.4–8.6 |
@@ -63,7 +63,7 @@ and the vector's wait on separate bits. Four runs attribute a hang to one side
 of one handshake:
 
 | stages | what runs | result |
-|---|---|---|
+| --- | --- | --- |
 | 2 | the cube's set, nobody waiting | returns — the set is fine |
 | 8 | the vector's wait, nobody setting | hangs — the vector half is alive |
 | 16 | the vector sets, the cube waits | returns — vector to cube works |
@@ -76,7 +76,7 @@ on a hang; `msdebug` segfaults on `breakpoint set --name` followed by `run`.
 ## The channel split, and the eighth defect
 
 | 8 rows, µs | 1 block | 2 | 4 | 8 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | fused | 22.737 | 14.914 | **12.307** | 12.936 |
 | cube kernel plus vector kernel | 25.626 | 17.732 | 15.093 | 15.621 |
 | ratio | 1.13 | 1.19 | 1.23 | 1.21 |
@@ -174,7 +174,7 @@ halves' branches, because every core must arrive even where its own stage work
 is skipped.
 
 | 8 rows, µs | 1 block | 2 | 4 | 8 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | whole chain, one kernel | 23.802 | 16.465 | **13.863** | 14.468 |
 
 Correct at every block count, 0 of 49152 against a host reference that
@@ -197,7 +197,7 @@ barriers, because the down projection reads every slice and the row maximum
 spans every slice. [raw](dynamic.txt)
 
 | 8 rows, µs | 1 block | 2 | 4 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | static scale | 23.802 | 16.465 | 13.863 |
 | per-token dynamic | 61.678 | 36.948 | **29.343** |
 
@@ -212,7 +212,7 @@ The cost is attributed, by stage bits on one binary rather than by differences
 between code versions — which is how the first attempt went wrong.
 
 | at four blocks, 8 rows | cumulative µs | own |
-|---|---|---|
+| --- | --- | --- |
 | gate and up projection, dequantisation, SwiGLU, partial maxima | 14.568 | 14.568 |
 | plus the two `SyncAll<false>()` barriers, nothing else | 16.278 | 1.710 |
 | plus the cross-block reduction, quantisation and down projection | 23.069 | 6.791 |

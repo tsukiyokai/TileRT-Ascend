@@ -16,7 +16,7 @@ five raw hidden states, selections and attention probabilities match the
 five-layer run exactly; all five diagnostic logits also match exactly.
 
 | Position / input | Peak hidden NRMSE | Minimum cosine | Final hidden NRMSE / cosine | Peak logits max-abs | Final logits max-abs / relative difference |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | 8192 / 6500 | 0.170898, L31 | 0.985360 | 0.090432 / 0.995911 | 2.921875, L52 | 1.062500 / 0.031716 |
 | 8193 / 382 | 0.206640, L38 | 0.978990 | 0.074282 / 0.997241 | 2.703125, L54 | 0.760742 / 0.025571 |
 
@@ -57,7 +57,7 @@ replay checks. These checks establish reference repeatability; layer
 differences below are diagnostics without pass/fail judgments.
 
 | Layer | Hidden NRMSE | Cosine | Logits max-abs | Index overlap / 2048 | HF cutoff gap | HF unmatched mass, mean / max head |
-|---|---:|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 0.003595 | 0.999994 | 0.046875 | 2048 | 0.359726 | 0 / 0 |
 | 1 | 0.005956 | 0.999982 | 0.062500 | 2045 | 0.109863 | 0.000723 / 0.002174 |
 | 2 | 0.007693 | 0.999970 | 0.062500 | 2045 | 0.212891 | 0.000746 / 0.002251 |

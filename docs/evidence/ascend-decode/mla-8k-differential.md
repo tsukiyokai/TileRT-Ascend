@@ -14,7 +14,7 @@ rows; the call appends one row and selects 2,048 keys. Peak Torch reservation
 is 130 MiB under a 1.5 GiB limit. No HCCL group or complete model loads.
 
 | Same-input comparison | Different values | NRMSE |
-|---|---|---|
+| --- | --- | --- |
 | Absorbed query and RoPE vs CPU Prolog | 0/2,304 | 0 |
 | SFA context vs FP32 compressed oracle | 23/2,048 | 0.000468 |
 | Value projection from the actual SFA context vs CPU | 0/1,024 | 0 |

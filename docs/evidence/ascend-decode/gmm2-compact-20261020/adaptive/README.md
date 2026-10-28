@@ -48,12 +48,12 @@ peak reserved1796MiB. Every arm's output and route hashes match. Foreign Ray
 weights remain resident; these are single-die screening measurements.
 
 | Width / routing | A1 µs | B1 µs | B2 µs | A2 µs | B−A, adjacent pairs µs |
-|---|---:|---:|---:|---:|---:|
-|1 / random|33.13|34.31|33.39|31.58|+1.18 / +1.82|
-|8 / random|77.48|57.06|54.66|71.43|−20.42 / −16.77|
-|32 / random|146.98|107.86|106.18|143.90|−39.12 / −37.72|
-|32 / shared8|38.09|45.09|40.77|34.99|+7.01 / +5.79|
-|32 / all256|212.81|153.04|142.95|210.09|−59.78 / −67.14|
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 / random | 33.13 | 34.31 | 33.39 | 31.58 | +1.18 / +1.82 |
+| 8 / random | 77.48 | 57.06 | 54.66 | 71.43 | −20.42 / −16.77 |
+| 32 / random | 146.98 | 107.86 | 106.18 | 143.90 | −39.12 / −37.72 |
+| 32 / shared8 | 38.09 | 45.09 | 40.77 | 34.99 | +7.01 / +5.79 |
+| 32 / all256 | 212.81 | 153.04 | 142.95 | 210.09 | −59.78 / −67.14 |
 
 M8/M32 dispersed routing improves; M1 and shared8 regress. Retaining the old
 tile shape does not retain its original schedule. Keep this option disabled

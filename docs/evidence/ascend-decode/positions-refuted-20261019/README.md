@@ -7,7 +7,7 @@ here — barrier-only overlay, cache off, width 8 — from a different working
 directory, and read a different floor:
 
 | | p10 of a round | mean |
-|---|---|---|
+| --- | --- | --- |
 | baseline, first chain | 56.757, 56.789, 56.676 | 56.741 |
 | the same configuration, later chain | 57.110, 56.875, 56.839 | 56.941 |
 | with the patch, first chain | 57.033, 56.846, 57.177 | 57.019 |
@@ -59,7 +59,7 @@ six requests in two independent runs.
 [the round clock](../round-clock-20261019/README.md)
 
 | | p10 of a round | TPOT |
-|---|---|---|
+| --- | --- | --- |
 | baseline | 56.757, 56.789, 56.676 | 12.9709, 12.8348, 12.7836 |
 | with the patch | 57.033, 56.846, 57.177 | 13.2023, 12.8156, 13.1831 |
 

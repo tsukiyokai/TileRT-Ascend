@@ -47,7 +47,7 @@ Stability tracks whether ranks enter in step, not message size.
 Measured profiler-off on device 7, one process:
 
 | item | ms/round |
-|---|---|
+| --- | --- |
 | AscendCL launch work, 522 launch-class API calls × 10.542 µs | 5.503 |
 | the one remaining host token read | 0.335 |
 | `MtpRoundExecutor.advance` Python control flow | 0.023 |

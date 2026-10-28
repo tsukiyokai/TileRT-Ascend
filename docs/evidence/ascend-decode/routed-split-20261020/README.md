@@ -9,7 +9,7 @@ arithmetic error of ours on the way.
 Gate-and-up projection only, four blocks, by row count:
 
 | rows | 2 | 4 | 8 | 16 | 32 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | µs | 10.742 | 10.709 | 10.717 | 10.852 | 11.416 |
 
 Sixteen times the rows for 6% more time. The cost is the weight stream and the
@@ -27,7 +27,7 @@ against the vendor's `GroupedMatmul` plus `GroupedMatmulSwigluQuantV2` at
 Same projection, 8 rows, 1.57 MB of INT8 weights whichever way it is split:
 
 | blocks | 1 | 2 | 4 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | µs | 20.610 | 13.120 | 10.795 |
 | GB/s | 76 | 120 | 145 |
 

@@ -12,7 +12,7 @@ ssh a3-gs python3 - /data/shanshan/trt-asc/models/GLM-5.2-w4a8c8 \
 ## 流量模型
 
 | 主干部分 | 单 token 逻辑读取，GB |
-|---|---:|
+| --- | ---: |
 | Attention 投影、norm、kvB | 14.033071104 |
 | 21 个 indexer | 0.218158080 |
 | 前 3 层 dense FFN | 0.680214528 |

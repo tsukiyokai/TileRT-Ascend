@@ -9,7 +9,7 @@ replays per batch after fifty warmup replays, twenty batches, one chain
 length per process.
 
 | chain length | replay median (µs) | marginal (µs/kernel) |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 8.546 | |
 | 2 | 8.469 | −0.076 |
 | 4 | 13.388 | 2.459 |

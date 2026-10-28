@@ -4,7 +4,7 @@
 Four active-expert counts a projection, `--rows 8`.
 
 | | e8 | e16 | e32 | e64 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | gate_up MB | 6.00 | 12.00 | 24.00 | 48.00 |
 | gate_up µs | 64.295 | 67.854 | 75.792 | 112.340 |
 | down MB | 3.00 | 6.00 | 12.00 | 24.00 |
@@ -26,7 +26,7 @@ table at 8 slots against 256, which is what the 95.301-against-55.387 pair in
 ## The implied rates exceed the die
 
 | segment | added | added | implied |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | gate_up e8→16 | 6.00 MB | 3.559 µs | 1768 GB/s |
 | gate_up e16→32 | 12.00 MB | 7.938 µs | 1585 GB/s |
 | gate_up e32→64 | 24.00 MB | 36.548 µs | 689 GB/s |

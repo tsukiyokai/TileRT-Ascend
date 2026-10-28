@@ -5,7 +5,7 @@ which the offline corpus put at 5.441, so the drafting measurements transfer to
 this arm within a percent.
 
 | arm | expected saving | round | TPOT |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | narrow | 22.20 ms | 28.51 | **5.27** |
 | hoist-rope | 0.13 | 50.58 | 9.36 |
 | aicpu | negative | 50.71+ | 9.38+ |

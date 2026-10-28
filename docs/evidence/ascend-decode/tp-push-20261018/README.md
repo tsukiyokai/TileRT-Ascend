@@ -24,7 +24,7 @@ reduction is numerically correct.**
 ## What does not, and the measurement that found it
 
 | configuration | per reduction |
-|---|---|
+| --- | --- |
 | push and reduce | 543 µs |
 | **reduce only, no communication at all** | **557 µs** |
 | reduce only, vectorised through UB | 358 µs |
@@ -57,7 +57,7 @@ Every number above divided one kernel launch by the round count. A round
 sweep at fixed shape exposed it:
 
 | rounds | reported per reduction | implied total |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 26454.8 µs | 26.5 ms |
 | 5 | 5363.1 | 26.8 |
 | 50 | 573.7 | 28.7 |
@@ -70,7 +70,7 @@ earlier "557 µs reduce-only" and "543 µs full" were both that same launch.
 With the launch amortised over 4000 rounds the per-reduction cost appears:
 
 | configuration | cores | per reduction |
-|---|---|---|
+| --- | --- | --- |
 | reduce only | 8 | 7.118 µs |
 | reduce only | 48 | 23.184 |
 | **push and reduce** | **4** | **5.215** |
@@ -178,7 +178,7 @@ dependencies, so the `.cpp` must be touched first and the `.run` reinstalled.
 With that in place, at two PEs, blocks 8, `[4, 6144]` float32:
 
 | stage | result |
-|---|---|
+| --- | --- |
 | publish and wait, no reduce | **0.874 µs**, `wrong 0` |
 | reduce only | hangs, no plog |
 | full | hangs, no plog |

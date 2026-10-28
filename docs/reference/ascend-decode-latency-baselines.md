@@ -24,7 +24,7 @@ Qwen3.5-35B-A3B (TP=2), covering both plain decode and MTP speculative decoding.
 > + AllReduce/RMSNorm fusion + fused MC2:
 >
 > | Scenario | Before | After |
-> |---|---|---|
+> | --- | --- | --- |
 > | c=1 TPOT (no MTP) | ~8.2 ms | ~7.6 ms |
 > | c=1 TPOT (MTP=4, min_tokens=512) | ~7.0 ms | ~5.1 ms (-27%) |
 > | c=4 TPOT (MTP=4, min_tokens=512) | ~8.9 ms | ~9.0 ms (unchanged) |

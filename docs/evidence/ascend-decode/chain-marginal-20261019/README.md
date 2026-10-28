@@ -3,7 +3,7 @@
 From the two widths measured on the fixed configuration, with no new run.
 
 | | round | acceptance | chained forwards |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | width 4 | 48.50 ms | 3.332 | 3 |
 | width 8 | 57.84 ms | 4.507 | 7 |
 

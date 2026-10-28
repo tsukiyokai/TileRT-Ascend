@@ -21,7 +21,7 @@ From the width-8 capture, seven ranks analysed.
 ## Every collective is in the draft graph, none in the verify
 
 | `Model ID` | collectives |
-|---|---|
+| --- | --- |
 | 49 (draft graph) | 216 |
 | 47 | 36 |
 | 4294967295 (eager) | 20 |
@@ -35,7 +35,7 @@ collectives all belong to the draft side.
 ## The tail is 96% of the all-gather time
 
 | | `hcom_allGather_` | `hcom_allReduce_` |
-|---|---|---|
+| --- | --- | --- |
 | calls | 140 | 132 |
 | p10 | 22.44 µs | 11.90 |
 | median | 25.40 | 22.92 |
@@ -49,7 +49,7 @@ The `Wait Time` column has a median of 0.36 µs and totals 0.349 ms, so the
 ## Not a slow rank: arrival spread
 
 | rank | gather total | gmm1 total | gmm2 total |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 7 | 22.321 ms | 22.953 | 19.072 |
 | 8 | 34.686 | 22.740 | 20.142 |
 | 15 | 42.117 | 24.190 | 20.710 |

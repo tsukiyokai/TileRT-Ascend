@@ -39,7 +39,7 @@ first version's means mixed warmup rounds with measured ones and had the
 phases summing to 124.505 ms against a 57 ms round.
 
 | phase | p10 | median | p90 | calls a round |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `chain` | 0.942 | 1.682 | 1.876 | 6.00 |
 | `verify` | 2.196 | 2.366 | 2.510 | 1.00 |
 | `conditioned` | **42.877** | 43.311 | 43.763 | 1.00 |

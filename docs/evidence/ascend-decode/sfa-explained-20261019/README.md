@@ -40,7 +40,7 @@ data-proportional — was the wrong inference from a right measurement.
 ## Four passes over the selected KV, not one
 
 | pass | unit | line | bytes a row |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | paged KV → UB | AIV MTE2 | `service_vector_mla.h:954/960` | 2.36 MB |
 | UB → `kvMergeGm_` | AIV MTE3 | `:983/987` | 2.36 |
 | `kvMergeGm_` → L1 for mm1 | AIC MTE2 | `service_cube_mla.h:646/652/668/674` | 2.36 |
@@ -52,7 +52,7 @@ data-proportional — was the wrong inference from a right measurement.
 ## Which closes the arithmetic to within 3%
 
 | | bytes | time less the 12.88 µs floor | rate |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | one row, eager | 9.2 MB | 72.43 µs | 127 GB/s |
 | eight rows, eager | 73.4 | 76.29 | 962 |
 | eight rows, in graph | 73.4 | 74.13 | **990** |

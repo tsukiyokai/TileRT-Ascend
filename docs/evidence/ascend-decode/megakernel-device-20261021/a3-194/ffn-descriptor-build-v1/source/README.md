@@ -20,7 +20,7 @@ all three references to its bridge/body producers keep their original values.
 ## Field equivalence
 
 | Original body parameters | Descriptor source |
-|---|---|
+| --- | --- |
 | GU/down weights, correction and scales | Six original weight addresses |
 | Restored rows/scales, counts/starts/source/slot/probability metadata | Original body slots 10 through 16 |
 | Stacked input, GU product, middle codes/scales, down product, route output | Original body slots 0 through 5 |

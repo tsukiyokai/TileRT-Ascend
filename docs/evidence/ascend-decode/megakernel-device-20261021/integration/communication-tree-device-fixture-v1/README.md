@@ -8,7 +8,7 @@ This archive contains that fixture and CPU gate; root owns the separate device
 execution and its numerical acceptance.
 
 | Artifact | SHA256 |
-|---|---|
+| --- | --- |
 | Fixture manifest | `18d57bafa45fb629965916d0d380e014686dd322c575c469ee6327caa4cc98e8` |
 | Original driver | `9973741bbf0ecb5ab330607733ad8895d68bd8d8a38904e58dea572496c0d5b3` |
 | Accepted serial DSO | `1be5fa375d0d6e7a2a6dcf7f5265cf886317108398aeec940e2b1ce0de04e22f` |

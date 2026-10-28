@@ -4,7 +4,7 @@
 boundary in a layer, priced and either taken or closed.
 
 | merge | measured | a round |
-|---|---|---|
+| --- | --- | --- |
 | routed experts, four launches into one | 181.172 -> 72.463 us | **8.48 ms** |
 | TP reduction by one-sided push | 63.5 x 2 -> 22.3 us | **6.50 ms** |
 | four projections off the hidden states | 68.724 -> 37.238 us | **2.46 ms** |

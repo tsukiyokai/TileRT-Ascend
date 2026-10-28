@@ -27,7 +27,7 @@ per draft stage), so the export covers 3.01 rounds and the per-round column
 below divides by three.
 
 | operator | core | calls | per round (ms) | avg (µs) | max (µs) | share |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `allreduceAicpuKernel` | AI_CPU | 501 | 44.28 | 265.16 | 3706.71 | 47.8% |
 | `GroupedMatmulSwigluQuantV2` | MIX_AIC | 235 | 7.90 | 100.88 | 126.17 | 8.5% |
 | `Slice` | AI_VECTOR_CORE | 190 | 6.85 | 108.15 | 366.26 | 7.4% |

@@ -5,7 +5,7 @@ arm's lowest round p10. Width 8, the three gmm1 patches, cache fix on, same
 tree, same overlay read back from every arm's own record.
 
 | pass | off | on | delta |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 55.880 | 52.717 | −3.162 |
 | 2 | 55.163 | 52.365 | −2.798 |
 | 3 | 55.143 | 52.166 | −2.977 |
