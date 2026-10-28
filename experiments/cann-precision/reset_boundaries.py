@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests/glm52")]
 
-from run_cann_model import digest, load_capture  # noqa: E402
+from run_cann_model import capture_mlp, digest, load_capture  # noqa: E402
 from frozen_teacher import load_teacher  # noqa: E402
 from tilert.pd_vllm.ascend_cache import checkpoint_fingerprint  # noqa: E402
 from tilert.pd_vllm.decode_timing import atomic_json  # noqa: E402
@@ -235,7 +235,9 @@ def run(args, report):
             for phase, clear in (("wide", True), ("reset", False), ("clear", True)):
                 prepare(clear)
                 trace.begin()
-                step = target.verify(tokens, full_logits=True)
+                with capture_mlp(target, 3) as stages:
+                    step = target.verify(tokens, full_logits=True)
+                    trace.save("layer.3.mlp_stages", stages)
                 values = trace.readback(step)
                 path = args.output / f"rank-{rank}-{phase}.pt"
                 torch.save(values, path)
