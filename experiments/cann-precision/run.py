@@ -193,7 +193,7 @@ def mapped_libraries():
             )
         ) and Path(path).is_file():
             paths.add(path)
-    return {path: digest(path) for path in sorted(paths)}
+    return {path: digest(Path(path)) for path in sorted(paths)}
 
 
 def run(args, report, rank):

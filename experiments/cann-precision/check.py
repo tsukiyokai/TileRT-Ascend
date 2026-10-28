@@ -1,10 +1,12 @@
 """Real CPU tensor checks for the strict entry; no checkpoint or NPU proof."""
 
 import copy
+import ctypes
 from functools import wraps
 from importlib import util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,17 @@ class StrictInterface(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
+
+    def test_actual_mapped_elf_is_hashed_through_the_path_interface(self):
+        source = next(Path(line.split()[-1]) for line in
+                      Path("/proc/self/maps").read_text().splitlines()
+                      if "/libm.so." in line and Path(line.split()[-1]).is_file())
+        with tempfile.TemporaryDirectory(prefix="ascend-mapped-library-") as temporary:
+            path = Path(temporary) / source.name
+            shutil.copyfile(source, path)
+            library = ctypes.CDLL(str(path))
+            self.assertIsNotNone(library._handle)
+            self.assertEqual(entry.mapped_libraries()[str(path)], entry.digest(path))
 
     def test_original_comparator_accepts_real_complete_tensors(self):
         result, checks = passes(actual_row())
