@@ -45,6 +45,8 @@
 
 定位全模型误差时，固定 teacher 输入，保存第一次分歧处的 hidden、logits、索引、专家和有效 KV。自由生成在第一次分歧后便走入不同上下文，适合检查最终行为；固定轨迹适合比较同一次计算。分别验证串行与宽验证、重复请求、短请求接长请求，以及拒绝后的回滚。局部层检查之后继续检查完整模型，少 rank 检查之后继续检查目标 TP16 规约顺序。参见 [独立参考与教师检查](evidence/ascend-decode/shared-fia-model-20261020/README.md)、[宽度不变性负例](evidence/width-invariance-20261023/round-invariance.json)、[两 rank 组合验证](evidence/ascend-decode/megakernel-device-20261021/integration/vendor-hook-tp-chain-wide-v2-a3-194/summary.json)。
 
+局部诊断要有退出条件。[Attention扩层](evidence/ascend-decode/attention-rounding-a3-20261029/README.md)中，h1误差下降约45%，h3却只改善约14%；第一层逐位闭合不能替代传播检查。已在原容差内的比特差异，先检查是否导致后续越界、索引/路由分歧或宽度不一致，再决定是否继续细分。数学图及阈值保持固定，原CANN精确比较与独立HF容差比较分别报告。
+
 ## 3. 保留计算中的舍入和编码规则
 
 融合去掉写回时，仍须保留该位置的中间 BF16 舍入。Norm 后量化、路由概率转换、专家乘权与求和，以及 TP 归约的数据类型和结合顺序，共同决定基线计算。项目中的 Norm/Quant 融合改变了 INT8 编码，继而改变完整模型输出，见 [融合舍入实验](evidence/ascend-decode/shared-fia-model-20261020/norm-quant-fusion/README.md)。等价替换沿用原舍入规则；采用更高精度时，另立计算与质量对照。

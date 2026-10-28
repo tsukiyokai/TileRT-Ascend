@@ -3,6 +3,7 @@
 import hashlib
 import inspect
 from pathlib import Path
+from statistics import median
 
 
 def compare_sfa(
@@ -286,16 +287,23 @@ def compare_sfa(
             "scores": "FP32(QL @ C_selected.T + QPE @ KPE_selected.T) * scale",
             "fp32_probability": "BF16(softmax(scores)_FP32 @ C_selected_FP32)",
             "bf16_probability": "BF16(BF16(softmax(scores)).float() @ C_selected_FP32)",
+            "bf16_score_probability": "BF16(BF16(softmax(BF16(scores).float())).float() @ C_selected_FP32)",
         },
     }
-    outputs = {"fp32_probability": [], "bf16_probability": []}
+    outputs = {
+        "fp32_probability": [],
+        "bf16_probability": [],
+        "bf16_score_probability": [],
+    }
+    expanded_outputs = {"hf_probability": [], "bf16_score_probability": []}
     for rank, (capture, inputs) in enumerate(zip(captures, rank_inputs)):
         latent, rope, indices, weight = inputs
         b = capture["boundaries"]
         keys, key_rope = latent[indices].float(), rope[indices].float()
         scores = b["sfa.query_nope"][0].float() @ keys.T
         scores = scores + b["sfa.query_rope"][0].float() @ key_rope.T
-        probability = torch.softmax(scores * 0.0625, dim=-1)
+        scaled_scores = scores * 0.0625
+        probability = torch.softmax(scaled_scores, dim=-1)
         context = attention_reference(
             b["sfa.query_nope"],
             b["sfa.query_rope"],
@@ -315,11 +323,14 @@ def compare_sfa(
             hf_local[:, outside].float().sum(-1).tolist()
         )
         for label, local_outputs in outputs.items():
-            candidate_probability = (
-                probability
-                if label == "fp32_probability"
-                else probability.to(torch.bfloat16)
-            )
+            if label == "fp32_probability":
+                candidate_probability = probability
+            elif label == "bf16_probability":
+                candidate_probability = probability.to(torch.bfloat16)
+            else:
+                candidate_probability = torch.softmax(
+                    scaled_scores.to(torch.bfloat16).float(), dim=-1
+                ).to(torch.bfloat16)
             candidate_context = (
                 context.to(torch.bfloat16)
                 if label == "fp32_probability"
@@ -349,8 +360,63 @@ def compare_sfa(
                 .sum(-1)
                 .tolist(),
             }
+            if label == "bf16_score_probability":
+                rows = (rank * 1792, (rank + 1) * 1792)
+                prefix = weights._floating_product(
+                    "model.layers.0.self_attn.kv_b_proj",
+                    latent[:8192],
+                    rows=rows,
+                )
+                current = weights._floating_product(
+                    "model.layers.0.self_attn.kv_b_proj",
+                    latent[8192:],
+                    rows=rows,
+                )
+                expanded = torch.cat((prefix, current)).reshape(8193, 4, 448)
+                values = expanded[:, :, 192:].permute(1, 0, 2).contiguous()
+                for arm, probabilities in (
+                    ("hf_probability", hf_local),
+                    ("bf16_score_probability", aligned),
+                ):
+                    expanded_outputs[arm].append(
+                        torch.matmul(
+                            probabilities.unsqueeze(1), values
+                        ).reshape(1, 1024)
+                    )
     report["candidates"] = {
         label: tail(local) for label, local in outputs.items()
+    }
+    errors = {
+        label: [
+            row[label]["probability_vs_hf_logical_positions"]["nrmse"]
+            for row in rank_reports
+        ]
+        for label in ("bf16_probability", "bf16_score_probability")
+    }
+    baseline, candidate = errors.values()
+    report["score_rounding_hypothesis"] = {
+        "prediction": "BF16 scaled scores reduce max probability NRMSE below 0.01 and median by at least half",
+        "controls": "Actual QL/QPE/KV, index order, scale, BF16 probability output and Value computation fixed",
+        "baseline_max_nrmse": max(baseline),
+        "candidate_max_nrmse": max(candidate),
+        "baseline_median_nrmse": median(baseline),
+        "candidate_median_nrmse": median(candidate),
+        "prediction_met": (
+            max(candidate) < 0.01 and median(candidate) <= median(baseline) / 2
+        ),
+    }
+    report["expanded_value"] = {
+        label: tail(local) for label, local in expanded_outputs.items()
+    }
+    require(
+        report["expanded_value"]["hf_probability"]["h1_vs_hf"]["exact"],
+        "Frozen HF probabilities and rebuilt Value did not reconstruct HF h1",
+    )
+    error = report["expanded_value"]["bf16_score_probability"]["h1_vs_hf"]
+    report["score_and_value_hypothesis"] = {
+        "prediction": "BF16 score/probability with expanded Value gives h1 NRMSE below 0.001",
+        "h1_nrmse": error["nrmse"],
+        "prediction_met": error["nrmse"] < 0.001,
     }
     report["logical_cache_agreement"] = {
         "latent": all(

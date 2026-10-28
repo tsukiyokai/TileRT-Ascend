@@ -21,6 +21,7 @@ class Boundaries:
         self.metadata = {}
         self.handles = []
         self.patches = []
+        self.restores = []
         self.stage = None
 
     def save(self, name, value):
@@ -110,7 +111,8 @@ class Boundaries:
         self.patches.append(replacement)
 
         def input_norm(module, inputs, output):
-            self.save("input_norm", output)
+            normalized = output[0] if isinstance(output, tuple) else output
+            self.save("input_norm", normalized)
 
         def o_before(module, inputs):
             self.stage = "o_proj"
@@ -175,14 +177,22 @@ class Boundaries:
         for replacement in reversed(self.patches):
             replacement.stop()
         self.patches.clear()
+        for restore in reversed(self.restores):
+            restore()
+        self.restores.clear()
 
 
-def instrument(original, engine, factory, *args, **kwargs):
+def instrument(
+    original, engine, factory, *args, attention_override=None, **kwargs
+):
     observer = Boundaries()
     original_reduce = engine._tp_sum_original
 
     def observed_factory(*factory_args, **factory_kwargs):
         layer = factory(*factory_args, **factory_kwargs)
+        if attention_override is not None:
+            impl = layer.self_attn.mla_attn.mla_attn.impl
+            observer.restores.append(attention_override(impl))
         observer.install(layer)
         return layer
 
@@ -245,14 +255,15 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--check-inputs-only", action="store_true")
+    parser.add_argument("--expanded-value", action="store_true")
     options, remaining = parser.parse_known_args()
     sys.path[:0] = [str(options.source), str(options.source / "tests/glm52")]
     legacy = importlib.import_module("run_cann_layer_major")
     with patch.object(sys, "argv", [sys.argv[0], *remaining]):
         args = legacy.arguments()
-    if (args.layers, args.steps, args.query_width) != (1, 1, 1):
+    if not (1 <= args.layers <= 3 and args.steps == args.query_width == 1):
         parser.error(
-            "This observer requires --layers 1 --steps 1 --query-width 1"
+            "This observer requires --layers 1..3 --steps 1 --query-width 1"
         )
     if args.baseline is None:
         parser.error(
@@ -280,9 +291,16 @@ def main():
         )
         return 0
     original = legacy.run_layer
+    attention_override = None
+    if options.expanded_value:
+        from expanded_attention import install
+
+        attention_override = install
 
     def observed(*args, **kwargs):
-        return instrument(original, *args, **kwargs)
+        return instrument(
+            original, *args, attention_override=attention_override, **kwargs
+        )
 
     with patch.object(legacy, "run_layer", observed):
         return legacy.execute(args)
