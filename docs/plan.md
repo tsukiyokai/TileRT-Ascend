@@ -2,7 +2,9 @@
 
 TileRT-Ascend 是构建在 Ascend 上的专用低时延 decode 框架：它从成熟服务栈接收 prefill 交来的历史状态，接管单请求或极低并发下的 token 生成关键路径，并对输出质量、请求状态与完整解码时间负责。项目定位见 [readme]，实验方法见 [lesson]，实测账本与正负证据见 [probe]。
 
-## CPU 前沿验收
+## 当前验收
+
+A3 单 die 已通过 [token staging 对照](evidence/ascend-decode/token-staging-a3-20261028/README.md)，width32 配对节省 p50 为 2.13–2.24 ms/整数夹具轮；[SFA 元数据预搬运](evidence/ascend-decode/sfa-metadata-a3-20261028/README.md)数值通过却使配对时延退化，保留原实现。下一项比较规约所有权与数据交换结构，独立修正 Carver 的 A3 资源描述；组件结果继续接到真实权重、TP16 和在线门禁。
 
 CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)继续通过[无环节点 GC 对照](evidence/ascend-decode/lookup-gc-20261028/README.md)减少本地构造分配与典型成本，复制收益很弱且长尾仍有退化；默认部署尚未安装扩展。[78 层合成 HF](evidence/ascend-decode/hf-runtime-20261028/README.md)已有 [A/B/A 各 32 行的完整参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)；[持久观测槽](evidence/ascend-decode/graph-producer-20261028/README.md)已在 CPU AOT 的实际 verify 入口检查字段新鲜度与坏图拒绝。下一步闭合实际 NPU/SuperKernel graph→HF 观测与正式 CANN 门禁，检验请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 
@@ -10,19 +12,20 @@ CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。
 
 构建专用低时延 decode 框架，首先要越过两重幻象。第一重是自上而下的抽象框架幻象：在尚未打穿单条极限物理路径前先搭通用算子注册表、多模型插件层与调度外壳，只会把错误的内核边界固化成维护负担；逆向拆解上游 ROCm 产物可见（见 [ROCm 融合结构][tilert-rocm]），其逐原语通用 GEMV 库在二进制中完全不可达，真正支撑单用户 469 tok/s 的是整层静态展开内核与携带代次标签的核内点对点写。第二重是 GPU 持久大内核的同构幻象（见 [AMD 机制重读][amd-reread] 与 [Ascend 融合机制][ascend-fusion]）：Ascend A3（`dav-2201`）在物理上切开了 AIC 与 AIV，不存在 `L0C→UB` 通路，跨核交接必经 `L0C → Fixpipe → L2/GM → MTE2 → UB` 并配齐 `DataSyncBarrier<DDR>`；`CrossCoreSetFlag` 仅有 16 个不可清零的 4 位硬件计数器（上限 15 次），且 `CrossCoreWaitFlag` 在 `dav-2201` 上会阻塞等待核全部流水线，强行跨越 78 层串联硬件信号必触发死锁或溢出。
 
-实测数字决定了框架的真实主攻方向。按 [A3 流量下界][a3-roofline]，GLM-5.2-W4A8C8 在单机 16 die（TP16）、8K 上下文下单 rank 逻辑读取约 4.056 GB，70% HBM 带宽效率对应的物理传输时间仅 3.62 ms，配合 [LookupDrafter][lookup-draft] 已达 5.72 至 7.1 的轮均接受数，2.x ms 的 TPOT 在物理上完全敞开。而在当前 61 至 71 ms 的整轮墙钟里（见 [probe]），Cube 与 Vector 算术活跃占比均不足 5%，真正吞噬关键路径的是四项结构税：标量流水线 `PIPE_S` 循环读取全局元数据触发无条件清缓存带来的约 20.4 ms 阻塞（集中在 256 专家分组遍历与稀疏注意力 `MergeKv` 收集）、每轮 156 次 TP16 串行集合规约会合、AIV 未流水化开销，以及 5.26 ms 宿主周转与隐式同步空洞。TileRT-Ascend 因此不是包裹厂商算子的编排壳，而是把上述硬件裂隙转化为确定性流水线的编译器与运行时联合体：先在 GLM-5.2 / A3 TP16 首条路径上逐级打穿这四项结构税，再从两条以上已验证路径的交集中析出通用框架接口。
+当前可复核的整模型锚点是同一冻结前缀下的内部 TPOT 12.413 ms，正式精度、多输入与在线门禁仍待验收。后续预算以同版本、同轨迹的整轮墙钟和受控替换为据，记录于 [机制档案与余量账本](probe.md)。[A3 流量模型][a3-roofline]的 4.056 GB/rank 与 3.62 ms，以及历史 PIPE_S、宿主周转计数，提供实验先验；各流水线计数的重叠关系和实际访存重用须随实验确认。token 批量准备在真实 A3 上形成组件收益，SFA 元数据预搬运则已退化，表明结构替换仍须由实际消费者的数值和墙钟共同筛选。2.x ms 保持为待实测达成的目标，优先比较宿主准备、索引/KV 数据流、通信所有权与层内融合，再从多条已验证路径中提炼框架接口。
 
 ## 首条验证锚点与演进路线图
 
 | 项目 | 范围 |
 | -- | -- |
 | 模型与精度 | 真实 GLM-5.2-W4A8C8 checkpoint，保留原稀疏 attention、量化、采样与 KV 语义 |
-| 解码拓扑 | 一台 A3，16 die（`Ascend910_9392`），TP16，单请求常驻服务 |
+| 解码拓扑 | 一台 A3，16 die（`Ascend910_9392` 或 `9382`），TP16，单请求常驻服务；单算子与少卡实验可直接利用局部空闲 die 推进 |
 | 基准负载 | 八个独立 8192-token 输入，每请求连续生成 1024 个 token |
 | 终极时延门禁 | 生产端与客户端双时钟 32 请求 p50/p95 TPOT ≤ 2.x ms（`passes_2ms`） |
+| 成果沉淀目标 | 沿途下蛋回流全部 GitCode `cann/*` 仓库、`vllm-ascend`、`tilelang-ascend` 与 `TileRT` |
 | 扩展工作负载 | 短对话、长短交替会话、EOS 与取消恢复、百万上下文 AgentX 回放 |
 
-已有 [冻结前缀宽验证计时][width32]（内部 TPOT 中位数 12.413 ms，正式精度与多输入门禁未开）、[真实 P/D 冷启动链路][pd-live] 与 [三 rank 原生树规约整层检查][tree-check]。路线图按消除物理瓶颈的因果次序划分为五个阶段，局部算子开发与 CPU 状态检查可超前并行，但合入默认主干必须逐级通过设备数值、整模型与常驻服务验收：
+已有 [冻结前缀宽验证计时][width32]（内部 TPOT 中位数 12.413 ms，正式精度与多输入门禁未开）、[真实 P/D 冷启动链路][pd-live] 与 [三 rank 原生树规约整层检查][tree-check]。下述五个阶段为可证伪的工作假说地图而非教条禁锢：任何编译器/ISA 栈、规约拓扑（平面直写、两级规约或树规约）或常驻执行结构，只要经真实 NPU 精度门禁确认且能压降墙钟时延，均可超越或合并中间阶段：
 
 | 阶段 | 周期参考 | 核心目标与交付物 | 整轮与 TPOT 门禁 |
 | -- | -- | -- | -- |
@@ -48,7 +51,7 @@ CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。
 在重写整层算子前，先在 P0 可信基线上拔除宿主调度空洞与设备标量管线阻塞，并建立绕开厂商 OPP 工程束缚的直接编译底座（对照见 [低时延宿主杠杆目录][latency-baselines] 与 [自定义算子包装机制][op-packaging]）。
 
 1. 零同步静态宿主信封：将解码轮内的 token、position、slot 映射、[RoPE 刷新][cann-model]、有效序列长度槽、跨层稀疏选择代次与拒绝采样 EOS 掩码全部绑定到预分配固定设备地址与锁页主机内存，消除每步分页 H2D 拷贝、事件反复创建销毁、`.tolist()` 阻塞以及退化为 `NonZero` 强制同步的布尔掩码索引；将 MoE 权重预取激活阈值降至 1 token；实现词表并行局部 argmax，仅跨 rank 收集 `(value, index)` 二元组并直接送入设备侧验证器，消除全词表 FP32 logits 聚合。
-2. 根除 `PIPE_S` 全局内存阻塞：确立内核实现的硬约束——禁止在标量管线中使用 `GetValue` 循环遍历全局内存元数据。将 MoE 算子对 256 个专家分组列表的逐项标量读取、以及稀疏注意力 `MergeKv` 的逐位置索引收集，统一改写为单次 MTE2 批量搬入 UB 后的向量侧计算，利用同一投机轮多行查询高度重合的 top-2048 索引并集消除冗余 KV 收集与注意力标量真除法。
+2. 索引与 KV 数据流：SFA 的 top-k/页表预搬入 UB 已在 width32 退化，结束该轮预算并保留原实现。下一种索引方案须改变实际重复访问、布局或消费者同步，提出新的定量预测，再做隔离缓存、变化输入的配对差分。MoE 分组元数据与跨查询索引共享分别验收，收益取自对应完整阶段及紧邻消费者。
 3. `dav-2201` Tile 编译与图直通底座：修正 `tilelang-ascend` 中 `carver/arch/ascend.py` 将 `Ascend910_9392` 误判为 `Ascend910A` 的缺陷，补齐 24 AIC / 48 AIV 核配比、双缓冲 64 KB L0C、真实 UB/L1 容量阶梯，以及裸 `bisheng -xcce --npu-arch=dav-2201` 编译下缺失的 `MTE2_S`、`S_MTE3` 与 `V_MTE2` 显式同步推导；统一通过 `torch.library` 的 `PrivateUse1` 分派键与 `fake_impl` 将 TileLang 生成内核及受控 AscendC/PTO 内核直接注册进 ACLGraph 捕获流，停止修补受限于固定函数原型的厂商二进制算子包。
 
 验收标准：无 profiler 干扰下整轮设备墙钟从 61–71 ms 压降至 35–40 ms，5.26 ms 宿主周转空洞消失，标量管线固定开销大幅回落，八个冻结输入在线稳态 TPOT ≤ 7.0 ms 且数值完全符合 P0 门禁。

@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import platform
 import statistics
+from types import SimpleNamespace
 
 
 def argument_parser():
@@ -171,7 +172,8 @@ def time_graph(torch, graph, stream, iterations):
     return begin.elapsed_time(end) * 1000 / iterations
 
 
-def run_case(torch, torch_npu, args, weights, rows, requested_blocks):
+def make_case_fixture(torch, torch_npu, args, weights, rows, requested_blocks):
+    """Expose the same owned buffers and calls to isolated experiments."""
     def nd(value):
         return torch_npu.npu_format_cast(value.to(args.device).contiguous(), 2)
 
@@ -272,6 +274,27 @@ def run_case(torch, torch_npu, args, weights, rows, requested_blocks):
     with torch.npu.stream(stream):
         update(0)
     stream.synchronize()
+    return SimpleNamespace(
+        native=native, vendor=vendor, update=update, stream=stream,
+        scratch=scratch, output=output, blocks=blocks, pages=pages,
+        table_pages=table_pages, cache_base=cache_base, rope_base=rope_base,
+        cache_native=cache_native, cache_vendor=cache_vendor,
+        rope_native=rope_native, rope_vendor=rope_vendor,
+        x=x, x_scale=x_scale, sin=sin, cos=cos, slots=slots, topk=topk,
+        query_lengths=query_lengths, kv_lengths=kv_lengths,
+        page_table=page_table,
+    )
+
+
+def run_case(torch, torch_npu, args, weights, rows, requested_blocks):
+    case = make_case_fixture(
+        torch, torch_npu, args, weights, rows, requested_blocks,
+    )
+    native, vendor, update = case.native, case.vendor, case.update
+    stream, scratch = case.stream, case.scratch
+    cache_native, cache_vendor = case.cache_native, case.cache_vendor
+    rope_native, rope_vendor = case.rope_native, case.rope_vendor
+    blocks, pages, table_pages = case.blocks, case.pages, case.table_pages
     if args.capture:
         native_graph, native_output = capture(torch, native, stream)
         vendor_graph, vendor_outputs = capture(torch, vendor, stream)
