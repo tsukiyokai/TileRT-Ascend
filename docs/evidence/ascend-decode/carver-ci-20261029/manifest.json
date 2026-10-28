@@ -39,9 +39,10 @@
       "bytes": 64,
       "sha256": "f636dd9c38f3728b3a99bc33e28f406aee058d34de358c18939c30520bd47602"
     },
-    "template_base.py": {
-      "bytes": 5979,
-      "sha256": "1af2ace69483e1693081928d170bd369c9327bb5db674b45d3f1f42159d0bcc5"
+    "template_base.py.gz": {
+      "bytes": 1471,
+      "sha256": "4f78b067073785d099fcb61556f64dfad9f35a2c013280fb1f3e002ff03cd5c9",
+      "uncompressed_sha256": "1af2ace69483e1693081928d170bd369c9327bb5db674b45d3f1f42159d0bcc5"
     }
   }
 }
