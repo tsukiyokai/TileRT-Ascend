@@ -2,8 +2,8 @@
   "files": [
     {
       "path": "README.md",
-      "bytes": 1628,
-      "sha256": "c634653449fe17cc5643f3fd3034239e9d594874af0089586aee1365ba10c603"
+      "bytes": 1762,
+      "sha256": "6d6a4cd78388baeb273bfc5bcfe9201b1ee1879a82d6312fa8b649fe04e48383"
     },
     {
       "path": "binary-identities.json",
@@ -29,6 +29,16 @@
       "path": "raw/deps/tilelang-ascend/tilelang/carver/arch/ascend_specs.py",
       "bytes": 3660,
       "sha256": "d029d5abf8b89809d016e8421f137399bed95134181c5a8c01ab390861e18360"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/ascend.py",
+      "bytes": 8325,
+      "sha256": "faf37d0b7e3d664b71d2fa9b92fb44f7c80006603f910ee1a0be6e6eb20bb24a"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/ascend_specs.py",
+      "bytes": 3652,
+      "sha256": "39d7ced7fae13479e5a832413354a3276651c06c65025911550cb84a8a62b863"
     },
     {
       "path": "raw/receipts/tilelang-profile/baseline/oversized-exit-code.txt",
@@ -91,6 +101,31 @@
       "sha256": "629e7ad2f861b9d3da6643af27fcb13d8425960711b5a2f56c6b9c793c0b7a17"
     },
     {
+      "path": "raw/receipts/tilelang-profile/formatted-pr/jit.cpp",
+      "bytes": 2624,
+      "sha256": "f905dd22408595a0080adf769d4a6d2f523d425384a91cf053daf28a0a5dba55"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/formatted-pr/jit.json",
+      "bytes": 1244,
+      "sha256": "7af4dab65f50364f5053439b2a9bb170a193b3128d40b736e38cb80c48091920"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/formatted-pr/jit.log.gz",
+      "bytes": 658,
+      "sha256": "191cb813ea7426565d09d639f2ec05afa11700035b6d72f306fb902833643619"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/formatted-pr/profile.json",
+      "bytes": 1415,
+      "sha256": "2aaaed7515a56a8d2c0869df62bf321622786ebf107ca95fc13caf6e74a68cfd"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/formatted-pr/profile.log.gz",
+      "bytes": 607,
+      "sha256": "91ee07c8fab88a39dfe45a273476cb0ce8e8b3df8082ad9f814224d483d2e956"
+    },
+    {
       "path": "raw/receipts/tilelang-profile/import-v1.log.gz",
       "bytes": 415,
       "sha256": "df5a663248b567d4e6ebbf6d327a32d270c431da762790b1245049f8afe1e6a3"
@@ -134,6 +169,11 @@
       "path": "raw/receipts/tilelang-profile/python-deps.log.gz",
       "bytes": 326,
       "sha256": "f524ca78f64f01bb04fef1ce93c482eaa4fdbefeb3be6072cf705ecdbcaa26d0"
+    },
+    {
+      "path": "raw/receipts/tilelang-profile/test_ascend_specs.py",
+      "bytes": 9754,
+      "sha256": "b71ead8da3a795974dec2fd56b0f601459bdc3ea9978de818b87716b4e84188e"
     },
     {
       "path": "raw/receipts/tilelang-profile/trt-carver-hints-debug.py",

@@ -11,6 +11,6 @@
 
 实际 `Ascend()` 与真实 `AscendDefaultPolicy._check_l0_usage` 对 FP16 输入、FP32 累加的 `256×256×64` 分块从允许改为拒绝；`128×256×64` 仍允许。后者经完整 TVM/TileLang 原生构建与真实 A3 JIT 执行，三个变化输入的 `256×256` 输出均与独立 CPU 精确计算逐位一致，共 196608 个 FP16 输出元素。
 
-[原生报告](raw/receipts/tilelang-profile/jit-128-256/report.json)、生成源码、基线/候选描述、所选 SDK 文件 SHA、九个仓库/子模块版本、构建日志与复现脚本均保留。未提交的安装包和编译库只保留[身份](binary-identities.json)。独立 CPU 测试 15 项通过。
+[原生报告](raw/receipts/tilelang-profile/jit-128-256/report.json)、生成源码、基线/候选描述、所选 SDK 文件 SHA、九个仓库/子模块版本、构建日志与复现脚本均保留。未提交的安装包和编译库只保留[身份](binary-identities.json)。独立 CPU 测试 15 项通过；源码修正已提交 [TileLang-Ascend PR #1955](https://github.com/tile-ai/tilelang-ascend/pull/1955)，上游基线为 `43b0b697`。
 
 两版实际 `recommend_hints` 均返回空列表。调试日志显示继承的 CUBE axis `[1,2]` 与二维 tile 不匹配，在容量检查前被拒绝；本补丁没有修复该问题，也没有证明自动选块改善。旧超容量分块仅做隔离编译，编译器进程退出 139，未执行设备 kernel。本组没有配对时延、模型精度或 TPOT 结论。
