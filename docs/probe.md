@@ -26,7 +26,7 @@
 | --- | --- | --- | --- |
 | HCCL | [width32/lookup][w32-lookup] 内部 TPOT 12.413 ms；正式精度未过 | 待对应实测 | 待对应实测 |
 | 离散 SHMEM | [完整 push][execution-gap] 为共享设备上的通信组件对照 | 待对应实测 | 待对应实测 |
-| 核内 SHMEM | [RSAG TP2/TP4/TP16](evidence/ascend-decode/rsag-a3-20261028/README.md) 双规约+CUBE 数值通过，未计时 | [三 rank 整层 tree][native-tp-tree-v1] 数值通过；合成权重、未计时 | 待对应实测 |
+| 核内 SHMEM | [RSAG TP2/TP4/TP16](evidence/ascend-decode/rsag-a3-20261028/README.md) 双规约+CUBE 数值通过；首轮计时未准入 | [三 rank 整层 tree][native-tp-tree-v1] 数值通过；合成权重、未计时 | 待对应实测 |
 
 ### 时间余量的证据边界
 
@@ -49,7 +49,9 @@
 
 [checkpoint消费者核验](evidence/ascend-decode/checkpoint-a3-20261028/README.md)完成109文件、405008283962B的完整SHA与固定版本清单匹配，96个索引文件另过header/区间/张量覆盖；只读视图补齐两项optional对象。SDK9.2与匹配框架实际导入通过，整模型精度另验。[Carver资源修正](evidence/ascend-decode/carver-a3-20261028/README.md)已提交[上游PR #1955](https://github.com/tile-ai/tilelang-ascend/pull/1955)，真实9392资源读取、合法分块原生JIT和15项CPU检查通过，未声称自动选块或时延改善。
 
-真实HF参考首次构造被Transformers5.19的RoPE构造接口拒绝；[显式CPU上下文修复](evidence/ascend-decode/hf-rope-constructor-20261028/readback.json)已过实际构造。完整32行+reset正在CPU执行；[CANN一例入口](../experiments/cann-precision/README.md)已有9项CPU检查及显式仅采集权限分离，设备采集与严格HF比较尚待执行。
+真实HF参考首次构造被Transformers5.19的RoPE构造接口拒绝；[显式CPU上下文修复](evidence/ascend-decode/hf-rope-constructor-20261028/readback.json)已过实际构造。完整32行+reset正在CPU执行；[CANN一例入口](../experiments/cann-precision/README.md)已有11项CPU检查及显式仅采集权限分离。[真实9382首跑](evidence/ascend-decode/cann-precision-a3-20261028/README.md)的16rank均在加载阶段因未知`rot`模块失败，前向帧为0。实际双进程注册表与加载方法对照确认遗漏`ascend_model`插件；补齐白名单后，新9382主机的109文件SHA、实际模型类解析与冻结输入准入通过，模型前向与严格HF比较另验。
+
+[线性接受数修复](evidence/ascend-decode/linear-acceptance-20261028/README.md)从实际候选/预测的首次mismatch独立重算接受和预算裁剪，拒绝字段彼此一致却虚报全接受的收据；28项CPU检查通过，未构成设备数值或TPOT结果。
 
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 

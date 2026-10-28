@@ -1,0 +1,37 @@
+{
+  "scope": "Failed capture and verified plugin/runtime admission; no model precision or timing pass",
+  "files": {
+    "README.md": {
+      "sha256": "a7eeea9c78bcfb1efe0927ba7168e2923918542d2c680eeec94ae00e5dce5a26",
+      "bytes": 1522
+    },
+    "failure-readback.json": {
+      "sha256": "6e4f4a1315b4519b97a4031f4f288fe4a975cd8f67840509be03d7b2b240e6a8",
+      "bytes": 7764
+    },
+    "plugin-admission/actual-loader.json": {
+      "sha256": "e271ba8a31236b2b6ff80c09f9adebbe7d59e11bc109da9996cb196efe51b4a7",
+      "bytes": 1458
+    },
+    "plugin-admission/actual-loader.log.gz": {
+      "sha256": "3cf28f7781bafdb1ab337aea04e74d0d3d9f323389b2a699d84bf0ba01e51060",
+      "bytes": 833
+    },
+    "plugin-admission/ascend+ascend_model.log.gz": {
+      "sha256": "c4f72128047c4dd2f7ccc9c2e66800b57836949b3ac025668663ce949c0c3d22",
+      "bytes": 287
+    },
+    "plugin-admission/ascend.log.gz": {
+      "sha256": "31ab5863f0af43ddc8106d249ceb5f6f91aa45e666f489b16cf2a089ee2bf8a5",
+      "bytes": 263
+    },
+    "plugin-admission/registry.json": {
+      "sha256": "734d7e5638290f0688636b150ebc78fda3a3f042a67292d6992fdf3b9beb6a08",
+      "bytes": 341
+    },
+    "v3-admission.json": {
+      "sha256": "62bca22b40464027845cff17ca90a5c65bc24a6c677599c8242b56df45326d99",
+      "bytes": 40540
+    }
+  }
+}

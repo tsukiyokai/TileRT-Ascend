@@ -141,6 +141,8 @@ ACL graph capture 记录任务；要得到一次完成的 forward，须显式重
 
 ## 工具入口
 
+`VLLM_PLUGINS` 同时筛选平台与通用插件。只允许 `ascend` 会漏掉 `ascend_model`，使主模型使用基础 GLM loader，把 MTP 专用 `rot.weight` 当成未知主干参数。先核对实际 entry point metadata，再在全新进程里检查 `get_model_architecture()` 返回类和真实 `load_weights` 源码；导入成功或只查看注册表不足以证明已解析类的缓存同步更新。[实际对照](evidence/ascend-decode/cann-precision-a3-20261028/README.md)
+
 | 任务 | 入口 | 先核对 |
 | -- | -- | -- |
 | 整机 decode | [统一启动](../tests/glm52/launch_arm_unified.sh) | 配套源码、模型、设备、TAG |

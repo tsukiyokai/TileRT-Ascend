@@ -38,12 +38,10 @@ set -u
 # `PassConfig.enable_sp`, which only `vllm-unified` and `vllm-35a49` have.
 #
 # VLLM_ASCEND_TREE overrides where `vllm_ascend` comes from. The pinned
-# `ascend-python-build` cannot serve this checkpoint: its GLM class has no
-# `rot` parameter while the checkpoint's index declares `rot.weight` and its
-# description says `is_rot_used: True`, so the loader raises "no module or
-# parameter named 'rot'". `vllm-ascend-unified` builds `self.rot` from
-# `is_rot_weight_used`, and it is also the source the working
-# `vllm_ascend_C` was compiled from.
+# `ascend_model` must select its Ascend GLM class: the target loader skips
+# the checkpoint's MTP-only `rot.weight`; the MTP class owns `self.rot`.
+# `vllm-ascend-unified` is also the source the working `vllm_ascend_C` was
+# compiled from. The source trees and plugin metadata must match.
 #
 # The engine stack comes from the pinned trees under RUNTIME, because the
 # omniinfer image ships `omni_npu` rather than `vllm_ascend` and the unified
@@ -73,9 +71,9 @@ export LD_LIBRARY_PATH="/opt/openEuler/gcc-toolset-12/root/usr/lib64${LD_LIBRARY
 # `libcust_opapi.so` and in no `libopapi.so`, so the KV scatter faults without
 # it.
 export ASCEND_CUSTOM_OPP_PATH="/opt/kernel-overlay/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-# Only the ascend plugin: the image's own omni_npu registers against vllm 0.30's
-# entrypoint layout and the pinned vllm is 0.25.1.
-export VLLM_PLUGINS=ascend
+# Select the Ascend platform and model adapters before the first vLLM import.
+# The image's omni_npu uses a different vLLM entrypoint layout.
+export VLLM_PLUGINS=ascend,ascend_model
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 # Both belong to an arm's identity rather than to the harness: a deterministic
 # reduction fixes the summation order, which moves the logits and so the greedy
