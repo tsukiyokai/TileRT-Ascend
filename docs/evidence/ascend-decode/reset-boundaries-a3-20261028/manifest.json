@@ -1,0 +1,13 @@
+{
+  "scope": "Instrumented repeated-forward diagnosis; no precision or TPOT acceptance",
+  "files": {
+    "README.md": {
+      "bytes": 1623,
+      "sha256": "04323828a7bc85c36b432a166bada5705c1ea624ef2cb177f9fe045ebc380960"
+    },
+    "boundaries-v1.json.gz": {
+      "bytes": 67391,
+      "sha256": "4c738952c54a3090de16cb6ee7565aac55bf200ea34855b91c5078d47e44961a"
+    }
+  }
+}

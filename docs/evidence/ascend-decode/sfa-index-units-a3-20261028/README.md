@@ -15,3 +15,5 @@ v4保留了16rank×32个M1工件与全部prefix精确检查；M32因观测槽硬
 [独立CPU HF](hf-complete.json)已完成32行与精确reset，25347项检查全过，32份trace实际复制SHA匹配。v6使用`03fa67187e572622838b477b60a6d809c781b8a6`与上述单行运行包修正，在同一9382主机完成16rank的512个M1、16个M32及16个reset工件，实际退出1。各rank状态一致，但采集执行检查失败，未通过单例精度。
 
 [首帧对照](candidate-v6-readback.json.gz)中，logits恢复有限，预测382与HF一致；hidden1/2 NRMSE降至0.003595/0.005977。首行1096项仍有438项失败，最终logits NRMSE为0.115986、max-abs为1.732704，不能只凭top1相同判精度通过。rank0的M1/M32、M1/reset及精确reset仍分别有13280/13226/14572项失败。[宽帧/reset读回](candidate-v6-reset.json.gz)确认前3个hidden及前3层选择逐位相同，后续分歧仍待定位。没有新增TPOT测量。
+
+[rank0全部32行首差](candidate-v6-first-reset-difference.json.gz)进一步确认hidden0–4逐位相同、hidden5首次不同，max-abs为0.0001220703125。hidden字段是下一层input norm输出的融合残差，未记录该norm的两输入或归一化输出，不能据此排除更早的分支差异。[后续16rank边界采集](../reset-boundaries-a3-20261028/README.md)把首个已采差异推进至部分rank的layer3本地MoE、TP输入之前。原summary的rank状态一致仅覆盖预测、位置和epoch，不代表中间Tensor相同。

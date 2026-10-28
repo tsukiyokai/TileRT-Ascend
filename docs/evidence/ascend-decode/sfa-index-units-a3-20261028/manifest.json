@@ -2,8 +2,12 @@
   "scope": "Observed SFA unit witness, failed v4 model and CPU request-slot checks; no TPOT acceptance",
   "files": {
     "README.md": {
-      "bytes": 2840,
-      "sha256": "f038a49198e605287e5901e19ffd4d7eaf8424158def715ad6f5816a45627744"
+      "bytes": 3392,
+      "sha256": "c3481e95503f1086b50aa6c9e8fdcf6de79239faa34a7d38dde448537a48f1e5"
+    },
+    "candidate-v6-first-reset-difference.json.gz": {
+      "bytes": 506,
+      "sha256": "361e167e0a3f9deb3e667420776e1169dd9749628ef5b12fd4268f1aedd085b8"
     },
     "candidate-v6-readback.json.gz": {
       "bytes": 21025,
