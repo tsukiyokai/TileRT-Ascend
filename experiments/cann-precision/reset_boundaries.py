@@ -100,6 +100,17 @@ class Boundaries:
 
         return observed
 
+    def method(self, tag, original):
+        @wraps(original)
+        def observed(*args, **kwargs):
+            self.save(tag + ".in", args)
+            self.save(tag + ".kwargs", kwargs)
+            result = original(*args, **kwargs)
+            self.save(tag + ".out", result)
+            return result
+
+        return observed
+
     def __enter__(self):
         try:
             for index in (3, 4, 5):
@@ -118,6 +129,14 @@ class Boundaries:
                 name = "_execute_sparse_flash_attention_process"
                 self.replace(attention, name, self.attention(
                     tag + ".sfa", getattr(attention, name)))
+                if index == 3:
+                    runner = layer.mlp.experts
+                    for owner, name in ((runner, "_forward_impl"),
+                                        (runner, "_compute_router_logits"),
+                                        (runner.routed_experts, "forward_impl"),
+                                        (runner.routed_experts, "_select_experts")):
+                        self.replace(owner, name, self.method(
+                            tag + ".moe." + name, getattr(owner, name)))
             group = self.target._tp_sum_group
             self.replace(group, "_all_reduce_out_place", self.reduce(
                 group._all_reduce_out_place))
