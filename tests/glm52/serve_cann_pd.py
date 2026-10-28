@@ -14,7 +14,9 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tilert.pd_vllm.ascend_cache import CannRankEngine  # noqa: E402
+from tilert.pd_vllm.ascend_cache import (  # noqa: E402
+    CannRankEngine, drafter_metadata,
+)
 
 
 def create_model(args, device, rank):
@@ -119,6 +121,7 @@ class DeferredModel:
 
 
 def run(args):
+    host_drafter = drafter_metadata("lookup") if args.lookup else None
     import torch
     import torch.distributed as distributed
     import torch_npu  # noqa: F401
@@ -188,6 +191,7 @@ def run(args):
         "mtp_width": args.mtp_width,
         "parent_hidden": speculative,
         "drafter": "lookup" if args.lookup else "mtp" if speculative else None,
+        "host_drafter": host_drafter,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel, "fp32_head": args.fp32_head,
         "target_graph_requested": args.target_graph,
@@ -202,7 +206,9 @@ def run(args):
         "precision_verified": False, "performance_measured": False,
         "checkpoint_sha256": fingerprint,
         "source_sha256": {**model.source_metadata(),
-                          **{str(path): digest(path) for path in sources}},
+                          **{str(path): digest(path) for path in sources},
+                          **({} if host_drafter is None else
+                             host_drafter["source_sha256"])},
         "hixl_library_sha256": digest(args.hixl_library),
         "world_size": distributed.get_world_size(),
         "capacity": model.capacity,

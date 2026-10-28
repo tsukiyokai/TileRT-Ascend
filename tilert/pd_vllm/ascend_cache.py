@@ -32,6 +32,32 @@ CHECKPOINT_FILES = (
 )
 
 
+def drafter_metadata(name):
+    """Describe the imported host drafter and reject stale native sources."""
+    spec = DRAFTERS[name]
+    module = importlib.import_module(spec.module)
+    path = Path(module.__file__).resolve()
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    build = getattr(module, "_NATIVE_BUILD", None)
+    result = {
+        "module": module.__name__, "class": spec.name,
+        "kind": "python" if build is None else build["kind"],
+        "file": str(path), "file_sha256": actual,
+        "source_sha256": {str(path): actual},
+    }
+    if build is not None:
+        if actual != build["loaded_binary_sha256"]:
+            raise RuntimeError("Loaded native lookup file changed")
+        for filename, expected in build["source_sha256"].items():
+            source = path.with_name(filename)
+            if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+                raise RuntimeError("Native lookup sources changed; rebuild")
+            result["source_sha256"][str(source)] = expected
+        result["build"] = {**build,
+                           "source_sha256": dict(build["source_sha256"])}
+    return result
+
+
 def receive_device_id(rank):
     """Move each PD destination off its source die on the single A3 host."""
     return (rank + 1) % NUM_RANKS

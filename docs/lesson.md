@@ -71,6 +71,8 @@ A/B 每次改变一个因素，用同配置重复请求测出运行间波动；�
 
 逐轮计时也会改变被测堆。将 GC 起点、callback 和报告保留方式分别纳入对照，先定位回收落在哪个调用，再验收索引表示变化的总成本。[全局 arena 对照](evidence/ascend-decode/lookup-arena-20261028/README.md)减少了节点对象，却使复制与轻度编辑退化；[仅将局部字典的边改为上下文坐标](evidence/ascend-decode/lookup-coordinate-20261028/README.md)才在四类输入获得 p50 收益，编辑负载仍有尾部退化。容器、标签和访问方式分别验收。
 
+原生扩展须核对实际类型声明和热路径。完整包名的构建目录若未匹配 `.pxd`，仍可生成保留 Python 属性分派的 `.so`。检查生成 C、实际字段类型与二进制，再用同一已检查产物测量和安装；见 [lookup 原生执行](evidence/ascend-decode/lookup-native-20261028/README.md)。
+
 报告 TPOT 时同时保存轮时间、实际接受数和完整输出。先写明计时起止点，再确定分母：若取首个与最后一个输出 token 的回调时间差，且输出数 N > 1，分母就是 N−1 个输出间隔；其他计时口径按原始记录定义分母。说明首 token、bonus token 和最后一轮裁剪如何计数。接受数从逐轮记录读取，验证宽度只表示候选容量。短、长请求分别测量，因为它们的接受分布可能不同。参见 [完整机器重测](evidence/ascend-decode/whole-machine-20261023/README.md)、[宽度梯子](evidence/ascend-decode/width-ladder-20261023/README.md)。
 
 ## 5. 用对照定位耗时来源

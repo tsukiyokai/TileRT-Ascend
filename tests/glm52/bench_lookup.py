@@ -3,11 +3,13 @@
 import argparse
 from functools import partial
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
 import platform
 import statistics
+import sys
 from time import perf_counter_ns
 
 from ngram_acceptance import lookup, matched_prefix
@@ -81,8 +83,12 @@ def main():
     args = parser.parse_args()
     if args.longest < args.shortest:
         parser.error("--longest must be at least --shortest")
-    spec = importlib.util.spec_from_file_location("candidate", args.candidate)
+    native = any(str(args.candidate).endswith(suffix)
+                 for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+    name = args.candidate.name.split(".", 1)[0] if native else "candidate"
+    spec = importlib.util.spec_from_file_location(name, args.candidate)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     factories = {
         "scan": partial(ReverseScan, shortest=args.shortest,

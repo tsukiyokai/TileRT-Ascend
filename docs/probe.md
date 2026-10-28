@@ -38,6 +38,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 后续[局部坐标边](evidence/ascend-decode/lookup-coordinate-20261028/README.md)保留节点字典，只删除持久 tuple 标签与逆序 word 构造。生产 A/B 的四类总 CPU p50 约降 6–40%；完整签名、79 项回归、126 个实际 session 与逐前缀正负例通过。carry 编辑稳态 p99 仍从 2.536 增至 3.771 ms；另一个带 callback 的 1.734 ms commit 与 GC2 区间重叠 1.706 ms，记录回收数为 0。原始尾部与所有退化保留，生产 GC 配置不变。
 
+[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)保持算法文件不变，通过增补声明消除热路径的 Python 属性与遍历分派。本地四类 8K+1024 轨迹总 CPU p50 从约 5.0–8.9 降至 1.9–4.0 ms，正常 GC 的 240 对总成本全部下降；carry 编辑稳态 p95 仍从 2.177 增至 2.708 ms。79 项回归、24159 次独立提议、126 个 session、安装及入口检查通过；1536 个原始样本的 864384 轮与完整统计另经独立读回。默认仍用 Python，服务器须重建并显式安装受检产物；NPU 与 TPOT 尚未测定。
+
 [FP32 head 参考](evidence/ascend-decode/fp32-head-reference-20261028/README.md)补齐显式输出算术、实际导入源与模式准入。匹配的 C8 header 已在仓库逐文件核对；[78 层合成 CPU 执行](evidence/ascend-decode/hf-runtime-20261028/README.md)修正当前 HF gate/MoE 路由协议，实际运行最终与 77 个诊断 head。两种 head 模式各 2379 项采集/reset 对照、48 项独立检查、44 项回归及 62 项元数据检查通过。BF16/FP32 的合成贪心结果分别为 0/17；真实 checkpoint、Prolog-v3、CANN FP32 caller 及实际 graph 数值继续验收。
 
 [32 行参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)保存合成 78 层模型的 96 次实际 HF teacher forward，组成 A/B/A 三帧，各含 628 字段。完整严格账本的 297632 项检查中，256 项为预期数值负例失败，意外失败为零。旧接收器会让空参考零检查通过；当前接收器从保存的 Tensor 核对 60288 个字段行、重算 629 项标量 oracle，并拒绝 15 类空缺及身份类型反例。真实 8K/top-2048、NPU producer、SuperKernel 图与正式 CANN 精度门禁仍待闭合。

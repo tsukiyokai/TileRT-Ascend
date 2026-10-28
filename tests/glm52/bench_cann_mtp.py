@@ -26,7 +26,7 @@ from run_cann_model import digest
 
 from tilert.models.glm_5_2_ascend.session import PrefixRequest
 from tilert.pd_vllm.ascend_cache import (
-    CannRankEngine, FullRankPrefix, checkpoint_fingerprint,
+    CannRankEngine, FullRankPrefix, checkpoint_fingerprint, drafter_metadata,
 )
 from tilert.pd_vllm.prefix_capture import prompt_digest
 from tilert.pd_vllm.decode_timing import (
@@ -503,6 +503,10 @@ def validate_delivery(requests, histories, args):
             previous = op["end_ns"]
 
 def run(args, report):
+    if host_drafted(args):
+        name = ("tree" if args.tree else
+                "automaton" if args.automaton else "lookup")
+        report["host_drafter"] = drafter_metadata(name)
     import torch
     import torch.distributed as distributed
     import torch_npu  # noqa: F401
@@ -665,6 +669,8 @@ def run(args, report):
                         conditioned_width=(args.width
                                            if args.conditioned_graph else 0))
             sources = source_hashes(target, draft)
+            if host_drafted(args):
+                sources.update(report["host_drafter"]["source_sha256"])
             for name in ("mtp_session.py", "tp_runtime.py",
                          "lookup_draft.py", "automaton_draft.py",
                          "tree_draft.py", "tree_mask.py", "tree_resolve.py",
