@@ -14,4 +14,4 @@
 
 [首行独立HF对照](first-hf-180.json.gz)为425/1096项失败，预测同为382，最终logits NRMSE为0.0771525；hidden1为0.00359480，hidden6为0.00921656，hidden7升至0.0277551，首次专家路由分歧在layer6。后续用[真实概率的Value重排见证](../mla-value-order-a3-20261029/README.md)区分MLA舍入边界与norm/quant输入差异。当前无新增TPOT结果。
 
-原始工件已在180本机形成70989101922B归档，SHA256 `3188dc0b4a4a1c9b0ec4559e6c85567a9f7f931590b9ad8be4d0a63e358e502e`，完整zstd解码和成员清单检查通过；共享存储同步另由[归档收据](archive-180.json)核验。本方[完成的容器](container-180-retired.json)已移除，原始目录保留。
+原始工件已在180本机形成70989101922B归档，SHA256 `3188dc0b4a4a1c9b0ec4559e6c85567a9f7f931590b9ad8be4d0a63e358e502e`，完整zstd解码和成员清单检查通过；[共享副本](archive-180.json)已核对同一SHA，位于 `/trt-a3-evidence-20261028/full-fixed-v3-source3fcfd8b-20261029.tar.zst`。本方[完成的容器](container-180-retired.json)已移除，原始目录保留。
