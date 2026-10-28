@@ -2,6 +2,8 @@
 
 从同一个 `lookup_draft.py` 与增补 `.pxd` 构建 CPython 扩展；构建环境需要 C 编译器、Cython 3.3.0 与 setuptools 82.0.1。扩展运行时不导入 Cython 或 Torch。必须在目标主机、匹配的 Python ABI 下重新构建。
 
+当前构建器只对私有无环节点关闭循环 GC，起草器自身继续支持引用环；正常方法只连接后代，并把键归一化为整数。实际 GC 标志在隔离装载时检查。[节点 GC 对照](../lookup-gc/README.md)保留受 GC 跟踪的控制构建、生命周期与长尾结果。
+
 ```sh
 python experiments/lookup-native/build.py --output /tmp/lookup-native-build
 python experiments/lookup-native/check.py \

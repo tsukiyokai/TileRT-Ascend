@@ -60,14 +60,20 @@ def prepare(root, output):
         "cython": Cython.__version__, "setuptools": setuptools.__version__,
         "python_abi": sysconfig.get_config_var("SOABI"),
         "python": platform.python_version(), "machine": platform.machine(),
-        "directives": DIRECTIVES,
+        "directives": DIRECTIVES, "acyclic_nodes": True,
     }
     source = output / "source"
     package = source / DIRECTORY
     package.mkdir(parents=True)
-    (package / "lookup_draft.py").write_text(
-        paths[0].read_bytes().decode() + native_guard(identity),
+    original = paths[0].read_text()
+    if original.count("class _Node:") != 1:
+        raise ValueError("Expected one lookup node class")
+    # Node links own descendants only; the drafter retains cyclic GC support.
+    lowered = original.replace(
+        "class _Node:",
+        "import cython\n\n\n@cython.no_gc\n@cython.cclass\nclass _Node:", 1,
     )
+    (package / "lookup_draft.py").write_text(lowered + native_guard(identity))
     shutil.copyfile(paths[1], package / "lookup_draft.pxd")
     setup = f'''from Cython.Build import cythonize
 from setuptools import Extension, setup
@@ -87,7 +93,7 @@ setup(
 
 
 def validate(binary, identity):
-    script = '''import importlib.util, json, pathlib, sys
+    script = '''import gc, importlib.util, json, pathlib, sys
 name, filename = sys.argv[1:]
 spec = importlib.util.spec_from_file_location(name, filename)
 module = importlib.util.module_from_spec(spec)
@@ -97,6 +103,9 @@ loaded = pathlib.Path(module.__file__).resolve()
 assert loaded == pathlib.Path(filename).resolve()
 assert "__pyx_vtable__" in vars(module.LookupDrafter)
 assert "context" in vars(module.LookupDrafter)
+assert gc.is_tracked(module._Node(0, 0, -1)) is (
+    not module._NATIVE_BUILD.get("acyclic_nodes", False))
+assert gc.is_tracked(module.LookupDrafter([1,2,1,2]))
 assert module.LookupDrafter([1,2,7,9,2,8,2], 3, 1).propose(1) == [8]
 assert "torch" not in sys.modules and "Cython" not in sys.modules
 print(json.dumps(module._NATIVE_BUILD, sort_keys=True))
