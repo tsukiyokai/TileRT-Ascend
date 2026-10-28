@@ -21,3 +21,13 @@ independently admitted reference with exactly 32 rows, checks typed identities,
 and returns owned CPU snapshots. `check_readback.py` reads the saved real
 tensors, recomputes the scalar oracles, and checks rejection cases without
 constructing or running HF. Formal CANN admission remains a separate owner.
+
+`producer_probe.py` exercises persistent observation slots at the actual
+`CannModel.verify` boundary with a CPU fixture and a CPU Dynamo/AOT graph.
+The [saved producer experiment](../../docs/evidence/ascend-decode/graph-producer-20261028/README.md)
+includes full graph records and deletion of the actual stamp writeback.
+It does not run ACL/SK or establish independent HF precision.
+
+```sh
+python experiments/graph-evidence/producer_probe.py --output /tmp/producer-new.json
+```

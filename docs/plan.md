@@ -4,7 +4,7 @@
 
 ## CPU 前沿验收
 
-CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)继续通过[无环节点 GC 对照](evidence/ascend-decode/lookup-gc-20261028/README.md)减少本地构造分配与典型成本，复制收益很弱且长尾仍有退化；默认部署尚未安装扩展。[78 层合成 HF](evidence/ascend-decode/hf-runtime-20261028/README.md)已有 [A/B/A 各 32 行的完整参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)。下一步闭合实际 compiled/SuperKernel graph→HF 观测与正式 CANN 门禁，检验请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
+CPU 接入、状态、计时修复及正负结果见 [10-28 账本](probe.md)。[同源码原生 lookup](evidence/ascend-decode/lookup-native-20261028/README.md)继续通过[无环节点 GC 对照](evidence/ascend-decode/lookup-gc-20261028/README.md)减少本地构造分配与典型成本，复制收益很弱且长尾仍有退化；默认部署尚未安装扩展。[78 层合成 HF](evidence/ascend-decode/hf-runtime-20261028/README.md)已有 [A/B/A 各 32 行的完整参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)；[持久观测槽](evidence/ascend-decode/graph-producer-20261028/README.md)已在 CPU AOT 的实际 verify 入口检查字段新鲜度与坏图拒绝。下一步闭合实际 NPU/SuperKernel graph→HF 观测与正式 CANN 门禁，检验请求观测成本；设备验证按[单 die、少 rank、空闲 A3](evidence/ascend-decode/online-lookup-20261028/README.md)推进，先核对构造副作用。整模型精度与在线 TPOT 仍待验收，当前未宣告 CPU 前沿耗尽。
 
 ## 首条验证路径
 

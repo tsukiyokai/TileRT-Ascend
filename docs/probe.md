@@ -46,6 +46,8 @@ tree 容量只剩一行时，实际轮宽缩至 1，旧路径调用 `propose_tre
 
 [32 行参考帧](evidence/ascend-decode/graph-frame32-20261028/README.md)保存合成 78 层模型的 96 次实际 HF teacher forward，组成 A/B/A 三帧，各含 628 字段。完整严格账本的 297632 项检查中，256 项为预期数值负例失败，意外失败为零。旧接收器会让空参考零检查通过；当前接收器从保存的 Tensor 核对 60288 个字段行、重算 629 项标量 oracle，并拒绝 15 类空缺及身份类型反例。真实 8K/top-2048、NPU producer、SuperKernel 图与正式 CANN 精度门禁仍待闭合。
 
+[持久观测槽](evidence/ascend-decode/graph-producer-20261028/README.md)在实际 `CannModel.verify` 入口执行 CPU AOT 夹具，A/B/A 的 96 行通过 104832 项原标量检查及 96 项输出 token ID 对照；八个负例均拒绝，包括实际删除 AOT stamp 写回后执行的坏图。观测槽保留完整字段、当前代次与独立复制，未执行真实 checkpoint、attention、NPU/SK 或 HF 精度验收。
+
 ## 整请求速度与输出
 
 ### 2026-10-17 至 23：历史整请求记录与更正

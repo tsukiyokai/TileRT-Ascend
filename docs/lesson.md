@@ -113,6 +113,8 @@ ACL graph capture 记录任务；要得到一次完成的 forward，须显式重
 
 图会复用输出和 workspace。消费者在下一次复用前完成读取或复制，链式 MTP 同时保留独立的 seed 与 recycle parent。预热后用毒化值填充未写 KV，确认 capture 前后相关状态不变、重放实际执行、reset 清除有效状态。分别记录图池和模型权重的峰值内存，并计入各宽度图持有的资源。先释放图，再释放它引用的缓冲区或通信窗口。参见 [ACL graph 检查](evidence/ascend-decode/cann-graph-20261017/README.md)、[MTP 链别名与回滚](evidence/ascend-decode/layer-major-20261018/mtp-chain-graph-audit.json)。
 
+编译图的观测按字段写入本轮代次，实际删除 stamp 写回后再执行，确认读回会拒绝；节点计数不能代替这个负例。输出 token ID 也须单独比较，logits 通过不会检查已打包的 ID。CPU AOT 的[持久观测检查](evidence/ascend-decode/graph-producer-20261028/README.md)只证明该机制，NPU/SK 的保留、流次序及正式图数值另验收。
+
 验证 P/D 完整链路时，用同一 request ID 关联各 rank 的 WRITE acknowledgement、prefill 首 token、真实 decode 步、回调 token 与 HTTP 响应；前缀传输完成只是其中一环。接收缓冲区要保留到消费者结束。单机分时验证若在 P 传输后释放模型再加载 D，应保留接收状态，并把模型加载计入 TTFT。按所用 HIXL 版本核对设备放置、监听端口和 allocator-block 注册规则。参见 [真实 handoff](evidence/ascend-decode/pd-live-20261017/README.md)与 [HIXL 设备记录](evidence/ascend-decode/pd-hixl-20261017/README.md)。
 
 ## 9. 沿真实提交边界评估草拟器
