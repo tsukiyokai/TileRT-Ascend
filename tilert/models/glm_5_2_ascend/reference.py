@@ -455,9 +455,8 @@ class HfReference:
         self._install_adapters()
         if mla_preprocess == "prolog_v3":
             self._install_prolog()
-        self.model.model.rotary_emb = GlmMoeDsaRotaryEmbedding(
-            config=config, device="cpu"
-        )
+        with torch.device("cpu"):
+            self.model.model.rotary_emb = GlmMoeDsaRotaryEmbedding(config=config)
         self.model.eval().requires_grad_(False)
         remaining = [name for name, value in (
             *self.model.named_parameters(), *self.model.named_buffers()
