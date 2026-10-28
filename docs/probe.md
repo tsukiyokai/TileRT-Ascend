@@ -65,6 +65,10 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [修正包的TP16 HF尝试](evidence/ascend-decode/fixed-hf-launch-20261029/README.md)在49节点加载68/96时被外部SIGKILL并删除，0个rank报告、0个Tensor工件；退出137。节点随后已被其他VLLM占用，未重建。本次不形成数值判定；后续先完成CPU完整SHA与顺序读，再经即时空闲检查启动设备作业。
 
+180节点随后完成相同修正包的TP16严格复验，取得576个PT与16份报告，rank状态一致、每rank的35072项reset_exact检查全过；M1/M32从第13行开始不同，两次对照各582项失败。每rank共211428项检查、40807项失败；首行HF为425/1096失败，最终logits NRMSE为0.0771525。[原始读回与归档](evidence/ascend-decode/fixed-hf-launch-20261029/README.md#9392完整复验)保留，模型精度仍未通过。
+
+[固定真实概率的Value重排](evidence/ascend-decode/mla-value-order-a3-20261029/README.md)在9392单die比较BF16先展开与后投影，各32次逐字节稳定；先展开匹配CPU，后投影对自身CPU最大差9.31e-10。两图有510/1024项不同、NRMSE为0.00333698。新用例的CPU设置已对齐冻结HF的mkldnn=False；该见证尚待实际层0 attention/Oproj输入确认对hidden1的贡献，未测时延。
+
 ## 2026-10-28：RSAG 所有权重排的 A3 数值门禁
 
 [原通信链 bootstrap](evidence/ascend-decode/shmem-bootstrap-a3-20261028/README.md) 在 9392、CANN 9.1、源码构建 SHMEM 上通过 TP2/TP4 的升 rank FP32 算术对照；TP4 随机输入与实际 HCCL 有差异，原串行顺序不视为 HCCL 等价。随后 [RSAG](evidence/ascend-decode/rsag-a3-20261028/README.md) 将控制与候选统一为原 FP32 TreePlan，仅重排 owner 分片、scatter/gather 与 ready 协议。两臂 TP2/TP4、rows1/12/32 共 324 条输入/权重/两次规约/哨兵检查通过，162 条跨臂摘要一致；含 eager、变化输入 graph、轮换延迟和无中间 barrier 的连续 parity 回放。随后两臂真实 TP16、blocks24 的 32 份 rank 默认门禁通过。四 rank 的顺序见证显示 HCCL 随 rows 改变结合顺序；TP16 的该见证在三种 rows 均匹配固定树。特殊有限值的 CUBE 后结果及 edges 首规约有共同 CPU 差异，默认 `pass` 不覆盖这些观测。设备时延另测，固定树未据此成为 HCCL 的通用等价替换。
