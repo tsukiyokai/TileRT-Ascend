@@ -237,6 +237,91 @@ class DecodeTimingChecks(unittest.TestCase):
             with self.subTest(field=key), self.assertRaises(ValueError):
                 bench.validate_producer(damaged, received, first, 4)
 
+    def test_first_mismatch_cannot_claim_a_complete_accepted_round(self):
+        for width in (4, 32):
+            with self.subTest(width=width):
+                engine, first, _, _ = self.fixture(
+                    width=width, prefix=8192, budget=1024,
+                    rounds_per_command=3,
+                )
+                tokens = engine.decode(first, 1024,
+                                       sampling={"ignore_eos": True})
+                engine.reset()
+                report = load_timing(self.directory, "request")
+                received = bench.DecodeStream()
+                received.feed(wire_message({"t": tokens})
+                              + wire_message(terminal(1024)), 100)
+                received.finish(first)
+                bench.validate_producer(report, received, first, width)
+                span = report["engine_stats"]["accepted_spans"][0]
+                self.assertEqual(span["accepted"], width)
+                span["candidates"][1] = (
+                    span["predictions"][0] + 1
+                ) % bench.VOCAB_SIZE
+                with self.assertRaisesRegex(ValueError, "acceptance differs"):
+                    bench.validate_producer(report, received, first, width)
+
+    def test_linear_acceptance_retains_rejections_and_final_budget_clipping(self):
+        cases = [(1, "accept"), *((width, mode)
+                 for width in (2, 4, 32)
+                 for mode in ("accept", "reject", "mixed"))]
+        for width, mode in cases:
+            with self.subTest(width=width, mode=mode):
+                engine, first, _, _ = self.fixture(
+                    width=width, mode=mode, prefix=8192, budget=1024,
+                    rounds_per_command=3,
+                )
+                tokens = engine.decode(first, 1024,
+                                       sampling={"ignore_eos": True})
+                engine.reset()
+                report = load_timing(self.directory, "request")
+                metrics, commands = bench.validate_producer(
+                    report, SimpleNamespace(token_ids=tokens), first, width,
+                )
+                self.assertEqual(metrics["output_tokens"], 1024)
+                if width == 1:
+                    self.assertEqual(commands, [])
+                elif mode == "accept":
+                    last = report["engine_stats"]["accepted_spans"][-1]
+                    self.assertEqual(last["natural_accepted"], width)
+                    self.assertEqual(last["accepted"], 1023 % width)
+
+    def test_linear_round_rows_reject_unknown_tree_and_invalid_tokens(self):
+        engine, first, _, _ = self.fixture(prefix=8192, budget=1024)
+        tokens = engine.decode(first, 1024, sampling={"ignore_eos": True})
+        engine.reset()
+        report = load_timing(self.directory, "request")
+        changes = (
+            {"parents": [None, 0, 1, 2]},
+            {"candidates": None},
+            {"predictions": [1]},
+            {"candidates": [first + 1, 1, 2, 3]},
+            {"predictions": [True, 1, 2, 3]},
+            {"predictions": [bench.VOCAB_SIZE, 1, 2, 3]},
+        )
+        for values in changes:
+            with self.subTest(values=values):
+                damaged = deepcopy(report)
+                damaged["engine_stats"]["accepted_spans"][0].update(values)
+                with self.assertRaisesRegex(ValueError, "linear candidate"):
+                    bench.validate_producer(
+                        damaged, SimpleNamespace(token_ids=tokens), first, 4,
+                    )
+
+    def test_eos_clipped_delivery_cannot_enter_the_fixed_length_gate(self):
+        engine, first, _, _ = self.fixture(prefix=8192, budget=1024)
+        baseline = engine.decode(first, 1024, sampling={"ignore_eos": True})
+        engine, first, _, _ = self.fixture(prefix=8192, budget=1024)
+        engine.engine.stop_ids = frozenset((baseline[2],))
+        tokens = engine.decode(first, 1024)
+        engine.reset()
+        report = load_timing(self.directory, "request")
+        self.assertEqual(report["engine_stats"]["finish_reason"], "stop")
+        with self.assertRaisesRegex(ValueError, "incomplete delivery"):
+            bench.validate_producer(
+                report, SimpleNamespace(token_ids=tokens), first, 4,
+            )
+
     def test_zero_one_and_first_eos_have_no_tpot(self):
         for count, stop in ((0, False), (1, False), (9, True)):
             engine, first, _, _ = self.fixture()

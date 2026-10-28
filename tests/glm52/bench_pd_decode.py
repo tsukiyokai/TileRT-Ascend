@@ -179,6 +179,34 @@ def command_rounds(operation):
     return count
 
 
+def validate_linear_acceptance(span, tokens, accepted):
+    """Recompute fixed-length, ignore-EOS acceptance from actual round rows."""
+    width = span["width"]
+    candidates, predictions = span.get("candidates"), span.get("predictions")
+    if (span.get("parents") is not None
+            or not all(isinstance(values, list) and len(values) == width
+                       for values in (candidates, predictions))
+            or any(type(token) is not int or not 0 <= token < VOCAB_SIZE
+                   for values in (candidates, predictions) for token in values)
+            or candidates[0] != tokens[accepted]):
+        raise ValueError("MTP round lacks linear candidate/prediction rows")
+    matched = 0
+    for proposed, predicted in zip(candidates[1:], predictions):
+        if proposed != predicted:
+            break
+        matched += 1
+    natural = matched + 1
+    committed = min(natural, OUTPUT_TOKENS - 1 - accepted)
+    if (any(type(span[field]) is not int for field in (
+            "matched_drafts", "natural_accepted", "accepted"))
+            or span["matched_drafts"] != matched
+            or span["natural_accepted"] != natural
+            or span["accepted"] != committed
+            or tokens[1 + accepted:1 + accepted + committed]
+            != predictions[:committed]):
+        raise ValueError("MTP acceptance differs from candidate/prediction rows")
+
+
 def validate_round_commands(operations, stats, mtp_width, tokens):
     spans = stats["accepted_spans"]
     if (not operations or not spans
@@ -202,12 +230,14 @@ def validate_round_commands(operations, stats, mtp_width, tokens):
         ]:
             raise ValueError("MTP command tokens differ from delivery")
         for item in group:
-            if (item["width"] not in WIDTHS or item["width"] > mtp_width
+            if (type(item["width"]) is not int
+                    or item["width"] not in WIDTHS or item["width"] > mtp_width
                     or not 1 <= item["accepted"] <= item["width"]
                     or item["output_tokens"] != item["accepted"]
                     or item["main_start"] != position
                     or item["main_retained"] != position + item["accepted"]):
                 raise ValueError("MTP round width, delivery or cache differs")
+            validate_linear_acceptance(item, tokens, accepted)
             position = item["main_retained"]
             accepted += item["accepted"]
         offset += count
