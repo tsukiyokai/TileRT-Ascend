@@ -85,6 +85,12 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 [原生M1/M32 row13读回](evidence/ascend-decode/width32-firstdiff-20261029/README.md)绑定原始rank0两PT与teacher，CPU mmap真实读取、零NPU绑定、退出0。h0～h68逐位相同，layer68输出h69首次不同，NRMSE 0.001774；layer70 latent以0.012712首先越过原容差，indices集合重叠2045/2048。此前indices仅顺序不同，row13返回ID仍相同。层内attention/MLP及其他行历史KV尚未划分，下一次采样前移到layer68两积木边界；未据此宣告根因、精度或TPOT通过。
 
+[layer68历史核对](evidence/ascend-decode/layer68-history-20261029/README.md)进一步读取rank0 serial00～13：14行h68合并残差、新latent/rope和routes均逐位相同，选择集合相同、部分顺序不同，386项冻结前缀检查通过。row13选择了全部14个新增位置，未发现不同历史KV；norm实际两输入、QL和层内结果仍需设备采样。已提取22.6MB原始输出控制，避免新采样逐次读取1.62GB宽帧。
+
+[layer68三臂TP16采样](evidence/ascend-decode/layer68-boundaries-a3-20261029/README.md)确认原生/复制/位置排序的row13 h69与最终logits逐位相同rank数为0/0/16，logits NRMSE为0.0327916/0.0327916/0。16rank实际norm输入、QL/QPE与有效KV相同；原生首差只在rank12 SFA的1个BF16元素，随后传播到TP输出。[同die固定M1干预](evidence/ascend-decode/sfa-order-a3-20261029/README.md)只替换实际M32索引顺序，32次均逐位复现M32 row13输出；三臂96个设备输出另经CPU重读核对。索引顺序足以造成该局部分歧；排序改变原生M1数值，完整HF、多输入及性能仍待验收。
+
+本夜Value缓存性能预测失败后，整模精度排障占据主线，尚未形成新增TPOT或独立组件性能收益。接下来先核对原生/预排序/每次排序的完整SFA双钟成本；预排序p50/p95均须至少改善5%，每次排序另计净收益。未达预测即关闭性能接入，数值因果结果单独保留；整模精度排障不再作为其他组件计时的前置条件。
+
 本轮执行反省：局部舍入对账挤占了完整请求对照；逐层准备约48秒，完成16/78层后才停止并换常驻模型。传播误差下降尚未形成通过精度的基线，完整性能A/B也未完成。后续常驻整模对照沿用固定容差，组件候选单独取得数值与配对墙钟证据；容差内的CPU比特差异不作为继续迭代的理由。
 
 [速度门禁反例修复](evidence/ascend-decode/diversity-gate-20261029/README.md)：八输入、32请求、1024个零、双钟1ms的同一CPU夹具，从旧`passes_target=true`变为false。当前从请求工件重算token/bigram/周期及文件SHA，应用显式冻结policy，并保留双钟与覆盖条件。36项CPU检查通过；这是准入修复，未测设备时延。
