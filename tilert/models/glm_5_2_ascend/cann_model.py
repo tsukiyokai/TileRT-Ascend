@@ -18,6 +18,19 @@ VOCAB_SIZE = 154880
 LENGTH_SLOTS = 64
 
 
+def _token_values(tokens):
+    import torch
+
+    values = tuple(tokens) if isinstance(tokens, (list, tuple)) else (tokens,)
+    has_tensors = False
+    for value in values:
+        if torch.is_tensor(value):
+            has_tensors = True
+        elif type(value) is not int or not 0 <= value < VOCAB_SIZE:
+            raise ValueError("Decode requires GLM-5.2 vocabulary tokens")
+    return values, has_tensors
+
+
 def device_tokens(tokens, device):
     """Normalise decode tokens to one device integer tensor.
 
@@ -30,14 +43,7 @@ def device_tokens(tokens, device):
 
     if torch.is_tensor(tokens):
         return tokens.reshape(-1).to(torch.int64)
-    values = tuple(tokens) if isinstance(tokens, (list, tuple)) else (tokens,)
-    has_tensors = False
-    for value in values:
-        if torch.is_tensor(value):
-            has_tensors = True
-            continue
-        if type(value) is not int or not 0 <= value < VOCAB_SIZE:
-            raise ValueError("Decode requires GLM-5.2 vocabulary tokens")
+    values, has_tensors = _token_values(tokens)
     if not has_tensors:
         return torch.tensor(values, dtype=torch.int64, device=device)
     return torch.stack([
@@ -243,6 +249,7 @@ class CannModel:
         gather_fia_max_width=None,
         mtp_tokens=0, layers=None,
         hoist_metadata=False, hoist_forward_context=False,
+        packed_host_inputs=False,
     ):
         if type(rank) is not int or not 0 <= rank < 16:
             raise ValueError("GLM-5.2 requires a logical TP rank in [0, 16)")
@@ -300,6 +307,7 @@ class CannModel:
         self.attention_kernel = attention_kernel
         self.graph_width = graph_width
         self.hoist_metadata = hoist_metadata
+        self.packed_host_inputs = packed_host_inputs
         self.fp32_head = fp32_head
         # A config-store endpoint turns the TP sum into a one-sided push: the
         # vendor collective is rendezvous rather than transfer. The decode
@@ -627,15 +635,30 @@ class CannModel:
     def _allocate_inputs(self):
         import torch
 
+        widths = (1, 2, 4, 6, 8, 12, 16, 24, 32)
+        self._host_inputs = None
+        if getattr(self, "packed_host_inputs", False):
+            from .host_inputs import HostInputs
+
+            self._host_inputs = HostInputs(
+                self.device, widths, slots=LENGTH_SLOTS,
+            )
         self.graph = None
         self._hoisted = {}
         self._input_buffers = {}
-        for width in (1, 2, 4, 6, 8, 12, 16, 24, 32):
-            tokens = torch.empty(width, dtype=torch.int32, device=self.device)
-            positions = torch.empty(
-                width, dtype=torch.long, device=self.device,
-            )
-            slots = torch.empty(width, dtype=torch.int32, device=self.device)
+        for width in widths:
+            if self._host_inputs is None:
+                tokens = torch.empty(
+                    width, dtype=torch.int32, device=self.device,
+                )
+                positions = torch.empty(
+                    width, dtype=torch.long, device=self.device,
+                )
+                slots = torch.empty(
+                    width, dtype=torch.int32, device=self.device,
+                )
+            else:
+                tokens, positions, slots, _ = self._host_inputs.views(width)
             query_cpu = torch.tensor([0, width], dtype=torch.int32)
             self._input_buffers[width] = (
                 tokens, positions, slots, query_cpu, query_cpu.to(self.device),
@@ -683,35 +706,41 @@ class CannModel:
                     destination[:length].copy_(source[name])
         self.position = length
 
-    def _metadata(self, width=1, *, graphed=False, depths=None):
+    def _metadata(self, width=1, *, graphed=False, depths=None,
+                  host_values=None):
         import torch
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
         from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
         (self.input_ids, self.positions, self.slots,
          self.query_cpu, self.query) = self._input_buffers[width]
-        slot = self._length_slot % LENGTH_SLOTS
-        self._length_slot += 1
-        length_cpu = self._lengths[slot:slot + 1]
-        length_cpu[0] = self.position + width
-        computed_cpu = torch.tensor([self.position], dtype=torch.int32)
-        slots_cpu = torch.arange(
-            self.position, self.position + width, dtype=torch.long,
-        )
-        # A row's slot is where its key is stored and a row's position is what
-        # rope sees, and a tree is the first thing that tells them apart: node
-        # i lives in slot i, so the mask can name it, but it stands at the
-        # depth of its own branch.
-        positions_cpu = slots_cpu if depths is None else torch.tensor(
-            [self.position + depth for depth in depths], dtype=torch.long,
-        )
-        self.seq_lens.copy_(length_cpu, non_blocking=True)
-        if width == 1:
-            self.slots.fill_(self.position)
-            self.positions.fill_(self.position)
+        host_inputs = getattr(self, "_host_inputs", None)
+        if host_inputs is not None:
+            self.seq_lens = host_inputs.views(width)[3]
+        if host_values is not None:
+            length_cpu, positions_cpu = host_inputs.stage(
+                host_values, self.position, depths,
+            )
         else:
-            self.slots.copy_(slots_cpu)
-            self.positions.copy_(positions_cpu)
+            slot = self._length_slot % LENGTH_SLOTS
+            self._length_slot += 1
+            length_cpu = self._lengths[slot:slot + 1]
+            length_cpu[0] = self.position + width
+            slots_cpu = torch.arange(
+                self.position, self.position + width, dtype=torch.long,
+            )
+            # A tree stores rows linearly and assigns RoPE positions by depth.
+            positions_cpu = slots_cpu if depths is None else torch.tensor(
+                [self.position + depth for depth in depths], dtype=torch.long,
+            )
+            self.seq_lens.copy_(length_cpu, non_blocking=True)
+            if width == 1:
+                self.slots.fill_(self.position)
+                self.positions.fill_(self.position)
+            else:
+                self.slots.copy_(slots_cpu)
+                self.positions.copy_(positions_cpu)
+        computed_cpu = torch.tensor([self.position], dtype=torch.int32)
         hoisted = self._hoisted.get(width) if graphed else None
         if hoisted is not None:
             metadata, values, _ = hoisted
@@ -783,21 +812,21 @@ class CannModel:
         elif self.graph.width != width:
             raise ValueError("The model already captures another width")
 
-    def verify(self, tokens, *, full_logits=True, depths=None):
-        """Consume M rows and return M next-token predictions.
-
-        The rows are causal in their own order unless `depths` says otherwise,
-        which is how a tree's branches get the positions their own ancestry
-        gives them rather than the ones their storage order would.
-        """
+    def _prepare_inputs(self, tokens, *, depths=None):
+        """Stage persistent model inputs and build their consumer metadata."""
         import torch
-        from vllm.config import set_current_vllm_config
-        from vllm_ascend.ascend_forward_context import (
-            set_ascend_forward_context,
-        )
 
-        tokens = device_tokens(tokens, self.device)
-        width = tokens.shape[0]
+        host_values = None
+        if (getattr(self, "_host_inputs", None) is not None
+                and not torch.is_tensor(tokens)):
+            values, has_tensors = _token_values(tokens)
+            if not has_tensors:
+                host_values = values
+        if host_values is None:
+            tokens = device_tokens(tokens, self.device)
+            width = tokens.shape[0]
+        else:
+            width = len(host_values)
         if width not in (1, 2, 4, 6, 8, 12, 16, 24, 32):
             raise ValueError("Unsupported verification width")
         if self.position + width > self.capacity:
@@ -808,13 +837,28 @@ class CannModel:
         if uses_fia and self.position < 2047:
             raise ValueError("FIA requires 2048 valid selected rows")
         use_graph = self.graph is not None and self.graph.width == width
+        metadata = self._metadata(
+            width, graphed=use_graph, depths=depths, host_values=host_values,
+        )
+        if use_graph:
+            self.refresh_hoisted_rope(width, self.positions)
+        if host_values is None:
+            self.input_ids.copy_(tokens)
+        return width, metadata
+
+    def verify(self, tokens, *, full_logits=True, depths=None):
+        """Consume causal rows, with optional tree depths for RoPE."""
+        import torch
+        from vllm.config import set_current_vllm_config
+        from vllm_ascend.ascend_forward_context import (
+            set_ascend_forward_context,
+        )
+
         with torch.npu.device(self.device), torch.inference_mode(), (
             set_current_vllm_config(self.config)
         ):
-            metadata = self._metadata(width, graphed=use_graph, depths=depths)
-            if use_graph:
-                self.refresh_hoisted_rope(width, self.positions)
-            self.input_ids.copy_(tokens)
+            width, metadata = self._prepare_inputs(tokens, depths=depths)
+            use_graph = self.graph is not None and self.graph.width == width
             with set_ascend_forward_context(
                 metadata, self.config, num_tokens=width,
                 num_actual_tokens=width,
@@ -973,6 +1017,8 @@ class CannModel:
                    type(self.model), type(self.model.model),
                    set_ascend_forward_context]
         objects.extend(type(builder) for _, builder in self.builders)
+        if getattr(self, "_host_inputs", None) is not None:
+            objects.append(type(self._host_inputs))
         if self.attention_kernel == "gather_fia":
             from .cann_attention import gathered_fia
 

@@ -202,3 +202,5 @@ runtime 日志在命令前设置 `ASCEND_GLOBAL_LOG_LEVEL=1 ASCEND_SLOG_PRINT_TO
 `msprof` 的时间线用于定位，`msobjdump` 的反汇编用于核对二进制结构，运行行为用真机记录验证。`ASCEND_LAUNCH_BLOCKING` 辅助同步定位，`NPU_COLLECT_PATH` 保存异常 dump；按匹配 SDK 配置，诊断结束后关闭，再验证正式执行。profile 与无 profiler 的正式计时分别保存。
 
 编译输出直接保存到日志文件，失败时连同警告一起检查；直接接到 `head` 会因 SIGPIPE 中断编译器。框架只报告准备步骤失败时，用它实际传入的参数单独执行该步骤，保存退出码。SHMEM 初始化失败时，打开 `SHMEM_LOG_LEVEL` 并读取 SDK 日志，定位具体失败调用和参数，再选择修复；`-4` 或 `507015` 本身只标识失败，可能对应多个原因。
+
+量化预测与实测变化分别记录。[合包输入](evidence/ascend-decode/host-inputs-a3-20261029/README.md)的20%双钟预测失败，墙钟18.082%的下降仍按原始数据保留；不删除共同CPU成本以改判通过。真实模型接线另做数值对照，结果不升级为TPOT。

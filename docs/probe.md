@@ -91,6 +91,10 @@ block1重试已完成全部M1/M32/reset工件；首行NaN消失、预测恢复38
 
 Value缓存性能预测失败后的这段执行由整模精度排障占据主线，尚未形成新增TPOT。[排序三臂计时](evidence/ascend-decode/sfa-order-timing-a3-20261029/README.md)已在9382单die完成M1/完整M32、两width各60组对照。width32原生/预排序/每次排序的墙钟p50为329.762/341.002/357.398µs，event为258.020/271.830/293.750µs；两width均未达预排序双钟p50/p95至少改善5%的预测，每次排序亦无净收益，停止此实现的性能接入。432个设备样本、全部双钟统计及完整输出另经独立重读；数值结果单独保留。整模精度排障不再作为其他组件计时的前置条件。
 
+[合包输入准备](evidence/ascend-decode/host-inputs-a3-20261029/README.md)把host tokens、positions、slots及length放进一个pinned packet，保留固定typed views。9382单die的width32准备窗口墙钟p50为767.251→628.517µs，event为604.400→424.150µs，p95均下降；墙钟18.082%未达预注册20%，不更改门槛。计时包含fixture生成与CommonMetadata、不含vendor builders或模型，137.520µs配对节省不并入整轮账本。默认关闭，`--packed-host-inputs`供后续对照。
+
+[真实TP16消费者](evidence/ascend-decode/host-inputs-model-a3-20261029/README.md)已在同一常驻模型核对两臂的M1首行、完整M32及reset。独立CPU读取96PT，旧设备输出、输入、新KV、跨臂/reset及16rank最终输出摘要均通过，16,496项比较无失败；每阶段前缀的18,528项现场断言另保留，未由PT独立重算。一个8K输入的eager数值结果，HF、实际模型graph、八输入与在线TPOT仍待验收。下一性能实验先取得同包真实width32整轮的诊断trace和profiler-off窗口，再选择通信buffer两端cast融合的完整消费者对照；保留原HCCL结合顺序及BF16舍入，剖析请求不入TPOT。
+
 本轮执行反省：局部舍入对账挤占了完整请求对照；逐层准备约48秒，完成16/78层后才停止并换常驻模型。传播误差下降尚未形成通过精度的基线，完整性能A/B也未完成。后续常驻整模对照沿用固定容差，组件候选单独取得数值与配对墙钟证据；容差内的CPU比特差异不作为继续迭代的理由。
 
 [速度门禁反例修复](evidence/ascend-decode/diversity-gate-20261029/README.md)：八输入、32请求、1024个零、双钟1ms的同一CPU夹具，从旧`passes_target=true`变为false。当前从请求工件重算token/bigram/周期及文件SHA，应用显式冻结policy，并保留双钟与覆盖条件。36项CPU检查通过；这是准入修复，未测设备时延。

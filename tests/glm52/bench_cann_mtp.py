@@ -141,6 +141,8 @@ def arguments():
                              " width and refresh only its rope slices")
     parser.add_argument("--hoist-forward-context", action="store_true",
                         help="Serve a prebuilt MC2 mask per token width")
+    parser.add_argument("--packed-host-inputs", action="store_true",
+                        help="Upload host tokens and decode metadata together")
     parser.add_argument("--compile-target", action="store_true")
     parser.add_argument("--super-kernel", action="store_true",
                         help="Use static kernels and SuperKernel for target")
@@ -550,7 +552,8 @@ def run(args, report):
                        plain_moe_combine=args.plain_moe_combine,
                        graph_width=args.width,
                        hoist_metadata=args.hoist_metadata,
-                       hoist_forward_context=args.hoist_forward_context)
+                       hoist_forward_context=args.hoist_forward_context,
+                       packed_host_inputs=args.packed_host_inputs)
     draft = None
     try:
         draft = create_draft(target, args)
@@ -799,6 +802,7 @@ def run(args, report):
                 "draft_projection_tp": args.draft_projection_tp,
                 "hoist_metadata": args.hoist_metadata,
                 "hoist_forward_context": args.hoist_forward_context,
+                "packed_host_inputs": args.packed_host_inputs,
                 "compile_target": args.compile_target,
                 "super_kernel": args.super_kernel,
                 "attention_kernel": args.attention_kernel,
@@ -835,6 +839,7 @@ def main():
         "draft_projection_tp": args.draft_projection_tp,
         "hoist_metadata": args.hoist_metadata,
         "hoist_forward_context": args.hoist_forward_context,
+        "packed_host_inputs": args.packed_host_inputs,
         "compile_target": args.compile_target,
         "super_kernel": args.super_kernel,
         "attention_kernel": args.attention_kernel,
